@@ -98,10 +98,18 @@ async def test_dispatch_free_uses_pool_not_paid():
         return await k["do_free_fn"]("ep", {"model": "m"}, {})
 
     out = await summarizer_dispatch(
-        True, "ep", {"model": "m"}, {}, "openai",
-        seed="m", free_pool_fn=_pool, do_paid_fn=_paid,
-        do_free_direct_fn=_paid, transport_request_fn=_transport,
-        chat_to_responses_fn=None, normalize_response_fn=None,
+        True,
+        "ep",
+        {"model": "m"},
+        {},
+        "openai",
+        seed="m",
+        free_pool_fn=_pool,
+        do_paid_fn=_paid,
+        do_free_direct_fn=_paid,
+        transport_request_fn=_transport,
+        chat_to_responses_fn=None,
+        normalize_response_fn=None,
     )
     assert out == ("r", {})
     assert calls == ["pool"]
@@ -123,10 +131,17 @@ async def test_dispatch_paid_uses_paid_not_pool():
         return await k["do_paid_fn"]()
 
     out = await summarizer_dispatch(
-        False, "ep", {"model": "m"}, {}, "openai",
-        free_pool_fn=_pool, do_paid_fn=_paid,
-        do_free_direct_fn=_paid, transport_request_fn=_transport,
-        chat_to_responses_fn=None, normalize_response_fn=None,
+        False,
+        "ep",
+        {"model": "m"},
+        {},
+        "openai",
+        free_pool_fn=_pool,
+        do_paid_fn=_paid,
+        do_free_direct_fn=_paid,
+        transport_request_fn=_transport,
+        chat_to_responses_fn=None,
+        normalize_response_fn=None,
     )
     assert out == ("r", {})
     assert calls == ["paid"]

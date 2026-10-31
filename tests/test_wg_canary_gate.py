@@ -257,9 +257,7 @@ def test_boot_auto_resolves_stack_from_env_not_key(tmp_path):
     m = _CanaryMgr(cfg, tmp_path)
     assert m._wg_key_file == str(key_file)
     assert os.path.exists(m._wg_key_file), "précondition : la clé WG existe bien"
-    assert m._stack_effective == "openvpn", (
-        "le .env par station prime sur la présence de la clé WG"
-    )
+    assert m._stack_effective == "openvpn", "le .env par station prime sur la présence de la clé WG"
 
 
 def test_boot_auto_falls_back_to_key_when_env_missing(tmp_path):

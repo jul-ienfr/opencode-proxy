@@ -86,15 +86,11 @@ def test_cache_token_readers_tolerate_malformed_usage():
 ANTHRO_WITH_CC = {
     "model": "test-model",
     "max_tokens": 4096,
-    "system": [
-        {"type": "text", "text": "Tu es un assistant.", "cache_control": {"type": "ephemeral"}}
-    ],
+    "system": [{"type": "text", "text": "Tu es un assistant.", "cache_control": {"type": "ephemeral"}}],
     "messages": [
         {
             "role": "user",
-            "content": [
-                {"type": "text", "text": "Bonjour", "cache_control": {"type": "ephemeral"}}
-            ],
+            "content": [{"type": "text", "text": "Bonjour", "cache_control": {"type": "ephemeral"}}],
         }
     ],
 }
@@ -274,9 +270,7 @@ def test_cache_rewrite_only_for_configured_models():
     assert _canon.CACHE_REWRITE_MODELS, "liste de modèles vide : contrat invalide"
     target = sorted(_canon.CACHE_REWRITE_MODELS)[0]
     other = "deepseek-v4-flash"
-    assert other not in _canon.CACHE_REWRITE_MODELS, (
-        "le modèle témoin ne doit pas être dans CACHE_REWRITE_MODELS"
-    )
+    assert other not in _canon.CACHE_REWRITE_MODELS, "le modèle témoin ne doit pas être dans CACHE_REWRITE_MODELS"
 
     body = {
         "model": target,
@@ -284,17 +278,11 @@ def test_cache_rewrite_only_for_configured_models():
         "system": LONG_SYSTEM,
         "messages": [{"role": "user", "content": "Question"}],
     }
-    rewritten = _canon._restructure_for_cache(
-        pm.anthropic_to_openai({**body, "effort": "none"}, other), target
-    )
+    rewritten = _canon._restructure_for_cache(pm.anthropic_to_openai({**body, "effort": "none"}, other), target)
     n_before = len(rewritten["messages"])
     # Le modèle cible est réécrit, l'autre non : on compare les deux appels.
-    for_cache = _canon._restructure_for_cache(
-        pm.anthropic_to_openai({**body, "effort": "none"}, target), target
-    )
-    not_for_cache = _canon._restructure_for_cache(
-        pm.anthropic_to_openai({**body, "effort": "none"}, other), other
-    )
+    for_cache = _canon._restructure_for_cache(pm.anthropic_to_openai({**body, "effort": "none"}, target), target)
+    not_for_cache = _canon._restructure_for_cache(pm.anthropic_to_openai({**body, "effort": "none"}, other), other)
     assert len(for_cache["messages"]) >= n_before
     # Le témoin garde son unique message système.
     sys_not = [m for m in not_for_cache["messages"] if m.get("role") == "system"]
@@ -387,9 +375,7 @@ def test_orphan_tool_result_is_dropped_end_to_end_in_p2():
             {"role": "user", "content": "salut"},
             {
                 "role": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": "toolu_fantome", "content": "orphelin"}
-                ],
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_fantome", "content": "orphelin"}],
             },
         ],
     }
@@ -412,17 +398,13 @@ def test_valid_tool_pair_survives_p2_end_to_end():
             },
             {
                 "role": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": "toolu_ok", "content": "il fait beau"}
-                ],
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_ok", "content": "il fait beau"}],
             },
         ],
         "tools": [{"name": "t", "description": "d", "input_schema": {"type": "object"}}],
     }
     out = pm.anthropic_to_openai(body, "deepseek-v4-flash")
-    assert any(m.get("role") == "tool" for m in out["messages"]), (
-        "le tool_result valide a été supprimé à tort"
-    )
+    assert any(m.get("role") == "tool" for m in out["messages"]), "le tool_result valide a été supprimé à tort"
 
 
 def test_responses_orphan_guard_keeps_valid_pair():

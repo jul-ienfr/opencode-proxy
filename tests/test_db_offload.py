@@ -97,7 +97,7 @@ async def test_save_request_enqueues_raw_row(monkeypatch):
     assert raw.tools_used == ["read", "read", "grep"], "dédup effectué au writer, pas au caller"
 
     row = oc._materialize_db_row(raw)
-    assert len(row) == 32  # [Étape 2 — O2] + free_status/paid_status
+    assert len(row) == 35  # [audit 2026-10-30] + ttfb_ms/stop_reason/aborted
     assert row[0] == "req-d1"
     assert row[16] == json.dumps([{"name": "read"}])
     assert row[17] == json.dumps(["read", "grep"]), "tools_used dédupliqué"
@@ -116,7 +116,7 @@ async def test_materialized_row_redacts_secrets():
     }
     raw = oc._DbRowRaw(
         ("id",) * 16,
-        (None,) * 12,  # [Étape 2 — O2] tail 10 → 12 (+ free_status/paid_status)
+        (None,) * 15,  # [audit 2026-10-30] tail 12 -> 15 (+ ttfb_ms/stop_reason/aborted)
         request_body=body,
         response_body=None,
         tools=None,
@@ -127,10 +127,18 @@ async def test_materialized_row_redacts_secrets():
     assert "***" in row[18]
 
 
+def test_redact_fast_path_ignores_embedded_sk_dash():
+    """Le pré-test de redaction ne doit ni rater un secret ni matcher « task- »."""
+    text = "task-specific disk-io risk-free " * 2000
+    assert oc._redact(text) == text
+    assert oc._redact("ses_abcdef123456ABCDEFGHIJKLMN") == "ses_abcdef123456***"
+    assert "***" in oc._redact("x-api-key: vg3q59eBCjG9hWVXm2Wpc8n9smumwhtugihf7oDafv0")
+
+
 @pytest.mark.asyncio
 async def test_batch_writer_accepts_raw_rows_end_to_end(monkeypatch, tmp_path):
     """Garde-fou régression : _db_execute_batch_sync insère VRAIMENT une
-    _DbRowRaw matérialisée dans SQLite (32 colonnes) — pas l'objet brut."""
+    _DbRowRaw matérialisée dans SQLite (35 colonnes) — pas l'objet brut."""
     import sqlite3
 
     conn = sqlite3.connect(":memory:")
@@ -146,7 +154,8 @@ async def test_batch_writer_accepts_raw_rows_end_to_end(monkeypatch, tmp_path):
             client_user_agent TEXT, free_model_ip TEXT, identity TEXT,
             geo_country TEXT, geo_blocked TEXT, geo_direct_country TEXT,
             geo_direct_ip TEXT, geo_via_vpn TEXT, geo_allowed TEXT, station TEXT,
-            free_status INTEGER, paid_status INTEGER
+            free_status INTEGER, paid_status INTEGER,
+            ttfb_ms INTEGER, stop_reason TEXT, aborted INTEGER DEFAULT 0
         )
         """
     )
@@ -176,9 +185,7 @@ async def test_batch_writer_accepts_raw_rows_end_to_end(monkeypatch, tmp_path):
     assert isinstance(captured[0][1], oc._DbRowRaw)
     n = oc._db_execute_batch_sync(list(captured))
     assert n == 1
-    db_row = conn.execute(
-        "SELECT id, model, request_body FROM requests WHERE id='req-e2e'"
-    ).fetchone()
+    db_row = conn.execute("SELECT id, model, request_body FROM requests WHERE id='req-e2e'").fetchone()
     assert db_row is not None
     assert db_row[1] == "glm-5.1"
     assert "hello" in db_row[2]
@@ -210,8 +217,15 @@ async def test_log_free_model_usage_enqueues_without_sqlite_on_loop(monkeypatch)
     monkeypatch.setattr(oc, "_db_queue", _FakeQueue(captured))
 
     oc._log_free_model_usage(
-        "claude-sonnet", "glm-5.1", "sk-ant-api03-abcdef1234567890", "wrk_x", 200,
-        tokens_in=11, tokens_out=22, duration_ms=33, ip="1.2.3.4",
+        "claude-sonnet",
+        "glm-5.1",
+        "sk-ant-api03-abcdef1234567890",
+        "wrk_x",
+        200,
+        tokens_in=11,
+        tokens_out=22,
+        duration_ms=33,
+        ip="1.2.3.4",
     )
     assert rec.calls == [], "aucun appel sqlite synchrone sur la boucle"
     assert len(captured) == 1
@@ -237,10 +251,11 @@ async def test_free_usage_tagged_row_inserts_end_to_end(monkeypatch):
     monkeypatch.setattr(oc, "_conn", conn)
 
     batch = [
-        ("free_usage",
-         ("2026-08-26T10:00:00Z", "claude-sonnet", "glm-5.1", "sk-...mask",
-          "wrk_x", 200, 5, 7, 42, "1.2.3.4")),
-        ("requests", ("id-r",) + ("x",)) ,  # type ignoré : table absente → item sauté fail-soft
+        (
+            "free_usage",
+            ("2026-08-26T10:00:00Z", "claude-sonnet", "glm-5.1", "sk-...mask", "wrk_x", 200, 5, 7, 42, "1.2.3.4"),
+        ),
+        ("requests", ("id-r",) + ("x",)),  # type ignoré : table absente → item sauté fail-soft
     ]
     # La ligne requests ci-dessus vise une table inexistante : le contrat
     # fail-soft du writer veut qu'elle soit sautée SANT casser le batch.
@@ -292,7 +307,8 @@ async def test_mixed_batch_requests_and_free_usage(monkeypatch):
             client_user_agent TEXT, free_model_ip TEXT, identity TEXT,
             geo_country TEXT, geo_blocked TEXT, geo_direct_country TEXT,
             geo_direct_ip TEXT, geo_via_vpn TEXT, geo_allowed TEXT, station TEXT,
-            free_status INTEGER, paid_status INTEGER
+            free_status INTEGER, paid_status INTEGER,
+            ttfb_ms INTEGER, stop_reason TEXT, aborted INTEGER DEFAULT 0
         )
         """
     )
@@ -301,7 +317,7 @@ async def test_mixed_batch_requests_and_free_usage(monkeypatch):
 
     raw_req = oc._DbRowRaw(
         ("id-mix", "2026-08-26T10:00:00Z", "glm-5.1") + (None,) * 13,
-        (None,) * 12,  # [Étape 2 — O2] tail 10 → 12 (+ free_status/paid_status)
+        (None,) * 15,  # [audit 2026-10-30] tail 12 -> 15 (+ ttfb_ms/stop_reason/aborted)
         request_body=None,
         response_body=None,
         tools=None,
@@ -309,8 +325,7 @@ async def test_mixed_batch_requests_and_free_usage(monkeypatch):
     )
     batch = [
         ("requests", raw_req),
-        ("free_usage",
-         ("2026-08-26T10:00:01Z", "opus", "minimax-m2.5", "k", "w", 200, 1, 2, 3, "")),
+        ("free_usage", ("2026-08-26T10:00:01Z", "opus", "minimax-m2.5", "k", "w", 200, 1, 2, 3, "")),
     ]
     n = oc._db_execute_batch_sync(batch)
     assert n == 2

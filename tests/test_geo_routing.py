@@ -178,9 +178,7 @@ class TestGeoGateIntegration:
 
     def test_hot_reload_geo_policies(self, monkeypatch):
         monkeypatch.setattr(st, "GEO_ENABLED", True)
-        monkeypatch.setattr(
-            st, "GEO_POLICIES", {"p1": {"allowed_countries": ["Germany"], "mode": "strict"}}
-        )
+        monkeypatch.setattr(st, "GEO_POLICIES", {"p1": {"allowed_countries": ["Germany"], "mode": "strict"}})
         monkeypatch.setattr(st, "IP_ROTATION", {"server_countries": "Germany,France"})
         route = {"model": "x", "geo": {"extends": "p1"}}
         r = st.resolve_geo(route)
@@ -370,9 +368,7 @@ class TestEstoniaNonRegression:
         import opencode
 
         monkeypatch.setattr(st, "GEO_ENABLED", True)
-        monkeypatch.setattr(
-            st, "IP_ROTATION", {"enabled": True, "server_countries": "Germany,United States,France"}
-        )
+        monkeypatch.setattr(st, "IP_ROTATION", {"enabled": True, "server_countries": "Germany,United States,France"})
         monkeypatch.setattr(
             st,
             "GEO_POLICIES",
@@ -417,9 +413,7 @@ class TestEstoniaNonRegression:
         req = _FakeRequest()
 
         # _enforce_geo_gate should NOT return None (should force tunnel)
-        result = asyncio.run(
-            opencode._enforce_geo_gate(route, req, is_stream=False, protocol="openai")
-        )
+        result = asyncio.run(opencode._enforce_geo_gate(route, req, is_stream=False, protocol="openai"))
         # When _direct_country is Estonia and allow_direct=True but Estonia
         # not in effective_allowed, the gate sets _geo_force_tunnel=True
         # and continues to pin logic.  If station already in allowed, it
@@ -438,9 +432,7 @@ class TestEstoniaNonRegression:
 
         monkeypatch.setattr(opencode, "_direct_country", _direct_germany)
         req2 = _FakeRequest()
-        result2 = asyncio.run(
-            opencode._enforce_geo_gate(route, req2, is_stream=False, protocol="openai")
-        )
+        result2 = asyncio.run(opencode._enforce_geo_gate(route, req2, is_stream=False, protocol="openai"))
         # Direct IP Germany in allowed + allow_direct=True → pass through
         assert result2 is None, "Direct Germany in allowed + allow_direct=True → gate must pass"
         assert getattr(req2.state, "_geo_force_tunnel", False) is False, (
@@ -450,9 +442,7 @@ class TestEstoniaNonRegression:
         # --- Case C: direct country = Germany + allow_direct=False → tunnel forced ---
         monkeypatch.setattr(st, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", False)
         req3 = _FakeRequest()
-        result3 = asyncio.run(
-            opencode._enforce_geo_gate(route, req3, is_stream=False, protocol="openai")
-        )
+        result3 = asyncio.run(opencode._enforce_geo_gate(route, req3, is_stream=False, protocol="openai"))
         # Even though Germany is in allowed, allow_direct=False → must force tunnel
         if result3 is None:
             assert getattr(req3.state, "_geo_force_tunnel", False) is True, (
@@ -466,9 +456,7 @@ class TestEstoniaNonRegression:
         import opencode
 
         monkeypatch.setattr(st, "GEO_ENABLED", True)
-        monkeypatch.setattr(
-            st, "IP_ROTATION", {"enabled": True, "server_countries": "Germany,France"}
-        )
+        monkeypatch.setattr(st, "IP_ROTATION", {"enabled": True, "server_countries": "Germany,France"})
         monkeypatch.setattr(
             st,
             "GEO_POLICIES",
@@ -499,9 +487,7 @@ class TestEstoniaNonRegression:
 
         req = _FakeRequest()
 
-        result = asyncio.run(
-            opencode._enforce_geo_gate(route, req, is_stream=True, protocol="openai")
-        )
+        result = asyncio.run(opencode._enforce_geo_gate(route, req, is_stream=True, protocol="openai"))
         assert result is not None, "VPN down + strict + require_vpn must block"
         # Must be a StreamingResponse (SSE)
         from starlette.responses import StreamingResponse

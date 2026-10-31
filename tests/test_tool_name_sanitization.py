@@ -144,9 +144,7 @@ class TestFastPath:
         out, mmap = pm.sanitize_tool_names(tools)
         assert out is tools or out == tools
         assert mmap == {}
-        assert pm._TOOL_NAME_MAP_KEY not in pm._chat_to_responses_request(
-            _chat_req(tools=[_oai_tool("Read")])
-        )
+        assert pm._TOOL_NAME_MAP_KEY not in pm._chat_to_responses_request(_chat_req(tools=[_oai_tool("Read")]))
 
 
 # ── 7 : restore non-stream ───────────────────────────────────────────
@@ -317,9 +315,7 @@ class TestSamePathFreePaid:
         body = {
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [
-                {"name": LONG65, "description": "d", "input_schema": {"type": "object"}}
-            ],
+            "tools": [{"name": LONG65, "description": "d", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "tool", "name": LONG65},
         }
         req = pm._anthropic_to_responses_request(body)
@@ -353,9 +349,7 @@ def _history_messages(long_name):
 
 def _function_call_names(req):
     return [
-        item["name"]
-        for item in req.get("input", [])
-        if isinstance(item, dict) and item.get("type") == "function_call"
+        item["name"] for item in req.get("input", []) if isinstance(item, dict) and item.get("type") == "function_call"
     ]
 
 

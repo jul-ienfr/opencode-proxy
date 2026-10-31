@@ -9,6 +9,7 @@ import vpn_manager as vm
 
 # ── helpers ──────────────────────────────────────────────────────────
 
+
 async def _no_sleep(_seconds):
     return None
 
@@ -17,8 +18,13 @@ class _Clock:
     def __init__(self, t=0.0):
         self.t = t
         self._step = 0.0
-    def set_step(self, s): self._step = s
-    def advance(self, dt): self.t += dt
+
+    def set_step(self, s):
+        self._step = s
+
+    def advance(self, dt):
+        self.t += dt
+
     def __call__(self):
         self.t += self._step
         return self.t
@@ -26,6 +32,7 @@ class _Clock:
 
 class _CanaryMgr(vm.VPNManager):
     _WG_CANARY_POLL_INTERVAL_S = 0.0
+
     def __init__(self, cfg, tmp_path):
         cfg = dict(cfg)
         cfg.setdefault("state_file", str(tmp_path / "vpn_state.json"))
@@ -34,13 +41,17 @@ class _CanaryMgr(vm.VPNManager):
         self.compose_calls = []
         self.probe_calls = 0
         self._canary_probe_result = True
+
     def _docker_run(self, args, timeout=30, env=None):
         self.compose_calls.append(list(args))
+
         class _R:
             returncode = 0
             stdout = ""
             stderr = ""
+
         return _R()
+
     async def _canary_probe_once(self):
         self.probe_calls += 1
         return self._canary_probe_result
@@ -48,10 +59,14 @@ class _CanaryMgr(vm.VPNManager):
 
 def _canary_mgr(tmp_path, **over):
     cfg = {
-        "enabled": True, "vpn_stack": "auto",
-        "auto_wg_egress_ticks": 3, "auto_flip_cooldown_min": 0,
-        "auto_ov_return_min": 60, "auto_ov_fail_threshold": 3,
-        "wg_canary_fail_ttl_s": 90, "wg_canary_pass_ttl_s": 600,
+        "enabled": True,
+        "vpn_stack": "auto",
+        "auto_wg_egress_ticks": 3,
+        "auto_flip_cooldown_min": 0,
+        "auto_ov_return_min": 60,
+        "auto_ov_fail_threshold": 3,
+        "wg_canary_fail_ttl_s": 90,
+        "wg_canary_pass_ttl_s": 600,
         "wg_canary_countries": "Switzerland,Germany,Netherlands",
         "wg_canary_enabled": True,
     }
@@ -60,6 +75,7 @@ def _canary_mgr(tmp_path, **over):
 
 
 # ── P1.4 canary TTL asym ───────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_ttl_asym_fail_retested_before_pass(tmp_path):
@@ -113,6 +129,7 @@ async def test_canary_cache_invalidated_after_ov_to_wg_flip(tmp_path):
     m._sleep_fn = _no_sleep
     # need compose file for _apply_stack .env write
     import os
+
     tmpdir = str(tmp_path)
     compose = os.path.join(tmpdir, "docker-compose.yml")
     open(compose, "w").write("services: {}")
@@ -135,6 +152,7 @@ async def test_wg_canary_disabled_bypasses_gate(tmp_path, caplog):
     m._pending_flip = ("wireguard", "OV healthy 60 min")
     m._canary_probe_result = False
     import logging
+
     with caplog.at_level(logging.WARNING):
         cancelled = await m._cancel_wg_flip_if_canary_dead()
     assert cancelled is False
@@ -147,16 +165,23 @@ async def test_httpcore_missing_logs_warning(tmp_path, caplog, monkeypatch):
     """httpcore[socks] absent -> warning + bypass (pas de faux positif)."""
     # force ImportError for httpcore by patching __import__
     import builtins
+
     orig_import = builtins.__import__
+
     def fake_import(name, *a, **kw):
         if name == "httpcore":
             raise ImportError("No module named 'httpcore'")
         return orig_import(name, *a, **kw)
+
     monkeypatch.setattr(builtins, "__import__", fake_import)
     import logging
+
     # call the real probe (not the fake) — need a manager that uses real method
     # reuse _CanaryMgr but override to call super
-    m2 = _CanaryMgr({"enabled": True, "vpn_stack": "auto", "state_file": str(tmp_path / "s.json"), "wg_canary_enabled": True}, tmp_path)
+    m2 = _CanaryMgr(
+        {"enabled": True, "vpn_stack": "auto", "state_file": str(tmp_path / "s.json"), "wg_canary_enabled": True},
+        tmp_path,
+    )
     # replace with real impl for this test
     m2._canary_probe_once = vm.VPNManager._canary_probe_once.__get__(m2, vm.VPNManager)
     with caplog.at_level(logging.WARNING):
@@ -167,9 +192,16 @@ async def test_httpcore_missing_logs_warning(tmp_path, caplog, monkeypatch):
 
 # ── P2 cascade ───────────────────────────────────────────────────────
 
+
 def _cascade_mgr(tmp_path, **over):
-    cfg = {"enabled": True, "vpn_stack": "auto", "server_countries": "Germany,France",
-           "ovpn_protocol": "udp", "cascade_enabled": True, "auto_wg_egress_ticks": 3}
+    cfg = {
+        "enabled": True,
+        "vpn_stack": "auto",
+        "server_countries": "Germany,France",
+        "ovpn_protocol": "udp",
+        "cascade_enabled": True,
+        "auto_wg_egress_ticks": 3,
+    }
     cfg.update(over)
     m = FakeVPNManager(_cfg(tmp_path, **cfg), tmp_path=tmp_path)
     # ensure cascade attrs exist

@@ -143,9 +143,7 @@ def test_free_model_map_replaces_map_in_place(ctx):
 
     assert resp["ok"] is True
     assert st.FREE_MODEL_MAP == posted, "whole-map replacement"
-    assert st.FREE_MODEL_MAP is api.config_settings.FREE_MODEL_MAP, (
-        "the shared dict was mutated in place (no rebind)"
-    )
+    assert st.FREE_MODEL_MAP is api.config_settings.FREE_MODEL_MAP, "the shared dict was mutated in place (no rebind)"
 
 
 def test_free_model_map_visible_without_restart(ctx):

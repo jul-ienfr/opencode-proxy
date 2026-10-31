@@ -43,6 +43,7 @@ def _record_maintenance_error(where: str, exc: BaseException) -> None:
     db_maintenance_errors += 1
     logger.warning("[db] maintenance %s FAILED: %s: %s", where, type(exc).__name__, exc)
 
+
 # ── Constantes ──────────────────────────────────────────────────────
 
 MAX_BODY_STORAGE = 100_000  # Max chars stored per request/response body in DB
@@ -227,7 +228,10 @@ _SCHEMA_REQUESTS = """
         protocol TEXT,
         is_stream INTEGER,
         thinking TEXT,
-        effort TEXT
+        effort TEXT,
+        ttfb_ms INTEGER,
+        stop_reason TEXT,
+        aborted INTEGER DEFAULT 0
     )
 """
 
@@ -268,6 +272,10 @@ _REQUEST_COLUMN_MIGRATIONS = [
     # _save_request via peek _FALLBACK_CTX + statut paid ; NULL = pas de fallback)
     ("free_status", "NULL"),
     ("paid_status", "NULL"),
+    # [P0.6] observabilité du 60 s : TTFB réel, raison d'arrêt, troncature.
+    ("ttfb_ms", "NULL"),
+    ("stop_reason", "NULL"),
+    ("aborted", "0"),
 ]
 
 _INSERT_REQUESTS_SQL = """
@@ -275,8 +283,9 @@ _INSERT_REQUESTS_SQL = """
         tokens_input, tokens_output, tokens_cache, success, error,
         protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
         request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked,
-        geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station, free_status, paid_status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station, free_status, paid_status,
+        ttfb_ms, stop_reason, aborted)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 # Tables cibles acceptées sous forme de tuple taggé ``(table, payload)`` dans
@@ -492,7 +501,21 @@ def init_requests_schema_fast(conn: sqlite3.Connection, *, busy_timeout: int, ca
     conn.execute(f"PRAGMA cache_size=-{cache_size}")  # page cache
     conn.execute("PRAGMA temp_store=MEMORY")  # temp tables in RAM
     conn.execute(f"PRAGMA mmap_size={mmap_size}")  # memory-mapped I/O
+    # [P0.4] Le WAL ne doit jamais rester au high-water mark d'un cleanup
+    # massif (mesuré 2,4 Go sur 7 Go libres). Tronqué à 64 Mo après checkpoint.
+    conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute(_SCHEMA_REQUESTS)
+    # [P0.6] 3 colonnes d'observabilité ajoutées au boot (ALTER = métadonnée,
+    # ~0 ms) pour éviter la course « insert avant migration de fond ».
+    for _col, _ddl in (
+        ("ttfb_ms", "INTEGER"),
+        ("stop_reason", "TEXT"),
+        ("aborted", "INTEGER DEFAULT 0"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE requests ADD COLUMN {_col} {_ddl}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
 
 
@@ -561,9 +584,7 @@ def migrate_and_canary(conn: sqlite3.Connection, *, report: dict | None = None) 
     # [30] Canary: mixed naive/UTC timestamps break ORDER BY timestamp DESC.
     # BORNÉ : échantillon LIMIT au lieu de COUNT(*) full-scan (P0-4).
     try:
-        rows = conn.execute(
-            "SELECT 1 FROM requests WHERE timestamp NOT LIKE '%Z' LIMIT 1001"
-        ).fetchall()
+        rows = conn.execute("SELECT 1 FROM requests WHERE timestamp NOT LIKE '%Z' LIMIT 1001").fetchall()
         naive = len(rows)
         capped = naive == 1001
         if capped:
@@ -821,35 +842,81 @@ def cleanup_old_bodies(
     Bodies account for ~95% of DB storage. This keeps recent bodies for debugging
     while preventing unbounded growth. Called periodically by background task.
     """
-    try:
-        # Phase 1: Delete old rows entirely
-        cutoff_delete = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - delete_after_days * 86400))
-        cursor = conn.execute("DELETE FROM requests WHERE timestamp < ?", (cutoff_delete,))
-        deleted = cursor.rowcount
-        cursor2 = conn.execute("DELETE FROM free_model_usage WHERE timestamp < ?", (cutoff_delete,))
-        deleted2 = cursor2.rowcount
+    batch_size = 2_000
+    deleted = deleted2 = cleaned = 0
 
-        # Phase 2: Nullify bodies for 7-30 day old rows
+    def _commit_batch() -> None:
+        conn.commit()
+        try:
+            # PASSIVE ne bloque pas les writers ; le journal_size_limit
+            # empêche le WAL de repartir à 2,4 Go.
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
+
+    try:
+        cutoff_delete = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - delete_after_days * 86400))
+        # [P0.4] DELETE/UPDATE par lots de 2 000 : une transaction unique sur
+        # 2 Go de corps remplissait le WAL et le cache SQLite (RSS 3,6 Go).
+        while True:
+            with lock:
+                cur = conn.execute(
+                    "DELETE FROM requests WHERE rowid IN "
+                    "(SELECT rowid FROM requests WHERE timestamp < ? LIMIT ?)",
+                    (cutoff_delete, batch_size),
+                )
+                n = int(cur.rowcount or 0)
+                if n:
+                    _commit_batch()
+            if n <= 0:
+                break
+            deleted += n
+        while True:
+            with lock:
+                cur = conn.execute(
+                    "DELETE FROM free_model_usage WHERE rowid IN "
+                    "(SELECT rowid FROM free_model_usage WHERE timestamp < ? LIMIT ?)",
+                    (cutoff_delete, batch_size),
+                )
+                n = int(cur.rowcount or 0)
+                if n:
+                    _commit_batch()
+            if n <= 0:
+                break
+            deleted2 += n
+
         cutoff_null = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - retention_days * 86400))
-        cursor3 = conn.execute(
-            "UPDATE requests SET request_body = NULL, response_body = NULL "
-            "WHERE timestamp < ? AND (request_body IS NOT NULL OR response_body IS NOT NULL)",
-            (cutoff_null,),
-        )
-        cleaned = cursor3.rowcount
+        while True:
+            with lock:
+                cur = conn.execute(
+                    "UPDATE requests SET request_body = NULL, response_body = NULL "
+                    "WHERE rowid IN (SELECT rowid FROM requests WHERE timestamp < ? "
+                    "AND (request_body IS NOT NULL OR response_body IS NOT NULL) LIMIT ?)",
+                    (cutoff_null, batch_size),
+                )
+                n = int(cur.rowcount or 0)
+                if n:
+                    _commit_batch()
+            if n <= 0:
+                break
+            cleaned += n
 
         total = deleted + deleted2 + cleaned
         if total > 0:
-            conn.commit()
             debug_fn(f"  [db] cleanup: deleted {deleted}+{deleted2} old rows, cleared bodies from {cleaned} requests")
             log_fn(
                 f"  DB CLEANUP: deleted {deleted + deleted2} old rows, cleared {cleaned} bodies (>{retention_days}d)"
             )
-            vacuum_if_needed(conn, lock, deleted + deleted2)
-        return deleted + deleted2 + cleaned
+            # Pas de VACUUM ici : il bloquait les écritures et remplissait la
+            # queue. Le VACUUM hebdo (hors trafic) reste le seul point lourd.
+        return total
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         debug_fn(f"  [db] cleanup error: {type(e).__name__}: {e}")
-        return 0
+        return deleted + deleted2 + cleaned
 
 
 def wal_checkpoint(conn: sqlite3.Connection) -> None:
@@ -941,9 +1008,7 @@ def _purge_old_rows_locked(conn: sqlite3.Connection, days: int = WEEKLY_PURGE_DA
     return total
 
 
-def archive_old_rows(
-    conn: sqlite3.Connection, db_path: str, days: int = ARCHIVE_AFTER_DAYS
-) -> tuple[int, list[str]]:
+def archive_old_rows(conn: sqlite3.Connection, db_path: str, days: int = ARCHIVE_AFTER_DAYS) -> tuple[int, list[str]]:
     """Déplace les lignes > ``days`` jours vers logs/archive/requests-YYYY-MM.db.
 
     [P2-11] Pendant automatisé de scripts/archive_db.py (même format de
@@ -983,9 +1048,7 @@ def archive_old_rows(
         _record_maintenance_error("archive plan", e)
         return 0, []
     try:
-        schema_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='requests'"
-        ).fetchone()
+        schema_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='requests'").fetchone()
         col_names = [r[1] for r in conn.execute("PRAGMA table_info(requests)").fetchall()]
     except Exception as e:
         _record_maintenance_error("archive schema", e)

@@ -95,9 +95,7 @@ def bench_sqlite_index_p95(rows: int = 5000, queries: int = 40) -> float:
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "bench.db")
         conn = sqlite3.connect(db)
-        conn.execute(
-            "CREATE TABLE requests (id INTEGER PRIMARY KEY, station INT, ts TEXT, duration_ms INT)"
-        )
+        conn.execute("CREATE TABLE requests (id INTEGER PRIMARY KEY, station INT, ts TEXT, duration_ms INT)")
         conn.execute("CREATE INDEX idx_requests_station_ts ON requests(station, ts)")
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         conn.executemany(
@@ -372,9 +370,7 @@ def compare(baseline: dict, current: dict, threshold: float = REGRESSION_THRESHO
             # si dégradation relative ET absolue sont significatives.
             MIN_ABS_DELTA_MS = 0.5
             if delta > threshold and (float(cur["value"]) - old) >= MIN_ABS_DELTA_MS:
-                regressions.append(
-                    f"{name}: {old} -> {cur['value']} ms (+{delta:.0%} > {threshold:.0%})"
-                )
+                regressions.append(f"{name}: {old} -> {cur['value']} ms (+{delta:.0%} > {threshold:.0%})")
     return regressions
 
 
@@ -420,9 +416,7 @@ def main() -> int:
 
     if args.baseline:
         BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        BASELINE_PATH.write_text(
-            json.dumps({"results": results}, indent=2), encoding="utf-8"
-        )
+        BASELINE_PATH.write_text(json.dumps({"results": results}, indent=2), encoding="utf-8")
         lines.append(f"\nBaseline figée -> {BASELINE_PATH}")
 
     print("\n".join(lines))

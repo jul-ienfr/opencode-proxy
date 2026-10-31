@@ -59,13 +59,15 @@ def _cfg_flag_enabled(default: bool = False) -> bool:
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
         except Exception:
             pass
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--force", action="store_true", help="outrepasser models_catalog.enabled (manuel)")
-    ap.add_argument("--out", default=None, help="fichier de sortie (défaut : logs/models_catalog.diff.<horodatage>.json)")
+    ap.add_argument(
+        "--out", default=None, help="fichier de sortie (défaut : logs/models_catalog.diff.<horodatage>.json)"
+    )
     ap.add_argument("--json", action="store_true", help="imprimer le rapport JSON au lieu du texte")
     args = ap.parse_args()
 

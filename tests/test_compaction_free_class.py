@@ -23,22 +23,27 @@ sys.path.insert(0, ".")
 import opencode as oc  # noqa: E402
 
 FREE_CONVERSATIONS = [
-    # noms payants ayant un équivalent free déclaré
+    # homonymes exacts (politique par défaut "homonym")
+    "mimo-v2.6-flash",
+    "deepseek-v4.1-flash",
+    "glm-5.3-flash",
+    "jev-1.13",
+    # mappings explicites (souverains depuis le 2026-10-29)
     "mimo-v2.5",
-    "kimi-k2.6",
     "glm-5.1",
-    "muse-spark-1.3-contributor",
-    "deepseek-v4-flash",
+    "kimi-k2.6",
     # ids déjà free
-    "mimo-v2.5-free",
     "jev-1.13-free",
-    "deepseek-v4-flash-free",
-    "muse-spark-1.3-contributor-free",
+    "deepseek-v4.1-flash-free",
+    "glm-5.3-flash-free",
+    "mimo-v2.6-flash-free",
+    "beam-free",
 ]
 
 PAID_CONVERSATIONS = [
     "gpt-6-luna",
     "claude-opus-4-1",
+    "muse-spark-1.3-contributor",
 ]
 
 
@@ -46,11 +51,11 @@ PAID_CONVERSATIONS = [
 def test_free_conversation_gets_free_summarizer(model_id):
     """Conversation free → résumeur free, sur endpoint free, sans clé payante."""
     m, ep, proto, is_free = oc._compaction_summarizer_plan(
-        model_id, None, endpoint="https://opencode.ai/zen/go/v1/chat/completions", protocol="openai"
+        model_id, None, endpoint="https://opencode.ai/inference/go/openai/v1/chat/completions", protocol="openai"
     )[:4]
     assert is_free is True, f"{model_id!r} devrait produire un résumeur FREE"
     assert "/zen/go/" not in (ep or ""), f"résumeur free sur endpoint payant: {ep!r}"
-    assert "/inference/v1/" in (ep or ""), f"endpoint free attendu, obtenu {ep!r}"
+    assert "/inference/" in (ep or "") and "/go/" not in (ep or ""), f"endpoint free attendu, obtenu {ep!r}"
 
 
 @pytest.mark.parametrize("model_id", FREE_CONVERSATIONS)
@@ -67,10 +72,8 @@ def test_free_summarizer_never_uses_paid_key(model_id):
 @pytest.mark.parametrize("model_id", PAID_CONVERSATIONS)
 def test_paid_conversation_keeps_paid_summarizer(model_id):
     """Conversation payante → résumeur payant (route inchangée)."""
-    ep_in = "https://opencode.ai/zen/go/v1/messages"
-    m, ep, proto, is_free = oc._compaction_summarizer_plan(
-        model_id, None, endpoint=ep_in, protocol="anthropic"
-    )[:4]
+    ep_in = "https://opencode.ai/inference/go/anthropic/v1/messages"
+    m, ep, proto, is_free = oc._compaction_summarizer_plan(model_id, None, endpoint=ep_in, protocol="anthropic")[:4]
     assert is_free is False, f"{model_id!r} ne devrait pas être classé free"
     assert m == model_id
     assert ep == ep_in
@@ -80,7 +83,7 @@ def test_paid_conversation_keeps_paid_summarizer(model_id):
 def test_override_wins_over_conversation_class():
     """summarizer_model_override posé reste souverain."""
     m, ep, proto, is_free = oc._compaction_summarizer_plan(
-        "mimo-v2.5", "gpt-6-luna", endpoint="https://opencode.ai/zen/go/v1/chat/completions", protocol="openai"
+        "mimo-v2.6-flash", "gpt-6-luna", endpoint="https://opencode.ai/inference/go/openai/v1/chat/completions", protocol="openai"
     )[:4]
     assert m == "gpt-6-luna"
     assert is_free is False, "un override payant doit gagner sur une conversation free"
@@ -89,7 +92,7 @@ def test_override_wins_over_conversation_class():
 def test_override_to_free_model_stays_free():
     """Un override pointant un modèle mappé free reste servi par la jambe free."""
     m, ep, proto, is_free = oc._compaction_summarizer_plan(
-        "gpt-6-luna", "mimo-v2.5", endpoint="https://opencode.ai/zen/go/v1/chat/completions", protocol="openai"
+        "gpt-6-luna", "mimo-v2.6-flash", endpoint="https://opencode.ai/inference/go/openai/v1/chat/completions", protocol="openai"
     )[:4]
     assert is_free is True
     assert "/zen/go/" not in (ep or "")
@@ -99,10 +102,10 @@ def test_blank_override_ignored():
     """Override vide/espaces = absent (pas de route parasite)."""
     oc._free_model_rr.clear()
     m, ep, proto, is_free = oc._compaction_summarizer_plan(
-        "mimo-v2.5", "   ", endpoint="https://opencode.ai/zen/go/v1/chat/completions", protocol="openai"
+        "mimo-v2.6-flash", "   ", endpoint="https://opencode.ai/inference/go/openai/v1/chat/completions", protocol="openai"
     )[:4]
     assert is_free is True
-    assert m in ("mimo-v2.6-flash-free", "deepseek-v4.1-flash-free", "glm-5.3-flash-free")
+    assert m == "mimo-v2.6-flash-free"
 
 
 def test_plan_is_pure_and_never_raises():
@@ -140,8 +143,19 @@ def test_free_request_helper_never_calls_paid_helper(monkeypatch):
 
     import asyncio
 
-    out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        oc._compaction_summarizer_request(True, "https://opencode.ai/inference/v1/chat/completions", {"model": "mimo-v2.5-free", "messages": []}, {}, "openai", seed="mimo-v2.5")
+    out = (
+        asyncio.get_event_loop_policy()
+        .new_event_loop()
+        .run_until_complete(
+            oc._compaction_summarizer_request(
+                True,
+                "https://opencode.ai/inference/openai/v1/chat/completions",
+                {"model": "mimo-v2.5-free", "messages": []},
+                {},
+                "openai",
+                seed="mimo-v2.5",
+            )
+        )
     )
     assert out[0] == "FREERESP"
     assert calls["pool"] == 1
@@ -164,7 +178,14 @@ def test_free_pool_exhaustion_is_fail_open_never_paid(monkeypatch):
 
     try:
         asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-            oc._compaction_summarizer_request(True, "https://opencode.ai/inference/v1/chat/completions", {"model": "m", "messages": []}, {}, "openai", seed="mimo-v2.5")
+            oc._compaction_summarizer_request(
+                True,
+                "https://opencode.ai/inference/openai/v1/chat/completions",
+                {"model": "m", "messages": []},
+                {},
+                "openai",
+                seed="mimo-v2.5",
+            )
         )
     except oc.UpstreamError:
         pass
@@ -174,9 +195,7 @@ def test_free_pool_exhaustion_is_fail_open_never_paid(monkeypatch):
 
 def test_summarizer_never_targets_systemone():
     """Un résumeur est un corps chat : jamais l'endpoint systemone (typé)."""
-    m, ep, proto, is_free = oc._compaction_summarizer_plan(
-        "jev-1.13-free", None, endpoint="", protocol="openai"
-    )[:4]
+    m, ep, proto, is_free = oc._compaction_summarizer_plan("jev-1.13-free", None, endpoint="", protocol="openai")[:4]
     if is_free:
         assert "/systemone" not in (ep or ""), f"corps chat envoyé sur systemone: {ep!r}"
     else:
@@ -206,8 +225,14 @@ def test_responses_payload_normalized_to_chat():
             }
         ).encode(),
     )
-    out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        oc._compaction_normalize_response(resp, "https://opencode.ai/inference/v1/responses", {"model": "mimo-v2.5-free"})
+    out = (
+        asyncio.get_event_loop_policy()
+        .new_event_loop()
+        .run_until_complete(
+            oc._compaction_normalize_response(
+                resp, "https://opencode.ai/inference/openai/v1/responses", {"model": "mimo-v2.5-free"}
+            )
+        )
     )
     data = json.loads(out.content)
     assert data["choices"][0]["message"]["content"] == "RESUME-OK"
@@ -218,8 +243,12 @@ def test_chat_payload_left_untouched():
     import asyncio
 
     resp = oc.httpx.Response(200, headers={"content-type": "application/json"}, content=b'{"choices":[]}')
-    out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        oc._compaction_normalize_response(resp, "https://opencode.ai/inference/v1/chat/completions", {})
+    out = (
+        asyncio.get_event_loop_policy()
+        .new_event_loop()
+        .run_until_complete(
+            oc._compaction_normalize_response(resp, "https://opencode.ai/inference/openai/v1/chat/completions", {})
+        )
     )
     assert out is resp
 
@@ -229,8 +258,10 @@ def test_normalize_never_raises_on_garbage():
     import asyncio
 
     resp = oc.httpx.Response(200, headers={"content-type": "application/json"}, content=b"not-json")
-    out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        oc._compaction_normalize_response(resp, "https://opencode.ai/inference/v1/responses", {})
+    out = (
+        asyncio.get_event_loop_policy()
+        .new_event_loop()
+        .run_until_complete(oc._compaction_normalize_response(resp, "https://opencode.ai/inference/openai/v1/responses", {}))
     )
     assert out is resp
 
@@ -288,22 +319,22 @@ def test_paid_ids_still_resolve_to_none(model_id):
     assert oc._resolve_free_model(model_id) is None
 
 
-def test_mapped_paid_names_keep_their_destination():
+def test_mapped_paid_names_keep_their_destination(monkeypatch):
     """Les noms payants mappés gardent leur destination déclarée (non régressé)."""
     oc._free_model_rr.clear()
-    assert oc._resolve_free_model("mimo-v2.5") in (
-        "mimo-v2.6-flash-free",
-        "deepseek-v4.1-flash-free",
-        "glm-5.3-flash-free",
-    )
-    # deepseek-v4-flash-free mort côté amont (0 succès) : remappé sain.
-    assert oc._resolve_free_model("glm-5.1") in (
-        "mimo-v2.6-flash-free",
-        "deepseek-v4.1-flash-free",
-        "glm-5.3-flash-free",
-    )
-    assert oc._resolve_free_model("deepseek-v4-flash") in (
-        "mimo-v2.6-flash-free",
-        "deepseek-v4.1-flash-free",
-        "glm-5.3-flash-free",
-    )
+    monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "family")
+    assert oc._resolve_free_model("mimo-v2.5") == "mimo-v2.6-flash-free"
+    assert oc._resolve_free_model("glm-5.1") == "mimo-v2.6-flash-free"
+    assert oc._resolve_free_model("deepseek-v4-flash") == "deepseek-v4.1-flash-free"
+
+
+def test_strict_homonym_never_uses_another_free(monkeypatch):
+    """Mode strict : X -> X-free uniquement, jamais un free d'un autre modèle."""
+    oc._free_model_rr.clear()
+    monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "homonym")
+    assert oc._resolve_free_model("mimo-v2.6-flash") == "mimo-v2.6-flash-free"
+    # Une entr?e EXPLICITE de free_model_map est souveraine (2026-10-29).
+    assert oc._resolve_free_model("mimo-v2.5") == "mimo-v2.6-flash-free"
+    assert oc._resolve_free_model("deepseek-v4-flash") == "deepseek-v4.1-flash-free"
+    # Un payant sans mapping/homonyme reste sans cible free.
+    assert oc._resolve_free_model("gpt-5.5") is None

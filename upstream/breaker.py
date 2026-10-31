@@ -118,9 +118,7 @@ class CircuitBreaker:
         elif self.failures >= self._failure_threshold:
             self.state = "open"
             self.opened_at = time.monotonic()
-            self._debug_fn(
-                f"  [cb] {old_state} → open (failures={self.failures}/{self._failure_threshold})"
-            )
+            self._debug_fn(f"  [cb] {old_state} → open (failures={self.failures}/{self._failure_threshold})")
 
     def should_allow(self) -> bool:
         if self.state == "closed":
@@ -209,8 +207,7 @@ class Global429State:
             self._open_until = now + self.backoff
             hits.clear()
             self._debug_fn(
-                f"  [g429] breaker OPEN: {count} upstream 429s in {self.window:.0f}s "
-                f"→ backoff {self.backoff:.0f}s"
+                f"  [g429] breaker OPEN: {count} upstream 429s in {self.window:.0f}s → backoff {self.backoff:.0f}s"
             )
 
     def remaining(self) -> float:

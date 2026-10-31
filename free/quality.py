@@ -1,12 +1,14 @@
 """Qualité mesurée d'une station/IP — brique de sélection.
 
 Le pool historique choisissait par compteur de requêtes. Ce module fournit un
-score reproductible par (station, IP) : latence observée, taux de succès,
-fraîcheur du quota, charge serveur et stabilité. Il ne décide pas seul : le
-sélecteur (`free.selector`) et le pool appliquent les gates d'éligibilité.
+score reproductible par (station, IP) : latence observée, **débit de génération**
+(tok/s), taux de succès, fraîcheur du quota, charge serveur et stabilité. Il ne
+décide pas seul : le sélecteur (`free.selector`) et le pool appliquent les gates
+d'éligibilité.
 
-Aucune sonde réseau ici : `free.probe` alimente les probes, les requêtes
-réelles alimentent `observe()`.
+Aucune sonde réseau ici : `free.probe` alimente les probes, les requêtes réelles
+alimentent `observe()` (TTFB/statut) et `observe_completion()` (durée totale,
+tokens de sortie, tok/s, quarantaine slow lane).
 """
 
 from __future__ import annotations
@@ -37,13 +39,26 @@ class QualityConfig:
     probe_timeout_s: float = 5.0
     min_samples: int = 5
     exploration_pct: float = 5.0
-    latency_weight: float = 0.40
-    success_weight: float = 0.20
-    quota_weight: float = 0.15
-    server_weight: float = 0.15
+    latency_weight: float = 0.30
+    throughput_weight: float = 0.30
+    success_weight: float = 0.15
+    quota_weight: float = 0.10
+    server_weight: float = 0.05
     stability_weight: float = 0.10
     latency_floor_ms: float = 1000.0
     latency_ceiling_ms: float = 20000.0
+    # [P1 29/10] Un TTFB EWMA au-delà de ce seuil quarantaine l'IP même si
+    # elle génère vite ensuite (ex. 15,9 s observé sur s6).
+    ttfb_ceiling_ms: float = 8000.0
+    # [P1 29/10] Least-in-flight : pénalise une station déjà chargée pour
+    # répartir avant de saturer ses 8 sessions (s6 à 119 tok/s attirait tout).
+    inflight_penalty: float = 0.08
+    inflight_penalty_max: float = 0.60
+    throughput_floor_tps: float = 20.0
+    throughput_target_tps: float = 45.0
+    slow_lane_min_samples: int = 3
+    slow_lane_cooldown_s: float = 600.0
+    slow_lane_score: float = 0.0
     rotate_floor: float = 0.35
     consecutive_low: int = 3
 
@@ -71,16 +86,31 @@ class QualityConfig:
             probe_timeout_s=max(1.0, f("probe_timeout_s", 5.0)),
             min_samples=i("min_samples", 5),
             exploration_pct=max(0.0, min(50.0, f("exploration_pct", 5.0))),
-            latency_weight=f("latency_weight", 0.40),
-            success_weight=f("success_weight", 0.20),
-            quota_weight=f("quota_weight", 0.15),
-            server_weight=f("server_weight", 0.15),
+            latency_weight=f("latency_weight", 0.30),
+            throughput_weight=f("throughput_weight", 0.30),
+            success_weight=f("success_weight", 0.15),
+            quota_weight=f("quota_weight", 0.10),
+            server_weight=f("server_weight", 0.05),
             stability_weight=f("stability_weight", 0.10),
             latency_floor_ms=f("latency_floor_ms", 1000.0),
             latency_ceiling_ms=max(
                 f("latency_floor_ms", 1000.0) + 1.0,
                 f("latency_ceiling_ms", 20000.0),
             ),
+            ttfb_ceiling_ms=max(
+                f("latency_floor_ms", 1000.0) + 1.0,
+                f("ttfb_ceiling_ms", 8000.0),
+            ),
+            inflight_penalty=f("inflight_penalty", 0.08),
+            inflight_penalty_max=f("inflight_penalty_max", 0.60),
+            throughput_floor_tps=max(1.0, f("throughput_floor_tps", 20.0)),
+            throughput_target_tps=max(
+                f("throughput_floor_tps", 20.0) + 1.0,
+                f("throughput_target_tps", 45.0),
+            ),
+            slow_lane_min_samples=i("slow_lane_min_samples", 3),
+            slow_lane_cooldown_s=max(0.0, f("slow_lane_cooldown_s", 600.0)),
+            slow_lane_score=max(0.0, min(1.0, f("slow_lane_score", 0.0))),
             rotate_floor=max(0.0, min(1.0, f("rotate_floor", 0.35))),
             consecutive_low=i("consecutive_low", 3),
         )
@@ -101,6 +131,19 @@ class IpQuality:
     last_probe_at: float = 0.0
     last_probe_ok: bool | None = None
     consecutive_low: int = 0
+    # Débit de génération mesuré en fin de flux (tok/s) : c'est la métrique
+    # qui distingue une IP rapide au premier octet d'une IP qui génère vite.
+    tps_ewma: float | None = None
+    tps_n: int = 0
+    tps_ring: deque[float] = field(default_factory=lambda: deque(maxlen=5))
+    ttfb_n: int = 0
+    total_ewma_ms: float | None = None
+    last_stop_reason: str | None = None
+    slow_lane_until: float = 0.0
+    # Hostname du serveur VPN (ex. nl1050.nordvpn.com) : l'IP publique mesurée
+    # n'est PAS l'IP d'entrée de l'API NordVPN ; le hostname est la clé qui
+    # relie une mesure à un serveur sélectionnable.
+    server_host: str | None = None
 
     @property
     def count(self) -> int:
@@ -122,13 +165,10 @@ class IpQuality:
         """
         duration = max(1.0, float(duration_ms or 1.0))
         if latency:
+            self.ttfb_n += 1
             self.ring.append(duration)
             alpha = 0.3
-            self.ewma_ms = (
-                duration
-                if self.ewma_ms is None
-                else alpha * duration + (1.0 - alpha) * self.ewma_ms
-            )
+            self.ewma_ms = duration if self.ewma_ms is None else alpha * duration + (1.0 - alpha) * self.ewma_ms
         code = int(status) if status is not None else 0
         if code == 200 or (200 <= code < 300):
             self.success += 1
@@ -145,6 +185,83 @@ class IpQuality:
         self.last_probe_ok = bool(ok)
         if ok:
             self.last_ok_at = now
+
+    def observe_completion(
+        self,
+        duration_ms: float,
+        output_tokens: int,
+        now: float,
+        cfg: QualityConfig,
+        *,
+        success: bool = True,
+        stop_reason: str | None = None,
+        server_host: str | None = None,
+    ) -> None:
+        """Enregistre la fin de flux : durée totale, tokens, tok/s.
+
+        Séparé de ``observe()`` : le TTFB est connu au premier octet, le débit
+        seulement à la fin. Un flux tronqué (``success=False``) reste mesuré
+        en tok/s : c'est précisément le signal qui révèle une IP à 1 tok/s.
+        ``server_host`` relie la mesure au serveur VPN sélectionnable.
+        """
+        if server_host:
+            self.server_host = str(server_host)
+        duration = max(1.0, float(duration_ms or 1.0))
+        alpha = 0.3
+        self.total_ewma_ms = duration if self.total_ewma_ms is None else alpha * duration + (1.0 - alpha) * self.total_ewma_ms
+        self.last_stop_reason = (str(stop_reason)[:64] if stop_reason else None)
+        try:
+            out = int(output_tokens or 0)
+        except (TypeError, ValueError):
+            out = 0
+        # [audit 2026-10-30] A truncated/failed stream was already counted as
+        # a success at first byte. Correct the counters at completion.
+        if not success:
+            try:
+                if self.success > 0:
+                    self.success -= 1
+                self.errors += 1
+            except Exception:
+                pass
+        if out > 0:
+            tps = out / (duration / 1000.0)
+            if tps > 0.0:
+                self.tps_ewma = tps if self.tps_ewma is None else alpha * tps + (1.0 - alpha) * self.tps_ewma
+                self.tps_n += 1
+                self.tps_ring.append(tps)
+        floor = max(0.1, float(cfg.throughput_floor_tps))
+        _min_n = max(1, int(cfg.slow_lane_min_samples))
+        _ttfb_ceil = max(1.0, float(getattr(cfg, "ttfb_ceiling_ms", 8000.0)))
+        _ttfb_slow = (
+            self.ttfb_n >= _min_n
+            and self.ewma_ms is not None
+            and self.ewma_ms > _ttfb_ceil
+        )
+        _tps_slow = self.tps_n >= _min_n and self.tps_ewma is not None and self.tps_ewma < floor
+        if _tps_slow or _ttfb_slow:
+            self.slow_lane_until = now + max(0.0, float(cfg.slow_lane_cooldown_s))
+        elif (
+            self.tps_ewma is not None
+            and self.tps_ewma >= floor * 1.2
+            and (self.ewma_ms is None or self.ewma_ms <= _ttfb_ceil * 0.8)
+        ):
+            # Récupération explicite : une IP qui remonte au-dessus du plancher
+            # ET dont le TTFB est redescendu ne reste pas quarantinée.
+            self.slow_lane_until = 0.0
+
+    def is_slow_lane(self, now: float) -> bool:
+        return bool(self.slow_lane_until and now < self.slow_lane_until)
+
+    def tps_trend_pct(self, window: int = 5) -> float | None:
+        """Baisse relative (%) entre le début et la fin de la fenêtre tok/s.
+
+        Positif = dégradation (ex. 80 → 55 tok/s donne ~31 %). None si moins
+        de 3 points ou base nulle.
+        """
+        pts = list(self.tps_ring)[-max(3, int(window)) :]
+        if len(pts) < 3 or pts[0] <= 0:
+            return None
+        return max(0.0, (pts[0] - pts[-1]) / pts[0] * 100.0)
 
     def p95_ms(self) -> float | None:
         if len(self.ring) < 2:
@@ -169,14 +286,21 @@ class IpQuality:
         server_load: float | None,
         now: float,
     ) -> float:
+        if self.is_slow_lane(now):
+            return float(cfg.slow_lane_score)
+
         latency = self.latency_ms()
         if latency is None:
             latency_score = 0.5
         else:
             span = max(1.0, cfg.latency_ceiling_ms - cfg.latency_floor_ms)
-            latency_score = max(
-                0.0, min(1.0, 1.0 - (latency - cfg.latency_floor_ms) / span)
-            )
+            latency_score = max(0.0, min(1.0, 1.0 - (latency - cfg.latency_floor_ms) / span))
+
+        if self.tps_ewma is None:
+            throughput_score = 0.5
+        else:
+            target = max(1.0, cfg.throughput_target_tps)
+            throughput_score = max(0.0, min(1.0, self.tps_ewma / target))
 
         total = self.success + self.errors
         success_score = 0.5 if total == 0 else self.success / max(1, total)
@@ -207,6 +331,7 @@ class IpQuality:
 
         raw = (
             cfg.latency_weight * latency_score
+            + cfg.throughput_weight * throughput_score
             + cfg.success_weight * success_score
             + cfg.quota_weight * quota_score
             + cfg.server_weight * server_score
@@ -223,17 +348,25 @@ class IpQuality:
         return {
             "sid": self.sid,
             "ip": self.ip,
+            "server_host": self.server_host,
             "count": self.count,
             "success": self.success,
             "errors": self.errors,
             "recent_429": self.recent_429,
             "ewma_ms": round(self.ewma_ms, 1) if self.ewma_ms is not None else None,
             "p95_ms": self.p95_ms(),
+            "tps_ewma": round(self.tps_ewma, 2) if self.tps_ewma is not None else None,
+            "tps_n": self.tps_n,
+            "ttfb_n": self.ttfb_n,
+            "total_ewma_ms": round(self.total_ewma_ms, 1) if self.total_ewma_ms is not None else None,
+            "last_stop_reason": self.last_stop_reason,
+            "slow_lane": self.is_slow_lane(now),
+            "slow_lane_remaining_s": (
+                round(max(0.0, self.slow_lane_until - now), 1) if self.is_slow_lane(now) else 0.0
+            ),
             "probe_ms": round(self.last_probe_ms, 1) if self.last_probe_ms is not None else None,
             "probe_ok": self.last_probe_ok,
-            "probe_age_s": (
-                round(max(0.0, now - self.last_probe_at), 1) if self.last_probe_at else None
-            ),
+            "probe_age_s": (round(max(0.0, now - self.last_probe_at), 1) if self.last_probe_at else None),
             "score": self.score(cfg, now=now, **kw),
         }
 
@@ -266,12 +399,82 @@ class QualityRegistry:
         *,
         latency: bool = True,
     ) -> None:
-        self.get(sid, ip).observe(
-            duration_ms, status, time.monotonic(), latency=latency
-        )
+        self.get(sid, ip).observe(duration_ms, status, time.monotonic(), latency=latency)
 
     def observe_probe(self, sid: int, ip: str, duration_ms: float, ok: bool) -> None:
         self.get(sid, ip).observe_probe(duration_ms, ok, time.monotonic())
+
+    def observe_completion(
+        self,
+        sid: int,
+        ip: str,
+        duration_ms: float,
+        output_tokens: int,
+        *,
+        success: bool = True,
+        stop_reason: str | None = None,
+        server_host: str | None = None,
+    ) -> None:
+        self.get(sid, ip).observe_completion(
+            duration_ms,
+            output_tokens,
+            time.monotonic(),
+            self.cfg,
+            success=success,
+            stop_reason=stop_reason,
+            server_host=server_host,
+        )
+
+    def is_slow_lane(self, sid: int, ip: str, now: float | None = None) -> bool:
+        item = self._items.get((int(sid), str(ip or "unknown")))
+        if item is None:
+            return False
+        return item.is_slow_lane(float(now if now is not None else time.monotonic()))
+
+    def is_degrading(self, sid: int, ip: str, pct: float = 25.0) -> bool:
+        item = self._items.get((int(sid), str(ip or "unknown")))
+        if item is None:
+            return False
+        trend = item.tps_trend_pct()
+        return trend is not None and trend >= float(pct)
+
+    def is_ttfb_high(self, sid: int, ip: str, ceiling_ms: float = 8000.0) -> bool:
+        item = self._items.get((int(sid), str(ip or "unknown")))
+        if item is None:
+            return False
+        return item.ttfb_n >= max(1, int(self.cfg.slow_lane_min_samples)) and (
+            item.ewma_ms is not None and item.ewma_ms > float(ceiling_ms)
+        )
+
+    def host_quality(self, host: str, now: float | None = None) -> dict | None:
+        """Qualité agrégée d'un hostname VPN (toutes stations/IP confondues).
+
+        Le hostname est la clé de présélection : l'IP publique mesurée n'est
+        pas l'IP d'entrée de l'API NordVPN. Retourne None si aucune mesure.
+        """
+        host = str(host or "").strip().lower()
+        if not host:
+            return None
+        items = [i for i in self._items.values() if str(i.server_host or "").lower() == host]
+        if not items:
+            return None
+        tps = [float(i.tps_ewma) for i in items if i.tps_ewma is not None]
+        ttfb = [float(i.ewma_ms) for i in items if i.ewma_ms is not None]
+        n = sum(int(i.tps_n) for i in items)
+        now_ts = float(now if now is not None else time.monotonic())
+        return {
+            "host": host,
+            "n": n,
+            "tps": (sum(tps) / len(tps)) if tps else None,
+            "ttfb": (sum(ttfb) / len(ttfb)) if ttfb else None,
+            "slow": any(i.is_slow_lane(now_ts) for i in items),
+            "ips": len(items),
+        }
+
+    def slow_station_count(self, now: float | None = None) -> int:
+        """Nombre de stations dont au moins une IP est en slow lane."""
+        now_ts = float(now if now is not None else time.monotonic())
+        return len({i.sid for i in self._items.values() if i.is_slow_lane(now_ts)})
 
     def prune_sids(self, max_sid: int) -> int:
         try:

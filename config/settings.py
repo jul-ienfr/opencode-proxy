@@ -70,6 +70,25 @@ _yaml_data: dict[str, Any] = {}
 _config_yaml_mtime: float = 0.0  # set after initial load
 
 
+def _yaml_for_disk(data):
+    """Copy of the YAML tree safe to write: the control key never hits disk.
+
+    [audit 2026-10-30] The env override puts VPN_CONTROL_API_KEY into the
+    in-memory tree, but every save_yaml_config() used to dump it back into
+    tracked config.yaml. The key is already in credentials.env (container)
+    and .env (host); the YAML copy is redundant and a leak.
+    """
+    import copy as _copy
+
+    out = _copy.deepcopy(data) if isinstance(data, dict) else data
+    try:
+        if isinstance(out.get("ip_rotation"), dict):
+            out["ip_rotation"].pop("control_api_key", None)
+    except Exception:
+        pass
+    return out
+
+
 def load_yaml_config() -> dict:
     """Load config.yaml as the primary configuration source."""
     global _yaml_data, _config_yaml_mtime
@@ -105,11 +124,13 @@ def load_yaml_config() -> dict:
                 if str(_yaml_data["ip_rotation"].get("control_api_key") or "") != _env_ck:
                     _yaml_data["ip_rotation"]["control_api_key"] = _env_ck
                     logger.info("[config] control_api_key overriden from env (yaml not persisted)")
-            elif isinstance(_yaml_data.get("ip_rotation"), dict) and str(
-                _yaml_data["ip_rotation"].get("control_api_key") or ""
-            ).strip():
+            elif (
+                isinstance(_yaml_data.get("ip_rotation"), dict)
+                and str(_yaml_data["ip_rotation"].get("control_api_key") or "").strip()
+            ):
                 logger.warning(
-                    "[config] control_api_key en clair dans config.yaml — migrez vers VPN_CONTROL_API_KEY dans .env (chmod 600, gitignoré)")
+                    "[config] control_api_key en clair dans config.yaml — migrez vers VPN_CONTROL_API_KEY dans .env (chmod 600, gitignoré)"
+                )
         except Exception:
             pass
         # F-H6: generate control_api_key once if empty (boot single-flight, portalocker if available)
@@ -146,7 +167,7 @@ def load_yaml_config() -> dict:
                         tmp = CONFIG_PATH + ".tmp"
                         with open(tmp, "w", encoding="utf-8") as _wf:
                             yaml.dump(
-                                _yaml_data,
+                                _yaml_for_disk(_yaml_data),
                                 _wf,
                                 default_flow_style=False,
                                 allow_unicode=True,
@@ -196,7 +217,7 @@ def load_yaml_config() -> dict:
                     tmp = CONFIG_PATH + ".tmp"
                     with open(tmp, "w", encoding="utf-8") as _wf:
                         yaml.dump(
-                            _yaml_data,
+                            _yaml_for_disk(_yaml_data),
                             _wf,
                             default_flow_style=False,
                             allow_unicode=True,
@@ -274,6 +295,15 @@ def save_yaml_config():
                 for _sub in _subs:
                     if _sub not in mem_parent and _sub in _disk_parent:
                         mem_parent[_sub] = _disk_parent[_sub]
+        # [audit 2026-10-30] `free_model_map` is manual config: a live process
+        # that booted with a partial map must never erase the disk's entries
+        # on its next auto-persist (observed: glm-5.1/kimi/mimo mappings lost).
+        _disk_map = _on_disk.get("free_model_map")
+        if isinstance(_disk_map, dict):
+            _mem_map = _yaml_data.setdefault("free_model_map", {})
+            if isinstance(_mem_map, dict):
+                for _k, _v in _disk_map.items():
+                    _mem_map.setdefault(_k, _v)
     except Exception:
         pass  # jamais bloquer la sauvegarde pour une fusion manquée
     # _reload_lock may not yet be defined at import time; resolve at call time
@@ -284,7 +314,7 @@ def save_yaml_config():
             lock.acquire()
         tmp = CONFIG_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            yaml.dump(_yaml_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            yaml.dump(_yaml_for_disk(_yaml_data), f, default_flow_style=False, allow_unicode=True, sort_keys=False)
             f.flush()
             try:
                 os.fsync(f.fileno())
@@ -414,15 +444,28 @@ CACHE_MIN_PROMPT_SIZE = _env_int("CACHE_MIN_PROMPT_SIZE", yaml_get("cache", "min
 DEBUG = _env_bool("OPENCODE_DEBUG", yaml_get("server", "debug", False))
 
 # ── Upstream endpoints ──────────────────────────────────────────────
-API_BASE_OPENAI = yaml_get("upstream", "openai_base", "https://opencode.ai/zen/go/v1/chat/completions")
-API_BASE_ANTHROPIC = yaml_get("upstream", "anthropic_base", "https://opencode.ai/zen/go/v1/messages")
-API_BASE_FREE = yaml_get("upstream", "free_base", "https://opencode.ai/inference/v1/chat/completions")
+API_BASE_OPENAI = yaml_get("upstream", "openai_base", "https://opencode.ai/inference/go/openai/v1/chat/completions")
+API_BASE_ANTHROPIC = yaml_get("upstream", "anthropic_base", "https://opencode.ai/inference/go/anthropic/v1/messages")
+API_BASE_FREE = yaml_get("upstream", "free_base", "https://opencode.ai/inference/openai/v1/chat/completions")
 
 # ── Free model mapping (paid → free equivalent) ────────────────────
 FREE_MODEL_MAP = yaml_get("free_model_map", default={})
 
 # ── IP rotation (OpenVPN for free model quota) ────────────────────
 IP_ROTATION = yaml_get("ip_rotation", default={})
+
+# [audit 2026-10-30] If the tracked YAML still carries the control key and
+# the supported source (.env / process env) provides it, scrub the file once.
+try:
+    if (
+        isinstance(_yaml_data.get("ip_rotation"), dict)
+        and _yaml_data["ip_rotation"].get("control_api_key")
+        and (os.getenv("VPN_CONTROL_API_KEY") or os.getenv("CONTROL_API_KEY"))
+    ):
+        save_yaml_config()
+        logger.info("[config] control_api_key scrubbed from tracked config.yaml")
+except Exception:
+    pass
 
 # [Phase 1] Normaliseur déplacé vers config/loader.py (pur).
 from config.loader import _VALID_429_ACTIONS as _VALID_429_ACTIONS  # noqa: E402
@@ -437,6 +480,24 @@ def get_429_action(default: str = "both") -> str:
     """
     raw = yaml_get("ip_rotation", "on_429_action", default)
     return normalize_429_action(raw, default)
+
+
+# ── Politique de substitution payant → gratuit ──────────────────────
+# ``homonym`` : X → X-free uniquement. ``family`` : même famille acceptée.
+# Lecture live (IP_ROTATION est muté en place par le hot-reload du GUI).
+from config.free_policy import DEFAULT as FREE_SUBSTITUTION_DEFAULT  # noqa: E402
+from config.free_policy import POLICIES as FREE_SUBSTITUTION_POLICIES  # noqa: E402, F401
+from config.free_policy import normalize_policy as normalize_free_substitution_policy  # noqa: E402
+from config.free_policy import target_allowed as free_target_allowed  # noqa: E402, F401
+
+
+def get_free_substitution_policy(default: str = FREE_SUBSTITUTION_DEFAULT) -> str:
+    """Lit ``ip_rotation.free_substitution_policy`` à chaque appel (hot-reload)."""
+    try:
+        raw = (IP_ROTATION or {}).get("free_substitution_policy", default)
+    except Exception:
+        raw = default
+    return normalize_free_substitution_policy(raw, default)
 
 
 # ── Server-side compaction (voie free/payante unifiée + natifs, opt-in OFF) ──
@@ -460,7 +521,13 @@ def get_429_action(default: str = "both") -> str:
 #
 # Lectures LIVE (yaml_get, hot-reload safe) — pas de snapshot import-time.
 _SERVER_COMPACTION_DEFAULTS = {
-    "enabled": False,
+    # [audit 2026-10-30] Aligned with the official client: automatic
+    # compaction is on, recovers once when the provider rejects an overlong
+    # request. The proxy only acts reactively (on a real 400 overflow), which
+    # is the server-side equivalent of the official overflow recovery.
+    "enabled": True,
+    "auto": True,
+    "buffer": 0,
     "summary_max_tokens": 2048,
     "keep_recent_pairs": 4,
     "summarizer_model_override": None,
@@ -476,7 +543,10 @@ _SERVER_COMPACTION_DEFAULTS = {
     "summary_lean": True,
     "summary_lean_max_chars": 2000,
     "summary_clamp_max_tokens": 32000,  # SUMMARY_OUTPUT_MAX officiel
-    "keep_tokens": None,
+    # Official `compaction.keep.tokens` default is 15,000 (recent conversation
+    # kept verbatim beside the summary). `keep_recent_pairs` remains the
+    # rollback path when this is explicitly null/0.
+    "keep_tokens": 15000,
     "huge_warn_tokens": 0,
     "huge_deny_tokens": 0,
 }
@@ -496,12 +566,22 @@ def get_server_compaction(key: str | None = None, default=None):
             if k in cfg:
                 cfg[k] = v
     if key is None:
-        return cfg
+        # [audit 2026-10-30] Validate every key on the full-dict path too.
+        # The old return shipped raw YAML values (enabled:"false", negative
+        # timeouts, keep_recent_pairs:0) to the handlers.
+        return {k: get_server_compaction(k, _SERVER_COMPACTION_DEFAULTS.get(k)) for k in cfg}
     if key not in cfg:
         return default
     if key == "enabled":
         return bool(cfg["enabled"]) if isinstance(cfg["enabled"], bool) else default
-    if key in ("native_passthrough", "keep_tail", "summary_paid_bypass", "tiny_retry", "summary_lean"):
+    if key in (
+        "native_passthrough",
+        "keep_tail",
+        "summary_paid_bypass",
+        "tiny_retry",
+        "summary_lean",
+        "auto",
+    ):
         v = cfg[key]
         return bool(v) if isinstance(v, bool) else default
     if key == "class_policy":
@@ -509,12 +589,27 @@ def get_server_compaction(key: str | None = None, default=None):
         if isinstance(v, str) and v.strip().lower() in ("auto", "free_only", "paid_only"):
             return v.strip().lower()
         return default
+    if key == "buffer":
+        v = cfg[key]
+        try:
+            value = int(v)
+        except (TypeError, ValueError):
+            return default
+        return value if value >= 0 else default
     if key == "keep_tokens":
         v = cfg[key]
         return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else default
-    if key in ("summary_max_tokens", "keep_recent_pairs", "timeout_s", "max_attempts", "min_chars_implicit",
-                 "summary_lean_max_chars", "summary_clamp_max_tokens",
-                 "huge_warn_tokens", "huge_deny_tokens"):
+    if key in (
+        "summary_max_tokens",
+        "keep_recent_pairs",
+        "timeout_s",
+        "max_attempts",
+        "min_chars_implicit",
+        "summary_lean_max_chars",
+        "summary_clamp_max_tokens",
+        "huge_warn_tokens",
+        "huge_deny_tokens",
+    ):
         v = cfg[key]
         return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else default
     if key == "summarizer_model_override":
@@ -833,15 +928,16 @@ def get_model_capabilities(model_id: str, model_data: dict | None = None) -> dic
 # ── Models ──────────────────────────────────────────────────────────
 _models_cfg = yaml_get("models", default={})
 MODELS = {}
-# muse-* and spark-* models use /v1/responses (Responses API), not /chat/completions
-# Paid: https://opencode.ai/zen/go/v1/responses, Free: https://opencode.ai/inference/v1/responses
+# [audit 2026-10-30] Bases alignées sur le catalogue actuel (par protocole).
+# Paid: https://opencode.ai/inference/go/openai/v1/responses
+# Free: https://opencode.ai/inference/openai/v1/responses
 # (2026-10-15 : la jambe free /zen/v1/* répond 403 FreeTierError depuis la
 # migration inference — le natif 1.18.31 appelle inference/v1 directement)
 _RESPONSES_ENDPOINT = yaml_get(
-    "upstream", "responses_base", "https://opencode.ai/zen/go/v1/responses"
+    "upstream", "responses_base", "https://opencode.ai/inference/go/openai/v1/responses"
 )
 _RESPONSES_FREE_ENDPOINT = yaml_get(
-    "upstream", "responses_free_base", "https://opencode.ai/inference/v1/responses"
+    "upstream", "responses_free_base", "https://opencode.ai/inference/openai/v1/responses"
 )
 
 # ── [ALIGNEMENT 2026-10-20] Routes dérivées du catalogue public ─────────────
@@ -867,6 +963,9 @@ _FAMILY_SUFFIX = {
     "chat": "/chat/completions",
     "responses": "/responses",
     "messages": "/messages",
+    # [audit 2026-10-30] Gemini's method is appended by app.protocol.gemini
+    # (``models/{id}:generateContent``), so the configured endpoint is the base.
+    "gemini": "",
 }
 
 
@@ -884,6 +983,22 @@ def _load_catalog_routes() -> dict:
 
 
 CATALOG_ROUTES = _load_catalog_routes()
+
+# [audit 2026-10-30] Gemini models are not in the manual `models:` table but
+# the catalogue knows their native base. Seed them so `_route_for` can resolve
+# them; `app.protocol.gemini` appends the :generateContent method.
+try:
+    for _prov_rows in (CATALOG_ROUTES or {}).values():
+        for _mid, _route in (_prov_rows or {}).items():
+            if not isinstance(_route, dict) or _route.get("protocol") != "gemini":
+                continue
+            if _mid in MODELS:
+                continue
+            _base = str(_route.get("base_url") or "").strip()
+            if _base:
+                MODELS[_mid] = {"endpoint": _base, "protocol": "gemini"}
+except Exception:
+    pass
 
 
 def _catalog_unsupported_families() -> dict:
@@ -946,9 +1061,9 @@ def _catalog_endpoint(model_id: str, is_free: bool) -> str | None:
     family = route.get("family")
     base = str(route.get("base_url") or "").rstrip("/")
     suffix = _FAMILY_SUFFIX.get(str(family))
-    if not base or not suffix:
-        # Famille connue mais sans route chez nous (`gemini`) : on ne compose
-        # RIEN. Refuser est la décision de l'appelant, pas un endpoint inventé.
+    if not base or suffix is None:
+        # Famille inconnue : on ne compose RIEN. Refuser est la décision de
+        # l'appelant, pas un endpoint inventé.
         return None
     return base + suffix
 
@@ -970,6 +1085,8 @@ def _legacy_endpoint(model_id: str, model_data: dict, protocol: str) -> str:
 def _endpoint_family(endpoint: str, protocol: str) -> str:
     """Famille d'API d'un endpoint, déduite de sa forme."""
     low = str(endpoint or "").lower()
+    if "/google/" in low or "/gemini/" in low:
+        return "gemini"
     if low.endswith("/responses"):
         return "responses"
     if low.endswith("/messages"):
@@ -992,19 +1109,25 @@ def _catalog_override(model_id: str, model_data: dict, protocol: str) -> dict | 
       changer d'URL sans nécessité, c'est prendre un risque gratuit.
     """
     is_free = str(model_id).lower().endswith("-free")
+    route = catalog_route_for(model_id, is_free)
+    if not route:
+        _other = catalog_route_for(model_id, not is_free)
+        if isinstance(_other, dict) and str(_other.get("family") or "") == "gemini":
+            route = _other
+    if not route:
+        return None
+    family = str(route.get("family") or "")
     # Un `api:` explicite en config est une décision humaine (mesurée, datée) :
     # le catalogue ne la renverse pas. Il ne comble que ce que la config ne dit
     # pas. Sans cette borne, le catalogue écraserait aussi les `endpoint:`
     # volontaires (ex. un id `-free` sciemment servi par la jambe Go).
-    if isinstance(model_data, dict) and str(model_data.get("api") or "").strip():
+    # [audit 2026-10-30] Exception Gemini: live_models injects `api: chat` on
+    # catalogue-native ids, which must not keep the legacy Chat endpoint.
+    if family != "gemini" and isinstance(model_data, dict) and str(model_data.get("api") or "").strip():
         return None
-    route = catalog_route_for(model_id, is_free)
-    if not route:
-        return None
-    family = str(route.get("family") or "")
     catalog_protocol = str(route.get("protocol") or "")
     if not family or not catalog_protocol:
-        return None  # famille non convertible chez nous (gemini) : pas de route
+        return None  # famille non convertible chez nous : pas de route
 
     legacy = _legacy_endpoint(model_id, model_data, protocol)
     endpoint_family = _endpoint_family(legacy, protocol)
@@ -1029,6 +1152,21 @@ def _resolve_model_endpoint(model_id: str, model_data: dict, protocol: str) -> s
     choisit la famille d'endpoint, déclinée en variante `-free` le cas
     échéant ; à défaut d'`api:`, les heuristiques historiques s'appliquent.
     """
+    # [audit 2026-10-30] Gemini uses the catalogue's per-model native base;
+    # a legacy/injected `api` must not keep the Chat endpoint here.
+    if protocol == "gemini":
+        try:
+            _is_free = str(model_id).lower().endswith("-free")
+            _route = catalog_route_for(model_id, _is_free)
+            if not _route:
+                _other = catalog_route_for(model_id, not _is_free)
+                if isinstance(_other, dict) and str(_other.get("family") or "") == "gemini":
+                    _route = _other
+            _base = str((_route or {}).get("base_url") or "").strip()
+            if _base:
+                return _base
+        except Exception:
+            pass
     explicit = model_data.get("endpoint")
     if explicit:
         value = str(explicit).strip()
@@ -1038,8 +1176,6 @@ def _resolve_model_endpoint(model_id: str, model_data: dict, protocol: str) -> s
         if lowered == "free":
             return API_BASE_FREE
         return value
-    lid = model_id.lower()
-    is_free = lid.endswith("-free")
     # [ALIGNEMENT 2026-10-20] Le catalogue corrige le protocole, et l'endpoint
     # seulement si sa famille est incompatible. Cf. `_catalog_override`.
     override = _catalog_override(model_id, model_data, protocol)
@@ -1079,6 +1215,12 @@ for _model_id, _model_data in _models_cfg.items():
 # pour lesquels un appel réel a rendu 200. Le fichier est régénérable par
 # `_research/probe_free_models.py` ; il n'est jamais édité à la main.
 FREE_MODELS_EXPOSED_FILE = pathlib.Path(__file__).with_name("free_models_verified.json")
+#: Cache runtime des ids PROMUS par la sonde live (verdict alive/limited/
+#: not_probeable). Contrairement au fichier ci-dessus (preuve 200 statique),
+#: ce fichier est écrit par le proxy : il évite de re-sonder au démarrage.
+FREE_MODELS_PROBED_FILE = pathlib.Path(__file__).with_name("free_models_probed.json")
+_PROBED_FREE_MODELS: dict[str, dict] = {}
+_PROBED_FREE_LOCK = threading.Lock()
 
 
 def _load_exposed_free_models() -> dict:
@@ -1089,6 +1231,83 @@ def _load_exposed_free_models() -> dict:
         return {}
     models = data.get("models")
     return models if isinstance(models, dict) else {}
+
+
+def _load_probed_free_models() -> dict:
+    """`{model_id: verdict}` promus par la sonde live ; `{}` si absent."""
+    try:
+        data = json.loads(FREE_MODELS_PROBED_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    models = data.get("models")
+    if not isinstance(models, dict):
+        return {}
+    return {
+        str(mid): dict(spec)
+        for mid, spec in models.items()
+        if isinstance(spec, dict) and spec.get("verdict") in ("alive", "limited", "not_probeable")
+    }
+
+
+_PROBED_FREE_IDS: set = set()
+
+
+def _checked_epoch_from_iso(value: Any) -> float:
+    """``checked_at`` ISO → epoch UTC (0.0 si illisible). Ancien cache sans
+    ``checked_epoch`` : sans cette reconstruction, chaque boot rajeunissait le
+    verdict (``setdefault(..., now)``) et un ``limited`` périmé semblait frais."""
+    try:
+        from datetime import UTC, datetime
+
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return float(parsed.timestamp())
+    except Exception:
+        return 0.0
+
+
+def load_probed_free_models() -> int:
+    """Charge le cache runtime APRÈS l'import (lifespan), pas pendant.
+
+    Le charger à l'import polluait les tests et le seed initial avec un cache
+    de machine. Au démarrage serveur, il restaure les promotions de la veille.
+    """
+    models = _load_probed_free_models()
+    if not models:
+        return 0
+    blocked = set(globals().get("GO_ONLY_IDS") or ()) | set(globals().get("PURGED_IDS") or ())
+    models = {mid: spec for mid, spec in models.items() if mid not in blocked}
+    if not models:
+        return 0
+    _PROBED_FREE_MODELS.update(models)
+    _PROBED_FREE_IDS.update(models)
+    FREE_MODELS.update(models)
+    if isinstance(globals().get("FREE_MODEL_POOL"), list):
+        FREE_MODEL_POOL[:] = sorted(FREE_MODELS)
+    state = globals().get("_FREE_DISCOVERY_STATE")
+    if isinstance(state, dict):
+        probe = state.setdefault("probe", {})
+        results = dict(probe.get("results") or {})
+        now = time.time()
+        for mid, spec in models.items():
+            if mid not in results:
+                row = dict(spec)
+                try:
+                    epoch = float(row.get("checked_epoch") or 0.0)
+                except (TypeError, ValueError):
+                    epoch = 0.0
+                if epoch <= 0:
+                    epoch = _checked_epoch_from_iso(row.get("checked_at")) or now
+                row["checked_epoch"] = epoch
+                results[mid] = row
+        summary: dict = {}
+        for row in results.values():
+            verdict = (row or {}).get("verdict", "?")
+            summary[verdict] = summary.get(verdict, 0) + 1
+        probe.update({"enabled": True, "results": results, "summary": summary})
+        state["probe"] = probe
+    return len(models)
 
 
 #: Ids exposés **parce que vérifiés en direct** (200 mesuré). Ils doivent
@@ -1193,9 +1412,7 @@ try:
 except (TypeError, ValueError):
     LIVE_MODELS_INTERVAL = 300
 try:
-    LIVE_MODELS_CATALOG_INTERVAL = max(
-        300, int(LIVE_MODELS_CFG.get("catalog_interval", 1800) or 1800)
-    )
+    LIVE_MODELS_CATALOG_INTERVAL = max(300, int(LIVE_MODELS_CFG.get("catalog_interval", 1800) or 1800))
 except (TypeError, ValueError):
     LIVE_MODELS_CATALOG_INTERVAL = 1800
 LIVE_MODELS_REMOVE_DEPRECATED = bool(LIVE_MODELS_CFG.get("remove_deprecated", True))
@@ -1203,11 +1420,7 @@ LIVE_MODELS_NOTIFY_CLIENTS = bool(LIVE_MODELS_CFG.get("notify_clients", True))
 _live_ignore_raw = LIVE_MODELS_CFG.get("ignore_ids", ["test"])
 if not isinstance(_live_ignore_raw, (list, tuple, set)):
     _live_ignore_raw = ["test"]
-_LIVE_MODELS_IGNORED = {
-    str(x).strip().lower()
-    for x in _live_ignore_raw
-    if isinstance(x, str) and str(x).strip()
-}
+_LIVE_MODELS_IGNORED = {str(x).strip().lower() for x in _live_ignore_raw if isinstance(x, str) and str(x).strip()}
 _LIVE_MODELS_LOCK = threading.Lock()
 _LIVE_MODELS_STATE_PATH = os.path.join(ROOT, "logs", "live_models.json")
 _LIVE_MODELS_CATALOG: dict[str, Any] = {"data": {}, "fetched_at": 0.0, "last_attempt": 0.0}
@@ -1237,6 +1450,24 @@ if isinstance(_purged_raw, list):
     PURGED_IDS.update(x.strip().lower() for x in _purged_raw if isinstance(x, str) and x.strip())
 
 # Seed FREE_MODELS from existing free_model_map values (known frees at boot)
+# [audit 2026-10-30] Repair stale mapping targets BEFORE seeding: a target
+# retired from the live catalogue made the whole mapping dead and could be
+# re-written to disk by an old process/test. Remap to the configured default
+# when it is routable, otherwise drop the entry.
+try:
+    _default_free_target = str(globals().get("FREE_DISCOVERY_DEFAULT_TARGET") or "").strip()
+    for _map_key, _map_target in list(FREE_MODEL_MAP.items()):
+        if not isinstance(_map_target, str) or not _map_target:
+            FREE_MODEL_MAP.pop(_map_key, None)
+            continue
+        if _map_target in MODELS:
+            continue
+        if _default_free_target and _default_free_target in MODELS:
+            FREE_MODEL_MAP[_map_key] = _default_free_target
+        else:
+            FREE_MODEL_MAP.pop(_map_key, None)
+except Exception:
+    pass
 FREE_MODELS: set = {v for v in FREE_MODEL_MAP.values() if isinstance(v, str) and v}
 # [FIX 2026-10-20] Les modèles exposés parce que **vérifiés en direct** sont
 # free par construction : `_is_free_model_route` ne les reconnaissait pas (ni
@@ -1244,6 +1475,7 @@ FREE_MODELS: set = {v for v in FREE_MODEL_MAP.values() if isinstance(v, str) and
 # Mesuré : `big-pickle` → « All API keys exhausted » alors que sa base est
 # l'inférence anonyme.
 FREE_MODELS |= _EXPOSED_VERIFIED_IDS
+FREE_MODELS |= _PROBED_FREE_IDS
 FREE_MODEL_POOL: list = sorted(FREE_MODELS)
 # Observability state (exposed via GET /api/free-models)
 _FREE_DISCOVERY_STATE: dict[str, Any] = {
@@ -1265,6 +1497,9 @@ _FREE_DISCOVERY_URLS_CACHE = None
 #   * accepted None / gate absent / gate lève  → comportement historique
 #     (announce-only add) — fail-soft, la sonde n'est jamais bloquante.
 _FREE_PROBE_GATE: Any = None
+#: Sonde des candidats free-leg découverts par le catalogue vivant. Appelée
+#: avec une liste d'ids, elle planifie un thread et ne bloque jamais le relevé.
+_FREE_PROBE_NEW: Any = None
 
 
 # [Phase 1] URLs déplacées vers config/discovery.py (bases en paramètres).
@@ -1341,24 +1576,37 @@ def _apply_discovered_free_models(free_ids: set, source: str = "none") -> int:
     # passe : leur preuve (un 200 réel) ne périme pas à la découverte suivante.
     _missing_verified = _EXPOSED_VERIFIED_IDS - FREE_MODELS
     FREE_MODELS.update(_missing_verified)  # in-place : pas de rebind local
-    # [live-models] Le relevé vivant peut avoir ajouté des modèles de la jambe
-    # anonyme qui ne finissent pas par `-free` (claude-*, gpt-*, big-pickle).
-    # La découverte free, elle, rebâtit FREE_MODELS depuis son propre set :
-    # sans cette ré-injection, elle les effacerait à chaque cycle.
-    _live_free_added = False
-    try:
-        for _mid, _entry in (_live_models.get_state().get("available") or {}).items():
-            if (
-                isinstance(_entry, dict)
-                and _entry.get("leg") == _live_models.FREE_LEG
-                and _mid in MODELS
-                and _mid not in FREE_MODELS
-            ):
-                FREE_MODELS.add(_mid)
-                _live_free_added = True
-    except Exception:
-        pass
-    if (_missing_verified or _live_free_added) and isinstance(FREE_MODEL_POOL, list):
+    # Les cibles de FREE_MODEL_MAP sont des free par construction ; la
+    # découverte rebâtit le registre et peut les omettre si son endpoint ne
+    # les liste pas. On les ré-injecte comme les preuves explicites.
+    _map_targets = {
+        str(target)
+        for target in (FREE_MODEL_MAP or {}).values()
+        if isinstance(target, str) and target
+    }
+    _missing_map = (_map_targets - FREE_MODELS) - GO_ONLY_IDS - PURGED_IDS
+    FREE_MODELS.update(_missing_map)
+    # [sonde live 2026-10-28] Les ids promus par la sonde free-leg ne viennent
+    # pas forcément de la découverte (`-free`) : sans ré-injection, la passe
+    # suivante les effacerait. On ne ré-injecte QUE ces preuves, jamais tous
+    # les modèles listés sur la jambe anonyme (c'est ce qui gonflait le compte
+    # à 45/56 free).
+    _missing_probed = (_PROBED_FREE_IDS - FREE_MODELS) - GO_ONLY_IDS - PURGED_IDS
+    FREE_MODELS.update(_missing_probed)  # in-place : pas de rebind local
+    # Le suffixe ``-free`` reste une preuve même si la découverte l'oublie
+    # (ex. ``iceman-contributor-free``, absent de son endpoint).
+    _suffix_free = {
+        str(mid)
+        for mid in MODELS
+        if str(mid).lower().endswith("-free")
+        and str(mid) not in FREE_MODELS
+        and str(mid) not in GO_ONLY_IDS
+        and str(mid) not in PURGED_IDS
+    }
+    FREE_MODELS.update(_suffix_free)
+    if (
+        _missing_verified or _missing_map or _missing_probed or _suffix_free
+    ) and isinstance(FREE_MODEL_POOL, list):
         FREE_MODEL_POOL = sorted(FREE_MODELS)
     return added
 
@@ -1377,6 +1625,91 @@ def _persist_free_mappings():
     )
 
 
+def record_probed_free_models(results: dict) -> int:
+    """Persiste les verdicts de sonde ACCEPTÉS (alive/limited/not_probeable).
+
+    Le fichier est un cache runtime : au démarrage, ``FREE_MODELS`` récupère
+    ces ids sans re-sonder. Les refus (``not_free``/``dead``/``unknown``) ne
+    sont pas écrits : ils seront re-testés si l'id réapparaît.
+    """
+    clean = {
+        str(mid): {
+            "verdict": str(spec.get("verdict")),
+            "status": spec.get("status"),
+            "reason": str(spec.get("reason") or "")[:300],
+            "checked_at": spec.get("checked_at"),
+            "checked_epoch": spec.get("checked_epoch"),
+        }
+        for mid, spec in (results or {}).items()
+        if isinstance(spec, dict)
+        and spec.get("verdict") in ("alive", "limited", "not_probeable")
+    }
+    if not clean:
+        return 0
+    with _PROBED_FREE_LOCK:
+        _PROBED_FREE_MODELS.update(clean)
+        _PROBED_FREE_IDS.update(clean)
+        payload = {
+            "generated_by": "automatic free-leg probe",
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "models": _PROBED_FREE_MODELS,
+        }
+        try:
+            tmp = FREE_MODELS_PROBED_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(FREE_MODELS_PROBED_FILE)
+        except Exception as e:
+            logger.warning("[free-probe] persistance %s impossible: %s", FREE_MODELS_PROBED_FILE.name, e)
+            return 0
+    return len(clean)
+
+
+def forget_probed_free_models(ids) -> int:
+    """Retire du cache les ids qui ont disparu de l'amont.
+
+    Sans ce nettoyage, ``_apply_discovered_free_models`` ré-injectait un id
+    accepté hier alors que le modèle venait d'être retiré : ``FREE_MODELS``
+    gardait alors une entrée non servie.
+    """
+    clean = {str(mid) for mid in (ids or ()) if mid}
+    if not clean:
+        return 0
+    with _PROBED_FREE_LOCK:
+        removed = [mid for mid in clean if _PROBED_FREE_MODELS.pop(mid, None) is not None]
+        for mid in clean:
+            _PROBED_FREE_IDS.discard(mid)
+        if not removed:
+            return 0
+        payload = {
+            "generated_by": "automatic free-leg probe",
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "models": _PROBED_FREE_MODELS,
+        }
+        try:
+            tmp = FREE_MODELS_PROBED_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(FREE_MODELS_PROBED_FILE)
+        except Exception as e:
+            logger.warning("[free-probe] nettoyage %s impossible: %s", FREE_MODELS_PROBED_FILE.name, e)
+    if isinstance(globals().get("FREE_MODELS"), set):
+        FREE_MODELS.difference_update(clean)
+    if isinstance(globals().get("FREE_MODEL_POOL"), list):
+        FREE_MODEL_POOL[:] = sorted(FREE_MODELS)
+    state = globals().get("_FREE_DISCOVERY_STATE")
+    if isinstance(state, dict):
+        probe = state.get("probe")
+        if isinstance(probe, dict):
+            results = dict(probe.get("results") or {})
+            for mid in clean:
+                results.pop(mid, None)
+            summary: dict = {}
+            for row in results.values():
+                verdict = (row or {}).get("verdict", "?")
+                summary[verdict] = summary.get(verdict, 0) + 1
+            probe.update({"results": results, "summary": summary})
+    return len(removed)
+
+
 def _ensure_free_models_sync() -> int:
     """Synchronous ensure (fetch → apply → persist). Returns added count. Fail-soft."""
     if not FREE_DISCOVERY_ENABLED:
@@ -1389,10 +1722,10 @@ def _ensure_free_models_sync() -> int:
             urls_fn=_free_discovery_urls,
             log=logger,
         )
+        _has_announced = bool(free_ids)
         if not free_ids:
             logger.warning("[free-discovery] no free ids detected source=%s", source)
             _FREE_DISCOVERY_STATE["source"] = source
-            return 0
         # [Lot A — sonde active] Si une gate runtime est DI-ifiée par
         # opencode.py, les ids ANNONCÉS sont filtrés par verdict live avant
         # l'apply (alive/limited promus, dead/not_free refusés, unknown
@@ -1403,19 +1736,34 @@ def _ensure_free_models_sync() -> int:
             try:
                 _accepted, _probe_state = _gate(set(free_ids), set(FREE_MODELS), API_BASE_FREE)
             except Exception as e:
-                logger.warning(
-                    "[free-discovery] probe gate échouée (fallback announce-only): %s", e
-                )
+                logger.warning("[free-discovery] probe gate échouée (fallback announce-only): %s", e)
                 _accepted, _probe_state = None, None
             if isinstance(_probe_state, dict):
                 _FREE_DISCOVERY_STATE["probe"] = _probe_state
-            if isinstance(_accepted, set):
+                # Les verdicts de gate doivent survivre au redémarrage : sans
+                # ça le cache relançait l'ancien verdict (``limited``) au boot.
+                # On ne persiste QUE les ids acceptés par la gate (un alias
+                # payant ``not_probeable`` ne doit pas entrer dans le cache).
+                _probe_results = _probe_state.get("results")
+                if isinstance(_probe_results, dict) and isinstance(_accepted, set):
+                    try:
+                        record_probed_free_models(
+                            {m: r for m, r in _probe_results.items() if m in _accepted}
+                        )
+                    except Exception as e:
+                        logger.warning("[free-discovery] persistance verdicts sonde échouée: %s", e)
+            if isinstance(_accepted, set) and _has_announced:
                 free_ids = _accepted
                 if not free_ids:
                     logger.warning(
                         "[free-discovery] sonde : 0 id vivant promu cette passe (source=%s)",
                         source,
                     )
+        # Aucune annonce ce cycle : la gate a quand même fait la maintenance
+        # des ids connus (limited périmés / jamais prouvés), mais il n'y a rien
+        # à appliquer côté découverte (ne pas vider FREE_MODELS).
+        if not _has_announced:
+            return 0
         added = _apply_discovered_free_models(free_ids, source=source)
         if added or free_ids != set(_yaml_data.get("free_model_map", {}).values()):
             _persist_free_mappings()
@@ -1461,14 +1809,11 @@ _reload_lock = threading.Lock()
 
 def _live_models_index_urls() -> dict[str, str]:
     """URLs ``/models`` par jambe, dérivées des bases configurées."""
+
     def _models_url(base: str) -> str:
-        text = str(base or "").strip()
-        if not text:
-            return ""
-        if "/chat/completions" in text:
-            text = text.rsplit("/chat/completions", 1)[0]
-        text = text.rstrip("/")
-        return text + "/models" if text else ""
+        # [audit 2026-10-30] The inference bases 404 on /models; the helper
+        # maps each leg back to its real catalogue endpoint.
+        return _discovery_mod.models_endpoint_for(base)
 
     return {
         _live_models.PAID_LEG: _models_url(API_BASE_OPENAI),
@@ -1481,9 +1826,7 @@ def _live_model_leg(model_id: str, cfg: dict | None) -> str | None:
     data = cfg if isinstance(cfg, dict) else {}
     endpoint: str | None = None
     try:
-        endpoint = _resolve_model_endpoint(
-            model_id, data, data.get("protocol") or "openai"
-        )
+        endpoint = _resolve_model_endpoint(model_id, data, data.get("protocol") or "openai")
     except Exception:
         endpoint = data.get("endpoint")
     if endpoint in _LIVE_FREE_BASES:
@@ -1556,9 +1899,7 @@ def _load_live_models_persisted() -> None:
             announced=None,
             events=data.get("events") or [],
             revision=int(data.get("revision") or 0),
-            available_ids=(
-                data.get("available_ids") if "available_ids" in data else None
-            ),
+            available_ids=(data.get("available_ids") if "available_ids" in data else None),
         )
     except Exception:
         pass
@@ -1591,9 +1932,7 @@ def _live_catalog_snapshot(force: bool = False) -> dict:
         catalog_interval = max(
             300,
             int(
-                yaml_get(
-                    "live_models", "catalog_interval", LIVE_MODELS_CATALOG_INTERVAL
-                )
+                yaml_get("live_models", "catalog_interval", LIVE_MODELS_CATALOG_INTERVAL)
                 or LIVE_MODELS_CATALOG_INTERVAL
             ),
         )
@@ -1610,23 +1949,19 @@ def _live_catalog_snapshot(force: bool = False) -> dict:
             _LIVE_MODELS_CATALOG["fetched_at"] = now
             import datetime as _dt_live
 
-            _live_models.get_state()["last_catalog_refresh"] = (
-                _dt_live.datetime.now(_dt_live.UTC).isoformat()
-            )
+            _live_models.get_state()["last_catalog_refresh"] = _dt_live.datetime.now(_dt_live.UTC).isoformat()
             return data
     except Exception as exc:
         logger.debug("[live-models] catalog fetch failed (cache conservé): %s", exc)
     return dict(_LIVE_MODELS_CATALOG.get("data") or {})
 
 
-def _catalog_missing_live_ids(
-    live_by_leg: dict[str, set], catalog: dict | None
-) -> bool:
+def _catalog_missing_live_ids(live_by_leg: dict[str, set], catalog: dict | None) -> bool:
     """Vrai si un id annoncé par une jambe n'est pas encore dans le catalogue."""
     if not isinstance(catalog, dict) or not catalog:
         return False
     for leg, ids in (live_by_leg or {}).items():
-        models = ((catalog.get(leg) or {}).get("models") or {})
+        models = (catalog.get(leg) or {}).get("models") or {}
         if any(str(mid) not in models for mid in ids):
             return True
     return False
@@ -1657,14 +1992,10 @@ def refresh_live_models_sync(force_catalog: bool = False) -> dict[str, Any]:
         _force_catalog = bool(force_catalog)
         if not _force_catalog and _LIVE_MODELS_CATALOG.get("data"):
             try:
-                _age_attempt = time.monotonic() - float(
-                    _LIVE_MODELS_CATALOG.get("last_attempt") or 0.0
-                )
+                _age_attempt = time.monotonic() - float(_LIVE_MODELS_CATALOG.get("last_attempt") or 0.0)
             except (TypeError, ValueError):
                 _age_attempt = 0.0
-            if _age_attempt > 300 and _catalog_missing_live_ids(
-                live_by_leg, _LIVE_MODELS_CATALOG.get("data")
-            ):
+            if _age_attempt > 300 and _catalog_missing_live_ids(live_by_leg, _LIVE_MODELS_CATALOG.get("data")):
                 # Un id vient d'apparaître côté /models mais pas encore dans
                 # le catalogue : on force un relevé (au plus 1/5 min) pour
                 # obtenir ses niveaux d'effort sans attendre 30 min.
@@ -1672,11 +2003,7 @@ def refresh_live_models_sync(force_catalog: bool = False) -> dict[str, Any]:
         catalog = _live_catalog_snapshot(force=_force_catalog)
         fetched_legs = set(live_by_leg)
         previous = _live_models.by_leg()
-        current_legs = {
-            mid: _live_model_leg(mid, cfg)
-            for mid, cfg in list(MODELS.items())
-            if isinstance(cfg, dict)
-        }
+        current_legs = {mid: _live_model_leg(mid, cfg) for mid, cfg in list(MODELS.items()) if isinstance(cfg, dict)}
         snapshot = _live_models.build_snapshot(
             live_by_leg=live_by_leg,
             current_models=dict(MODELS),
@@ -1700,14 +2027,11 @@ def refresh_live_models_sync(force_catalog: bool = False) -> dict[str, Any]:
                     _kept["deprecated"] = True
                     snapshot.setdefault("available", {})[_mid] = _kept
             _dep = set(snapshot.get("deprecated") or ())
-            snapshot["removed_ids"] = [
-                m for m in (snapshot.get("removed_ids") or ()) if m not in _dep
-            ]
+            snapshot["removed_ids"] = [m for m in (snapshot.get("removed_ids") or ()) if m not in _dep]
             snapshot["removed_deprecated"] = []
         if snapshot.get("guarded"):
             logger.warning(
-                "[live-models] relevé tronqué (>50% des modèles auraient disparu) "
-                "— aucune suppression ce cycle"
+                "[live-models] relevé tronqué (>50% des modèles auraient disparu) — aucune suppression ce cycle"
             )
             # Conserver l'inventaire précédent : sinon /v1/models masquerait
             # les modèles absents du relevé tronqué, sans les retirer.
@@ -1733,18 +2057,31 @@ def refresh_live_models_sync(force_catalog: bool = False) -> dict[str, Any]:
             )
             if apply_result.get("added") or apply_result.get("removed") or apply_result.get("migrated"):
                 _live_rebuild_routes_locked()
+            if apply_result.get("removed"):
+                forget_probed_free_models(apply_result.get("removed"))
             # Les capabilities (web-search, etc.) ne sont pas dans le relevé :
             # on les fusionne avec la même source que les entrées config.
-            for mid in list(apply_result.get("added") or ()) + list(
-                apply_result.get("migrated") or ()
-            ):
+            for mid in list(apply_result.get("added") or ()) + list(apply_result.get("migrated") or ()):
                 try:
                     MODELS[mid]["capabilities"] = get_model_capabilities(mid, MODELS[mid])
                 except Exception:
                     pass
-        commit = _live_models.commit_snapshot(
-            snapshot, apply_result, source=source, model_ids=set(MODELS)
-        )
+        _probe_new = globals().get("_FREE_PROBE_NEW")
+        _candidate_ids = [
+            mid
+            for mid in (apply_result.get("free_candidates") or ())
+            if mid in MODELS
+            and (
+                mid not in FREE_MODELS
+                or str(mid).lower().endswith("-free")
+            )
+        ]
+        if _candidate_ids and callable(_probe_new):
+            try:
+                _probe_new(_candidate_ids)
+            except Exception as e:
+                logger.warning("[free-probe] planification des candidats échouée: %s", e)
+        commit = _live_models.commit_snapshot(snapshot, apply_result, source=source, model_ids=set(MODELS))
         # Persisté même sans pop-up : `available_ids` est la référence du
         # prochain démarrage pour ne pas rejouer un événement identique.
         _save_live_models_persisted()
@@ -1761,6 +2098,7 @@ def refresh_live_models_sync(force_catalog: bool = False) -> dict[str, Any]:
             "added": list(apply_result.get("added") or ()),
             "removed": list(apply_result.get("removed") or ()),
             "migrated": list(apply_result.get("migrated") or ()),
+            "free_candidates": list(apply_result.get("free_candidates") or ()),
             "deprecated": list(snapshot.get("removed_deprecated") or ()),
             "unavailable": list(snapshot.get("removed_unavailable") or ()),
             "partial": bool(snapshot.get("partial")),
@@ -1962,10 +2300,28 @@ def load_api_keys() -> list[dict]:
 
 
 def save_api_keys(configs: list[dict]):
-    """Save API key configs to api_keys.json (never config.yaml — secrets stay out of git)."""
-    with open(API_KEYS_PATH, "w", encoding="utf-8") as f:
-        json.dump(configs, f, indent=2, ensure_ascii=False)
-    API_KEYS[:] = configs  # Atomic replacement — readers never see empty list
+    """Save API key configs to api_keys.json (never config.yaml — secrets stay out of git).
+
+    [audit 2026-10-30] tmp+fsync+replace: a crash mid-write used to corrupt
+    the file, after which load_api_keys() silently fell back to YAML/.env and
+    every multi-account key was lost. Rows without a non-empty api_key are
+    rejected here as a last line of defence.
+    """
+    clean = [
+        dict(k)
+        for k in configs
+        if isinstance(k, dict) and str(k.get("api_key", "") or "").strip()
+    ]
+    tmp = f"{API_KEYS_PATH}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(clean, f, indent=2, ensure_ascii=False)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, API_KEYS_PATH)
+    API_KEYS[:] = clean  # Atomic replacement — readers never see empty list
 
 
 # ── Module-level state ──────────────────────────────────────────────
@@ -2100,13 +2456,9 @@ def maybe_reload_custom_routes():
                     # IP_ROTATION au premier reload, sans redémarrage.
                     try:
                         _env_ck_reload = (
-                            os.getenv("VPN_CONTROL_API_KEY")
-                            or os.getenv("CONTROL_API_KEY")
-                            or ""
+                            os.getenv("VPN_CONTROL_API_KEY") or os.getenv("CONTROL_API_KEY") or ""
                         ).strip()
-                        if _env_ck_reload and isinstance(
-                            new_yaml.get("ip_rotation"), dict
-                        ):
+                        if _env_ck_reload and isinstance(new_yaml.get("ip_rotation"), dict):
                             new_yaml["ip_rotation"]["control_api_key"] = _env_ck_reload
                     except Exception:
                         pass
@@ -2182,11 +2534,7 @@ def maybe_reload_custom_routes():
                         ).get("purged_ids", [])
                         if isinstance(_new_pur, list):
                             PURGED_IDS.clear()
-                            PURGED_IDS.update(
-                                x.strip().lower()
-                                for x in _new_pur
-                                if isinstance(x, str) and x.strip()
-                            )
+                            PURGED_IDS.update(x.strip().lower() for x in _new_pur if isinstance(x, str) and x.strip())
                     except Exception:
                         pass
                     # P2: server_countries change → regen .env via make_credentials_env

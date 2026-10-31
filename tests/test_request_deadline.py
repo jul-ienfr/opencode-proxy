@@ -37,9 +37,7 @@ def _run(app, path="/v1/messages", budget=0.15, min_budget=SHORT_MIN):
     async def receive():
         return {"type": "http.request", "body": b"", "more_body": False}
 
-    middleware = RequestDeadlineMiddleware(
-        app, budget_getter=lambda: budget, min_budget=min_budget
-    )
+    middleware = RequestDeadlineMiddleware(app, budget_getter=lambda: budget, min_budget=min_budget)
     asyncio.run(middleware({"type": "http", "path": path}, receive, send))
     return sent
 
@@ -131,7 +129,7 @@ class TestAbortAfterOutput:
 
         async def half_then_hang(scope, receive, send):
             await send(_start())
-            await send(_body(b'event: message_start\ndata: {}\n\n', more=True))
+            await send(_body(b"event: message_start\ndata: {}\n\n", more=True))
             await asyncio.sleep(5)
 
         sent = _run(half_then_hang, budget=0.1)

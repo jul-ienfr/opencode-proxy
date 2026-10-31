@@ -174,9 +174,7 @@ def main():
             assert "3 attempts" in str(e), f"unexpected message: {e}"
         assert raised, "CRITIC(5): connect_next must RAISE on total failure"
         assert v._status == vpn_manager.VPNState.ERROR, "status must be ERROR"
-        assert v._last_rotation_failed_at is not None, (
-            "CRITIC(6): fail-fast cooldown must be armed after a failure"
-        )
+        assert v._last_rotation_failed_at is not None, "CRITIC(6): fail-fast cooldown must be armed after a failure"
         # CRITIC(6): second call within 300 s is refused immediately, no task
         raised = False
         try:
@@ -217,9 +215,7 @@ def main():
         except asyncio.CancelledError:
             raised = True
         assert raised, "CancelledError must propagate"
-        assert v3._status == vpn_manager.VPNState.ERROR, (
-            "[17]: cancelled rotation must not stay CONNECTING"
-        )
+        assert v3._status == vpn_manager.VPNState.ERROR, "[17]: cancelled rotation must not stay CONNECTING"
         v7 = _bare_vpn()
 
         async def _boom2():
@@ -232,9 +228,7 @@ def main():
         except asyncio.CancelledError:
             raised = True
         assert raised, "CancelledError must propagate from connect()"
-        assert v7._status == vpn_manager.VPNState.ERROR, (
-            "[17]: cancelled connect() must not stay CONNECTING"
-        )
+        assert v7._status == vpn_manager.VPNState.ERROR, "[17]: cancelled connect() must not stay CONNECTING"
         print("PASS [17] CancelledError -> ERROR status")
 
     asyncio.run(_check_cancel())
@@ -260,9 +254,7 @@ def main():
         assert v5._current_ip == "10.0.0.77", "[20]: current_ip restored"
         assert v5._identity_index == 2, "[20]: identity_index restored"
         assert v5._total_switches == 5, "[20]: total_switches restored"
-        assert v5._circuit_breaker._servers["smoke-test"]["failures"] == 1, (
-            "[20]: CB failure count restored"
-        )
+        assert v5._circuit_breaker._servers["smoke-test"]["failures"] == 1, "[20]: CB failure count restored"
         # clamp: config shrank between restarts
         v5._identity_profiles = [{"impersonate": "a"}]
         v5.load_state()
@@ -279,9 +271,7 @@ def main():
         v6._active_free_streams = 0
         v6._update_opportune = lambda: False
         r = await v6.apply_update(check_opportune=True)
-        assert r["error"] == "not opportune (traffic active)", (
-            "[21]: not-opportune must skip inside the lock"
-        )
+        assert r["error"] == "not opportune (traffic active)", "[21]: not-opportune must skip inside the lock"
         v6._update_opportune = lambda: True
         v6._active_free_streams = 2
         r = await v6.apply_update(check_opportune=True)

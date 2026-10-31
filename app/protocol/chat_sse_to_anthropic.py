@@ -54,7 +54,7 @@ _STOP_REASON_MAP: Mapping[str, str] = MappingProxyType(
         "length": "max_tokens",
         "tool_calls": "tool_use",
         "function_call": "tool_use",
-        "content_filter": "end_turn",
+        "content_filter": "refusal",
     }
 )
 
@@ -127,11 +127,28 @@ _STATUS_ERROR_TYPES = MappingProxyType(
 # tokens written » ne doit pas devenir une surcharge. Ordre = priorité.
 _TEXT_ERROR_TYPES = (
     (
-        ("rate_limit", "rate limit", "ratelimit", "too many requests", "too_many_requests", "quota", "concurrency limit"),
+        (
+            "rate_limit",
+            "rate limit",
+            "ratelimit",
+            "too many requests",
+            "too_many_requests",
+            "quota",
+            "concurrency limit",
+        ),
         "rate_limit_error",
     ),
     (
-        ("overload", "capacity", "unavailable", "server_error", "internal_error", "internal server", "temporarily", "try again later"),
+        (
+            "overload",
+            "capacity",
+            "unavailable",
+            "server_error",
+            "internal_error",
+            "internal server",
+            "temporarily",
+            "try again later",
+        ),
         "overloaded_error",
     ),
     (
@@ -261,9 +278,7 @@ def _delta_text(content: object) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(
-            p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
-        )
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
     return ""
 
 
@@ -542,9 +557,7 @@ class ChatSseToAnthropicState:
         events.append(_sse("message_stop", {"type": "message_stop"}))
         return events
 
-    def _upstream_error_events(
-        self, payload: object, *, already_anthropic: bool = False
-    ) -> list[str]:
+    def _upstream_error_events(self, payload: object, *, already_anthropic: bool = False) -> list[str]:
         """F1 — séquence émise quand l'amont porte l'erreur DANS le flux.
 
         ``event: error`` d'abord (type + message classés), puis la queue de
@@ -624,9 +637,7 @@ class ChatSseToAnthropicState:
         # final à côté de l'erreur ne le perd pas.
         _upstream_error = chunk.get("error")
         if _upstream_error:
-            return self._upstream_error_events(
-                _upstream_error, already_anthropic=chunk.get("type") == "error"
-            )
+            return self._upstream_error_events(_upstream_error, already_anthropic=chunk.get("type") == "error")
 
         choices = chunk.get("choices")
         first_choice = choices[0] if isinstance(choices, list) and choices else {}
@@ -703,8 +714,9 @@ class ChatSseToAnthropicState:
                     # Parité officielle : jamais de bloc fantôme `tool_pending_*`.
                     # On bufferise id + args sans émettre ; le vrai nom arrivera
                     # au chunk suivant et le bloc sera créé avec le cumul.
-                    if tc.get("id"):
-                        self.pending_tool_ids[api_idx] = tc.get("id")
+                    _tc_id = tc.get("id")
+                    if _tc_id:
+                        self.pending_tool_ids[api_idx] = _tc_id
                     _pending_args = function.get("arguments", "")
                     if isinstance(_pending_args, dict):
                         try:

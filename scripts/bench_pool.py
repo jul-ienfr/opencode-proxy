@@ -41,9 +41,7 @@ async def bench(url: str, concurrency: int, total: int = 500):
         elapsed = time.monotonic() - start
         latencies = [r[0] for r in results]
         statuses = [r[1] for r in results]
-        print(
-            f"concurrency={concurrency} total={total} elapsed={elapsed:.2f}s rps={total / elapsed:.1f}"
-        )
+        print(f"concurrency={concurrency} total={total} elapsed={elapsed:.2f}s rps={total / elapsed:.1f}")
         print(
             f"  p50={statistics.median(latencies) * 1000:.1f}ms p95={sorted(latencies)[int(len(latencies) * 0.95)] * 1000:.1f}ms"
         )

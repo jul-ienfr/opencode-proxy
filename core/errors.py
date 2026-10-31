@@ -20,6 +20,20 @@ import re
 from fastapi.responses import JSONResponse
 
 
+def _coerce_status(status: object) -> int | None:
+    """``int()`` tolérant d'un ``status`` quelconque ; ``None`` si non convertible.
+
+    Les signatures publiquent ``status: object`` (les appelants relayent ce
+    qu'ils ont : header, JSON, objet partial) : mypy refuse ``int(object)``
+    même sous ``try/except``, d'où le unique ``type: ignore`` du fichier —
+    centralisé ici plutôt que répété sur les 5 sites de conversion.
+    """
+    try:
+        return int(status)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return None
+
+
 class UpstreamError(Exception):
     """Raised when an upstream HTTP request fails (connection, timeout, etc.)."""
 
@@ -54,9 +68,7 @@ class FreeRefusal(Exception):
             retry_after = str(retry_after or "")
         except Exception:
             retry_after = ""
-        super().__init__(
-            f"free refusal status={status} retry-after={retry_after!r} body={body[:120]!r}"
-        )
+        super().__init__(f"free refusal status={status} retry-after={retry_after!r} body={body[:120]!r}")
         self.status = status
         self.body = body
         self.retry_after = retry_after
@@ -111,9 +123,7 @@ def anthropic_error(status_code: int, message: str, error_type: str = "api_error
 _anthropic_error = anthropic_error
 
 
-def openai_error(
-    status_code: int, message: str, error_type: str = "invalid_request_error"
-) -> JSONResponse:
+def openai_error(status_code: int, message: str, error_type: str = "invalid_request_error") -> JSONResponse:
     """Return an error in OpenAI API format."""
     return JSONResponse(
         status_code=status_code,
@@ -154,7 +164,9 @@ def model_deprecated_error(
     return anthropic_error(status_code, message, error_type="not_found_error")
 
 
-def free_refusal_response(exc: FreeRefusal, protocol: str, *, anthropic_error_fn=anthropic_error, openai_error_fn=openai_error, redact_fn) -> JSONResponse:
+def free_refusal_response(
+    exc: FreeRefusal, protocol: str, *, anthropic_error_fn=anthropic_error, openai_error_fn=openai_error, redact_fn
+) -> JSONResponse:
     """[PLAN_CORRECTION_FAUX_429 Lot A1] Réponse HTTP véridique (non-stream).
 
     - status == 429 → 429 quota, message historique, Retry-After = header
@@ -288,6 +300,16 @@ _UPSTREAM_MOTIFS: tuple = (
     (r"creditlimitexceeded|credit.*limit.*exceed", "permission_error", False, True),
     (r"insufficient balance", "permission_error", False, True),
     (r"monthly usage limit", "permission_error", False, True),
+    # [audit 2026-10-30] Generic quota texts observed on the free leg were
+    # classified transient (no rotation, 30 s cooldown). They are real
+    # per-IP/account quota walls.
+    (
+        r"quota exceeded|exceeded your quota|quota limit exceeded|"
+        r"usage limit exceeded|daily limit reached|free quota",
+        "permission_error",
+        False,
+        True,
+    ),
     # auth : clé invalide / permission refusée → pas de retry, pause longue
     # (clé condamnée au 401/403). 400+`incorrect api key` inclus (officiel).
     (r"incorrect api key|invalid api key|api_key_invalid|invalid_api_key", "authentication_error", False, True),
@@ -297,7 +319,12 @@ _UPSTREAM_MOTIFS: tuple = (
     # clés parce qu'un prompt est invalide provoquerait une panne auto-infligée.
     # Parité v2 `ContentPolicy` → mappé `invalid_request_error` (non-retry).
     (r"invalid_prompt", "invalid_request_error", False, False),
-    (r"content_policy|usage.?policy|policy violation|blocked.*policy|harmful content", "invalid_request_error", False, False),
+    (
+        r"content_policy|usage.?policy|policy violation|blocked.*policy|harmful content",
+        "invalid_request_error",
+        False,
+        False,
+    ),
     # surcharge amont → transitoire, ça se rejoue. Inclut les textes OpenCode
     # « Endpoint is unavailable » : 429 transitoire côté SERVEUR, sans lien avec
     # le quota per-IP — rotater l'IP ne change rien (cf. is_free_quota_failure).
@@ -504,9 +531,8 @@ def classify_status_class(status: object, body: object = "") -> str:
     ``_STATUS_CLASS_TO_TYPE``, et la garder séparée permet de comparer les deux
     vocabulaires sans les confondre.
     """
-    try:
-        statut = int(status)
-    except (TypeError, ValueError):
+    statut = _coerce_status(status)
+    if statut is None:
         statut = 502
     hay = body if isinstance(body, str) else ""
     if not hay and isinstance(body, (bytes, bytearray)):
@@ -542,9 +568,8 @@ def classify_upstream_error(status: object, body: object) -> tuple:
     Parité v2 : 402 → quota (`permission_error`, non-retryable) même sans
     motif (facturation) ; le label `[code]` est déplié avant match.
     """
-    try:
-        status_i = int(status)
-    except (TypeError, ValueError):
+    status_i = _coerce_status(status)
+    if status_i is None:
         status_i = 502
     if status_i == 402:
         return status_i, "permission_error"
@@ -570,9 +595,7 @@ def upstream_retry_signal(status: object, body: object) -> tuple:
       (``_key_pauser._max_pause`` chez nous) ; le module reste pur et ne
       connaît pas le politique de pause.
     """
-    try:
-        int(status)
-    except (TypeError, ValueError):
+    if _coerce_status(status) is None:
         return False, False
     _m = _match_upstream_motif(body)
     if _m is None:
@@ -602,9 +625,8 @@ def is_free_quota_failure(status: object, body: object) -> bool:
     Pur : jamais de raise. Un statut hors 429 rend toujours False (ce helper
     ne qualifie que les 429).
     """
-    try:
-        s = int(status)
-    except (TypeError, ValueError):
+    s = _coerce_status(status)
+    if s is None:
         return False
     if s != 429:
         return False
@@ -677,9 +699,8 @@ def free_quota_scope(status: object, body: object) -> str:
     fenêtres) reste ``"rate-limited"`` : lui a un reset, contrairement au
     trial.
     """
-    try:
-        s = int(status)
-    except (TypeError, ValueError):
+    s = _coerce_status(status)
+    if s is None:
         return "unknown"
     if s != 429:
         return "unknown"
@@ -690,12 +711,7 @@ def free_quota_scope(status: object, body: object) -> str:
         nospace = low.replace(" ", "").replace("_", "").replace("-", "")
         if "freeusagelimiterror" in nospace or "free usage limit" in low:
             return "trial-exhausted"
-        if (
-            "rate limit" in low
-            or "rate_limit" in low
-            or "too many requests" in low
-            or "ratelimiterror" in nospace
-        ):
+        if "rate limit" in low or "rate_limit" in low or "too many requests" in low or "ratelimiterror" in nospace:
             return "rate-limited"
         if is_free_quota_failure(status, body):
             return "rate-limited"

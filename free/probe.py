@@ -90,9 +90,7 @@ async def probe_once(
                 pass
             return res
 
-    return list(
-        await asyncio.gather(*(_one(m) for m in managers if m is not None), return_exceptions=False)
-    )
+    return list(await asyncio.gather(*(_one(m) for m in managers if m is not None), return_exceptions=False))
 
 
 __all__ = ["probe_once", "probe_station"]

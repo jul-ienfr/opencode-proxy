@@ -59,9 +59,7 @@ def get_effort_order() -> list:
             order.append(name)
     # Garde-fou : un ordre custom doit au moins porter low/medium/high.
     if not {"low", "medium", "high"} <= seen:
-        logger.warning(
-            "thinking.effort_order invalide (%r), ordre par défaut utilisé", raw
-        )
+        logger.warning("thinking.effort_order invalide (%r), ordre par défaut utilisé", raw)
         return list(EFFORT_ORDER_DEFAULT)
     return order
 

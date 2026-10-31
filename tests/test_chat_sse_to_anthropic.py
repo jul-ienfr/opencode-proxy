@@ -280,9 +280,7 @@ def test_bloc_thinking_depuis_reasoning_content():
     assert starts[0]["content_block"] == {"type": "thinking", "thinking": "", "signature": ""}
     assert [s["index"] for s in starts] == [0, 1]
 
-    thinking_deltas = [
-        d for d in _data(events, "content_block_delta") if d["delta"]["type"] == "thinking_delta"
-    ]
+    thinking_deltas = [d for d in _data(events, "content_block_delta") if d["delta"]["type"] == "thinking_delta"]
     # Type de delta = celui de opencode.py:10648 (jamais "reasoning_delta").
     assert [d["delta"] for d in thinking_deltas] == [
         {"type": "thinking_delta", "thinking": "je réflé"},
@@ -341,7 +339,7 @@ def test_pas_de_bloc_thinking_quand_absent():
         ("length", "max_tokens"),
         ("tool_calls", "tool_use"),
         ("function_call", "tool_use"),
-        ("content_filter", "end_turn"),
+        ("content_filter", "refusal"),
         ("autre_inconnu", "end_turn"),
         # Parité officielle : sans finish_reason amont (coupure), on signale
         # `error` au lieu de déguiser en `end_turn` qui forçait un `continue`.
@@ -366,7 +364,7 @@ def test_correspondance_stop_reason(finish_reason, expected):
         ("length", "max_tokens"),
         ("tool_calls", "tool_use"),
         ("function_call", "tool_use"),
-        ("content_filter", "end_turn"),
+        ("content_filter", "refusal"),
         ("inconnu", "end_turn"),
         (None, "end_turn"),
     ],
@@ -490,7 +488,10 @@ def test_restauration_nom_outil_sans_map():
     """Sans map, le nom reçu est émis tel quel (pas de rename fantôme)."""
     st = ChatSseToAnthropicState(model="m", message_id="msg_nomap")
     events = _events(
-        [_chunk({"tool_calls": [{"index": 0, "id": "t", "function": {"name": "court", "arguments": ""}}]}), "data: [DONE]"],
+        [
+            _chunk({"tool_calls": [{"index": 0, "id": "t", "function": {"name": "court", "arguments": ""}}]}),
+            "data: [DONE]",
+        ],
         st,
     )
     assert _data(events, "content_block_start")[0]["content_block"]["name"] == "court"
@@ -953,4 +954,3 @@ class TestF1FormeDuWire:
         assert "message_stop" in _names(first)
         assert _events([_data_line({"error": {"message": "boom2", "type": "api_error"}})], st) == []
         assert st.finished is True
-

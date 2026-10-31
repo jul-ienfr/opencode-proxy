@@ -24,6 +24,19 @@ from free_ip_pool import FreeIPPool
 from ops.supervisor import StationSupervisor
 from vpn.manager import AuthCoolingDownError, VPNManager, VPNState
 
+
+@pytest.fixture(autouse=True)
+def _reset_auth_throttle():
+    """[P0.5] le throttle AUTH est global au process : le remettre à zéro
+    entre les tests pour éviter qu'une rafale d'un test ne bloque le suivant."""
+    from vpn.auth import _auth_reset_for_tests
+
+    cvm._GLOBAL_FAILED_HOSTS.clear()
+    _auth_reset_for_tests()
+    yield
+    cvm._GLOBAL_FAILED_HOSTS.clear()
+    _auth_reset_for_tests()
+
 # ── GraceFake ──────────────────────────────────────────────────────
 
 
@@ -34,9 +47,7 @@ def _gcfg(tmp_path, **over):
         "switch_delay": 0,
         "identity_rotation": True,
         "identity_diversity": False,
-        "identity_profiles": [
-            {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
-        ],
+        "identity_profiles": [{"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}],
         "watchdog_backoff_base": 15.0,
         "watchdog_backoff_max": 60.0,
         "auto_wg_egress_ticks": 3,
@@ -145,9 +156,7 @@ class TestServerIssueGrace:
         mgr = GraceFake(_gcfg(tmp_path), tmp_path)
         mgr.socks_ok = False  # egress réellement morte → vrai error
         mgr.ctl_status = False  # control arrêté aussi (pas de fallthrough)
-        mgr.log_text = (
-            "2026-01-01T00:00:00Z openvpn: Connection reset, restarting\n"
-        )
+        mgr.log_text = "2026-01-01T00:00:00Z openvpn: Connection reset, restarting\n"
         st = await mgr.refresh_status(force=True)
         assert st["status"] == VPNState.ERROR
         assert st["ip"] is None
@@ -197,9 +206,7 @@ class TestServerIssueGrace:
 class TestWaitHealthyTolerant:
     async def test_tunnel_up_socks_down_succeeds_with_flag(self, tmp_path):
         """tunnel UP + SOCKS KO → succès + egress_socks_pending + catch-up."""
-        mgr = GraceFake(
-            _gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path
-        )
+        mgr = GraceFake(_gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path)
         mgr.socks_ok = False
         started = await mgr._wait_healthy(timeout=5)
         assert started == "2026-01-01T00:00:00Z"
@@ -208,9 +215,7 @@ class TestWaitHealthyTolerant:
         _cancel(mgr._socks_catchup_task)
 
     async def test_tunnel_up_socks_up_clears_flag(self, tmp_path):
-        mgr = GraceFake(
-            _gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path
-        )
+        mgr = GraceFake(_gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path)
         started = await mgr._wait_healthy(timeout=5)
         assert started == "2026-01-01T00:00:00Z"
         assert mgr._egress_socks_pending is False
@@ -289,6 +294,10 @@ class TestOvAuthCooldown:
         """3 AUTH / fenêtre (seuil 3) → cooling + connect_next refusé."""
         mgr = GraceFake(_gcfg(tmp_path, ov_auth_station_threshold=3), tmp_path)
         for _ in range(3):
+            # Chaque itération simule une tentative réelle distincte : sans ce
+            # reset, l'hôte est déjà blacklisté et le scan stale est ignoré.
+            mgr._failed_hosts.clear()
+            cvm._GLOBAL_FAILED_HOSTS.clear()
             assert await mgr._check_auth_failed("", text=_AUTH_TXT) is True
         assert mgr._auth_cooling() is True
         assert mgr._auth_cool_remaining_s() > 0
@@ -297,20 +306,44 @@ class TestOvAuthCooldown:
         # AuthCoolingDownError ⊂ RotationFailed (compat handlers).
         assert issubclass(AuthCoolingDownError, cvm.RotationFailed)
 
+    async def test_stale_auth_line_on_connected_tunnel_is_deduped(self, tmp_path):
+        """[P0.5] Le re-scan de la même ligne ne recompte pas sur un tunnel sain."""
+        mgr = GraceFake(_gcfg(tmp_path), tmp_path)
+        mgr._status = VPNState.CONNECTED
+        assert await mgr._check_auth_failed("", text=_AUTH_TXT) is True
+        assert await mgr._check_auth_failed("", text=_AUTH_TXT) is False
+        assert len(mgr._auth_failed_window) == 1
+        # Tunnel down : la même ligne stale reste classée stale (False) — la
+        # panne est détectée par le statut/egress, pas par ce re-scan.
+        mgr._status = VPNState.DISCONNECTED
+        assert await mgr._check_auth_failed("", text=_AUTH_TXT) is False
+        assert len(mgr._auth_failed_window) == 1
+
+    def test_server_issue_does_not_emit_auth_failed(self, tmp_path, caplog):
+        """_check_server_issue ne doit pas maquiller un server-refused en
+        AUTH_FAILED : les containers n'avaient aucun AUTH (faux positif)."""
+        mgr = GraceFake(_gcfg(tmp_path), tmp_path)
+        caplog.set_level("WARNING")
+        mgr._record_auth_failure(_AUTH_TXT, kind="server")
+        assert "server-refused" in caplog.text
+        assert "AUTH_FAILED" not in caplog.text
+
     async def test_three_consec_same_host_blacklists_and_flags_repin(self, tmp_path):
         mgr = GraceFake(_gcfg(tmp_path, ov_auth_station_threshold=999), tmp_path)
         for _ in range(3):
+            mgr._failed_hosts.clear()
+            cvm._GLOBAL_FAILED_HOSTS.clear()
             await mgr._check_auth_failed("", text=_AUTH_TXT)
         assert mgr._host_blacklisted("de1234.nordvpn.com") is True
         assert mgr._auth_repin_needed is True
 
-    async def test_burst_sets_backoff_and_gate_respects_global_throttle(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_burst_sets_backoff_and_gate_respects_global_throttle(self, tmp_path, monkeypatch):
         """Backoff piloté posé en rafale ; connect() passe TOUJOURS par
         le throttle global (jamais de contournement)."""
         mgr = GraceFake(_gcfg(tmp_path, ov_auth_station_threshold=999), tmp_path)
         for _ in range(3):
+            mgr._failed_hosts.clear()
+            cvm._GLOBAL_FAILED_HOSTS.clear()
             await mgr._check_auth_failed("", text=_AUTH_TXT)
         assert mgr._auth_backoff_delay >= 90.0
         calls = {"n": 0}
@@ -394,18 +427,14 @@ class TestWatchdogGrace:
 
 class TestEgressStates:
     async def test_tunnel_up_full_is_connected(self, tmp_path):
-        mgr = GraceFake(
-            _gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path
-        )
+        mgr = GraceFake(_gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path)
         st = await mgr.refresh_status(force=True)
         assert st["status"] == VPNState.CONNECTED
         assert st["egress_state"] == "tunnel_up_full"
 
     async def test_tunnel_up_socks_down_is_degraded_routable(self, tmp_path):
         """Cas S6 : control running + IP, SOCKS KO → degraded, IP gardée."""
-        mgr = GraceFake(
-            _gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path
-        )
+        mgr = GraceFake(_gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path)
         mgr.socks_ok = False
         mgr._egress_socks_pending = True  # doute LOT B → classification LOT F
         st = await mgr.refresh_status(force=True)
@@ -416,9 +445,7 @@ class TestEgressStates:
         _cancel(mgr._server_issue_recheck_task)
 
     async def test_tunnel_down_is_error(self, tmp_path):
-        mgr = GraceFake(
-            _gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path
-        )
+        mgr = GraceFake(_gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path)
         mgr.ctl_status = False
         st = await mgr.refresh_status(force=True)
         assert st["status"] == VPNState.ERROR
@@ -608,9 +635,7 @@ class TestPinLoopEgressOk:
 
     async def test_old_reset_ov_stack_stays_plain_error(self, tmp_path):
         """Pas de régression LOT A : stack OV + egress KO → error simple."""
-        mgr = GraceFake(
-            _gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path
-        )
+        mgr = GraceFake(_gcfg(tmp_path, control_api_key="k", country_rotation=False), tmp_path)
         mgr._stack_effective = "openvpn"
         mgr.socks_ok = False
         mgr.ctl_status = False
@@ -840,9 +865,7 @@ class TestFastPathBoot:
             _cancel(mgr._update_task)
             _cancel(mgr._server_issue_recheck_task)
 
-    async def test_boot_adopted_ip_is_journaled_without_identity_advance(
-        self, tmp_path
-    ):
+    async def test_boot_adopted_ip_is_journaled_without_identity_advance(self, tmp_path):
         """L'IP du tunnel existant est enregistrée (registre + historique)
         SANS avancer l'identité — pas de rotation au boot."""
         mgr = GraceFake(_gcfg(tmp_path, control_api_key="k"), tmp_path)
@@ -888,9 +911,7 @@ class TestServerPickMode:
             return {}
 
         monkeypatch.setattr(mgr, "_fetch_nord_loads", _fake_fetch)
-        monkeypatch.setattr(
-            mgr, "_least_loaded_hostnames", lambda country: ["de9999.nordvpn.com"]
-        )
+        monkeypatch.setattr(mgr, "_least_loaded_hostnames", lambda country: ["de9999.nordvpn.com"])
         assert await mgr._control_pin_country("Poland", timeout=2) is True
         script = mgr.settings_script()
         assert '"countries":["Poland"]' in script
@@ -906,9 +927,7 @@ class TestServerPickMode:
             raise AssertionError("pas de fetch loads en mode délégué")
 
         monkeypatch.setattr(mgr, "_fetch_nord_loads", _boom_fetch)
-        monkeypatch.setattr(
-            mgr, "_least_loaded_hostnames", lambda country: ["de9999.nordvpn.com"]
-        )
+        monkeypatch.setattr(mgr, "_least_loaded_hostnames", lambda country: ["de9999.nordvpn.com"])
         assert await mgr._control_pin_country("Poland", timeout=2) is True
         script = mgr.settings_script()
         assert '"countries":["Poland"]' in script
@@ -960,8 +979,7 @@ class TestServerRefusedAutoRecovery:
     def test_refused_then_init_is_healed(self):
         """INIT après le refused → guérison prouvée (pas de re-pin inutile)."""
         live, _age, healed, _init = cvm._parse_server_issue_detail(
-            _ST1_REFUSED_CHUNK
-            + "2026-10-12T05:05:36Z Initialization Sequence Completed\n"
+            _ST1_REFUSED_CHUNK + "2026-10-12T05:05:36Z Initialization Sequence Completed\n"
         )
         assert live is False
         assert healed is True

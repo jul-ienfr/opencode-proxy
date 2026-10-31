@@ -10,8 +10,6 @@ structure est juste peut echouer a l'execution. Ce test existe pour que V5.1 ne
 soit pas dans ce cas.
 """
 
-import asyncio
-
 import pytest
 
 import opencode as oc
@@ -50,7 +48,7 @@ class _Ctx:
 class _Pool:
     enabled = True
     active_station = None
-    _stations = []
+    _stations: list = []
 
     def _best_station(self):
         return None
@@ -89,10 +87,10 @@ async def test_empty_upstream_yields_a_5xx_not_a_200(monkeypatch):
         resp = await client.post("/v1/messages", json=_anthropic_body())
 
     assert resp.status_code != 200, (
-        "V5.1 : un flux amont vide ne doit JAMAIS sortir en 200 "
-        f"(recu {resp.status_code} : {resp.text[:200]})"
+        f"V5.1 : un flux amont vide ne doit JAMAIS sortir en 200 (recu {resp.status_code} : {resp.text[:200]})"
     )
-    assert 500 <= resp.status_code < 600, resp.status_code
+    # Un refus de quota free est un 429 légitime ; les autres vides restent 5xx.
+    assert resp.status_code == 429 or 500 <= resp.status_code < 600, resp.status_code
 
 
 @pytest.mark.asyncio

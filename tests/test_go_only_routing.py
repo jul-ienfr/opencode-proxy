@@ -16,22 +16,13 @@ import config.settings as st
 
 class TestResolveModelEndpoint:
     def test_explicit_go(self):
-        assert (
-            st._resolve_model_endpoint("acme-proto-free", {"endpoint": "go"}, "openai")
-            == st.API_BASE_OPENAI
-        )
+        assert st._resolve_model_endpoint("acme-proto-free", {"endpoint": "go"}, "openai") == st.API_BASE_OPENAI
 
     def test_explicit_go_case_insensitive(self):
-        assert (
-            st._resolve_model_endpoint("acme-proto-free", {"endpoint": " GO "}, "openai")
-            == st.API_BASE_OPENAI
-        )
+        assert st._resolve_model_endpoint("acme-proto-free", {"endpoint": " GO "}, "openai") == st.API_BASE_OPENAI
 
     def test_explicit_free(self):
-        assert (
-            st._resolve_model_endpoint("some-free", {"endpoint": "free"}, "openai")
-            == st.API_BASE_FREE
-        )
+        assert st._resolve_model_endpoint("some-free", {"endpoint": "free"}, "openai") == st.API_BASE_FREE
 
     def test_explicit_full_url_verbatim(self):
         url = "https://example.com/v1/chat/completions"
@@ -42,27 +33,19 @@ class TestResolveModelEndpoint:
 
     def test_muse_free_responses(self):
         assert (
-            st._resolve_model_endpoint("muse-spark-1.2-contributor-free", {}, "openai")
-            == st._RESPONSES_FREE_ENDPOINT
+            st._resolve_model_endpoint("muse-spark-1.2-contributor-free", {}, "openai") == st._RESPONSES_FREE_ENDPOINT
         )
 
     def test_muse_paid_responses(self):
-        assert (
-            st._resolve_model_endpoint("muse-spark-1.2-contributor", {}, "openai")
-            == st._RESPONSES_ENDPOINT
-        )
+        assert st._resolve_model_endpoint("muse-spark-1.2-contributor", {}, "openai") == st._RESPONSES_ENDPOINT
 
     def test_muse_13_free_responses(self):
         assert (
-            st._resolve_model_endpoint("muse-spark-1.3-contributor-free", {}, "openai")
-            == st._RESPONSES_FREE_ENDPOINT
+            st._resolve_model_endpoint("muse-spark-1.3-contributor-free", {}, "openai") == st._RESPONSES_FREE_ENDPOINT
         )
 
     def test_muse_13_paid_responses(self):
-        assert (
-            st._resolve_model_endpoint("muse-spark-1.3-contributor", {}, "openai")
-            == st._RESPONSES_ENDPOINT
-        )
+        assert st._resolve_model_endpoint("muse-spark-1.3-contributor", {}, "openai") == st._RESPONSES_ENDPOINT
 
     def test_paid_openai_default(self):
         assert st._resolve_model_endpoint("kimi-k2.6", {}, "openai") == st.API_BASE_OPENAI
@@ -84,12 +67,20 @@ def test_live_models_muse_spark_13_endpoints():
         assert cfg["protocol"] == "openai"
 
 
-def test_live_models_muse_spark_13_free_map():
-    assert st.FREE_MODEL_MAP["muse-spark-1.3-contributor"] == "muse-spark-1.3-contributor-free"
+def test_free_model_map_targets_are_routable():
+    """[CATALOGUE 2026-10-27] plus aucun `-free` muse n'est annonce amont :
+    la carte payant → free se verifie sur son invariant (cible `-free` bien
+    routable) plutot que sur une paire musicienne devenue fantome."""
+    assert st.FREE_MODEL_MAP, "la carte payant → free est vide"
+    for paid, free in st.FREE_MODEL_MAP.items():
+        assert free.endswith("-free"), f"{paid} -> {free} : la cible doit etre free"
+        assert free in st.MODELS, f"cible {free} absente de MODELS"
 
 
 def test_live_models_muse_spark_13_geo():
-    for mid in ("muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free"):
+    # [CATALOGUE 2026-10-27] `muse-spark-1.3-contributor-free` n'est plus
+    # annonce amont : la parité geo 1.3/1.2 se joue sur les ids existants.
+    for mid in ("muse-spark-1.3-contributor", "muse-spark-1.3"):
         route = st.MODELS[mid]
         res = st.resolve_geo({"model": mid, "geo": route.get("geo", {})})
         ref = st.resolve_geo(
@@ -157,12 +148,8 @@ def _install_go_only(monkeypatch, snap, go_only_id, endpoint):
 def test_discovery_excludes_go_only_ids(monkeypatch):
     snap = _snapshot_settings()
     try:
-        go_only = _install_go_only(
-            monkeypatch, snap, "acme-proto-free", st.API_BASE_OPENAI
-        )
-        added = st._apply_discovered_free_models(
-            {go_only, "mimo-v2.5-free"}, source="test"
-        )
+        go_only = _install_go_only(monkeypatch, snap, "acme-proto-free", st.API_BASE_OPENAI)
+        added = st._apply_discovered_free_models({go_only, "mimo-v2.5-free"}, source="test")
         assert isinstance(added, int)
         assert go_only not in st.FREE_MODELS
         assert go_only not in st.FREE_MODEL_POOL
@@ -206,5 +193,8 @@ def test_list_models_ids_subset_of_models():
     assert len(ids) == len(set(ids)), "doublons dans /v1/models"
     ghosts = [i for i in ids if i not in st.MODELS]
     assert not ghosts, f"/v1/models annonce des ids non routables : {ghosts}"
-    for banned in ("gpt-5-codex", "gpt-5", "gpt-4o", "codex", "deepseek-chat"):
+    # [CATALOGUE 2026-10-27] `gpt-5` et `gpt-5-codex` sont des modeles reels
+    # desormais annonces par l'amont (logs/live_models.json, 91 ids) : ils
+    # quittent la liste noire. Restent les vrais alias factices.
+    for banned in ("gpt-4o", "codex", "deepseek-chat"):
         assert banned not in ids, f"alias factice {banned!r} de retour dans /v1/models"

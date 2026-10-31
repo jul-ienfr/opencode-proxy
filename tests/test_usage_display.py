@@ -144,9 +144,7 @@ def test_chat_to_responses_zero_when_absent():
     chat = {
         "id": "c1",
         "model": "test",
-        "choices": [
-            {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}
-        ],
+        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
         "usage": {"prompt_tokens": 5, "completion_tokens": 5},
     }
     out = _canon.openai_chat_to_responses(chat, "test-model")

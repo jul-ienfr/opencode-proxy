@@ -29,9 +29,7 @@ class _Station:
     """Minimal station double (same shape as test_pool_connection_failure,
     plus the slice get_status() reads)."""
 
-    def __init__(
-        self, sid, *, enabled=True, proxy_mode="vpn", status="connected", current_ip=None, quota=15
-    ):
+    def __init__(self, sid, *, enabled=True, proxy_mode="vpn", status="connected", current_ip=None, quota=15):
         self._station = sid
         self.enabled = enabled
         self.proxy_mode = proxy_mode

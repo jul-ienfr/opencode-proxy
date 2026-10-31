@@ -29,35 +29,41 @@ import pytest
 sys.path.insert(0, ".")
 from config import settings as cs  # noqa: E402
 
-FREE_BASE = "https://opencode.ai/inference/v1/chat/completions"
+FREE_BASE = "https://opencode.ai/inference/openai/v1/chat/completions"
 
 
 # ── 1. Le vrai correctif d'aujourd'hui ──────────────────────────────────────
 
 
 def test_the_one_real_fix_keeps_the_working_endpoint():
-    """`minimax-m3.1-flash-free` : protocole corrige, endpoint free conserve.
+    """Surcharge : protocole divergent corrige, endpoint conserve.
 
-    La config le declare `anthropic` ; le catalogue dit `chat`. Corriger le
-    protocole est indispensable (sinon un corps Anthropic part vers
-    `/chat/completions`). Changer l'endpoint ne l'est pas : la base free du
-    proxy repond 200, celle du catalogue (`/inference/openai/v1`) n'est pas
-    verifiee sur cette route.
+    [CATALOGUE 2026-10-27] le temoin vivant (`minimax-m3.1-flash-free`,
+    `protocol: anthropic` sur un endpoint chat) n'est plus annonce amont.
+    On rejoue la propriete sur `beam-free` avec la config buguee de facon
+    synthetique : corriger le protocole est indispensable (sinon un corps
+    Anthropic part vers `/chat/completions`) ; changer l'endpoint ne l'est
+    pas — la base free du proxy repond 200.
     """
-    data = cs._models_cfg["minimax-m3.1-flash-free"]
-    assert data.get("protocol") == "anthropic", "la config doit rester le temoin du bug"
-    override = cs._catalog_override("minimax-m3.1-flash-free", data, "anthropic")
+    data = {"protocol": "anthropic"}
+    override = cs._catalog_override("beam-free", data, "anthropic")
     assert override is not None
     assert override["protocol"] == "openai"
     assert override.get("endpoint") is None, "l'endpoint free qui marche ne doit pas bouger"
-    assert cs._resolve_model_endpoint("minimax-m3.1-flash-free", data, "openai") == FREE_BASE
+    assert cs._resolve_model_endpoint("beam-free", data, "openai") == FREE_BASE
 
 
 def test_the_corrected_model_is_resolved_with_the_catalog_protocol():
-    """Le MODELS construit a l'import porte bien `openai` pour ce modele."""
-    entry = cs.MODELS["minimax-m3.1-flash-free"]
-    assert entry["protocol"] == "openai"
-    assert entry["endpoint"] == FREE_BASE
+    """Le MODELS construit a l'import porte bien le protocole du catalogue.
+
+    Aucun modele actuel ne porte plus le bug (config `anthropic` / catalogue
+    `chat`) : on verifie que les entrees free construites alignent bien le
+    protocole sur la famille du catalogue et gardent la base free.
+    """
+    for mid in ("beam-free", "deepseek-v4.1-flash-free"):
+        entry = cs.MODELS[mid]
+        assert entry["protocol"] == "openai", mid
+        assert entry["endpoint"] == FREE_BASE, mid
 
 
 # ── 2. Aucun repli d'une jambe sur l'autre ──────────────────────────────────
@@ -75,11 +81,9 @@ def test_no_cross_leg_fallback_free_to_paid():
 
 def test_no_cross_leg_fallback_paid_to_free():
     """Un id purement payant ne doit pas emprunter la route free."""
-    payes = [m for m in (cs.CATALOG_ROUTES.get("opencode-go") or {})]
+    payes = list(cs.CATALOG_ROUTES.get("opencode-go") or {})
     assert payes, "le cache payant est vide : le test ne prouve rien"
-    purement_payes = [
-        m for m in payes if m not in (cs.CATALOG_ROUTES.get("opencode") or {})
-    ]
+    purement_payes = [m for m in payes if m not in (cs.CATALOG_ROUTES.get("opencode") or {})]
     assert purement_payes, "aucun id purement payant : adapter le test"
     temoin = purement_payes[0]
     assert cs.catalog_route_for(temoin, is_free=False) is not None
@@ -110,9 +114,7 @@ def test_paid_leg_anthropic_models_are_left_alone():
 
 def test_explicit_endpoint_key_still_wins():
     """Un `endpoint:` explicite en config reste souverain (ex. `-free` sur go)."""
-    assert cs._resolve_model_endpoint(
-        "minimax-m3.1-flash-free", {"endpoint": "go"}, "anthropic"
-    ) == cs.API_BASE_OPENAI
+    assert cs._resolve_model_endpoint("minimax-m3.1-flash-free", {"endpoint": "go"}, "anthropic") == cs.API_BASE_OPENAI
 
 
 # ── 4. La surcharge d'endpoint quand la famille differe vraiment ────────────
@@ -145,17 +147,16 @@ def test_endpoint_is_replaced_only_when_the_family_really_differs(monkeypatch):
     }
 
 
-def test_gemini_family_gets_no_route_rather_than_a_wrong_one():
-    """Famille connue, pas de convertisseur : aucune route inventee."""
-    monkeypatch_route = {
+def test_gemini_family_gets_native_base_route():
+    """Gemini is now routed through the native adapter (base URL, no suffix)."""
+    route = {
         "family": "gemini",
-        "protocol": None,
+        "protocol": "gemini",
         "base_url": "https://opencode.ai/inference/google/v1beta",
     }
-    assert cs._FAMILY_SUFFIX.get("gemini") is None, (
-        "une famille sans suffixe ne peut pas composer d'endpoint"
-    )
-    assert monkeypatch_route["protocol"] is None
+    assert cs._FAMILY_SUFFIX.get("gemini") == ""
+    assert route["protocol"] == "gemini"
+    assert route["base_url"].endswith("/google/v1beta")
 
 
 @pytest.mark.parametrize(

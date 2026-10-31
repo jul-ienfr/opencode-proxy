@@ -58,13 +58,8 @@ def test_c1_push_400_pop_prefixes_once_then_gone(_clean_ctx):
     # littéral dans le texte client fait classer la panne en « AUTH » par
     # `classifyPiAiError()` (dsh-llm-pi-ai, test `/\b(?:401|403)\b/` sur le message,
     # AVANT tout autre cas) → l'UI affiche « API key is invalid » et masque la vraie cause.
-    assert out == (
-        f"free {FREE_MODEL} → requête refusée par l'amont (échec jambe free), "
-        "paid fallback → UPSTREAM-MSG"
-    )
-    assert not re.search(r"\b(?:401|403)\b", out), (
-        f"texte client classable AUTH par DSH : {out!r}"
-    )
+    assert out == (f"free {FREE_MODEL} → requête refusée par l'amont (échec jambe free), paid fallback → UPSTREAM-MSG")
+    assert not re.search(r"\b(?:401|403)\b", out), f"texte client classable AUTH par DSH : {out!r}"
     # Pop destructif : le registre live est vide pour ce req_id…
     assert "req-c-corr" not in oc._FALLBACK_CTX
     # …donc le 2e appel ne préfixe plus (one-shot, pas de re-préfixe).

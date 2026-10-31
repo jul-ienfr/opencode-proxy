@@ -181,6 +181,7 @@ def test_body_conversation_key():
 
 # ── Filtrage vide (normalizeMessages, jambes Anthropic) ──
 
+
 def test_filter_empty_text_parts_keeps_signed_thinking():
     msgs = [
         {"role": "user", "content": [{"type": "text", "text": ""}]},
@@ -236,6 +237,7 @@ def test_empty_text_dropped_in_anthropic_request():
 
 # ── Modalités (unsupportedParts : table + texte d'erreur) ──
 
+
 def test_modalities_table():
     assert pm.model_supports_modality("claude-opus-4-7", "image")
     assert pm.model_supports_modality("kimi-k2.6", "pdf")
@@ -250,6 +252,7 @@ def test_unsupported_modality_error_text():
 
 
 # ── Thinking moderne (display + blockBinding) ──
+
 
 def test_anthropic_version_classifiers():
     assert pm.anthropic_modern_adaptive_thinking("claude-opus-4-7")
@@ -297,7 +300,8 @@ def test_beta_binding_controls_only_with_block_binding():
         assert "thinking-binding-controls" not in _beta_tokens(h)
         assert "thinking-binding-controls-2026-08-01" not in _beta_tokens(h)
         h2 = oc._ensure_anthropic_beta(
-            {"x-api-key": "k"}, {"thinking": {"type": "adaptive", "blockBinding": {"prefixMismatchBehavior": "drop_block"}}}
+            {"x-api-key": "k"},
+            {"thinking": {"type": "adaptive", "blockBinding": {"prefixMismatchBehavior": "drop_block"}}},
         )
         # [C2] la forme émise est la forme DATÉE du client officiel, pas la nue.
         assert "thinking-binding-controls-2026-08-01" in _beta_tokens(h2)
@@ -316,9 +320,7 @@ def test_beta_binding_controls_union_keeps_a_client_supplied_bare_form():
     l'union de `_ensure_anthropic_beta` est le filet, pas la constante."""
     oc._current_client_anthropic_betas.set({"anthropic-beta": "thinking-binding-controls"})
     try:
-        h = oc._ensure_anthropic_beta(
-            {"x-api-key": "k"}, {"thinking": {"type": "adaptive", "blockBinding": {}}}
-        )
+        h = oc._ensure_anthropic_beta({"x-api-key": "k"}, {"thinking": {"type": "adaptive", "blockBinding": {}}})
         toks = _beta_tokens(h)
         assert "thinking-binding-controls" in toks  # réclamée par le client
         assert "thinking-binding-controls-2026-08-01" in toks  # requise par le champ

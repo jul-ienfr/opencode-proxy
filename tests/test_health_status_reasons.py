@@ -15,8 +15,6 @@ from __future__ import annotations
 import pathlib
 import sys
 
-import pytest
-
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -44,9 +42,7 @@ class TestEachCauseIsNamed:
         assert any("upstream" in r for r in raisons)
 
     def test_open_circuit_names_the_endpoint(self):
-        etat, raisons = statut(
-            upstream_ok=True, open_breakers=["https://opencode.ai/zen/go/v1/chat/completions"]
-        )
+        etat, raisons = statut(upstream_ok=True, open_breakers=["https://opencode.ai/inference/go/openai/v1/chat/completions"])
         assert etat == "degraded"
         assert any("circuit open" in r and "opencode.ai" in r for r in raisons)
 

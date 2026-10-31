@@ -7,14 +7,13 @@ Contrat :
 * En tests (_control_enabled False) : comportement SOCKS-only inchangé.
 """
 
-import asyncio
 import sys
 
 import pytest
+from test_ip_probe import _FakeHttpx
 from test_vpn_freshness import FakeVPNManager, _cfg
 
 import vpn_manager as vm
-from test_ip_probe import _FakeClient, _FakeHttpx
 
 
 def _mgr(tmp_path, **over):

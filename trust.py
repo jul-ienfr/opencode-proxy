@@ -197,8 +197,12 @@ class DashboardTrustMiddleware:
 
     SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
         (
+            # Le front est buildé par Vite : aucun script inline, aucun CDN
+            # (chart.js est remplacé par uPlot bundleé) → `script-src 'self'`
+            # suffit. `style-src` garde 'unsafe-inline' pour les attributs
+            # `style=` des composants et les styles injectés par uPlot.
             b"content-security-policy",
-            b"default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+            b"default-src 'self'; script-src 'self'; "
             b"style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
             b"object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
         ),
@@ -289,9 +293,7 @@ class ClientAuthMiddleware:
     `key` sans clé configurée → retombe sur `lan` + warning une fois."""
 
     PROTECTED_PREFIXES: tuple[str, ...] = ("/v1/",)
-    PROTECTED_PATHS: frozenset[str] = frozenset(
-        {"/api/circuit-breakers/reset", "/api/key-pauses/reset"}
-    )
+    PROTECTED_PATHS: frozenset[str] = frozenset({"/api/circuit-breakers/reset", "/api/key-pauses/reset"})
 
     def __init__(
         self,

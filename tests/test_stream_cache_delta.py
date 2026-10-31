@@ -171,11 +171,7 @@ def test_convertisseur_libre_porte_le_cache_dans_le_message_delta():
             },
         }
     )
-    deltas = [
-        p
-        for p in _data_lines(st.finalize_events())
-        if p.get("type") == "message_delta"
-    ]
+    deltas = [p for p in _data_lines(st.finalize_events()) if p.get("type") == "message_delta"]
     assert len(deltas) == 1
     assert deltas[0]["usage"]["cache_read_input_tokens"] == 850
 
@@ -190,11 +186,7 @@ def test_delta_emis_par_le_convertisseur_est_credite_sans_double_compte():
             "usage": {"completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 850}},
         }
     )
-    md = [
-        p
-        for p in _data_lines(st.finalize_events())
-        if p.get("type") == "message_delta"
-    ][0]
+    md = [p for p in _data_lines(st.finalize_events()) if p.get("type") == "message_delta"][0]
 
     # Le message_start converti annonce 0 (comme l'API Anthropic)…
     courant, credit = _credit_replay(

@@ -18,6 +18,48 @@ FREE = lm.FREE_LEG
 PAID = lm.PAID_LEG
 
 
+def test_effective_model_limits_free_first_uses_target(monkeypatch):
+    """La fenêtre exposée est le min demandé/free quand la route est free-first."""
+    import opencode as oc
+
+    def _entry(model):
+        if model == "free-target":
+            return {"metadata": {"limit": {"context": 200000, "output": 32000}}}
+        return {"metadata": {"limit": {"context": 1000000, "output": 128000}}}
+
+    monkeypatch.setattr(oc, "_live_model_entry", _entry)
+    tier = {"free_first": True, "free_target": "free-target"}
+    assert oc._effective_model_limits("paid-alias", tier, {"context": 1000000, "output": 128000}) == (
+        200000,
+        32000,
+    )
+    # Pas de free-first : la limite du modèle demandé reste souveraine.
+    tier2 = {"free_first": False, "free_target": "free-target"}
+    assert oc._effective_model_limits("paid-alias", tier2, {"context": 1000000, "output": 128000}) == (
+        1000000,
+        128000,
+    )
+    # Free direct : sa propre limite.
+    assert oc._effective_model_limits("free-target", {"free_first": True, "free_target": None}, {"context": 200000}) == (
+        200000,
+        None,
+    )
+
+
+def test_model_capabilities_context_management_native():
+    """context_management = true seulement pour Anthropic/Responses natifs."""
+    import opencode as oc
+
+    native_anth = {"protocol": "anthropic", "endpoint": "https://x/anthropic/v1/messages"}
+    native_resp = {"protocol": "openai", "endpoint": "https://x/v1/responses"}
+    chat = {"protocol": "openai", "endpoint": "https://x/v1/chat/completions"}
+    gem = {"protocol": "gemini", "endpoint": "https://x/v1beta/models"}
+    assert oc._model_capabilities("m", native_anth, None)["context_management"]["supported"] is True
+    assert oc._model_capabilities("m", native_resp, None)["context_management"]["supported"] is True
+    assert oc._model_capabilities("m", chat, None)["context_management"]["supported"] is False
+    assert oc._model_capabilities("m", gem, None)["context_management"]["supported"] is False
+
+
 def _catalog(**entries) -> dict:
     return {
         provider: {"models": models}
@@ -76,14 +118,67 @@ def test_new_live_model_is_added_and_deprecated_is_removed():
         free={"old": {"status": "deprecated"}},
     )
     models = {"old": {"protocol": "openai"}, "dead": {"protocol": "openai"}}
-    snapshot, applied = _seed(
-        paid={"new", "old"}, free={"old"}, catalog=catalog, models=models
-    )
+    snapshot, applied = _seed(paid={"new", "old"}, free={"old"}, catalog=catalog, models=models)
     assert "new" in applied["added"]
     assert set(applied["removed"]) == {"old", "dead"}
     assert set(snapshot["removed_deprecated"]) == {"old"}
     assert set(snapshot["removed_unavailable"]) == {"dead"}
     assert "new" in models and "old" not in models and "dead" not in models
+
+
+def test_free_leg_model_is_a_candidate_until_the_probe_promotes_it():
+    models: dict = {}
+    free_models: set[str] = set()
+    snapshot = lm.build_snapshot(
+        live_by_leg={PAID: set(), FREE: {"future-nonsuffix"}},
+        current_models=dict(models),
+        catalog=_catalog(free={"future-nonsuffix": {}}),
+        fetched_legs={PAID, FREE},
+    )
+    applied = lm.apply_snapshot(
+        snapshot,
+        models=models,
+        free_models=free_models,
+        free_model_map={},
+        free_model_pool=[],
+        route_fn=lambda _mid, _entry: {"endpoint": "https://free.test", "protocol": "openai"},
+    )
+    assert "future-nonsuffix" in models
+    assert "future-nonsuffix" in applied["free_candidates"]
+    assert "future-nonsuffix" not in free_models
+
+    free_models.add("future-nonsuffix")
+    applied2 = lm.apply_snapshot(
+        snapshot,
+        models=models,
+        free_models=free_models,
+        free_model_map={},
+        free_model_pool=[],
+        route_fn=lambda _mid, _entry: {"endpoint": "https://free.test", "protocol": "openai"},
+    )
+    assert applied2["free_candidates"] == []
+
+
+def test_new_suffix_is_free_immediately_but_still_probed_once():
+    models: dict = {}
+    free_models: set[str] = set()
+    snapshot = lm.build_snapshot(
+        live_by_leg={PAID: set(), FREE: {"future-suffix-free"}},
+        current_models=dict(models),
+        catalog=_catalog(free={"future-suffix-free": {}}),
+        fetched_legs={PAID, FREE},
+    )
+    applied = lm.apply_snapshot(
+        snapshot,
+        models=models,
+        free_models=free_models,
+        free_model_map={},
+        free_model_pool=[],
+        route_fn=lambda _mid, _entry: {"endpoint": "https://free.test", "protocol": "openai"},
+    )
+
+    assert "future-suffix-free" in free_models
+    assert "future-suffix-free" in applied["free_candidates"]
 
 
 def test_deprecated_on_one_leg_migrates_to_the_active_leg():
@@ -234,9 +329,7 @@ def test_effort_caps_prefers_live_catalog_over_manual_table():
 
 def test_allow_list_uses_live_catalog_even_when_flag_is_false(monkeypatch):
     monkeypatch.setattr(reasoning_options, "allow_list_enabled", lambda: False)
-    catalog = _catalog(
-        paid={"highi": {"reasoning_options": [{"type": "effort", "values": ["low", "high"]}]}}
-    )
+    catalog = _catalog(paid={"highi": {"reasoning_options": [{"type": "effort", "values": ["low", "high"]}]}})
     _seed(paid={"highi"}, free=set(), catalog=catalog)
     assert reasoning_options.get_allowed_variants("highi") == ["low", "high"]
     assert reasoning_options.clamp_effort_to_allow_list("max", "highi") == "high"
@@ -397,9 +490,7 @@ def test_deprecated_model_gets_an_explicit_410(monkeypatch):
 def test_notice_middleware_adds_headers_without_buffering():
     import opencode as oc
 
-    lm.record_deprecation_notices(
-        {"old": [{"client_ip": "1.2.3.4", "account_alias": ""}]}
-    )
+    lm.record_deprecation_notices({"old": [{"client_ip": "1.2.3.4", "account_alias": ""}]})
     sent: list[dict] = []
 
     async def _app(scope, receive, send):

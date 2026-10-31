@@ -291,6 +291,7 @@ def test_liste_ambigu_exclut_bien_les_statuts_proteges():
     assert not (proteges & oc._MOTIF_RETRY_STATUSES)
     assert oc._MOTIF_RETRY_STATUSES == {400, 404, 408, 409, 422, 425}
 
+
 # ─────────── Intégration : le refus libre est classé ───────────
 
 
@@ -370,7 +371,7 @@ def test_le_relais_general_json_est_classe():
     doit lire le type dans le corps amont."""
     with open(oc.__file__, encoding="utf-8") as fh:
         body = fh.read()
-    assert '_classify_upstream_error(resp.status_code, resp.text[:4000])' in body
+    assert "_classify_upstream_error(resp.status_code, resp.text[:4000])" in body
 
 
 def test_le_relais_intact_de_compaction_nettoie_pas_le_type():

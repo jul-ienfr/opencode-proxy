@@ -139,9 +139,7 @@ class DockerEventWatcher:
             "{{json .}}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
-            creationflags=(
-                subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
-            ),
+            creationflags=(subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
         )
 
     # ── Event handling ─────────────────────────────────────────

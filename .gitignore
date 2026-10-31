@@ -16,6 +16,21 @@ logs/*.db*
 logs/requests.db.bak*
 logs/requests.db.*
 
+# Logs / artefacts de redémarrage et captures locales (jamais des sources)
+logs/*.bak
+logs/*.bak-*
+logs/*.pre-restart
+logs/headless.*
+logs/*.png
+logs/*.html
+.artifacts/
+
+# Build frontend local
+dashboard-ui/node_modules/
+dashboard-ui/dist/
+config.yaml.bak-*
+=
+
 # Artefacts d'exécution / recherche locale — jamais versionnés.
 # (Les rares fichiers suivis sous logs/ et _research/ restent suivis :
 #  .gitignore ne s'applique qu'aux fichiers non suivis.)
@@ -24,6 +39,8 @@ logs/boot.out
 logs/free_pool.json
 logs/live_models.json
 logs/live_models.json.tmp
+config/free_models_probed.json
+config/free_models_probed.json.tmp
 logs/*.lock.pid
 _research/
 config.yaml.*.bak*

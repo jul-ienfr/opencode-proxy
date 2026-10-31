@@ -48,17 +48,14 @@ def warmup_excluded_requests() -> int:
     try:
         from config.settings import _yaml_data
 
-        raw = (_yaml_data.get("supervisor") or {}).get(
-            "warmup_excluded_requests", default
-        )
+        raw = (_yaml_data.get("supervisor") or {}).get("warmup_excluded_requests", default)
         val = int(raw)
     except Exception:
         return default
     if val < 0 or val > 1000:
         clamped = max(0, min(1000, val))
         logger.warning(
-            "[supervisor-config] warmup_excluded_requests=%r hors bornes [0, 1000]"
-            " — clamp à %s",
+            "[supervisor-config] warmup_excluded_requests=%r hors bornes [0, 1000] — clamp à %s",
             raw,
             clamped,
         )
@@ -76,6 +73,10 @@ class StationSupervisor:
     # Breaker local léger (Lot 3 remplacera par CircuitBreaker per-station §3.4)
     consecutive_failures: int = 0
     breaker_open_until: float = 0.0
+    # [audit watchdog 2026-10-30] Bail d'une seule sonde half-open : sans ce
+    # verrou, `breaker_open()` rouvrait le breaker à tous les appelants.
+    half_open_until: float = 0.0
+    half_open_pending: bool = False
     breaker_threshold: int = 3
     breaker_cooldown_sec: float = 60.0
     last_probe_mono: float = 0.0
@@ -142,15 +143,16 @@ class StationSupervisor:
     def record_success(self) -> None:
         self.consecutive_failures = 0
         self.breaker_open_until = 0.0
+        self.half_open_until = 0.0
+        self.half_open_pending = False
 
     def record_failure(self) -> bool:
         """Incrémente le breaker local. Retourne True si le breaker VIENT
         de s'ouvrir (pour déclencher une rotation au Lot 3)."""
         self.consecutive_failures += 1
-        if (
-            self.consecutive_failures >= self.breaker_threshold
-            and self.breaker_open_until == 0.0
-        ):
+        self.half_open_until = 0.0
+        self.half_open_pending = False
+        if self.consecutive_failures >= self.breaker_threshold and self.breaker_open_until == 0.0:
             self.breaker_open_until = time.monotonic() + self.breaker_cooldown_sec
             logger.warning(
                 "[supervisor st%s] breaker OPEN %ss après %s échecs",
@@ -161,14 +163,32 @@ class StationSupervisor:
             return True
         return False
 
+    def breaker_open_readonly(self) -> bool:
+        """Lecture pure pour le diagnostic (ne consomme pas le bail half-open)."""
+        now = time.monotonic()
+        return bool(
+            self.breaker_open_until > now
+            or (self.half_open_pending and self.half_open_until > now)
+        )
+
     def breaker_open(self) -> bool:
+        now = time.monotonic()
+        # [audit watchdog 2026-10-30] Une seule sonde half-open : le premier
+        # appelant après le cooldown prend un bail court ; les suivants sont
+        # refusés jusqu'à son verdict (record_success/record_failure). Si le
+        # verdict n'arrive pas, un nouveau bail est accordé après expiration.
+        if self.half_open_pending:
+            if now < self.half_open_until:
+                return True
+            self.half_open_until = now + 5.0
+            return False
         if self.breaker_open_until == 0.0:
             return False
-        if time.monotonic() >= self.breaker_open_until:
-            # half-open immédiat : une seule sonde passera (Lot 3 posera le
-            # garde single-probe §14.1.11 côté appelant)
+        if now >= self.breaker_open_until:
             self.breaker_open_until = 0.0
             self.consecutive_failures = self.breaker_threshold - 1
+            self.half_open_pending = True
+            self.half_open_until = now + 5.0
             return False
         return True
 
@@ -186,6 +206,7 @@ class StationSupervisor:
         réconcilié (log warning) au lieu de diverger silencieusement."""
         try:
             from latency_rotation import get_engine as _ge
+
             tr = _ge().tracker_for(self.station, ip)
             # Réconcilie la vitrine locale sur l'instance moteur (bornée).
             try:
@@ -207,6 +228,11 @@ class StationSupervisor:
         de warm-up sur l'IP neuve ne doit pas déclencher de soft_rotate.
         Lot 3 : les trackers vivent dans le moteur → délégation."""
         self.consecutive_failures = 0
+        # [audit watchdog 2026-10-30] Une IP fraîche ne doit pas rester
+        # exclue par un cooldown ouvert avant la rotation.
+        self.breaker_open_until = 0.0
+        self.half_open_until = 0.0
+        self.half_open_pending = False
         for tr in self.ip_latency.values():
             tr.reset_consecutive_slow()
         try:
@@ -232,14 +258,10 @@ class StationSupervisor:
         status_code: int | None = None,
     ) -> dict[str, Any]:
         """Mesure §3.6.1 — délègue au moteur (cooldowns/décisions inclus)."""
-        decision: dict[str, Any] = self._engine().record_request(
-            self.station, ip, duration_ms, model, status_code
-        )
+        decision: dict[str, Any] = self._engine().record_request(self.station, ip, duration_ms, model, status_code)
         return decision
 
-    async def react_to_decision(
-        self, decision: dict[str, Any], station_obj: Any = None
-    ) -> dict[str, Any]:
+    async def react_to_decision(self, decision: dict[str, Any], station_obj: Any = None) -> dict[str, Any]:
         """Exécute la décision du moteur : soft → rotation pool existante
         (_launch_rotation), hard → restart superviseur + rotation. Garde-fous
         (anti-flap/paused/global_degraded) appliqués AVANT toute action."""
@@ -253,7 +275,9 @@ class StationSupervisor:
         if not ok:
             logger.info("[supervisor st%s] rotation ignorée (%s)", self.station, why)
             return {"executed": False, "why": why}
-        self._engine()._note_rotation(self.station)
+        # [audit 2026-10-30] Do NOT note the rotation here: switch_ip()
+        # notes it once when the new IP actually lands. The old pre-note
+        # double-counted every supervisor rotation against the hourly cap.
         pool = getattr(shared_state, "free_ip_pool", None)
         if action == "hard":
             await self.restart(f"latency_hard {decision.get('reason', '')}")
@@ -286,7 +310,7 @@ class StationSupervisor:
         latency: dict[str, Any] = {}
         try:
             eng = self._engine()
-            for (s, ip) in list(getattr(eng, "_trackers", {}).keys())[:10]:
+            for s, ip in list(getattr(eng, "_trackers", {}).keys())[:10]:
                 if int(s) != int(self.station):
                     continue
                 try:
@@ -295,21 +319,20 @@ class StationSupervisor:
                     continue
             if not latency:
                 latency = {
-                    ip: snap.__dict__
-                    for ip, tr in list(self.ip_latency.items())[:10]
-                    for snap in [tr.snapshot()]
+                    ip: snap.__dict__ for ip, tr in list(self.ip_latency.items())[:10] for snap in [tr.snapshot()]
                 }
         except Exception:
-            latency = {
-                ip: snap.__dict__
-                for ip, tr in list(self.ip_latency.items())[:10]
-                for snap in [tr.snapshot()]
-            }
+            latency = {ip: snap.__dict__ for ip, tr in list(self.ip_latency.items())[:10] for snap in [tr.snapshot()]}
+        _now = time.monotonic()
         return {
             "station": self.station,
             "manager": mgr_status,
             "consecutive_failures": self.consecutive_failures,
-            "breaker_open": self.breaker_open(),
+            # Lecture pure : `breaker_open()` consomme un bail half-open, le
+            # dashboard ne doit pas devenir une sonde.
+            "breaker_open": self.breaker_open_readonly(),
+            "half_open_pending": bool(self.half_open_pending),
+            "breaker_open_remaining_s": round(max(0.0, self.breaker_open_until - _now), 1),
             "restart_in_progress": self.restart_in_progress,
             "latency": latency,
         }

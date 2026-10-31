@@ -8,6 +8,7 @@ Le fichier debug.log peut etre verrouille par le process en cours : on l'ouvre
 en lecture partagee. Les lignes de payload (SSE, bodies convertis, schemas) sont
 exclues du regroupement car elles noient les vrais messages.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -151,13 +152,11 @@ def scan_db(path: str) -> dict:
         return {"error": f"ouverture impossible: {exc}"}
     cur = con.cursor()
     try:
-        tables = [r[0] for r in cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")]
+        tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")]
         out["tables"] = tables
         for t in tables:
             try:
-                out.setdefault("rowcounts", {})[t] = cur.execute(
-                    f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
+                out.setdefault("rowcounts", {})[t] = cur.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
             except sqlite3.Error:
                 pass
         cols = {}
@@ -192,18 +191,30 @@ def main() -> int:
     # Annoté `dict[str, Any]` : sans cela, le ternaire ci-dessous fait inférer
     # `dict[str, str]`, et chaque accès (`families`, `levels`, `window`…) devient
     # une erreur de type — le contenu réel mêle entiers, listes et Counters.
-    log: dict[str, Any] = (
-        scan_log(args.file, args.top) if os.path.exists(args.file) else {"error": "log introuvable"}
-    )
+    log: dict[str, Any] = scan_log(args.file, args.top) if os.path.exists(args.file) else {"error": "log introuvable"}
     db = scan_db(args.db)
 
     if args.json:
-        print(json.dumps({
-            "log": {k: (dict(v) if isinstance(v, Counter) else
-                        {kk: dict(vv) for kk, vv in v.items()} if isinstance(v, dict) and v and isinstance(next(iter(v.values())), Counter) else v)
-                    for k, v in log.items() if k != "family_samples"},
-            "db": db,
-        }, indent=2, default=str))
+        print(
+            json.dumps(
+                {
+                    "log": {
+                        k: (
+                            dict(v)
+                            if isinstance(v, Counter)
+                            else {kk: dict(vv) for kk, vv in v.items()}
+                            if isinstance(v, dict) and v and isinstance(next(iter(v.values())), Counter)
+                            else v
+                        )
+                        for k, v in log.items()
+                        if k != "family_samples"
+                    },
+                    "db": db,
+                },
+                indent=2,
+                default=str,
+            )
+        )
         return 0
 
     print("=" * 78)
@@ -239,12 +250,11 @@ def main() -> int:
         print(db["error"])
     else:
         size = db.get("size_bytes", 0)
-        print(f"taille            : {size/1e9:.2f} Go ({size/1e6:.0f} Mo)")
+        print(f"taille            : {size / 1e9:.2f} Go ({size / 1e6:.0f} Mo)")
         pages = db.get("page_count") or 0
         psize = db.get("page_size") or 0
-        print(f"page_count*size   : {pages} x {psize} = {pages*psize/1e9:.2f} Go")
-        print(f"freelist (vides)  : {db.get('freelist')} pages "
-              f"({(db.get('freelist') or 0)*psize/1e6:.0f} Mo)")
+        print(f"page_count*size   : {pages} x {psize} = {pages * psize / 1e9:.2f} Go")
+        print(f"freelist (vides)  : {db.get('freelist')} pages ({(db.get('freelist') or 0) * psize / 1e6:.0f} Mo)")
         print(f"tables            : {db.get('tables')}")
         print(f"rowcounts         : {db.get('rowcounts')}")
         for t, c in (db.get("columns") or {}).items():

@@ -16,7 +16,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import Request, Response
+from fastapi import Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -279,29 +279,63 @@ def _check_dashboard_token(request: Request):
 _SECRET_FIELDS = ("api_key", "go_workspace_id", "go_auth_cookie")
 
 
-def _merge_preserved_api_keys(rows: list) -> list:
+def _merge_preserved_api_keys(rows: list, *, replace: bool = False) -> list:
     """Merge posted api-key rows over the stored ones, KEEPING the stored
     secret when a posted secret field is empty (finding i).
 
-    Keys by ``alias`` (the UI's stable identity for a row). A row that only
-    carries masked placeholders + alias will therefore leave its secrets
-    untouched instead of blanking them.
+    [audit 2026-10-30] The old version only preserved rows that were POSTed.
+    The UI filtered out every existing row (its ``api_key`` is masked/empty),
+    so saving one new key ERASED all the others and the .env fallback was
+    disabled by the non-empty api_keys.json. Missing stored rows are now
+    appended unless the caller explicitly asks for a replace (``replace``),
+    and a row can be matched by alias OR by its masked value (alias rename).
     """
     if not isinstance(rows, list):
-        return rows if isinstance(rows, list) else []
-    stored = {str(k.get("alias", "")): k for k in API_KEYS if k.get("alias")}
-    out = []
+        return []
+    stored_rows = list(API_KEYS)
+    used: set[int] = set()
+    out: list[dict] = []
     for row in rows:
         if not isinstance(row, dict):
-            out.append(row)
             continue
         merged = dict(row)
-        old = stored.get(str(row.get("alias", "")))
-        if old:
+        # Locate the stored row: alias first, then masked secret, then the
+        # same index as a last resort (the UI keeps the original order).
+        idx = None
+        _alias = str(merged.get("alias", "") or "")
+        if _alias:
+            for i, old in enumerate(stored_rows):
+                if i not in used and str(old.get("alias", "") or "") == _alias:
+                    idx = i
+                    break
+        _masked = str(merged.get("api_key_masked", "") or "")
+        if idx is None and _masked:
+            for i, old in enumerate(stored_rows):
+                if i in used:
+                    continue
+                _ok = str(old.get("api_key", "") or "")
+                _om = (_ok[:4] + "****" + _ok[-4:]) if len(_ok) > 8 else "****"
+                if _om == _masked:
+                    idx = i
+                    break
+        if idx is None and not merged.get("api_key") and len(out) < len(stored_rows):
+            idx = len(out)
+        if idx is not None and idx not in used:
+            old = stored_rows[idx]
+            used.add(idx)
             for field in _SECRET_FIELDS:
                 if not merged.get(field) and old.get(field):
                     merged[field] = old[field]
+        # A brand-new row with no key is not a key: drop it instead of
+        # storing an empty credential that select_next_key() would use.
+        if not str(merged.get("api_key", "") or "").strip():
+            continue
+        merged["api_key"] = str(merged["api_key"]).strip()
         out.append(merged)
+    if not replace:
+        for i, old in enumerate(stored_rows):
+            if i not in used:
+                out.append(dict(old))
     return out
 
 
@@ -564,6 +598,53 @@ def _period_rates(count: int, period_minutes: float | None) -> tuple[float | Non
     return période, 0.0
 
 
+def _free_model_id_set() -> set[str]:
+    """Ensemble canonique des ids gratuits (tier == free), fail-soft.
+
+    Remplace les heuristiques ``-free`` : ``big-pickle`` est gratuit sans
+    suffixe, et un id ``-free`` routé payant reste sémantiquement gratuit.
+    Les ids historiques absents du catalogue restent couverts par le suffixe
+    dans les appelants.
+    """
+    try:
+        from config.live_models import get_model_entry
+        from config.model_tier import classify_model
+        from config.settings import (
+            FREE_MODEL_MAP,
+            FREE_MODELS,
+            MODELS,
+            get_free_substitution_policy,
+            get_model_config,
+        )
+
+        policy = get_free_substitution_policy()
+        ids = {str(mid) for mid in (FREE_MODELS or ())}
+        for mid in MODELS:
+            try:
+                verdict = classify_model(
+                    mid,
+                    get_model_config(mid),
+                    get_model_entry(mid),
+                    free_models=FREE_MODELS,
+                    free_model_map=FREE_MODEL_MAP,
+                    policy=policy,
+                )
+            except Exception:
+                if str(mid).endswith("-free"):
+                    ids.add(str(mid))
+                continue
+            if verdict.get("tier") == "free":
+                ids.add(str(mid))
+        return ids
+    except Exception:
+        try:
+            from config.settings import FREE_MODELS
+
+            return {str(mid) for mid in (FREE_MODELS or ())}
+        except Exception:
+            return set()
+
+
 def _compute_costs(rows, pricing: dict | None = None) -> dict:
     """[v10 §12.3.10] Coût payant + économies free à partir de lignes agrégées.
 
@@ -571,14 +652,16 @@ def _compute_costs(rows, pricing: dict | None = None) -> dict:
     ``pricing`` : {"currency", "defaults": {input/output_per_mtok},
     "per_model": {modèle: {...}}} — sinon défauts Anthropic Sonnet-class.
 
-    Les modèles `-free` ne coûtent rien mais génèrent ``free_saved_usd``
-    (ce qu'ils auraient coûté au tarif par défaut)."""
+    Les modèles gratuits (tier canonique, pas seulement le suffixe ``-free``)
+    ne coûtent rien mais génèrent ``free_saved_usd`` (ce qu'ils auraient coûté
+    au tarif par défaut)."""
     p = pricing or {}
     currency = str(p.get("currency", "USD"))
     defaults = p.get("defaults") if isinstance(p.get("defaults"), dict) else {}
     rate_in = float(defaults.get("input_per_mtok", 3.0)) if isinstance(defaults, dict) else 3.0
     rate_out = float(defaults.get("output_per_mtok", 15.0)) if isinstance(defaults, dict) else 15.0
     per_model_cfg = p.get("per_model") if isinstance(p.get("per_model"), dict) else {}
+    free_ids = _free_model_id_set()
 
     paid_usd = 0.0
     saved_usd = 0.0
@@ -596,7 +679,7 @@ def _compute_costs(rows, pricing: dict | None = None) -> dict:
         ri = float(rates.get("input_per_mtok", rate_in)) if isinstance(rates, dict) else rate_in
         ro_ = float(rates.get("output_per_mtok", rate_out)) if isinstance(rates, dict) else rate_out
         cost = ti / 1e6 * ri + to_ / 1e6 * ro_
-        is_free = model.endswith("-free")
+        is_free = model in free_ids or model.endswith("-free")
         if is_free:
             saved_usd += cost
         else:
@@ -622,6 +705,74 @@ def _compute_costs(rows, pricing: dict | None = None) -> dict:
 _persist_lock = __import__("threading").Lock()
 
 
+_QUALITY_BLOCK_SPEC: dict[str, dict[str, tuple]] = {
+    "quality_preselection": {
+        "enabled": (bool, None, None),
+        "fast_tps": (float, 0.1, 1000.0),
+        "slow_tps": (float, 0.1, 1000.0),
+        "max_load": (int, 0, 100),
+        "tier_b_quota": (int, 1, 500),
+        "tier_c_quota": (int, 1, 500),
+    },
+    "quality_rotation": {
+        "enabled": (bool, None, None),
+        "min_requests": (int, 1, 500),
+        "min_samples": (int, 1, 20),
+        "trend_pct": (float, 0.0, 100.0),
+        "ttfb_ceiling_ms": (float, 100.0, 60000.0),
+        "max_per_hour": (int, 0, 60),
+        "global_slow_guard": (int, 1, 10),
+    },
+    "post_rotation_probe": {
+        "enabled": (bool, None, None),
+        "max_attempts": (int, 1, 5),
+        "max_tokens": (int, 1, 32),
+    },
+}
+
+
+def _quality_blocks_errors(body) -> list:
+    """Validation des blocs qualité/presélection (partiels acceptés)."""
+    errors: list = []
+    if not isinstance(body, dict):
+        return errors
+    for block, spec in _QUALITY_BLOCK_SPEC.items():
+        if block not in body:
+            continue
+        data = body[block]
+        if not isinstance(data, dict):
+            errors.append(f"{block} doit être un objet")
+            continue
+        for key, val in data.items():
+            if key not in spec:
+                errors.append(f"{block}.{key} non supporté")
+                continue
+            typ, lo, hi = spec[key]
+            if typ is bool:
+                if not isinstance(val, bool):
+                    errors.append(f"{block}.{key} doit être booléen")
+                continue
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                errors.append(f"{block}.{key} doit être numérique")
+                continue
+            if lo is not None and not lo <= num <= hi:
+                errors.append(f"{block}.{key}={num} hors bornes [{lo}, {hi}]")
+            if typ is int and not num.is_integer():
+                errors.append(f"{block}.{key} doit être un entier")
+        if block == "quality_preselection":
+            _fast = data.get("fast_tps")
+            _slow = data.get("slow_tps")
+            if _fast is not None and _slow is not None:
+                try:
+                    if float(_slow) >= float(_fast):
+                        errors.append("quality_preselection.slow_tps doit être < fast_tps")
+                except (TypeError, ValueError):
+                    pass
+    return errors
+
+
 def _validate_vpn_config_payload(body) -> list:
     """[v10 §12.1.4] validation DRY-RUN d'un payload VPN — retourne la liste
     des erreurs (vide = valide). Mêmes règles que les endpoints d'application,
@@ -629,6 +780,8 @@ def _validate_vpn_config_payload(body) -> list:
     errors: list = []
     if not isinstance(body, dict):
         return ["le payload doit être un objet"]
+
+    errors.extend(_quality_blocks_errors(body))
 
     if "station_count" in body:
         try:
@@ -773,6 +926,7 @@ def _persist_vpn_config(updates: dict):
                 "proxy_mode": "proxy_mode",
                 "dual_station": "dual_station",
                 "strict_free": "strict_free",
+                "free_substitution_policy": "free_substitution_policy",
                 "quota_per_ip": "quota_per_ip",
                 "switch_delay": "switch_delay",
                 "docker_container": "docker_container",
@@ -874,7 +1028,19 @@ def _persist_vpn_config(updates: dict):
                 ip_rot["latency_rotation"] = merged_lr
                 _lr_changed = True
             updates = {k: v for k, v in updates.items() if k != "latency_rotation"}
-        changed = _fp_changed or _lr_changed
+        # [GUI qualité] blocs imbriqués partiels : merge sans écraser les seuils
+        # déjà présents. Un POST {"enabled": false} ne doit pas perdre fast_tps.
+        _quality_changed = False
+        for _block in _QUALITY_BLOCK_SPEC:
+            if not isinstance(updates.get(_block), dict):
+                continue
+            _existing = ip_rot.get(_block) if isinstance(ip_rot.get(_block), dict) else {}
+            _merged = {**_existing, **updates[_block]}
+            if _merged != _existing:
+                ip_rot[_block] = _merged
+                _quality_changed = True
+            updates = {k: v for k, v in updates.items() if k != _block}
+        changed = _fp_changed or _lr_changed or _quality_changed
         for key, yaml_key in key_map.items():
             if key in updates:
                 old_val = ip_rot.get(yaml_key)
@@ -1112,15 +1278,11 @@ def _persist_retry_until_success(updates: dict) -> str | None:
         except (TypeError, ValueError):
             merged["max_delay_s"] = max(float(merged["base_delay_s"]), 60.0)
         try:
-            merged["keepalive_interval_s"] = max(
-                1.0, min(120.0, float(merged.get("keepalive_interval_s", 10)))
-            )
+            merged["keepalive_interval_s"] = max(1.0, min(120.0, float(merged.get("keepalive_interval_s", 10))))
         except (TypeError, ValueError):
             merged["keepalive_interval_s"] = 10.0
         try:
-            merged["buffer_max_bytes"] = max(
-                1024, min(64 * 1024 * 1024, int(merged.get("buffer_max_bytes", 10485760)))
-            )
+            merged["buffer_max_bytes"] = max(1024, min(64 * 1024 * 1024, int(merged.get("buffer_max_bytes", 10485760))))
         except (TypeError, ValueError):
             merged["buffer_max_bytes"] = 10485760
         if merged == current:
@@ -1179,25 +1341,65 @@ def _persist_free_model_map(mapping: dict):
         _debug(f"  [free] failed to persist free_model_map: {e}")
 
 
-def _write_credentials_env(username: str, password: str):
+def _write_credentials_env(username: str, password: str, path: str | None = None):
     """Write NordVPN credentials to credentials.env — the single source
     gluetun reads via docker-compose env_file ([24]).
 
     Plaintext on disk by design (docker compose env_file format); the file
     is .gitignored. A container restart is needed for gluetun to pick up
     the new values.
+
+    [audit 2026-10-30] UPSERT, never overwrite: this file also carries
+    ``VPN_CONTROL_API_KEY``, ``HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE`` and
+    ``NORDVPN_TOKEN``. The historical ``open(..., "w")`` erased them, which
+    made every recreated gluetun container reject its own control API (401)
+    and loop unhealthy. Secrets are never logged; values containing a line
+    break are rejected (env-file injection).
     """
     import os
 
+    for value, name in ((username, "username"), (password, "password")):
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"{name} must not contain a line break")
+
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    cred_path = os.path.join(root, "credentials.env")
-    with open(cred_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(f"OPENVPN_USER={username}\nOPENVPN_PASSWORD={password}\n")
+    cred_path = path or os.path.join(root, "credentials.env")
+    updates = {"OPENVPN_USER": username, "OPENVPN_PASSWORD": password}
+
+    lines: list[str] = []
+    if os.path.exists(cred_path):
+        with open(cred_path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        stripped = line.lstrip()
+        if "=" in line and not stripped.startswith("#"):
+            key = line.split("=", 1)[0].strip()
+            if key in updates:
+                out.append(f"{key}={updates[key]}")
+                seen.add(key)
+                continue
+        out.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            out.append(f"{key}={value}")
+
+    tmp_path = f"{cred_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(out).rstrip("\n") + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp_path, cred_path)
     try:
         os.chmod(cred_path, 0o600)
     except Exception:
         pass
-    _debug(f"  [vpn] credentials written to {cred_path}")
+    _debug(f"  [vpn] credentials written to {cred_path} (other keys preserved)")
 
 
 # ── [Axe 3.1] SOCKS5 / NordVPN / diagnostic helpers ──
@@ -1560,9 +1762,31 @@ def _docker_diag() -> dict[str, Any]:
     return diag
 
 
+_SECRET_ENV_LINE_RE = re.compile(
+    r"(?im)^(\s*[A-Za-z0-9_]*"
+    r"(?:KEY|TOKEN|PASSWORD|PASS|SECRET|COOKIE|AUTH|PRIVATE|CREDENTIAL|USER)"
+    r"[A-Za-z0-9_]*\s*[:=]\s*)(.*)$"
+)
+
+
+def _redact_compose_text(text: str) -> str:
+    """Mask secrets in raw `docker compose config` output.
+
+    [audit 2026-10-30] The diagnostic bundle returned the full compose
+    model, including ``OPENCODE_API_KEY``, the Go auth cookie, the NordVPN
+    token and the gluetun control key. The dashboard is reachable on the
+    LAN by default, so this was a credential leak. Keep the keys visible
+    for diagnosis; replace only their values.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    return _SECRET_ENV_LINE_RE.sub(lambda m: f"{m.group(1)}\"***REDACTED***\"", text)
+
+
 def _docker_compose_config() -> list:
     """`docker compose config` output per active station (diagnostic
-    bundle). Empty list when no managers or docker is absent."""
+    bundle). Empty list when no managers or docker is absent. Secret
+    values are redacted before leaving the process."""
     try:
         import shared_state
 
@@ -1582,7 +1806,7 @@ def _docker_compose_config() -> list:
                 timeout=15,
                 creationflags=_CREATE_NO_WINDOW,
             )
-            out.append(f"=== {df}\n{(r.stdout or r.stderr).strip()}")
+            out.append(f"=== {df}\n{_redact_compose_text((r.stdout or r.stderr).strip())}")
         except Exception as e:
             out.append(f"=== {df}\n(erreur: {e})")
     return out
@@ -1632,21 +1856,49 @@ def register_dashboard(
 
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-    # Cache index.html in memory — avoids re-reading from disk on every request
-    _index_html_cache: bytes | None = None
-    try:
-        with open(os.path.join(static_dir, "index.html"), "rb") as _f:
-            _index_html_cache = _f.read()
-    except Exception:
-        pass
+    # index.html : le front reconstruit (Vite) vit dans `static/dist/`, l'ancien
+    # front reste dans `static/` (repli si `npm run build` n'a jamais tourné, par
+    # exemple sur un checkout nu). On sert le premier candidat lisible.
+    # Lu en mémoire — `/` est le chemin le plus sollicité — et RELU seulement si
+    # le mtime a bougé : après un `npm run build`, un simple rafraîchissement du
+    # navigateur suffit, sans redémarrer le proxy.
+    _index_cache: dict[str, Any] = {"path": None, "mtime": -1.0, "data": None}
+
+    def _load_index() -> bytes | None:
+        for candidate in (
+            os.path.join(static_dir, "dist", "index.html"),
+            os.path.join(static_dir, "index.html"),
+        ):
+            try:
+                st = os.stat(candidate)
+            except OSError:
+                continue
+            if st.st_size <= 0:
+                continue
+            if _index_cache["path"] == candidate and _index_cache["mtime"] == st.st_mtime:
+                return _index_cache["data"]
+            try:
+                with open(candidate, "rb") as _f:
+                    data = _f.read()
+            except OSError:
+                continue
+            _index_cache.update(path=candidate, mtime=st.st_mtime, data=data)
+            return data
+        return None
 
     @app.get("/")
     async def root():
-        if _index_html_cache is not None:
-            return Response(content=_index_html_cache, media_type="text/html; charset=utf-8")
-        from fastapi.responses import FileResponse
-
-        return FileResponse(os.path.join(static_dir, "index.html"))
+        data = _load_index()
+        if data is not None:
+            return Response(content=data, media_type="text/html; charset=utf-8")
+        # Aucun front lisible. Un FileResponse sur un fichier absent ferait
+        # échouer l'envoi (500 opaque) : on préfère une erreur lisible qui
+        # indique comment régénérer le bundle.
+        return Response(
+            content=("Dashboard UI introuvable : lancez `npm run build` dans dashboard-ui/ (sortie : static/dist/)."),
+            status_code=503,
+            media_type="text/plain; charset=utf-8",
+        )
 
     # ── Config endpoints ──
 
@@ -1685,6 +1937,28 @@ def register_dashboard(
             _port = int(getattr(_mgr, "port", PORT)) if _mgr else PORT
         except (TypeError, ValueError):
             _port = PORT
+        _free_policy = config_settings.get_free_substitution_policy()
+        _free_map = config_settings.FREE_MODEL_MAP or {}
+        # [2026-10-29] Le mapping explicite est souverain : la politique ne
+        # filtre que les candidats automatiques. L'API doit refléter ce que le
+        # proxy applique réellement (sinon le GUI affichait « ignoré » un
+        # mapping pourtant utilisé, ou l'inverse).
+        _free_map_effective = dict(_free_map)
+        try:
+            from config.model_tier import tier_counts as _tier_counts
+
+            _model_counts = _tier_counts(models_info.values() if isinstance(models_info, dict) else ())
+        except Exception:
+            _model_counts = {
+                "total": len(models_info) if isinstance(models_info, dict) else 0,
+                "free": 0,
+                "paid": 0,
+                "paid_free_fallback": 0,
+                "paid_free_ignored": 0,
+                "unknown": 0,
+                "route_mismatch": 0,
+                "catalog_mismatch": 0,
+            }
         return {
             "proxy": PROXY or "",
             "api_key_set": bool(API_KEY),
@@ -1696,6 +1970,7 @@ def register_dashboard(
             "local_ips": local_ips,
             "routes": routes_info,
             "models": models_info,
+            "model_counts": _model_counts,
             "model_limits": get_model_limits_for_all(models_info),
             "model_capabilities": get_model_capabilities_for_all(models_info),
             "proxy_running": server_manager_getter().is_running
@@ -1738,7 +2013,9 @@ def register_dashboard(
             ],
             "routing": API_KEY_ROUTING,
             "free_parallel": dict(getattr(config_settings, "FREE_PARALLEL", {})),
-            "free_model_map": config_settings.FREE_MODEL_MAP,
+            "free_substitution_policy": _free_policy,
+            "free_model_map": _free_map,
+            "free_model_map_effective": _free_map_effective,
             "lang": os.getenv("PROXY_LANG", "en"),
         }
 
@@ -1963,7 +2240,7 @@ def register_dashboard(
                 "via_vpn": bool(wf_via),
                 "on_error": wf_onerr,
             },
-            "available_models": sorted(list(MODELS.keys())),
+            "available_models": sorted(MODELS.keys()),
             "modes": ["duckduckgo", "model", "ddg_then_model", "model_then_ddg"],
             "web_fetch_modes": ["direct", "model", "direct_then_model"],
             "native_models": WEB_SEARCH_NATIVE_MODELS,
@@ -2088,7 +2365,7 @@ def register_dashboard(
             "enabled": bool(yaml_get("web_fetch", "enabled", True)),
             "via_vpn": bool(yaml_get("web_fetch", "via_vpn", False)),
             "on_error": yaml_get("web_fetch", "on_error", "strip"),
-            "available_models": sorted(list(MODELS.keys())),
+            "available_models": sorted(MODELS.keys()),
             "modes": ["direct", "model", "direct_then_model"],
             "native_models": WEB_SEARCH_NATIVE_MODELS,
         }
@@ -2164,10 +2441,25 @@ def register_dashboard(
         body = await request.json()
         if "api_keys" in body:
             _debug(f"  [config] API keys updated ({len(body['api_keys'])} keys)")
-            merged = _merge_preserved_api_keys(body["api_keys"])
+            merged = _merge_preserved_api_keys(body["api_keys"], replace=bool(body.get("replace")))
             save_api_keys(merged)
+            try:
+                import opencode as _oc
+
+                _oc._rebuild_key_cache()
+            except Exception as _e:
+                _debug(f"  [config] key cache rebuild failed: {_e}")
         if "routing" in body:
             save_env({"API_KEY_ROUTING": body["routing"]})
+            # [audit 2026-10-30] opencode imported API_KEY_ROUTING by value;
+            # save_env only updated config.settings, so the dashboard toggle
+            # had no effect until a restart.
+            try:
+                import opencode as _oc
+
+                _oc.API_KEY_ROUTING = str(body["routing"])
+            except Exception:
+                pass
         return {"status": "ok", "message": "API keys saved."}
 
     @app.post("/api/config")
@@ -2204,6 +2496,12 @@ def register_dashboard(
 
         if "routing" in body:
             env_updates["API_KEY_ROUTING"] = body["routing"]
+            try:
+                import opencode as _oc
+
+                _oc.API_KEY_ROUTING = str(body["routing"])
+            except Exception:
+                pass
 
         if "lang" in body:
             env_updates["PROXY_LANG"] = body["lang"]
@@ -2327,7 +2625,19 @@ def register_dashboard(
     # ── Stats & history ──
 
     @app.get("/api/stats")
-    async def get_stats(from_date: str = None, to_date: str = None, station: int = None):
+    async def get_stats(
+        from_date: str = None,
+        to_date: str = None,
+        station: int = None,
+        # [perf/dashboard] Le front envoie `?from=&to=` (Stats.svelte) alors que
+        # l'endpoint historique attend `from_date`/`to_date` : les deux étaient
+        # ignorés → agrégation sur TOUTE la table (2,5 Go, 3-10 s) à chaque
+        # affichage. Alias explicites pour que le filtre de période s'applique.
+        from_: str = Query(None, alias="from"),
+        to_: str = Query(None, alias="to"),
+    ):
+        from_date = from_date or from_
+        to_date = to_date or to_
         where, params = _build_where(from_date, to_date, station=station)
         cache_key = f"stats:{where}:{tuple(params)}"
 
@@ -2921,8 +3231,8 @@ def register_dashboard(
     async def _ip_stats_db(vpn_manager=None) -> dict:
         """Per-IP usage stats for the IP History block (free egress IPs).
 
-        Reads the requests table — free/paid split via the `-free` model
-        suffix (the proxy is the only producer of `-free` models), identity
+        Reads the requests table — free/paid split via the canonical tier set
+        (``big-pickle`` is free without a ``-free`` suffix), identity
         = fingerprint profile of the most recent request on that IP,
         rotation info (server + time) merged from the _ip_history of BOTH
         stations (dual station — the table only records free_model_ip, not
@@ -2934,14 +3244,21 @@ def register_dashboard(
         cached = _stats_cache.get("ip_stats")
         if cached is not None:
             return cached
+        free_ids = sorted(_free_model_id_set())
+        if free_ids:
+            free_clause = "model IN ({})".format(",".join("?" for _ in free_ids))
+            grouped_params = tuple(free_ids) * 2
+        else:
+            free_clause = "0"
+            grouped_params = ()
         stats: dict = {}
         try:
 
             def _query_grouped(db):
                 return db.execute(
                     "SELECT free_model_ip, COUNT(*) AS total,"
-                    "       SUM(CASE WHEN model LIKE '%-free' THEN 1 ELSE 0 END),"
-                    "       SUM(CASE WHEN model NOT LIKE '%-free' THEN 1 ELSE 0 END),"
+                    f"       SUM(CASE WHEN {free_clause} THEN 1 ELSE 0 END),"
+                    f"       SUM(CASE WHEN NOT ({free_clause}) THEN 1 ELSE 0 END),"
                     "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
                     "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
                     "       MIN(timestamp), MAX(timestamp)"
@@ -2949,7 +3266,8 @@ def register_dashboard(
                     " WHERE free_model_ip IS NOT NULL AND free_model_ip != ''"
                     " GROUP BY free_model_ip"
                     " ORDER BY COUNT(*) DESC, MAX(timestamp) DESC"
-                    " LIMIT 100"
+                    " LIMIT 100",
+                    grouped_params,
                 ).fetchall()
 
             def _query_identity(db):
@@ -3075,10 +3393,7 @@ def register_dashboard(
                 ]
                 _cache_s = max(
                     0.5,
-                    min(
-                        float(getattr(m, "_STATUS_CACHE_SECONDS", 5.0))
-                        for m in managers
-                    ),
+                    min(float(getattr(m, "_STATUS_CACHE_SECONDS", 5.0)) for m in managers),
                 )
                 _known_ages = [a for a in _ages if a is not None]
                 status_age_s = max(_known_ages) if _known_ages else None
@@ -3187,22 +3502,38 @@ def register_dashboard(
             # [roadmap] boot_error dynamique : l'ancien champ restait collé à
             # « boot 5/6 » après guérison. On recalcule à chaque lecture.
             try:
-                _expected_n = config_settings.resolved_station_count(
-                    getattr(config_settings, "IP_ROTATION", {}) or {}
+                # [audit watchdog 2026-10-30] `expected` doit refléter les
+                # stations réellement enabled (hors disabled_stations) : le
+                # compteur config brut affichait un faux « boot N/N+1 » avec
+                # une station désactivée. Et une station `connecting` pendant
+                # sa rotation n'est pas un échec de boot.
+                _expected_n = sum(
+                    1
+                    for _m in managers
+                    if getattr(_m, "enabled", True) and not getattr(_m, "_disabled", False)
                 )
                 _up_n = sum(
                     1
                     for _m in managers
-                    if str(getattr(_m, "status", "disconnected") or "disconnected")
-                    in ("connected", "degraded")
+                    if str(getattr(_m, "status", "disconnected") or "disconnected") in ("connected", "degraded")
                 )
-                _enabled = bool(
-                    (getattr(config_settings, "IP_ROTATION", {}) or {}).get("enabled", False)
+                _missing = [
+                    _m
+                    for _m in managers
+                    if getattr(_m, "enabled", True)
+                    and not getattr(_m, "_disabled", False)
+                    and str(getattr(_m, "status", "disconnected") or "disconnected")
+                    not in ("connected", "degraded")
+                ]
+                _only_transient = bool(_missing) and all(
+                    str(getattr(_m, "status", "disconnected") or "disconnected") == "connecting"
+                    and getattr(_m, "_rotation_task", None) is not None
+                    and not getattr(_m._rotation_task, "done", lambda: True)()
+                    for _m in _missing
                 )
-                if _enabled and _up_n < _expected_n:
-                    shared_state.boot_error = (
-                        f"boot {_up_n}/{_expected_n}: connected {_up_n} — reconcile/pool"
-                    )
+                _enabled = bool((getattr(config_settings, "IP_ROTATION", {}) or {}).get("enabled", False))
+                if _enabled and _up_n < _expected_n and not _only_transient:
+                    shared_state.boot_error = f"boot {_up_n}/{_expected_n}: connected {_up_n} — reconcile/pool"
                     data["boot_error"] = shared_state.boot_error
                 else:
                     shared_state.boot_error = None
@@ -3370,6 +3701,27 @@ def register_dashboard(
                 data["control_401_badge"] = bool(_c401 and (time.time() - _c401) < 300)
             except Exception:
                 pass
+            # [audit watchdog 2026-10-30] Le breaker superviseur était
+            # invisible : le pool pouvait exclure une station « routable »
+            # sans que le dashboard n'explique pourquoi.
+            try:
+                import shared_state as _ss_sup
+
+                _sups = []
+                for _sup in getattr(_ss_sup, "station_supervisors", None) or []:
+                    _ro = getattr(_sup, "breaker_open_readonly", None)
+                    _sups.append(
+                        {
+                            "station": int(getattr(_sup, "station", -1)),
+                            "breaker_open": bool(_ro()) if callable(_ro) else bool(getattr(_sup, "breaker_open_until", 0.0)),
+                            "half_open_pending": bool(getattr(_sup, "half_open_pending", False)),
+                            "consecutive_failures": int(getattr(_sup, "consecutive_failures", 0)),
+                            "restart_in_progress": bool(getattr(_sup, "restart_in_progress", False)),
+                        }
+                    )
+                data["supervisors"] = _sups
+            except Exception:
+                pass
         return data
 
     @app.get("/api/pool-status")
@@ -3500,8 +3852,22 @@ def register_dashboard(
         import shared_state
 
         if shared_state.vpn_manager:
-            return shared_state.vpn_manager.get_config()
-        return {"enabled": False, "servers": [], "auth_file": "", "protocol": "udp"}
+            cfg = shared_state.vpn_manager.get_config()
+            try:
+                _ip_rot = getattr(config_settings, "IP_ROTATION", None) or {}
+                for _block in _QUALITY_BLOCK_SPEC:
+                    if isinstance(_ip_rot.get(_block), dict):
+                        cfg[_block] = dict(_ip_rot[_block])
+            except Exception:
+                pass
+            return cfg
+        return {
+            "enabled": False,
+            "servers": [],
+            "auth_file": "",
+            "protocol": "udp",
+            "free_substitution_policy": config_settings.get_free_substitution_policy(),
+        }
 
     @app.get("/api/vpn-stack-info")
     async def get_vpn_stack_info():
@@ -3533,7 +3899,10 @@ def register_dashboard(
             username = creds.get("username", "")
             password = creds.get("password", "")
             if username and password:
-                _write_credentials_env(username, password)
+                try:
+                    _write_credentials_env(username, password)
+                except ValueError as exc:
+                    return JSONResponse(status_code=400, content={"error": str(exc)})
 
         # [fix 19/08] free_model_map is a TOP-LEVEL config.yaml key (not an
         # ip_rotation one) — hot-reload by mutating the shared dict in place
@@ -3584,6 +3953,14 @@ def register_dashboard(
             if str(body["free_exception_fallback"]) not in ("station-first", "direct"):
                 return {"error": "free_exception_fallback doit être 'station-first' ou 'direct'"}
             body["free_exception_fallback"] = str(body["free_exception_fallback"])
+        if "free_substitution_policy" in body:
+            _v = str(body["free_substitution_policy"] or "").strip().lower()
+            if _v not in config_settings.FREE_SUBSTITUTION_POLICIES:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "free_substitution_policy doit être 'homonym' ou 'family'"},
+                )
+            body["free_substitution_policy"] = _v
         # Action sur 429 — validate, then let it flow to _persist + pool
         if "on_429_action" in body:
             _v = str(body["on_429_action"] or "").strip().lower()
@@ -3640,6 +4017,10 @@ def register_dashboard(
                 return JSONResponse(status_code=400, content={"error": "latency_rotation doit être un objet"})
             if "enabled" in _lr and not isinstance(_lr["enabled"], bool):
                 return JSONResponse(status_code=400, content={"error": "latency_rotation.enabled doit être booléen"})
+
+        _q_errors = _quality_blocks_errors(body)
+        if _q_errors:
+            return JSONResponse(status_code=400, content={"error": "; ".join(_q_errors)})
 
         # [free_parallel] type check only — PAS de normalisation ici.
         # `_normalize_free_parallel` remplit les clés absentes avec leurs
@@ -4025,9 +4406,15 @@ def register_dashboard(
         password = body.get("password", "")
 
         if not username or not password:
-            return {"error": "Nom d'utilisateur et mot de passe requis"}
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Nom d'utilisateur et mot de passe requis"},
+            )
 
-        _write_credentials_env(username, password)
+        try:
+            _write_credentials_env(username, password)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
         return {
             "ok": True,
             "note": "restart the VPN container (docker compose up -d) for gluetun to pick up new credentials",
@@ -4189,11 +4576,7 @@ def register_dashboard(
         if stack not in ("wireguard", "openvpn"):
             return JSONResponse(status_code=400, content={"error": "stack doit être wireguard|openvpn"})
         mgr = next(
-            (
-                m
-                for m in (getattr(shared_state, "vpn_managers", None) or [])
-                if getattr(m, "_station", None) == sid
-            ),
+            (m for m in (getattr(shared_state, "vpn_managers", None) or []) if getattr(m, "_station", None) == sid),
             None,
         )
         if mgr is None:
@@ -4201,9 +4584,7 @@ def register_dashboard(
         try:
             # Flip PER-STATION : stations=[sid] borne le blast-radius.
             # force=True répare une éventuelle divergence état/conteneur.
-            res = await mgr.set_stack(
-                stack, propagate=True, stations=[sid], force=True
-            )
+            res = await mgr.set_stack(stack, propagate=True, stations=[sid], force=True)
             if not res.get("ok"):
                 return JSONResponse(
                     status_code=502,
@@ -4916,6 +5297,7 @@ def register_dashboard(
             return rows, total_count
 
         rows, total_count = await _db_read_sync(_query_history)
+        free_ids = _free_model_id_set()
 
         return {
             "logs": [
@@ -4936,7 +5318,7 @@ def register_dashboard(
                     "effort": r["effort"] if "effort" in r.keys() else None,
                     "client_ip": r["client_ip"] if "client_ip" in r.keys() else None,
                     "account_alias": r["account_alias"] if "account_alias" in r.keys() else None,
-                    "is_free_model": "-free" in (r["model"] or ""),
+                    "is_free_model": (r["model"] or "") in free_ids or "-free" in (r["model"] or ""),
                     "station": r["station"] if "station" in r.keys() else None,
                     "free_ip": r["free_model_ip"] if "free_model_ip" in r.keys() and r["free_model_ip"] else "",
                     "geo_country": r["geo_country"] if "geo_country" in r.keys() else None,

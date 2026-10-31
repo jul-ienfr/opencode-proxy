@@ -54,10 +54,7 @@ def test_db_tables_exist():
         pytest.skip("no DB")
     conn = sqlite3.connect(str(p))
     try:
-        tables = {
-            r[0]
-            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
-        }
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()}
         assert "requests" in tables
         assert "free_model_usage" in tables
     finally:

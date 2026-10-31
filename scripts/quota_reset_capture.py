@@ -22,6 +22,7 @@ Budget de sondage : concurrency 3, intervalle adaptatif 0.5-3 s. Assez rapide
 pour gagner la course, assez sobre pour ne pas consommer soi-meme le quota
 qu'on veut mesurer.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -64,14 +65,14 @@ _BACKOFF = (2.0, 3.0, 5.0, 8.0, 12.0, 18.0, 25.0, 30.0)
 
 
 def log(msg: str) -> None:
-    ts = dt.datetime.now(dt.timezone.utc).strftime("%H:%M:%S")
+    ts = dt.datetime.now(dt.UTC).strftime("%H:%M:%S")
     print(f"[{ts}Z] {msg}", flush=True)
 
 
 def next_utc_midnight(now: dt.datetime | None = None) -> dt.datetime:
-    now = now or dt.datetime.now(dt.timezone.utc)
+    now = now or dt.datetime.now(dt.UTC)
     d = (now + dt.timedelta(days=1)).date()
-    return dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc)
+    return dt.datetime(d.year, d.month, d.day, tzinfo=dt.UTC)
 
 
 def _ensure_dirs() -> None:
@@ -98,7 +99,7 @@ def _rotate_attempts(max_bytes: int = 2_000_000, keep: int = 10) -> None:
             return
     except Exception:
         return
-    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     try:
         os.replace(ATTEMPTS, f"{ATTEMPTS}.{ts}")
     except Exception:
@@ -125,7 +126,7 @@ def _save_full(record: dict, kind: str, directory: str | None = None) -> str:
     """
     directory = directory or REFERENCE_DIR
     os.makedirs(directory, exist_ok=True)
-    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    ts = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
     path = os.path.join(directory, f"{kind}_{ts}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2, default=str)
@@ -148,9 +149,7 @@ def _acquire_lock() -> bool:
             if pid.isdigit():
                 import subprocess
 
-                r = subprocess.run(
-                    ["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=15
-                )
+                r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=15)
                 if pid in (r.stdout or ""):
                     log(f"veille deja active (pid {pid}) — sortie")
                     return False
@@ -209,8 +208,8 @@ async def probe(oc, station: int, ip: str, model: str) -> dict:
         imp, fp = oc._get_free_fp_kwargs()
 
         if "/systemone" in endpoint:
-            body = {"model": model, "state": "reply OK", "questions": {"ok": {"type": "score"}}}
-            raw = body
+            body: dict = {"model": model, "state": "reply OK", "questions": {"ok": {"type": "score"}}}
+            raw: dict = body
         else:
             raw = {
                 "model": model,
@@ -221,7 +220,7 @@ async def probe(oc, station: int, ip: str, model: str) -> dict:
 
         body_bytes = oc._serialize_json_body(body)
         rec = {
-            "ts_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "ts_utc": dt.datetime.now(dt.UTC).isoformat(),
             "station": station,
             "egress_ip": ip,
             "model": model,
@@ -248,21 +247,13 @@ async def probe(oc, station: int, ip: str, model: str) -> dict:
         pool = slot = None
         t0 = time.monotonic()
         try:
-            pool, slot = await oc._get_pooled_curl_session(
-                f"socks5://127.0.0.1:{port}", imp, fp, egress_ip=ip
-            )
-            resp = await slot.sess.post(
-                endpoint, content=body_bytes, headers=headers, timeout=(8, 45), stream=True
-            )
+            pool, slot = await oc._get_pooled_curl_session(f"socks5://127.0.0.1:{port}", imp, fp, egress_ip=ip)
+            resp = await slot.sess.post(endpoint, content=body_bytes, headers=headers, timeout=(8, 45), stream=True)
             elapsed = round((time.monotonic() - t0) * 1000)
             chunks = []
             try:
                 async for ln in resp.aiter_lines():
-                    chunks.append(
-                        ln.decode("utf-8", "replace")
-                        if isinstance(ln, (bytes, bytearray))
-                        else str(ln)
-                    )
+                    chunks.append(ln.decode("utf-8", "replace") if isinstance(ln, (bytes, bytearray)) else str(ln))
                     if sum(len(c) for c in chunks) > 4000:
                         break
             finally:
@@ -293,7 +284,7 @@ async def probe(oc, station: int, ip: str, model: str) -> dict:
 
 async def measure_quota(oc, station: int, ip: str, model: str, max_probes: int = 120) -> dict:
     """Compte les 200 successifs sur CETTE IP avant le premier 429."""
-    counts = {"200": 0, "429": 0, "other": 0, "first_429_at": None, "statuses": [], "retry_after": None}
+    counts: dict = {"200": 0, "429": 0, "other": 0, "first_429_at": None, "statuses": [], "retry_after": None}
     for i in range(max_probes):
         rec = await probe(oc, station, ip, model)
         resp = rec.get("response") or {}
@@ -319,7 +310,7 @@ async def measure_quota(oc, station: int, ip: str, model: str, max_probes: int =
 def write_report(accepted: list[dict], refusals: int, measurements: list[dict]) -> None:
     _ensure_dirs()
     lines = ["# Capture quota opencode", ""]
-    lines.append(f"Mis a jour : {dt.datetime.now(dt.timezone.utc).isoformat()}")
+    lines.append(f"Mis a jour : {dt.datetime.now(dt.UTC).isoformat()}")
     lines.append(f"- refus observes (session courante) : {refusals}")
     lines.append(f"- acceptations capturees : {len(accepted)}")
     lines.append("")
@@ -354,9 +345,11 @@ def write_report(accepted: list[dict], refusals: int, measurements: list[dict]) 
         lines += ["Aucune acceptation pour l'instant — le chat gratuit reste refuse.", ""]
         # Meme en refus, on documente et on rend rejouable la derniere reference.
         try:
-            refs = sorted(
-                n for n in os.listdir(REFERENCE_DIR) if n.endswith(".json")
-            ) if os.path.isdir(REFERENCE_DIR) else []
+            refs = (
+                sorted(n for n in os.listdir(REFERENCE_DIR) if n.endswith(".json"))
+                if os.path.isdir(REFERENCE_DIR)
+                else []
+            )
         except Exception:
             refs = []
         if refs:
@@ -392,8 +385,7 @@ def write_report(accepted: list[dict], refusals: int, measurements: list[dict]) 
                     lines.append(f"  - `{k}: {v}`")
                 lines += [
                     "",
-                    "Rejouer : `python scripts/quota_replay.py --record reference/"
-                    f"{refs[-1]}`",
+                    f"Rejouer : `python scripts/quota_replay.py --record reference/{refs[-1]}`",
                     "",
                 ]
         else:
@@ -419,7 +411,7 @@ async def watch(max_seconds: float, dry_run: bool, full: bool, until_reset: bool
     _ensure_dirs()
     if until_reset:
         target = next_utc_midnight()
-        wait = max(0.0, (target - dt.datetime.now(dt.timezone.utc)).total_seconds() - 20.0)
+        wait = max(0.0, (target - dt.datetime.now(dt.UTC)).total_seconds() - 20.0)
         log(f"reset annonce {target.isoformat()} — attente {wait / 60:.1f} min")
         await asyncio.sleep(wait)
 
@@ -467,9 +459,7 @@ async def watch(max_seconds: float, dry_run: bool, full: bool, until_reset: bool
                     (v for k, v in resp.get("headers") or [] if str(k).lower() == "retry-after"),
                     None,
                 )
-                _append_attempt(
-                    f"{rec['ts_utc']} {st} {rec['egress_ip']} {rec['model']} ra={ra}"
-                )
+                _append_attempt(f"{rec['ts_utc']} {st} {rec['egress_ip']} {rec['model']} ra={ra}")
             else:
                 # 403/5xx/timeout : signal fort, on le garde en entier.
                 anomalies.append(rec)
@@ -494,10 +484,7 @@ async def watch(max_seconds: float, dry_run: bool, full: bool, until_reset: bool
             if not dry_run:
                 try:
                     p = _save_full(rec, "anomalie")
-                    log(
-                        f"ANOMALIE {(rec.get('response') or {}).get('status')} "
-                        f"-> {os.path.relpath(p, ROOT)}"
-                    )
+                    log(f"ANOMALIE {(rec.get('response') or {}).get('status')} -> {os.path.relpath(p, ROOT)}")
                 except Exception as e:
                     log(f"echec sauvegarde anomalie : {e}")
 
@@ -509,12 +496,8 @@ async def watch(max_seconds: float, dry_run: bool, full: bool, until_reset: bool
                 log(f"ACCEPTATION CAPTUREE -> {path}")
                 accepted.append(rec)
                 # mesure immediate du quota sur cette IP avant les autres
-                counts = await measure_quota(
-                    oc, rec["station"], rec["egress_ip"], rec["model"]
-                )
-                measurements.append(
-                    {"ip": rec["egress_ip"], "model": rec["model"], "counts": counts}
-                )
+                counts = await measure_quota(oc, rec["station"], rec["egress_ip"], rec["model"])
+                measurements.append({"ip": rec["egress_ip"], "model": rec["model"], "counts": counts})
                 log(f"quota mesure ip={rec['egress_ip']} : {counts['200']} succes avant 429")
                 found_this_pass = True
             if not dry_run:
@@ -559,9 +542,7 @@ def main() -> None:
         if args.now > 0:
             asyncio.run(watch(args.now, args.dry_run, args.full, False))
         else:
-            asyncio.run(
-                watch(args.max_seconds, args.dry_run, args.full, args.until_reset)
-            )
+            asyncio.run(watch(args.max_seconds, args.dry_run, args.full, args.until_reset))
     finally:
         _release_lock()
 

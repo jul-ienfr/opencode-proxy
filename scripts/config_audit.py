@@ -34,6 +34,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 RACINE = Path(__file__).resolve().parent.parent
 CONFIG = RACINE / "config.yaml"
@@ -85,7 +86,7 @@ def _fichiers_python() -> list[Path]:
     return sortie
 
 
-def cles_du_fichier(chemin: Path | None = None) -> dict[str, object]:
+def cles_du_fichier(chemin: Path | None = None) -> dict[str, Any]:
     """Aplatit `config.yaml` en `section.sous_cle` → valeur (les dynamiques exclues).
 
     `chemin=None` plutôt que `chemin=CONFIG` : un défaut est lié à la définition,
@@ -179,7 +180,7 @@ _SOURCE_CACHE: str | None = None
 _AUDIT_CACHE: dict[tuple[str, float], dict[str, object]] = {}
 
 
-def auditer(chemin: Path | None = None) -> dict[str, object]:
+def auditer(chemin: Path | None = None) -> dict[str, Any]:
     chemin = chemin or CONFIG
     try:
         signature = (str(chemin), chemin.stat().st_mtime)
@@ -221,7 +222,7 @@ def auditer(chemin: Path | None = None) -> dict[str, object]:
     return resultat
 
 
-def _rapport(r: dict[str, object]) -> None:
+def _rapport(r: dict[str, Any]) -> None:
     dead = r["dead"]
     missing = r["missing"]
     print(f"clés de configuration (hors sections dynamiques) : {r['total_cles']}")
@@ -261,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.strict:
-        reference = {"dead": [], "missing": []}
+        reference: dict[str, list[str]] = {"dead": [], "missing": []}
         if BASELINE.exists():
             reference = json.loads(BASELINE.read_text(encoding="utf-8"))
         nouvelles_dead = sorted(set(resultat["dead"]) - set(reference.get("dead", [])))

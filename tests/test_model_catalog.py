@@ -53,10 +53,7 @@ def test_resolve_endpoint_api_driven():
     assert st._resolve_model_endpoint("qwen3.7-plus", {"api": "chat"}, "anthropic") == st.API_BASE_ANTHROPIC
     assert st._resolve_model_endpoint("kimi-k2.6", {"api": "chat"}, "openai") == st.API_BASE_OPENAI
     # override explicite : api chat sur famille responses
-    assert (
-        st._resolve_model_endpoint("muse-spark-1.3-contributor", {"api": "chat"}, "openai")
-        == st.API_BASE_OPENAI
-    )
+    assert st._resolve_model_endpoint("muse-spark-1.3-contributor", {"api": "chat"}, "openai") == st.API_BASE_OPENAI
 
 
 def test_resolve_endpoint_heuristic_fallback_unchanged():
@@ -89,9 +86,12 @@ def test_capabilities_explicit_merge_and_fresh():
 def test_models_entries_and_config():
     st.get_model_config.cache_clear()
     try:
-        free = st.get_model_config("muse-spark-1.3-contributor-free")
-        assert free["api"] == "responses"
-        assert free["endpoint"] == st._RESPONSES_FREE_ENDPOINT
+        # [CATALOGUE 2026-10-27] l'amont n'annonce plus aucun id free de la
+        # famille `responses` (91 ids) : la jambe free est 100 % chat. On
+        # verrouille donc sur un free chat reel, riche en modalites.
+        free = st.get_model_config("deepseek-v4.1-flash-free")
+        assert free["api"] == "chat"
+        assert free["endpoint"] == st.API_BASE_FREE
         assert {"text", "image", "pdf"} <= set(free["capabilities"]["input"])
         chat = st.get_model_config("kimi-k2.6")
         assert chat["api"] == "chat"

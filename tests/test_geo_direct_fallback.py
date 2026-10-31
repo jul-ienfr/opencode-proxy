@@ -35,9 +35,13 @@ def _fake_request():
 
 def test_i18n_fr_via():
     fr = opencode._geo_i18n("direct_via_vpn", "fr").format(
-        station=1, vpnCountry="United States", vpnIp="5.5.5.5",
-        model="muse-spark-1.2-contributor", allowed="US, CA",
-        directIp="82.12.34.56", directCountry="France",
+        station=1,
+        vpnCountry="United States",
+        vpnIp="5.5.5.5",
+        model="muse-spark-1.2-contributor",
+        allowed="US, CA",
+        directIp="82.12.34.56",
+        directCountry="France",
     )
     assert "Vous êtes en mode Direct" in fr
     assert "82.12.34.56" in fr and "France" in fr
@@ -45,9 +49,13 @@ def test_i18n_fr_via():
 
 def test_i18n_en_via():
     en = opencode._geo_i18n("direct_via_vpn", "en").format(
-        station=2, vpnCountry="Japan", vpnIp="1.1.1.1",
-        model="x", allowed="JP",
-        directIp="2.2.2.2", directCountry="France",
+        station=2,
+        vpnCountry="Japan",
+        vpnIp="1.1.1.1",
+        model="x",
+        allowed="JP",
+        directIp="2.2.2.2",
+        directCountry="France",
     )
     assert "You are in Direct" in en
 
@@ -56,7 +64,11 @@ def test_direct_compatible_no_warning(monkeypatch):
     monkeypatch.setattr(st, "GEO_ENABLED", True)
     monkeypatch.setattr(st, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
     monkeypatch.setattr(st, "IP_ROTATION", {"enabled": True, "server_countries": "France,Germany,United States"})
-    monkeypatch.setattr(st, "GEO_POLICIES", {"meta": {"allowed_countries": ["United States", "France"], "mode": "strict", "require_vpn": True}})
+    monkeypatch.setattr(
+        st,
+        "GEO_POLICIES",
+        {"meta": {"allowed_countries": ["United States", "France"], "mode": "strict", "require_vpn": True}},
+    )
     route = {"model": "muse-spark-1.2-contributor", "geo": {"extends": "meta"}}
     monkeypatch.setattr(shared_state, "vpn_managers", [FakeMgr("United States", "5.5.5.5", 1)], raising=False)
 
@@ -72,7 +84,9 @@ def test_direct_compatible_no_warning(monkeypatch):
     assert res is None
     assert getattr(req.state, "_geo_via_vpn_while_direct", False) is False
     # headers must not contain warning
-    h = opencode._geo_headers(route, pinned=getattr(req.state, "_geo_pinned", False), current_country=getattr(req.state, "_geo_current", None))
+    h = opencode._geo_headers(
+        route, pinned=getattr(req.state, "_geo_pinned", False), current_country=getattr(req.state, "_geo_current", None)
+    )
     assert "X-Geo-Warning" not in h
 
 
@@ -80,7 +94,11 @@ def test_direct_incompatible_via_warning_headers_and_state(monkeypatch):
     monkeypatch.setattr(st, "GEO_ENABLED", True)
     monkeypatch.setattr(st, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
     monkeypatch.setattr(st, "IP_ROTATION", {"enabled": True, "server_countries": "France,Germany,United States,Japan"})
-    monkeypatch.setattr(st, "GEO_POLICIES", {"meta": {"allowed_countries": ["United States", "Japan"], "mode": "strict", "require_vpn": True}})
+    monkeypatch.setattr(
+        st,
+        "GEO_POLICIES",
+        {"meta": {"allowed_countries": ["United States", "Japan"], "mode": "strict", "require_vpn": True}},
+    )
     route = {"model": "muse-spark-1.2-contributor", "geo": {"extends": "meta"}}
     fake = FakeMgr("United States", "5.5.5.5", 1)
     monkeypatch.setattr(shared_state, "vpn_managers", [fake], raising=False)
@@ -122,7 +140,9 @@ def test_unknown_direct_via_warning(monkeypatch):
     monkeypatch.setattr(st, "GEO_ENABLED", True)
     monkeypatch.setattr(st, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
     monkeypatch.setattr(st, "IP_ROTATION", {"enabled": True, "server_countries": "United States,Japan"})
-    monkeypatch.setattr(st, "GEO_POLICIES", {"meta": {"allowed_countries": ["United States"], "mode": "strict", "require_vpn": True}})
+    monkeypatch.setattr(
+        st, "GEO_POLICIES", {"meta": {"allowed_countries": ["United States"], "mode": "strict", "require_vpn": True}}
+    )
     route = {"model": "x", "geo": {"extends": "meta"}}
     fake = FakeMgr("United States", "5.5.5.5", 1)
     monkeypatch.setattr(shared_state, "vpn_managers", [fake], raising=False)
@@ -141,5 +161,7 @@ def test_unknown_direct_via_warning(monkeypatch):
     asyncio.run(opencode._enforce_geo_gate(route, req, is_stream=False, protocol="openai"))
     assert getattr(req.state, "_geo_via_vpn_while_direct", False) is True
     # i18n unknown message
-    msg = opencode._geo_i18n("direct_via_vpn_unknown", "fr").format(station=1, vpnCountry="United States", vpnIp="5.5.5.5", model="x", allowed="United States")
+    msg = opencode._geo_i18n("direct_via_vpn_unknown", "fr").format(
+        station=1, vpnCountry="United States", vpnIp="5.5.5.5", model="x", allowed="United States"
+    )
     assert "indéterminée" in msg

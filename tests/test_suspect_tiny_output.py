@@ -232,3 +232,18 @@ def test_should_retry_empty_stream_ignore_une_simple_enveloppe():
     assert oc._should_retry_empty_stream(True, 12, content_yielded=True) is False
     # tool call complet : contenu exploitable
     assert oc._should_retry_empty_stream(True, 0, content_yielded=True) is False
+
+
+def test_stream_content_started_ignore_une_enveloppe_role():
+    """[2026-10-30] Une enveloppe `role` ne doit pas bloquer un retry.
+
+    Même règle que l'EOF, mais pour les erreurs en cours de flux : sans elle,
+    un amont qui ouvre le SSE (`role: assistant`) puis meurt faisait émettre
+    « stream interrupted » au client alors que rien d'exploitable n'était parti.
+    """
+    assert oc._stream_content_started(0, set()) is False
+    assert oc._stream_content_started(None, set()) is False
+    assert oc._stream_content_started(0, {0}) is True  # tool call émis
+    assert oc._stream_content_started(12, set()) is True  # texte/raisonnement
+    # fail-safe : entrée illisible -> on ne rejoue pas (pas de concaténation)
+    assert oc._stream_content_started(object(), object()) is True

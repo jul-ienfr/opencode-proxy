@@ -40,9 +40,7 @@ class TestCacheKey:
         quelle que soit la taille (le vieux hash() 64-bit collisionnait)."""
         k1 = pm._anthropic_cache_key("m", _body(text="a"))
         k2 = pm._anthropic_cache_key("m", _body(text="b"))
-        k3 = pm._anthropic_cache_key(
-            "m", _body(text="a" * 100_000 + "!")
-        )
+        k3 = pm._anthropic_cache_key("m", _body(text="a" * 100_000 + "!"))
         assert len({k1, k2, k3}) == 3
 
     def test_model_is_part_of_the_key(self):

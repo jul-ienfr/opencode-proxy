@@ -92,7 +92,7 @@ A mono-instance file lock (`logs/opencode.lock`) makes a second `python opencode
 
 ## VPN & IP Rotation (Free Model Quota)
 
-The proxy multiplies free model quotas by rotating the egress IP through a [gluetun](https://github.com/qdm12/gluetun-wiki) container (declared in `docker-compose.yml`, managed automatically by the proxy). Each successful IP rotation also advances the **client identity** — a `curl_cffi` impersonation profile (TLS fingerprint, HTTP/2 parameters, `sec-ch-*` headers) + User-Agent + optional extra headers — so opencode.ai cannot correlate sessions across IPs. No paid-account artifact (API key, client UA, cookies) ever reaches the free endpoint.
+The proxy multiplies free model quotas by rotating the egress IP through a [gluetun](https://github.com/qdm12/gluetun-wiki) container (declared in `docker-compose.yml`, managed automatically by the proxy). Each egress IP gets its own **official OpenCode client identity**: the free wire replays the real client (`opencode/<version> … runtime/bun/…` UA + per-IP `project`/`ses_`/`msg_`), and the TLS layer replays the Bun fingerprint. Identity profiles no longer describe a browser (no `sec-ch-*`/`Accept-Language`): `impersonate` is only the `curl_cffi` TLS carrier. No paid-account artifact (API key, client UA, cookies) ever reaches the free endpoint.
 
 ### Setup
 
@@ -116,11 +116,12 @@ ip_rotation:
   circuit_breaker_recovery: 300
   backoff_max_delay: 60
   ip_check_url: https://api.ipify.org
-  identity_rotation: true        # rotate client fingerprint with each IP change
-  identity_profiles:             # curl_cffi impersonation targets (desktop browsers)
-    - impersonate: chrome131
-      user_agent: null           # null = curl_cffi bundle provides the matching UA
-      extra_headers: {}
+  identity_rotation: true        # rotate the official client face with each IP change
+  identity_diversity: true       # expand to the official client-name grid (cli/desktop)
+  identity_profiles:             # official-client faces; UA derived from `client`
+    - client: cli                # opencode/prod/2.0.28/cli
+    - client: desktop            # opencode/prod/2.0.28/desktop
+                                 # optional: impersonate: <curl_cffi carrier> (TLS only)
   update_enabled: true           # auto-apply gluetun image updates
   update_check_interval: 21600   # check every 6 h
   update_apply_window: 03:00-05:00
@@ -128,13 +129,13 @@ ip_rotation:
   rotation_wait_timeout: 5       # max s a request waits for a fresh IP before paid fallback
 ```
 
-The compose service runs with `FIREWALL=on`: the container only talks through the VPN tunnel — no accidental leaks. The default config uses a single `chrome131` profile, so behavior is unchanged until you add more profiles.
+The compose service runs with `FIREWALL=on`: the container only talks through the VPN tunnel — no accidental leaks. The default config lists both official clients (`cli`/`desktop`); per-IP version/project/session diversity comes from the identity vault.
 
 ### How it works
 
 - **Free model requests** go through the gluetun tunnel (HTTP proxy `:8888` / SOCKS5 `:1080`); **paid requests** always go direct, never through the VPN
 - Free quota exhausted (HTTP 429) or `quota_per_ip` reached → the proxy switches to a new NordVPN server and records a per-(model, IP) cooldown, so the retry lands on a fresh address
-- Each successful rotation advances the identity profile: a different TLS fingerprint + User-Agent on the new IP
+- Each successful rotation advances the official client face (UA v2 + Bun TLS) while the per-IP vault issues a fresh `project`/`ses_`/`msg_` set
 - VPN down → free requests fail over to a direct connection (fail-open, by design) until the tunnel recovers
 - gluetun image updates are checked periodically and applied automatically during the configured idle window
 
@@ -160,7 +161,18 @@ The compose service runs with `FIREWALL=on`: the container only talks through th
 
 ## Web Dashboard
 
-The dashboard features 4 tabs with real-time updates via SSE (Server-Sent Events).
+The dashboard is a Svelte 5 + Vite single-page app (source in `dashboard-ui/`, built to `static/dist/`) with 7 tabs, real-time updates via SSE (Server-Sent Events), per-tab lazy loading, dark/light themes, and English/French translations.
+
+**Frontend development**
+
+```bash
+cd dashboard-ui
+npm install
+npm run dev      # hot reload on http://localhost:5173/static/dist/ (API proxied to :4000)
+npm run build    # production bundle → static/dist/
+npm run check    # svelte-check (types + a11y), must be clean
+python scripts/precompress.py   # gzip/brotli sidecars served by the proxy
+```
 
 ### Token Stats
 - Overview counters: Input, Output, Cache, Total, Success, Failed, Avg Duration
@@ -190,6 +202,46 @@ The proxy auto-discovers every `*-free` model announced on [Zen docs](https://op
 - **Durable + audit**: add-only merge, delta-check (`if new_set == FREE_MODELS: no-op` — no `mtime` bump), atomic `tmp+fsync+os.replace` under `_reload_lock`; removed upstream ids are never deleted, just logged (`[free-discovery] upstream removed … — keeping local`) and exposed in `GET /api/free-models → {removed}`.
 - **Lifecycle**: fire-and-forget at boot (no boot delay if Zen is down) + background loop `GET /models` every `free_discovery.interval` s (default 3600 s, `±10 %` jitter; after 3 consecutive failures `min(7200, interval×2)` backoff). On-demand `POST /api/free-discovery/refresh` (singleflight lock, guarded by `control_api_key` when `control_enabled`, `429` if >1/min).
 - **Observability**: `GET /api/free-models → {detected, mapped, pool, removed, last_refresh, next_refresh, source, consecutive_failures}` + dashboard badge + event `free_models_updated`. **5 free models covered with no manual step**: `mimo-v2.5-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`, `muse-spark-1.2-contributor-free`, `muse-spark-1.3-contributor-free` — `mimo-v2.5-free` is the live `free_model_map` target for the `minimax-*`/`qwen*` payants (strict rotation); the others are discovered and instantly usable (e.g. `model: mimo-v2.5-free`).
+
+### Free vs paid — one canonical classification
+
+Every model now carries a server-computed tier, so a client never has to guess
+from the `-free` suffix:
+
+```bash
+curl -s 'http://localhost:4000/v1/models?tier=free' | jq '.counts, .data[].id'
+curl -s 'http://localhost:4000/v1/models?tier=paid&free_first=true' | jq '.data[].id'
+```
+
+- `tier` = `free` | `paid` | `unknown` — billing classification. `free` requires an explicit signal: a `-free` suffix, a verified free id (`free_verified`, e.g. `big-pickle`), or membership in the verified `FREE_MODELS` registry. **Being listed on the anonymous free leg is not proof**: the live catalogue now sends new free-leg ids to the automatic free-only probe first. Only `alive`/`limited` (and `not_probeable` for an id already free by suffix/mapping) are promoted; `gpt-5.5`, `claude-opus-5-5`, … stay `paid` with `tier_source=unproven`.
+- **Auto-probe des nouveaux ids** : le relevé vivant ne bloque jamais ; il planifie `_free_probe_new_candidates` en arrière-plan. La sonde utilise la jambe free + `Bearer public` (aucun repli payant), mémorise les refus et persiste les promotions dans [`config/free_models_probed.json`](config/free_models_probed.json). Un modèle free sans suffixe est donc testé et promu automatiquement dès sa détection. Un lot dont **tous** les ids répondent `429` est traité comme ambigu (quota global/transitoire), pas comme une preuve de gratuité : verdict `unknown` et re-test après `free_discovery.probe.transient_429_retry_s` (300 s par défaut), sauf si un modèle free de contrôle répond 2xx (le `429` est alors ciblé et reste `limited`).
+- `tier_source` = `route` | `suffix` | `discovery` | `mapped` | `endpoint` | `unproven` | `catalog` | `unknown` — why the tier was chosen. `route` is resolved first: a `ROUTES`/custom alias is classified as its real target; `route_target` names that target. If the target is free, the alias stays **paid** with `free_target` (it is a free substitute, exactly like an active mapping), e.g. `glm-5.1 → glm-5.3-flash-free` is `paid` + `free_target`.
+- `route_leg` = `free` | `paid` | `internal` | `unknown` — the leg actually used by the proxy, independent from billing.
+- `free_first` = the proxy will try a free substitute first. A paid model with an active `free_model_map` entry stays `tier=paid`, `free_first=true`.
+- `free_target` / `free_mapping` / `free_mapping_active` expose the substitution. Under the default `homonym` policy, `mimo-v2.5`'s mapping is **ignored**; `family` activates it. `glm-5.1`'s old mapping is also ignored, but its route alias supplies a free target.
+- `route_mismatch` / `catalog_mismatch` are warnings, not filters: the first means billing and real route disagree; the second means the live catalogue and the route disagree (informational). `unproven` candidates do not raise `route_mismatch`.
+- `proxy.probe` expose le dernier verdict free-leg connu (`alive`, `limited`, `not_free`, `dead`, `unknown`, `not_probeable`) et son statut HTTP, quand la sonde automatique a testé l’id ou sa cible.
+
+`GET /api/config` exposes the same fields per model plus `model_counts`;
+`GET /api/free-models` adds `counts` (`detected`, `listed`, `candidates`,
+`routed`, `served`, `unproven`, `cooldown`, …) and a `status` per free model.
+“Detected” is the verified registry, “listed” is the strict free list, and
+“routed” does not mean “proven healthy”. On the local instance the live
+catalogue has 56 free-leg ids, the probe rejects the 32 paid Go ids, and the
+strict free list is 10.
+
+Per-call headers (best-effort, set at response start):
+
+| Header | Meaning |
+|---|---|
+| `X-OpenCode-Proxy-Tier` | actual tier of the leg that served the response |
+| `X-OpenCode-Proxy-Requested-Tier` | tier of the model the client asked for |
+| `X-OpenCode-Proxy-Model` | actual upstream model id |
+| `X-OpenCode-Proxy-Requested-Model` | requested model id |
+| `X-OpenCode-Proxy-Fallback` | `paid_to_free` or `free_to_paid` when a substitution happened |
+
+A fallback that happens mid-stream cannot rewrite headers already sent; use
+`GET /v1/models` for the authoritative per-model classification.
 
 Config keys (all optional, defaults shown):
 
@@ -361,11 +413,13 @@ gui/
   tray.py                # System tray menu
   window.py              # WebView window
   _webview_main.py       # WebView entry point
+dashboard-ui/            # Dashboard UI — Svelte 5 + Vite (source)
+  src/pages/             # Stats, Logs, Quotas, FreeModels, Config, Traffic, Debug
+  src/lib/               # api, i18n, thème, router, temps réel, composants
+  package.json           # svelte, vite, uplot, svelte-check
 static/
-  index.html             # Dashboard UI
-  styles.css             # Theming (dark/light)
-  app.js                 # Frontend logic
-scripts/                 # Outils : bench_perf, bench, migration DB, etc.
+  dist/                  # Build servi par le proxy (index.html + assets/ précompressés)
+scripts/                 # Outils : bench_perf, bench, migration DB, precompress, etc.
 tests/                   # Suite pytest (~740 tests)
 custom_routes.json       # Custom route mappings (persistent)
 docker-compose.yml       # Proxy + gluetun VPN tunnel stack

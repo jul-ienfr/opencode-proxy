@@ -71,9 +71,7 @@ def test_family_distribution_matches_the_measurement(catalog):
     """Repartition mesuree le 2026-10-20 — toute derive doit echouer ici."""
     import collections
 
-    free = collections.Counter(
-        mc.api_family_for_model(catalog, "opencode", m) for m in _models(catalog, "opencode")
-    )
+    free = collections.Counter(mc.api_family_for_model(catalog, "opencode", m) for m in _models(catalog, "opencode"))
     paid = collections.Counter(
         mc.api_family_for_model(catalog, "opencode-go", m) for m in _models(catalog, "opencode-go")
     )
@@ -88,12 +86,10 @@ def test_gemini_models_are_detected_not_silently_routed_to_chat(catalog):
     ou n'avaient aucune route : dans les deux cas, un echec opaque.
     """
     gemini_free = [
-        m for m in _models(catalog, "opencode")
-        if mc.api_family_for_model(catalog, "opencode", m) == "gemini"
+        m for m in _models(catalog, "opencode") if mc.api_family_for_model(catalog, "opencode", m) == "gemini"
     ]
     gemini_paid = [
-        m for m in _models(catalog, "opencode-go")
-        if mc.api_family_for_model(catalog, "opencode-go", m) == "gemini"
+        m for m in _models(catalog, "opencode-go") if mc.api_family_for_model(catalog, "opencode-go", m) == "gemini"
     ]
     assert len(gemini_free) == 9
     assert len(gemini_paid) == 1
@@ -102,10 +98,7 @@ def test_gemini_models_are_detected_not_silently_routed_to_chat(catalog):
 
 def test_anthropic_family_models_get_the_anthropic_url(catalog):
     """Les modeles `@ai-sdk/anthropic` pointent bien vers `/anthropic/v1`."""
-    ids = [
-        m for m in _models(catalog, "opencode")
-        if mc.api_family_for_model(catalog, "opencode", m) == "messages"
-    ]
+    ids = [m for m in _models(catalog, "opencode") if mc.api_family_for_model(catalog, "opencode", m) == "messages"]
     assert len(ids) == 24
     for m in ids:
         assert "/anthropic/" in (mc.model_api(catalog, "opencode", m) or ""), m

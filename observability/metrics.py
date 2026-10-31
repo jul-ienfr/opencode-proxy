@@ -90,9 +90,7 @@ def reset_fallback_metrics(fallback_counts: dict | None, failover_counts: dict |
         pass
 
 
-def observe_latency_ms(
-    rings: dict[str, deque], lock, name: str, ms: float, *, ring_max: int = LAT_RING_MAX
-) -> None:
+def observe_latency_ms(rings: dict[str, deque], lock, name: str, ms: float, *, ring_max: int = LAT_RING_MAX) -> None:
     """Alimente le ring de latence ``name`` — fail-soft, jamais de raise."""
     try:
         with lock:
@@ -208,9 +206,7 @@ def percentile(sorted_vals: list[float], q: float) -> float:
     return sorted_vals[idx]
 
 
-def latency_snapshot(
-    rings: dict[str, deque], lock
-) -> dict[str, tuple[int, float, float, float]]:
+def latency_snapshot(rings: dict[str, deque], lock) -> dict[str, tuple[int, float, float, float]]:
     """name -> (n, p50, p95, p99) en ms. Snapshot sous lock, tri hors lock."""
     with lock:
         snapshot = {k: list(v) for k, v in rings.items()}
@@ -304,6 +300,20 @@ def render_vpn_section(vpn: dict | None) -> list[str]:
         "restarts watchdog par station (fenêtre 1 h)",
         [(lbl, val) for lbl, val in vpn.get("restarts", []) if val],
     )
+    # [audit watchdog 2026-10-30] Le heartbeat n'était visible que dans les
+    # logs ; l'âge et les skips sont maintenant alertables.
+    _gauge(
+        lines,
+        "watchdog_heartbeat_age_seconds",
+        "âge du dernier heartbeat watchdog par station (-1 = jamais émis)",
+        vpn.get("heartbeat_age", []),
+    )
+    _gauge(
+        lines,
+        "watchdog_skipped_ticks_total",
+        "ticks watchdog sautés (rotation en vol ou verrou) par station",
+        vpn.get("skipped", []),
+    )
     _gauge(lines, "vpn_latency_ewma_ms", "EWMA par station·ip (ms)", vpn.get("ewma", []))
     _gauge(lines, "vpn_latency_p95_ms", "p95 glissant par station·ip (ms)", vpn.get("p95", []))
     _gauge(
@@ -394,9 +404,7 @@ def render_free_429_section(counts: dict | None) -> list[str]:
     return lines
 
 
-def render_fallback_section(
-    fb_snap: dict, fo_snap: dict, causes: tuple = FALLBACK_CAUSES
-) -> list[str]:
+def render_fallback_section(fb_snap: dict, fo_snap: dict, causes: tuple = FALLBACK_CAUSES) -> list[str]:
     """Familles counter proxy_fallback_total / proxy_failover_total.
 
     Toujours émises (même à zéro) pour la cause quota_429 — les dashboards
@@ -452,9 +460,7 @@ def render_lot0_section(
     lines.append("# HELP proxy_ttfb_failover_total retentatives du watchdog TTFB paid")
     lines.append("# TYPE proxy_ttfb_failover_total counter")
     for _ka, _st in sorted(ttfb_snap.keys()):
-        lines.append(
-            f'proxy_ttfb_failover_total{{key_alias="{_ka}",retry_stage="{_st}"}} {ttfb_snap[(_ka, _st)]}'
-        )
+        lines.append(f'proxy_ttfb_failover_total{{key_alias="{_ka}",retry_stage="{_st}"}} {ttfb_snap[(_ka, _st)]}')
     return lines
 
 

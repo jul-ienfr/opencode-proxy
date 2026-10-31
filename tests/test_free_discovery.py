@@ -331,8 +331,7 @@ class TestApplyPersist:
         try:
             # muse-spark models use /v1/responses (Responses API), not /chat/completions
             assert (
-                st._free_endpoint_for("muse-spark-1.2-contributor-free")
-                == "https://opencode.ai/inference/v1/responses"
+                st._free_endpoint_for("muse-spark-1.2-contributor-free") == "https://opencode.ai/inference/openai/v1/responses"
             )
             assert st._free_endpoint_for("mimo-v2.5-free") == st.API_BASE_FREE
         finally:
@@ -445,9 +444,7 @@ class TestForcedPoolRotation:
         assert "forced_pool" in captured, "_launch_rotation must have been called"
         assert captured["forced_pool"] is fp, "forced_pool must be passed through"
         # Verify station was tagged with geo constraint
-        assert getattr(station, "_geo_forced_pool", None) is fp, (
-            "station._geo_forced_pool must be set to forced_pool"
-        )
+        assert getattr(station, "_geo_forced_pool", None) is fp, "station._geo_forced_pool must be set to forced_pool"
 
     def test_quota_rotation_without_forced_pool_no_tag(self):
         """When forced_pool is None, station must NOT be tagged with

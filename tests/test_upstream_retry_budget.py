@@ -59,8 +59,7 @@ def test_defaut_effectif_identique_a_avant():
     cfg = _read_cfg()
     got = oc._upstream_max_retries()
     assert got == _legacy_expected(cfg), (
-        "G2 change le budget effectif sur la config du dépôt — "
-        f"attendu {_legacy_expected(cfg)}, obtenu {got}"
+        f"G2 change le budget effectif sur la config du dépôt — attendu {_legacy_expected(cfg)}, obtenu {got}"
     )
 
 

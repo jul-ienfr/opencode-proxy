@@ -78,6 +78,25 @@ def _lean_blocks(blocks, max_chars: int) -> tuple[list, int]:
         return blocks if isinstance(blocks, list) else [], 0
 
 
+def _lean_tool_blocks_only(blocks, max_chars: int) -> tuple[list, int]:
+    """Trim ONLY tool_result/function_call_output blocks.
+
+    [audit 2026-10-30] A user message can contain a tool_result AND a long
+    user instruction. The old path leaned every text block of such a message
+    as if it were tool output, truncating the instruction at 2000 chars.
+    """
+    cut = 0
+    out = []
+    for b in blocks if isinstance(blocks, list) else []:
+        if isinstance(b, dict) and b.get("type") in ("tool_result", "function_call_output"):
+            nb, c = _lean_blocks([b], max_chars)
+            out.extend(nb)
+            cut += c
+        else:
+            out.append(b)
+    return out, cut
+
+
 def _is_tool_message(msg) -> bool:
     """Message de sortie d'outil : rôle tool/function OU bloc tool_result /
     function_call_output (formats Anthropic/Chat/Responses)."""
@@ -110,7 +129,11 @@ def _lean_tool_message(msg, max_chars: int) -> tuple[dict, int]:
             t, cut = _lean_text(content, max_chars)
             nm["content"] = t
         elif isinstance(content, list):
-            nm["content"], cut = _lean_blocks(content, max_chars)
+            _whole = msg.get("role") in ("tool", "function") or str(msg.get("type", "")).lower() == "function_call_output"
+            if _whole:
+                nm["content"], cut = _lean_blocks(content, max_chars)
+            else:
+                nm["content"], cut = _lean_tool_blocks_only(content, max_chars)
         # Responses : le texte vit aussi sous output/output_text.
         for key in ("output",):
             val = nm.get(key)

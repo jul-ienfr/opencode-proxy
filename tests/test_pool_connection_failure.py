@@ -99,9 +99,7 @@ class TestPoolSignalling:
 
         p.notify_connection_failure(st1)
 
-        assert p._per_station(st1)["bad_until"] is None, (
-            "C1: last standing station must not be bad-marked"
-        )
+        assert p._per_station(st1)["bad_until"] is None, "C1: last standing station must not be bad-marked"
         assert st1.armed == [1], "arm happens even under C1 (mono-station too)"
 
     def test_mono_station_arms_without_mark(self):
@@ -138,9 +136,7 @@ class TestPoolSignalling:
 
         p.notify_connection_failure(st1)
 
-        assert p._per_station(st1)["bad_until"] is None, (
-            "fresh rotation (< bad_ttl) absorbs the late signal"
-        )
+        assert p._per_station(st1)["bad_until"] is None, "fresh rotation (< bad_ttl) absorbs the late signal"
         assert st1.armed == [1]
 
     def test_stale_signal_bad_marks(self):
@@ -377,9 +373,7 @@ class TestRequestPathWiring:
         """RequestsError code 7 (connection failed — the dead-tunnel class)
         → notified + re-raised: the caller keeps its fallback, the pool
         bad-marks and the manager arms."""
-        rec = self._patch(
-            monkeypatch, self._FakeSession(error=_err.RequestsError("connect failed", 7))
-        )
+        rec = self._patch(monkeypatch, self._FakeSession(error=_err.RequestsError("connect failed", 7)))
 
         with pytest.raises(_err.RequestsError):
             await oc._do_free_request_curl_cffi({}, {}, "socks5://127.0.0.1:1080", "st1")
@@ -477,9 +471,7 @@ class TestStreamsCancelled:
         pool.cancel_streams(st1)
 
         assert pool.is_watchdog_cancelled(st1, t2)
-        assert not pool.is_watchdog_cancelled(st1, t1), (
-            "stale burst id must not survive the overwrite"
-        )
+        assert not pool.is_watchdog_cancelled(st1, t1), "stale burst id must not survive the overwrite"
 
     def test_re_registered_stream_marked_again(self):
         """A stream still REGISTERED at the next burst is re-marked (still

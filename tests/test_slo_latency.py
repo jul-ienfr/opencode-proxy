@@ -12,8 +12,6 @@ distributions. La mesure existait deja ; personne ne la comparait a une cible.
   * une serie `unknown` ne masque jamais une serie cassee.
 """
 
-import pytest
-
 from observability.slo import DEFAULT_TARGETS, MIN_SAMPLES, evaluate, series_from_health
 
 

@@ -77,17 +77,25 @@ jobs:
         # n'existent pas, donc `--check` signalerait « périmé » à tort. Le CI
         # vérifie donc que le script TOURNE et produit bien des variantes
         # compressées pour chaque asset servi.
+        # Récursif depuis la découpe Vite (bundles dans static/dist/assets/) et
+        # aligné sur le contrat de scripts/precompress.py : seuls les .js/.css
+        # de ≥ 500 o sont compressés (MIN_SIZE), les plus petits sont ignorés
+        # volontairement.
         run: |
           python scripts/precompress.py -q
           python - <<'PY'
           import os
-          missing = [
-              f"{n}.{e}"
-              for n in os.listdir("static")
-              if n.endswith((".js", ".css"))
-              for e in ("gz",)
-              if not os.path.exists(os.path.join("static", f"{n}.{e}"))
-          ]
+          missing = []
+          for root, _dirs, files in os.walk("static"):
+              for n in sorted(files):
+                  if not n.endswith((".js", ".css")):
+                      continue
+                  src = os.path.join(root, n)
+                  if os.path.getsize(src) < 500:
+                      continue
+                  gz = src + ".gz"
+                  if not os.path.exists(gz):
+                      missing.append(os.path.relpath(gz, "static"))
           print("manquants:", missing or "aucun")
           assert not missing, f"pré-compression incomplète: {missing}"
           PY

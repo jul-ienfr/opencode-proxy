@@ -142,9 +142,7 @@ class TestH3RedactedThinkingCache:
             data = f"blob_{i}_" + "A" * 64
             body = {
                 "model": "test",
-                "messages": [
-                    {"role": "assistant", "content": [{"type": "redacted_thinking", "data": data}]}
-                ],
+                "messages": [{"role": "assistant", "content": [{"type": "redacted_thinking", "data": data}]}],
             }
             pm.anthropic_to_openai(body, "glm-5-air")
         assert len(pm._redacted_thinking_cache) <= pm._REDACTED_THINKING_CACHE_MAX
@@ -280,7 +278,11 @@ class TestH6ToolsRoundtrip:
         msgs = [
             {"role": "user", "content": "hi"},
             {"role": "tool", "tool_call_id": "nonexistent", "content": "orphan"},
-            {"role": "assistant", "content": "ok", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+            {
+                "role": "assistant",
+                "content": "ok",
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+            },
             {"role": "tool", "tool_call_id": "call_1", "content": "valid"},
         ]
         filtered = pm._drop_orphan_tool_messages(msgs)

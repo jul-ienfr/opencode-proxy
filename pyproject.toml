@@ -43,7 +43,9 @@ disallow_untyped_defs = false
 check_untyped_defs = false
 no_implicit_optional = false
 strict = false
-exclude = ["\\.kilo/", "\\.venv/", "logs/", "Lib/", "scripts/bottle\\.py", "scripts/pywin32_.*\\.py", "\\.audit-wt/", "\\.audit-logs-wt/", "\\.trou.*-wt/"]
+# _research/ = sondes et protocoles jetables (probe_*/diagnose_*) : jamais
+# importés en prod ni en CI, leur typage ne doit pas peser sur la gate.
+exclude = ["\\.kilo/", "\\.venv/", "logs/", "Lib/", "scripts/bottle\\.py", "scripts/pywin32_.*\\.py", "\\.audit-wt/", "\\.audit-logs-wt/", "\\.trou.*-wt/", "_research/"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

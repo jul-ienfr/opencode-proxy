@@ -98,9 +98,9 @@ class _EchoHandler(http.server.BaseHTTPRequestHandler):
             # wire (même pour les appelants non-stream, qui collectent) :
             # l'écho répond en SSE comme l'amont réel.
             sse = (
-                b'data: {"id":"echo","object":"chat.completion.chunk","model":"free-test-model",'
+                b'data: {"id":"echo","object":"chat.completion.chunk","model":"paid-test-model-free",'
                 b'"choices":[{"index":0,"delta":{"role":"assistant","content":"echo"},"finish_reason":null}]}\n\n'
-                b'data: {"id":"echo","object":"chat.completion.chunk","model":"free-test-model",'
+                b'data: {"id":"echo","object":"chat.completion.chunk","model":"paid-test-model-free",'
                 b'"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
                 b'"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n'
                 b"data: [DONE]\n\n"
@@ -115,7 +115,7 @@ class _EchoHandler(http.server.BaseHTTPRequestHandler):
             {
                 "id": "echo",
                 "object": "chat.completion",
-                "model": "free-test-model",
+                "model": "paid-test-model-free",
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},
                 "choices": [
                     {
@@ -190,7 +190,7 @@ def free_env(monkeypatch, echo_server, tmp_path):
     monkeypatch.setattr(oc, "_log_free_model_usage", lambda *a, **k: None)
     monkeypatch.setattr(oc, "_debug", lambda *a, **k: None)
     monkeypatch.setattr(oc, "_log", lambda *a, **k: None)
-    monkeypatch.setattr(oc, "FREE_MODEL_MAP", {"paid-test-model": "free-test-model"})
+    monkeypatch.setattr(oc, "FREE_MODEL_MAP", {"paid-test-model": "paid-test-model-free"})
     # [gate 2026-09-17] la session free ne doit jamais toucher logs/ en test
     monkeypatch.setattr(oc, "_FREE_SESSION_FILE", str(tmp_path / "_free_session_id"))
     oc._FREE_SESSION_CACHE = None
@@ -212,12 +212,8 @@ def assert_no_paid_artifacts(label, headers, body):
     for name in ("x-api-key", "cookie", "x-request-id"):
         assert name not in headers, f"{label}: forbidden header {name!r} reached API_BASE_FREE"
     for name, value in headers.items():
-        assert not name.startswith("x-stainless-"), (
-            f"{label}: SDK identifier {name!r} reached API_BASE_FREE"
-        )
-        assert PAID_KEY_MARKER not in value, (
-            f"{label}: paid key leaked in header {name!r} (value={value!r})"
-        )
+        assert not name.startswith("x-stainless-"), f"{label}: SDK identifier {name!r} reached API_BASE_FREE"
+        assert PAID_KEY_MARKER not in value, f"{label}: paid key leaked in header {name!r} (value={value!r})"
     ua = headers.get("user-agent", "")
     assert "claude-cli" not in ua and "python-httpx" not in ua, (
         f"{label}: client UA leaked to the free endpoint: {ua!r}"
@@ -234,9 +230,9 @@ def assert_official_free_identity(label, headers):
     # n'ont pas le même suffixe provider-utils/runtime. On vérifie la FORME
     # officielle, pas une version figée.
     ua = headers.get("user-agent") or ""
-    assert re.match(
-        r"^opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/", ua
-    ), f"{label}: official UA expected, got {ua!r}"
+    assert re.match(r"^opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/", ua), (
+        f"{label}: official UA expected, got {ua!r}"
+    )
     # [ALIGNEMENT 2026-10-20] Wire officiel 1.19.3 : l'identité de session est
     # portée par x-opencode-session-id / x-session-affinity / x-session-id
     # (même valeur). Le quartet 1.18.x (client/project/request/session) n'est
@@ -253,16 +249,12 @@ def assert_official_free_identity(label, headers):
         or headers.get("x-session-id")
         or headers.get("x-opencode-session")
     )
-    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", _sid or ""), (
-        f"{label}: bad free session ID: {_sid!r}"
-    )
+    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", _sid or ""), f"{label}: bad free session ID: {_sid!r}"
 
 
 def _single_capture(label):
     captured = _EchoHandler.captured
-    assert len(captured) == 1, (
-        f"{label}: expected exactly 1 request to the echo server, got {len(captured)}"
-    )
+    assert len(captured) == 1, f"{label}: expected exactly 1 request to the echo server, got {len(captured)}"
     return captured[0]
 
 
@@ -274,7 +266,7 @@ async def test_path_b_direct_httpx_free_attempt(free_env):
     assert result is not None, "free attempt must succeed against the echo server"
     resp, _resp_headers, free_model, _free_ip = result
     assert resp.status_code == 200
-    assert free_model == "free-test-model", "model swap to the free model failed"
+    assert free_model == "paid-test-model-free", "model swap to the free model failed"
 
     cap = _single_capture("Path B")
     headers = cap["headers"]
@@ -283,28 +275,24 @@ async def test_path_b_direct_httpx_free_attempt(free_env):
     assert_official_free_identity("Path B", headers)
     # Model swap reached the wire
     wire = json.loads(cap["body"])
-    assert wire["model"] == "free-test-model"
+    assert wire["model"] == "paid-test-model-free"
     # [gate body 2026-09-18] grille tools (read seul depuis V6.2.2) + stream : le
     # corps non-stream du client part en stream:true avec les shims.
     assert wire.get("stream") is True, "Path B: free wire must force stream:true"
     # [V6.2.2] `bash` retiré : mesuré non load-bearing (read seul -> 200).
-    assert {"read"} <= {
-        t.get("function", {}).get("name") for t in wire.get("tools", []) if isinstance(t, dict)
-    }, "Path B: free wire must carry the read tool"
+    assert {"read"} <= {t.get("function", {}).get("name") for t in wire.get("tools", []) if isinstance(t, dict)}, (
+        "Path B: free wire must carry the read tool"
+    )
     # Le jeu officiel est uniforme : aucun header protocole client
     # (anthropic-version) n'est répercuté
-    assert "anthropic-version" not in headers, (
-        "Path B: official header set expected (no client protocol header)"
-    )
+    assert "anthropic-version" not in headers, "Path B: official header set expected (no client protocol header)"
 
 
 # ── Path D: stream direct fallback (httpx) ────────────────────────────────
 @pytest.mark.asyncio
 async def test_path_d_direct_stream_fallback(free_env):
-    body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
-    async with oc._open_free_stream(
-        oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True
-    ) as resp:
+    body = {"model": "paid-test-model-free", "messages": [{"role": "user", "content": "hello"}]}
+    async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True) as resp:
         assert resp.status_code == 200
         lines = [ln async for ln in resp.aiter_lines()]
     assert any("echo" in ln for ln in lines), "stream must deliver the echo payload"
@@ -314,16 +302,14 @@ async def test_path_d_direct_stream_fallback(free_env):
     assert_no_paid_artifacts("Path D", headers, cap["body"])
     # [gate 2026-09-17] identité officielle, pas de répercussion client
     assert_official_free_identity("Path D", headers)
-    assert "anthropic-version" not in headers, (
-        "Path D: official header set expected (no client protocol header)"
-    )
+    assert "anthropic-version" not in headers, "Path D: official header set expected (no client protocol header)"
 
 
 # ── Path A: non-stream via VPN (curl_cffi) ────────────────────────────────
 @pytest.mark.asyncio
 async def test_path_a_curl_cffi_non_stream(free_env):
     pytest.importorskip("curl_cffi")
-    body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
+    body = {"model": "paid-test-model-free", "messages": [{"role": "user", "content": "hello"}]}
     resp = await oc._do_free_request_curl_cffi(body, dict(PAID_HEADERS), proxy_url=None)
     assert resp.status_code == 200
 
@@ -333,9 +319,7 @@ async def test_path_a_curl_cffi_non_stream(free_env):
     # [gate 2026-09-17] UA officiel posé explicitement (le bundle curl ne
     # l'écrase pas : il ne remplit que les headers absents)
     assert_official_free_identity("Path A", headers)
-    assert "anthropic-version" not in headers, (
-        "Path A: official header set expected (no client protocol header)"
-    )
+    assert "anthropic-version" not in headers, "Path A: official header set expected (no client protocol header)"
 
 
 # ── Path C: stream via tunnel (curl_cffi) ─────────────────────────────────
@@ -345,10 +329,8 @@ async def test_path_c_curl_cffi_tunnel_stream(free_env, monkeypatch):
     monkeypatch.setattr(oc, "_free_ip_pool", _StubPool())
     # Drop only the tunnel hop; the REAL curl_cffi stream branch keeps running.
     monkeypatch.setattr(oc, "_curl_proxy_url", lambda p: None)
-    body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
-    async with oc._open_free_stream(
-        oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True
-    ) as resp:
+    body = {"model": "paid-test-model-free", "messages": [{"role": "user", "content": "hello"}]}
+    async with oc._open_free_stream(oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True) as resp:
         assert resp.status_code == 200
         lines = [ln async for ln in resp.aiter_lines()]
     assert any("echo" in ln for ln in lines), "stream must deliver the echo payload"
@@ -358,9 +340,7 @@ async def test_path_c_curl_cffi_tunnel_stream(free_env, monkeypatch):
     assert_no_paid_artifacts("Path C", headers, cap["body"])
     # [gate 2026-09-17] identité officielle sur la branche curl aussi
     assert_official_free_identity("Path C", headers)
-    assert "anthropic-version" not in headers, (
-        "Path C: official header set expected (no client protocol header)"
-    )
+    assert "anthropic-version" not in headers, "Path C: official header set expected (no client protocol header)"
 
 
 # ── _current_free_identity: station-aware identity resolution ─────────────
@@ -383,9 +363,7 @@ class _StubIdentityPool:
 
 def test_current_free_identity_explicit_station_wins_over_pool_active(monkeypatch):
     """Explicit station param WINS over the pool's last-picked station."""
-    explicit = _StubIdentityMgr(
-        {"impersonate": "firefox144", "user_agent": None, "extra_headers": {}}
-    )
+    explicit = _StubIdentityMgr({"impersonate": "firefox144", "user_agent": None, "extra_headers": {}})
     active = _StubIdentityMgr({"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
     monkeypatch.setattr(oc, "_free_ip_pool", _StubIdentityPool(active))
     monkeypatch.setattr(oc, "_vpn_manager", None)
@@ -446,8 +424,7 @@ class _StubPoolNeverCount(_StubPool):
     async def on_request(self):
         type(self).calls += 1
         raise AssertionError(
-            "count_request=False must not call pool.on_request() "
-            "(the quota counter must not advance on a retry)"
+            "count_request=False must not call pool.on_request() (the quota counter must not advance on a retry)"
         )
 
 
@@ -469,8 +446,7 @@ class _StubPoolDisconnectRetry:
     async def on_request(self):
         type(self).calls_to_request += 1
         raise AssertionError(
-            "fresh_station=True must not call pool.on_request() "
-            "(the quota counter must not advance on a retry)"
+            "fresh_station=True must not call pool.on_request() (the quota counter must not advance on a retry)"
         )
 
     async def on_disconnect_retry(self, failed=None):
@@ -535,9 +511,7 @@ async def test_open_free_stream_count_false_reuses_stored_station(free_env, monk
     _FakeCurlSession.created.clear()
 
     pool = _StubPoolNeverCount()
-    pool.active_station = _StubIdentityMgr(
-        {"impersonate": "edge101", "user_agent": None, "extra_headers": {}}
-    )
+    pool.active_station = _StubIdentityMgr({"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
     # The stored station is an int sentinel here; the real helper would
     # dereference .current_ip on it — stub it (the IP is already in the
@@ -561,7 +535,7 @@ async def test_open_free_stream_count_false_reuses_stored_station(free_env, monk
         }
     )
     try:
-        body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
+        body = {"model": "paid-test-model-free", "messages": [{"role": "user", "content": "hello"}]}
         async with oc._open_free_stream(
             oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True, count_request=False
         ) as resp:
@@ -615,7 +589,7 @@ async def test_open_free_stream_count_false_empty_attempt_direct_fallback(free_e
 
     oc._current_free_attempt.set({})
     try:
-        body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
+        body = {"model": "paid-test-model-free", "messages": [{"role": "user", "content": "hello"}]}
         async with oc._open_free_stream(
             oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True, count_request=False
         ) as resp:
@@ -636,9 +610,7 @@ async def test_open_free_stream_count_false_empty_attempt_direct_fallback(free_e
     # FORME officielle, pas une version figée — le test doit rester stable
     # quand le vault tire l'une ou l'autre.
     ua = kwargs["headers"].get("User-Agent") or ""
-    assert re.match(
-        r"^opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/", ua
-    ), ua
+    assert re.match(r"^opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/", ua), ua
     assert kwargs["headers"].get("Authorization") == "Bearer public"
     # Retry state: station None → the next attempt also falls back direct
     assert attempt.get("station") is None
@@ -681,7 +653,7 @@ async def test_open_free_stream_fresh_station_switches_station(free_env, monkeyp
         }
     )
     try:
-        body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
+        body = {"model": "paid-test-model-free", "messages": [{"role": "user", "content": "hello"}]}
         async with oc._open_free_stream(
             oc.API_BASE_FREE,
             body,
@@ -707,9 +679,7 @@ async def test_open_free_stream_fresh_station_switches_station(free_env, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_open_free_stream_fresh_station_direct_fallback_preserves_station(
-    free_env, monkeypatch
-):
+async def test_open_free_stream_fresh_station_direct_fallback_preserves_station(free_env, monkeypatch):
     """fresh_station=True but no usable station (on_disconnect_retry returns
     (None, None)) → direct httpx fallback; the ContextVar KEEPS the failed
     station so a later retry can still switch away from it instead of
@@ -727,7 +697,7 @@ async def test_open_free_stream_fresh_station_direct_fallback_preserves_station(
         {"proxy_url": "socks5://127.0.0.1:1080", "station": 1, "identity": "", "ip": "9.9.9.9"}
     )
     try:
-        body = {"model": "free-test-model", "messages": [{"role": "user", "content": "hello"}]}
+        body = {"model": "paid-test-model-free", "messages": [{"role": "user", "content": "hello"}]}
         async with oc._open_free_stream(
             oc.API_BASE_FREE,
             body,

@@ -127,7 +127,7 @@ def is_retryable_status(status: object) -> bool:
     n'est pas rejouable — mieux vaut rendre l'erreur que boucler dessus.
     """
     try:
-        code = int(status)  # type: ignore[arg-type]
+        code = int(status)  # type: ignore[call-overload]
     except (TypeError, ValueError):
         return False
     return code in RETRYABLE_STATUSES

@@ -4,9 +4,7 @@ import json
 import os
 import sys
 
-STATE_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "window_state.json"
-)
+STATE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "window_state.json")
 
 
 def _load_state():

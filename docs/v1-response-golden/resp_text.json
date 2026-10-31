@@ -41,6 +41,6 @@
       "cache_read_input_tokens": 4
     }
   },
-  "_note": "usage prompt/completion -> input/output tokens ; cached_tokens -> cache_read ; input Anthropic = 12 − 4 = 8",
+  "_note": "usage prompt/completion -> input/output tokens ; cached_tokens -> cache_read",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
 }

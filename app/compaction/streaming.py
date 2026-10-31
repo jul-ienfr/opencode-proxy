@@ -44,12 +44,7 @@ def should_buffer_compaction(
     texte (tool_use, thinking, bloc compaction natif…) retombe en live.
     """
     try:
-        return bool(
-            is_stream
-            and is_compaction
-            and tiny_retry_enabled
-            and has_free_leg
-        )
+        return bool(is_stream and is_compaction and tiny_retry_enabled and has_free_leg)
     except Exception:
         return False
 
@@ -197,7 +192,7 @@ def _dump(payload) -> bytes:
 
 
 def chat_sse_from_completion(
-    text, *, model="", msg_id="", created=0, prompt_tokens=0, completion_tokens=0
+    text, *, model="", msg_id="", created=0, prompt_tokens=0, completion_tokens=0, finish_reason="stop"
 ) -> list:
     """SSE Chat Completions depuis un texte complet : 1 delta + final + DONE.
 
@@ -215,11 +210,9 @@ def chat_sse_from_completion(
             "model": model or "",
         }
         first = dict(base)
-        first["choices"] = [
-            {"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}
-        ]
+        first["choices"] = [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]
         last = dict(base)
-        last["choices"] = [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        last["choices"] = [{"index": 0, "delta": {}, "finish_reason": str(finish_reason or "stop")}]
         last["usage"] = {
             "prompt_tokens": prompt_tokens or 0,
             "completion_tokens": completion_tokens or 0,
@@ -285,9 +278,7 @@ def anthropic_sse_from_completion(
             b"event: content_block_delta\ndata: "
             + _dump({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})
             + b"\n\n",
-            b"event: content_block_stop\ndata: "
-            + _dump({"type": "content_block_stop", "index": 0})
-            + b"\n\n",
+            b"event: content_block_stop\ndata: " + _dump({"type": "content_block_stop", "index": 0}) + b"\n\n",
             b"event: message_delta\ndata: "
             + _dump(
                 {

@@ -34,23 +34,22 @@ import argparse
 import json
 import os
 import subprocess
-import sys
 import tempfile
-import time
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUT = os.path.join(ROOT, "free", "official_payload.json")
 
 SSE = (
-    'data: {"id":"chatcmpl-capture","object":"chat.completion.chunk","created":1,'
-    '"model":"capture","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},'
-    '"finish_reason":null}]}\n\n'
-    'data: {"id":"chatcmpl-capture","object":"chat.completion.chunk","created":1,'
-    '"model":"capture","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
-    "data: [DONE]\n\n"
-).encode()
+    b'data: {"id":"chatcmpl-capture","object":"chat.completion.chunk","created":1,'
+    b'"model":"capture","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},'
+    b'"finish_reason":null}]}\n\n'
+    b'data: {"id":"chatcmpl-capture","object":"chat.completion.chunk","created":1,'
+    b'"model":"capture","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+    b"data: [DONE]\n\n"
+)
 
 
 class _Capture(BaseHTTPRequestHandler):
@@ -165,9 +164,7 @@ def main() -> None:
         if proc.stderr:
             print(f"[capture] stderr : {proc.stderr.strip()[-400:]}")
     except FileNotFoundError:
-        raise SystemExit(
-            "[capture] `opencode` introuvable. Installe-le (npm i -g opencode-ai) puis relance."
-        )
+        raise SystemExit("[capture] `opencode` introuvable. Installe-le (npm i -g opencode-ai) puis relance.") from None
     except subprocess.TimeoutExpired:
         print("[capture] délai dépassé, on regarde ce qui a été reçu")
     finally:
@@ -195,7 +192,7 @@ def main() -> None:
 
     body = json.loads(rec["body"])
     tools = [t.get("function", {}).get("name") for t in body.get("tools") or []]
-    system = next((m for m in body.get("messages") or [] if m.get("role") == "system"), {})
+    system: dict = next((m for m in body.get("messages") or [] if m.get("role") == "system"), {})
     if len(tools) < 10:
         print(f"[capture] ATTENTION : seulement {len(tools)} tools vus (attendu 10)")
 

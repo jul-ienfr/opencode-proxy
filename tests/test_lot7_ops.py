@@ -38,8 +38,7 @@ def make_scope(method="POST", length=None):
     headers = []
     if length is not None:
         headers.append((b"content-length", str(length).encode()))
-    return {"type": "http", "method": method, "path": "/v1/messages",
-            "headers": headers, "client": ("127.0.0.1", 5)}
+    return {"type": "http", "method": method, "path": "/v1/messages", "headers": headers, "client": ("127.0.0.1", 5)}
 
 
 @pytest.mark.asyncio
@@ -100,10 +99,10 @@ def test_metrics_text_contains_expected_families(monkeypatch):
         "# TYPE vpn_station_connected gauge",
         'vpn_station_connected{station="1"} 1',
         'vpn_station_connected{station="2"} 0',
-        "vpn_latency_ewma_ms{station=\"1\",ip=\"1.2.3.4\"}",
-        "vpn_latency_p95_ms{station=\"1\",ip=\"1.2.3.4\"",
-        "vpn_rotations_total{kind=\"soft\"} 1",
-        "vpn_cooldown_active{kind=\"soft\"} 1",
+        'vpn_latency_ewma_ms{station="1",ip="1.2.3.4"}',
+        'vpn_latency_p95_ms{station="1",ip="1.2.3.4"',
+        'vpn_rotations_total{kind="soft"} 1',
+        'vpn_cooldown_active{kind="soft"} 1',
         'vpn_rotation_paused{paused="false"} 0',
     ):
         assert expected in text, f"métrique manquante: {expected}"
@@ -129,9 +128,7 @@ def test_maintenance_next_run_is_sunday_3am():
 
     now = dtm.datetime(2026, 8, 25, 9, 30)  # mardi
     days_ahead = (6 - now.weekday()) % 7  # 6 = dimanche
-    target = (now + dtm.timedelta(days=days_ahead)).replace(
-        hour=3, minute=0, second=0, microsecond=0
-    )
+    target = (now + dtm.timedelta(days=days_ahead)).replace(hour=3, minute=0, second=0, microsecond=0)
     if target <= now:
         target += dtm.timedelta(weeks=1)
     assert target.weekday() == 6 and target.hour == 3

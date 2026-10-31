@@ -35,6 +35,17 @@ goldens §v1-response.md. Aliases actuels (`free_model_map`) :
 - `muse-spark-1.2-contributor` → `muse-spark-1.3-contributor-free` (la cible `-free` homonyme est `deprecated` côté anonyme — recâblé N2 le 2026-10-12)
 - `muse-spark-1.3-contributor` → `muse-spark-1.3-contributor-free`
 
+> Les alias `ROUTES`/custom routes sont résolus **avant** le mapping free :
+> `glm-5.1` et `qwen3.7-max` partent vers `glm-5.3-flash-free` (tier `paid`,
+> `tier_source=route`, `free_target=glm-5.3-flash-free`), même si une ancienne
+> entrée `free_model_map` existe. Une cible gratuite est un **repli**, pas une
+> promotion de l'alias en gratuit.
+>
+> Une entrée **explicite** de `free_model_map` est toujours honorée, y compris
+> quand la politique est `homonym` : la politique ne filtre que les candidats
+> automatiques (`X-free`, `free_model_candidates`). Depuis le 2026-10-29, ce
+> n'est plus `homonym` qui décide si un mapping déployé est actif.
+
 Modèles free directs : `nemotron-3-ultra-free`,
 `nemotron-3.5-lightning-free`, `deepseek-v4-flash-vision-exp`, `longcat-2.0`.
 
@@ -43,6 +54,41 @@ Modèles free directs : `nemotron-3-ultra-free`,
 > (2026-09-09 — pings live 503 upstream). La découverte auto est add-only,
 > mais `live_models` les retire du routage au relevé suivant s'ils ne sont
 > plus annoncés.
+
+### Tier gratuit/payant vs jambe de routage (2026-10-27)
+
+Le champ `proxy.leg` de `GET /v1/models` est la **jambe du catalogue**
+(`opencode` = anonyme, `opencode-go` = clé API), pas le tier de facturation.
+Un id annoncé sur la jambe gratuite peut être routé payant ; un id payant peut
+avoir un repli gratuit. La source canonique est `config/model_tier.py` :
+
+- `tier` (`free`/`paid`/`unknown`) : suffixe `-free` → mapping actif →
+  registre vérifié `FREE_MODELS` (`discovery`) → `free_verified` hors registre →
+  endpoint payant → endpoint free non vérifié (`unproven`) → catalogue →
+  inconnu. Le registre n'est **plus** alimenté par le simple listing de la jambe
+  anonyme : les nouveaux ids passent par la sonde free-leg automatique
+  (`alive`/`limited`, ou `not_probeable` seulement si déjà free par suffixe,
+  mapping ou `free_verified`). Les refus (`not_free`, `dead`) et les `unknown`
+  restent `paid` ; le cache des promotions est
+  [`config/free_models_probed.json`](../config/free_models_probed.json).
+- `route_leg` : endpoint réellement configuré pour l'id ;
+- `route_target` : cible réelle d'un alias (une seule résolution, comme le
+  chemin de requête) ;
+- `free_first` : le proxy tentera un gratuit d'abord (reste `tier=paid` si le
+  modèle demandé est payant) ;
+- `free_target` : ce qui sera réellement appelé (mapping actif **ou** alias
+  de route vers une cible free) ;
+- `route_mismatch` / `catalog_mismatch` : incohérences signalées, jamais
+  utilisées pour masquer un modèle. Les candidats `unproven` ne déclenchent
+  pas `route_mismatch`.
+- `probe` : dernier verdict de la sonde free-leg (`alive`, `limited`,
+  `not_free`, `dead`, `unknown`, `not_probeable`) + statut HTTP, pour l'id ou
+  sa cible réelle.
+
+`GET /v1/models?tier=free` est strict (pas de payant à repli) ;
+`GET /v1/models?tier=paid&free_first=true` liste les payants servis
+gratuitement d'abord. Les en-têtes par appel sont documentés dans
+[`clients-compat.md`](clients-compat.md).
 
 ## Catalogue vivant (`live_models`)
 

@@ -147,9 +147,7 @@ def test_opencode_import_budget():
         out = _boot_probe(
             "import time;t=time.perf_counter();import opencode;print('MS: %.0f' % ((time.perf_counter()-t)*1000))"
         )
-        vals.append(
-            float([ln for ln in out.splitlines() if ln.startswith("MS:")][0].split(":")[1])
-        )
+        vals.append(float([ln for ln in out.splitlines() if ln.startswith("MS:")][0].split(":")[1]))
     ms = min(vals)
     assert ms < 900, f"import opencode = {ms:.0f} ms (budget 900 ms, passes={vals})"
 

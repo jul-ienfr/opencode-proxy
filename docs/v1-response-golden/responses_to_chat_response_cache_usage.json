@@ -65,7 +65,7 @@
             }
           ]
         },
-        "finish_reason": "stop"
+        "finish_reason": "tool_calls"
       }
     ],
     "usage": {

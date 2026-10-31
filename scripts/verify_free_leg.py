@@ -113,8 +113,11 @@ def main() -> int:
     t0 = time.monotonic()
     code, d = _req(
         f"{base}/v1/chat/completions",
-        {"model": model, "messages": [{"role": "user", "content": f"Réponds exactement : OK [v{nonce}]"}],
-         "max_tokens": 16},
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": f"Réponds exactement : OK [v{nonce}]"}],
+            "max_tokens": 16,
+        },
         args.timeout,
     )
     ms = round((time.monotonic() - t0) * 1000)
@@ -129,8 +132,11 @@ def main() -> int:
     # 3. Anthropic.
     code, d = _req(
         f"{base}/v1/messages",
-        {"model": model, "max_tokens": 16,
-         "messages": [{"role": "user", "content": f"Réponds exactement : OK [v{nonce}]"}]},
+        {
+            "model": model,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": f"Réponds exactement : OK [v{nonce}]"}],
+        },
         args.timeout,
     )
     blocks = [b.get("type") for b in (d.get("content") or [])] if code == 200 else []
@@ -153,16 +159,22 @@ def main() -> int:
             "function": {
                 "name": "get_weather",
                 "description": "Donne la météo d'une ville.",
-                "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
-                               "required": ["city"]},
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
             },
         }
         code, d = _req(
             f"{base}/v1/chat/completions",
-            {"model": model, "max_tokens": 96,
-             "messages": [{"role": "user",
-                           "content": f"Utilise l'outil get_weather pour Paris. N'utilise aucun autre outil. [v{nonce}]"}],
-             "tools": [tool]},
+            {
+                "model": model,
+                "max_tokens": 96,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"Utilise l'outil get_weather pour Paris. N'utilise aucun autre outil. [v{nonce}]",
+                    }
+                ],
+                "tools": [tool],
+            },
             args.timeout,
         )
         calls = []
@@ -174,9 +186,11 @@ def main() -> int:
 
         code, d = _req(
             f"{base}/v1/chat/completions",
-            {"model": args.reasoning_model, "max_tokens": 300,
-             "messages": [{"role": "user",
-                           "content": f"Calcule 17*23 en détaillant chaque étape. [v{nonce}]"}]},
+            {
+                "model": args.reasoning_model,
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": f"Calcule 17*23 en détaillant chaque étape. [v{nonce}]"}],
+            },
             args.timeout,
         )
         reasoning = ""

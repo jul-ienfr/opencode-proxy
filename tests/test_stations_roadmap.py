@@ -209,9 +209,7 @@ def test_sync_stack_env_preserves_mixed_stacks(tmp_path):
     mgr = object.__new__(VPNManager)
     compose = tmp_path / "docker-compose.yml"
     compose.write_text("services: {}\n", encoding="utf-8")
-    (tmp_path / ".env").write_text(
-        "VPN_TYPE_STATION1=wireguard\nSOME_SECRET=abc\n", encoding="utf-8"
-    )
+    (tmp_path / ".env").write_text("VPN_TYPE_STATION1=wireguard\nSOME_SECRET=abc\n", encoding="utf-8")
     mgr._compose_file_path = lambda: str(compose)  # type: ignore[method-assign]
     assert mgr._sync_stack_env({1: "wireguard", 2: "openvpn"}) is True
     text = (tmp_path / ".env").read_text(encoding="utf-8")

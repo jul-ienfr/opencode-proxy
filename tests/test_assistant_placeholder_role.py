@@ -17,6 +17,7 @@ figeait. Constaté sur les corps réels de ``logs/requests.db``.
 
 Ces tests verrouillent la règle « le type de texte suit le rôle ».
 """
+
 import json
 
 import pytest
@@ -57,7 +58,9 @@ def test_assistant_tool_use_never_becomes_input_text():
 @pytest.mark.parametrize("role", ["assistant"])
 def test_assistant_placeholders_are_output_text(role):
     """Tout placeholder de texte d'un assistant est en `output_text`."""
-    parts = _parts(role, [{"type": "text", "text": "ok"}, {"type": "tool_use", "id": "c1", "name": "read", "input": {}}])
+    parts = _parts(
+        role, [{"type": "text", "text": "ok"}, {"type": "tool_use", "id": "c1", "name": "read", "input": {}}]
+    )
     placeholders = [p for p in parts if p.get("type") in ("input_text", "output_text")]
     # Le texte légitime + le placeholder : tous deux output_text.
     assert all(p["type"] == "output_text" for p in placeholders), placeholders
@@ -86,10 +89,10 @@ def test_assistant_text_part_is_output_text():
 @pytest.mark.parametrize(
     "block",
     [
-        {"type": "video_url", "video_url": {"url": "http://x/v.mp4"}},      # vidéo
+        {"type": "video_url", "video_url": {"url": "http://x/v.mp4"}},  # vidéo
         {"type": "input_audio", "input_audio": {"data": "zz", "format": "ogg"}},  # audio hors set
-        {"type": "document", "source": {"type": "base64"}},                # inconnu
-        {"type": "image_url", "image_url": {"url": "https://x/i.png"}},    # image
+        {"type": "document", "source": {"type": "base64"}},  # inconnu
+        {"type": "image_url", "image_url": {"url": "https://x/i.png"}},  # image
         {"type": "input_audio", "input_audio": {"data": "AAA", "format": "wav"}},  # audio DANS le set
         {"type": "file", "file": {"file_data": "data:application/pdf;base64,AAA", "filename": "d.pdf"}},
         {"type": "file", "file": {"file_id": "f_1"}},
@@ -128,11 +131,14 @@ def test_no_input_text_on_any_assistant_across_a_conversation():
         "model": "muse-spark-1.3-contributor",
         "messages": [
             {"role": "user", "content": "fais un truc"},
-            {"role": "assistant", "content": [
-                {"type": "text", "text": "Je regarde."},
-                {"type": "tool_use", "id": "c1", "name": "read", "input": {}},
-                {"type": "tool_use", "id": "c2", "name": "bash", "input": {}},
-            ]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Je regarde."},
+                    {"type": "tool_use", "id": "c1", "name": "read", "input": {}},
+                    {"type": "tool_use", "id": "c2", "name": "bash", "input": {}},
+                ],
+            },
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "ok"}]},
             {"role": "assistant", "content": [{"type": "video_url", "video_url": {"url": "x"}}]},
         ],
@@ -150,7 +156,9 @@ def test_no_input_text_on_any_assistant_across_a_conversation():
 def test_emitted_body_is_wire_serializable():
     """Le corps final reste sérialisable après le fix."""
     out = pm._chat_to_responses_request(
-        _chat("assistant", [{"type": "text", "text": "a"}, {"type": "tool_use", "id": "c", "name": "read", "input": {}}])
+        _chat(
+            "assistant", [{"type": "text", "text": "a"}, {"type": "tool_use", "id": "c", "name": "read", "input": {}}]
+        )
     )
     assert json.loads(json.dumps(out))["input"]
 

@@ -40,7 +40,7 @@
               "media_type": "application/pdf",
               "data": "JVBERi0="
             },
-            "name": "r.pdf"
+            "title": "r.pdf"
           },
           {
             "type": "document",
@@ -55,7 +55,7 @@
               "type": "url",
               "url": "https://ex.com/a.pdf"
             },
-            "name": "u.pdf"
+            "title": "u.pdf"
           }
         ]
       }

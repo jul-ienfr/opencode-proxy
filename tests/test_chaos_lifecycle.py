@@ -120,9 +120,7 @@ def test_reconcile_keeps_healthy_openvpn_fleet_with_stale_wg_key(tmp_path, monke
         if args[:1] == ["inspect"]:
             name = args[1]
             r = R()
-            payload = [
-                {"Config": {"Env": ["VPN_TYPE=openvpn"], "Name": f"/{name}"}}
-            ]
+            payload = [{"Config": {"Env": ["VPN_TYPE=openvpn"], "Name": f"/{name}"}}]
             r.stdout = json.dumps(payload)
             return r
         if args[:1] == ["rm"]:

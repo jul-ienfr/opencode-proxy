@@ -1,4 +1,5 @@
 """Parité v2 pure : output fallback/cap, fit thinking, matrice npm."""
+
 import config.limits as lim
 from config.effort_policy import MIN_THINKING_BUDGET, fit_thinking_budget
 from config.npm_routing import endpoint_for_npm, is_routable_npm

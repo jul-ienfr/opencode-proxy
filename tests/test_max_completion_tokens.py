@@ -57,9 +57,7 @@ def test_p4_chain_still_reads_classic_max_tokens():
 
 def test_p4_chain_defaults_when_client_sends_nothing():
     """Aucune limite demandée → défaut officiel Anthropic 32000 (parité v2)."""
-    out = openai_to_anthropic_request(
-        {"model": "x", "messages": [{"role": "user", "content": "hi"}]}
-    )
+    out = openai_to_anthropic_request({"model": "x", "messages": [{"role": "user", "content": "hi"}]})
     assert out.get("max_tokens") == 32000
 
 
@@ -256,13 +254,9 @@ def test_handlers_pass_the_routed_model_not_the_client_alias():
     import re
     from pathlib import Path
 
-    src = Path(__file__).resolve().parent.parent.joinpath("opencode.py").read_text(
-        encoding="utf-8", errors="replace"
-    )
+    src = Path(__file__).resolve().parent.parent.joinpath("opencode.py").read_text(encoding="utf-8", errors="replace")
     # 2e argument positionnel de l'appel (le 1er est le body à convertir).
-    calls = re.findall(
-        r"anthropic_to_openai\(\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*([A-Za-z_][A-Za-z0-9_]*)", src
-    )
+    calls = re.findall(r"anthropic_to_openai\(\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*([A-Za-z_][A-Za-z0-9_]*)", src)
     bad = [c for c in calls if c != "model_id"]
     assert not bad, (
         f"anthropic_to_openai appelé avec {bad} au lieu de `model_id` : un alias "

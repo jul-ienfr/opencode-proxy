@@ -77,11 +77,11 @@ def test_les_cinq_verdicts():
         free={"vivant-free": {}, "fini-free": {"status": "deprecated"}},
     )
     models = {
-        "vivant": {"protocol": "openai"},           # payé, routé payé
-        "fini": {"protocol": "openai"},             # payé, routé payé, déprécié
-        "vivant-free": {"protocol": "openai"},      # anonyme, routé anonyme
-        "fini-free": {"protocol": "openai"},        # anonyme, routé anonyme, déprécié
-        "fantome": {"protocol": "openai"},           # absent des deux jambes
+        "vivant": {"protocol": "openai"},  # payé, routé payé
+        "fini": {"protocol": "openai"},  # payé, routé payé, déprécié
+        "vivant-free": {"protocol": "openai"},  # anonyme, routé anonyme
+        "fini-free": {"protocol": "openai"},  # anonyme, routé anonyme, déprécié
+        "fantome": {"protocol": "openai"},  # absent des deux jambes
         "interne": {"endpoint": "https://exemple.local/v1"},  # hors catalogue, interne
     }
     got = {mid: mc.classify(mid, cfg, catalog) for mid, cfg in models.items()}
@@ -125,13 +125,18 @@ def test_suffixe_free_ne_decide_pas_de_la_jambe():
 
     # Sans endpoint explicite, le suffixe envoie côté anonyme.
     assert mc.resolved_endpoint("longcat-2.5-preview-free", suffixe) == cs.API_BASE_FREE
-    assert mc.classify("longcat-2.5-preview-free", suffixe, _catalog(paid={"longcat-2.5-preview-free": {}})) == mc.HORS_JAMBE
+    assert (
+        mc.classify("longcat-2.5-preview-free", suffixe, _catalog(paid={"longcat-2.5-preview-free": {}}))
+        == mc.HORS_JAMBE
+    )
     assert mc.classify("longcat-2.5-preview-free", suffixe, _catalog(free={"longcat-2.5-preview-free": {}})) == mc.OK
 
     # La route explicite décide : même id, même suffixe, verdict inverse.
     assert mc.resolved_endpoint("longcat-2.5-preview-free", paye) == cs.API_BASE_OPENAI
     assert mc.classify("longcat-2.5-preview-free", paye, _catalog(paid={"longcat-2.5-preview-free": {}})) == mc.OK
-    assert mc.classify("longcat-2.5-preview-free", paye, _catalog(free={"longcat-2.5-preview-free": {}})) == mc.HORS_JAMBE
+    assert (
+        mc.classify("longcat-2.5-preview-free", paye, _catalog(free={"longcat-2.5-preview-free": {}})) == mc.HORS_JAMBE
+    )
 
     # Présent sur les deux jambes : n'importe quelle route donne ``ok``.
     deux = _catalog(paid={"longcat-2.5-preview-free": {}}, free={"longcat-2.5-preview-free": {}})
@@ -221,8 +226,7 @@ def test_un_seul_consommateur_de_capabilities():
     src = _ROOT / "opencode.py"
     body = src.read_text(encoding="utf-8")
     assert body.count('cfg.get("capabilities")') == 1, (
-        "un second consommateur de capabilities est apparu : "
-        "la purge d'une entrée models: n'est plus un non-changement"
+        "un second consommateur de capabilities est apparu : la purge d'une entrée models: n'est plus un non-changement"
     )
 
 

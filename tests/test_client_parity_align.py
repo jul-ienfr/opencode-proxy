@@ -51,6 +51,34 @@ def test_ensure_beta_unions_client_betas():
         _reset_betas()
 
 
+def test_ensure_beta_adds_official_compact_beta():
+    """Parité `requiredBetaHeaders` : compact-2026-01-12 quand le corps compacte."""
+    _reset_betas()
+    try:
+        body = {"context_management": {"edits": [{"type": "compact_20260112"}]}}
+        out = oc._ensure_anthropic_beta({"x-api-key": "k"}, body)
+        tokens = [t.strip() for t in out["anthropic-beta"].split(",") if t.strip()]
+        assert "compact-2026-01-12" in tokens
+        # Pas de doublon si le client l'a déjà demandé.
+        _reset_betas()
+        oc._capture_client_anthropic_betas({"anthropic-beta": "compact-2026-01-12"})
+        out2 = oc._ensure_anthropic_beta({"x-api-key": "k"}, body)
+        assert out2["anthropic-beta"].count("compact-2026-01-12") == 1
+        # Replay d'un bloc compaction dans l'historique.
+        _reset_betas()
+        out3 = oc._ensure_anthropic_beta(
+            {"x-api-key": "k"},
+            {"messages": [{"role": "assistant", "content": [{"type": "compaction", "content": "x"}]}]},
+        )
+        assert "compact-2026-01-12" in out3["anthropic-beta"]
+        # Un corps normal ne l'ajoute pas.
+        _reset_betas()
+        out4 = oc._ensure_anthropic_beta({"x-api-key": "k"}, {"messages": [{"role": "user", "content": "hi"}]})
+        assert "compact-2026-01-12" not in out4["anthropic-beta"]
+    finally:
+        _reset_betas()
+
+
 def test_ensure_beta_never_raises():
     _reset_betas()
     try:

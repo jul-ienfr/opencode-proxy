@@ -114,12 +114,31 @@ def estimate_input_tokens(
     log_fn: Callable[..., None] = _noop,
 ) -> int:
     """Estimate input tokens from message content, tools, and tool_results."""
+    # [audit 2026-10-30] ``compaction.truncate.split_keep_recent`` passes a
+    # plain string (the text of one conversation pair), while every handler
+    # injects this body-shaped estimator. The old code called ``.get`` on a
+    # str, swallowed the AttributeError and returned 0 for every pair, so
+    # ``keep_tokens`` kept the whole history instead of truncating it.
+    if isinstance(body, str):
+        try:
+            if encoding:
+                return len(encoding.encode(body))
+            return max(1, len(body) // 3)
+        except Exception:
+            return max(1, len(body) // 3)
     try:
         chunks = []
         # [Lot L4 — A10] Tokens des médias (image/document/audio), accumulés à
         # part : ils ne passent pas par le texte (tiktoken) mais par une
         # estimation proportionnelle à la taille de la charge utile.
         media_cost = 0
+
+        # [audit 2026-10-30] Responses met le prompt système dans
+        # ``instructions`` (pas ``system``) : il était ignoré, donc un client
+        # Responses sous-estimait tout son contexte et ne compactait jamais.
+        instructions = body.get("instructions")
+        if isinstance(instructions, str):
+            chunks.append(instructions)
 
         # System prompt
         system = body.get("system", "")
@@ -132,14 +151,29 @@ def estimate_input_tokens(
                 elif isinstance(s, dict):
                     chunks.append(s.get("text", ""))
 
-        # Tools definitions
-        for tool in body.get("tools", []):
-            chunks.append(tool.get("name", ""))
-            chunks.append(tool.get("description", ""))
-            chunks.append(str(tool.get("input_schema", {})))
+        # Tools definitions. Trois formes coexistent :
+        #   Anthropic  {name, description, input_schema}
+        #   Chat       {type:"function", function:{name, description, parameters}}
+        #   Responses  {type:"function", name, description, parameters}
+        # L'ancien code ne lisait que `name`/`description`/`input_schema` :
+        # les schémas Chat/Responses (souvent 10-50 Ko) comptaient pour zéro et
+        # le déclencheur de compaction ne voyait pas le vrai budget.
+        for tool in body.get("tools", []) or []:
+            if not isinstance(tool, dict):
+                continue
+            _fn_raw = tool.get("function")
+            fn = _fn_raw if isinstance(_fn_raw, dict) else tool
+            chunks.append(str(fn.get("name", "")))
+            chunks.append(str(fn.get("description", "")))
+            _schema = fn.get("input_schema")
+            if _schema is None:
+                _schema = fn.get("parameters", {})
+            chunks.append(str(_schema))
 
         # Messages
-        for msg in body.get("messages", []):
+        for msg in body.get("messages", []) or []:
+            if not isinstance(msg, dict):
+                continue
             content = msg.get("content", "")
             if isinstance(content, str):
                 chunks.append(content)
@@ -171,6 +205,51 @@ def estimate_input_tokens(
                             _m = _media_token_cost(block)
                             if _m:
                                 media_cost += _m
+            # Chat: les arguments des appels d'outils sont du contexte réel.
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                _tc_fn_raw = tc.get("function")
+                _tc_fn = _tc_fn_raw if isinstance(_tc_fn_raw, dict) else {}
+                chunks.append(str(_tc_fn.get("name", "")))
+                chunks.append(str(_tc_fn.get("arguments", "")))
+
+        # [audit 2026-10-30] Responses: l'historique vit dans ``input``, pas
+        # ``messages``. Il n'était jamais estimé (0 token), donc la compaction
+        # proactive ne pouvait pas se déclencher sur cette porte.
+        for item in body.get("input", []) or []:
+            if isinstance(item, str):
+                chunks.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            itype = str(item.get("type") or "")
+            if itype in ("function_call", "function_call_output"):
+                chunks.append(str(item.get("name", "")))
+                chunks.append(str(item.get("arguments", "")))
+                chunks.append(str(item.get("output", "")))
+                continue
+            if itype == "reasoning":
+                _summary = item.get("summary")
+                if isinstance(_summary, list):
+                    for part in _summary:
+                        if isinstance(part, dict):
+                            chunks.append(str(part.get("text", "")))
+                elif isinstance(_summary, str):
+                    chunks.append(_summary)
+            content = item.get("content")
+            if isinstance(content, str):
+                chunks.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, str):
+                        chunks.append(block)
+                    elif isinstance(block, dict):
+                        chunks.append(str(block.get("text", "")))
+                        chunks.append(str(block.get("refusal", "")))
+                        _m = _media_token_cost(block)
+                        if _m:
+                            media_cost += _m
 
         combined = "\n".join(chunks)
         if encoding:

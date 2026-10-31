@@ -34,7 +34,7 @@ MIN_SAMPLES = 5
 
 def _as_series(entries) -> list[dict]:
     """Normalise les entrees (dict de /health ou tuples) en lignes lisibles."""
-    rows = []
+    rows: list[dict] = []
     if not isinstance(entries, dict):
         return rows
     for key, value in entries.items():

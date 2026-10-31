@@ -724,7 +724,7 @@ def test_chat_tool_file_and_audio_to_function_call_output():
 # ── Plan section 4 : Responses → Anthropic ────────────────────────────────
 
 
-def test_responses_input_file_filename_becomes_document_name():
+def test_responses_input_file_filename_becomes_document_title():
     body = {
         "model": "muse-spark-1.3-contributor",
         "input": [
@@ -743,7 +743,7 @@ def test_responses_input_file_filename_becomes_document_name():
     out = openai_responses_to_anthropic(body)
     docs = [b for b in out["messages"][0]["content"] if b.get("type") == "document"]
     assert len(docs) == 1
-    assert docs[0]["name"] == "rapport.pdf"
+    assert docs[0]["title"] == "rapport.pdf"
     assert docs[0]["source"]["data"] == _PDF_B64
 
 
@@ -771,6 +771,8 @@ def test_responses_function_call_output_list_multimodal():
     body = {
         "model": "muse-spark-1.3-contributor",
         "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "go"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
             {
                 "type": "function_call_output",
                 "call_id": "call_1",
@@ -795,14 +797,18 @@ def test_responses_function_call_output_list_multimodal():
         ],
     }
     out = openai_responses_to_anthropic(body)
-    tr = out["messages"][0]["content"][0]
-    assert tr["type"] == "tool_result"
+    tr = next(
+        b
+        for m in out["messages"]
+        for b in (m.get("content") or [])
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    )
     by_type = {}
     for b in tr["content"]:
         by_type.setdefault(b["type"], []).append(b)
     assert by_type["text"][0]["text"] == "voici"
     assert by_type["image"][0]["source"]["data"] == _B64
-    assert by_type["document"][0]["name"] == "doc.pdf"
+    assert by_type["document"][0]["title"] == "doc.pdf"
     assert by_type["document"][0]["source"]["data"] == _PDF_B64
     assert {"type": "text", "text": "[audio:unsupported-by-anthropic]"} in tr["content"]
 
@@ -812,6 +818,8 @@ def test_responses_function_call_output_string_stays_string():
     body = {
         "model": "muse-spark-1.3-contributor",
         "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "go"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
             {
                 "type": "function_call_output",
                 "call_id": "call_1",
@@ -821,8 +829,12 @@ def test_responses_function_call_output_string_stays_string():
         ],
     }
     out = openai_responses_to_anthropic(body)
-    tr = out["messages"][0]["content"][0]
-    assert tr["type"] == "tool_result"
+    tr = next(
+        b
+        for m in out["messages"]
+        for b in (m.get("content") or [])
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    )
     assert tr["content"] == "pong"
 
 

@@ -10,6 +10,7 @@ Module PUR (aucun import projet) : l'hôte (`config/settings.py`) reste seul
 juge du routage ; ce module expose la vérité catalogue pour le job diff
 lecture seule (`scripts/check_models_catalog.py`) et les tests.
 """
+
 from __future__ import annotations
 
 NPM_ANTHROPIC = "@ai-sdk/anthropic"

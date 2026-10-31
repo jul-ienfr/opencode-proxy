@@ -300,9 +300,7 @@ def case_responses_api_entry():
     """Client /v1/responses (OpenAI Responses) -> requête Anthropic."""
     body = {
         "model": "claude-sonnet-4-5",
-        "input": [
-            {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}
-        ],
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
         "max_output_tokens": 256,
     }
     return {
@@ -426,7 +424,9 @@ def case_req_tools_complex():
                                                                                     "properties": {
                                                                                         "l8": {
                                                                                             "type": "object",
-                                                                                            "properties": {"l9": {"type": "string"}},
+                                                                                            "properties": {
+                                                                                                "l9": {"type": "string"}
+                                                                                            },
                                                                                         }
                                                                                     },
                                                                                 }
@@ -835,9 +835,7 @@ def case_p2_documents_tool_result_media():
                 "messages": [
                     {
                         "role": "assistant",
-                        "content": [
-                            {"type": "tool_use", "id": "toolu_01ABC", "name": "read", "input": {"p": "a.pdf"}}
-                        ],
+                        "content": [{"type": "tool_use", "id": "toolu_01ABC", "name": "read", "input": {"p": "a.pdf"}}],
                     },
                     {
                         "role": "user",

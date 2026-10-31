@@ -30,7 +30,11 @@ from app.db import (
 def test_fast_path_no_alter_no_canary_on_source():
     """Le fast path n'exécute ni migrations ALTER ni canary COUNT(*)."""
     src = inspect.getsource(init_requests_schema_fast)
-    assert "ALTER TABLE requests ADD COLUMN" not in src
+    # [audit 2026-10-30] Les 3 colonnes d'observabilit? (ttfb_ms,
+    # stop_reason, aborted) sont ajout?es au boot (ALTER = m?tadonn?e, ~0 ms)
+    # pour ?viter la course avant la migration de fond. Le fast path ne doit
+    # toujours faire ni index ni canary COUNT(*).
+    assert "ttfb_ms" in src and "stop_reason" in src and "aborted" in src
     assert "SELECT COUNT" not in src
     assert "_REQUESTS_INDEXES" not in src
     assert "journal_mode=WAL" in src
@@ -54,12 +58,8 @@ def test_migrate_and_canary_detects_naive_timestamps():
     """Le canary compte les rows à timestamps naïfs (sans 'Z')."""
     conn = sqlite3.connect(":memory:")
     init_requests_schema(conn, busy_timeout=5000, cache_size=1000, mmap_size=1024)
-    conn.execute(
-        "INSERT INTO requests (timestamp, model) VALUES ('2026-09-09T10:00:00', 'm')"
-    )
-    conn.execute(
-        "INSERT INTO requests (timestamp, model) VALUES ('2026-09-09T10:00:00Z', 'm')"
-    )
+    conn.execute("INSERT INTO requests (timestamp, model) VALUES ('2026-09-09T10:00:00', 'm')")
+    conn.execute("INSERT INTO requests (timestamp, model) VALUES ('2026-09-09T10:00:00Z', 'm')")
     assert migrate_and_canary(conn) == 1
 
 

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import threading
@@ -42,9 +42,7 @@ def test_le_parse_du_corps_amont_ne_gele_pas_la_boucle():
 
         tache = asyncio.create_task(veille())
         try:
-            return await asyncio.wait_for(
-                oc._resp_json_hors_boucle(_Corps(entre, relache, charge)), timeout=5
-            )
+            return await asyncio.wait_for(oc._resp_json_hors_boucle(_Corps(entre, relache, charge)), timeout=5)
         finally:
             relache.set()
             tache.cancel()

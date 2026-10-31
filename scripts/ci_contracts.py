@@ -116,10 +116,7 @@ def _lancer(chemins: list[Path], etiquette: str) -> int:
         if suite is not None:
             total = int(suite.get("tests") or 0)
             echecs = int(suite.get("failures") or 0) + int(suite.get("errors") or 0)
-            print(
-                f"\n[{etiquette}] {total} tests, {echecs} échec(s), {duree:.1f} s "
-                f"sur {len(chemins)} fichiers"
-            )
+            print(f"\n[{etiquette}] {total} tests, {echecs} échec(s), {duree:.1f} s sur {len(chemins)} fichiers")
     except Exception:
         print(f"\n[{etiquette}] code de sortie {code} ({duree:.1f} s)", file=sys.stderr)
     if code != 0:

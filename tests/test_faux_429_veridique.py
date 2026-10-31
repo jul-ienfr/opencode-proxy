@@ -13,7 +13,7 @@ import pytest
 import opencode as oc
 
 PAID_MODEL = "paid-test-model"
-FREE_MODEL = "free-test-model"
+FREE_MODEL = "paid-test-model-free"
 PAID_HEADERS = {"Content-Type": "application/json"}
 
 
@@ -117,9 +117,18 @@ def free_vpn_env(monkeypatch):
 
 @pytest.fixture
 def free_cfg():
-    saved = {k: oc.IP_ROTATION.get(k) for k in (
-        "max_free_attempts", "free_exception_fallback", "strict_free",
-        "auto_max_free_attempts", "station_count", "free_parallel", "on_429_action")}
+    saved = {
+        k: oc.IP_ROTATION.get(k)
+        for k in (
+            "max_free_attempts",
+            "free_exception_fallback",
+            "strict_free",
+            "auto_max_free_attempts",
+            "station_count",
+            "free_parallel",
+            "on_429_action",
+        )
+    }
     if isinstance(saved.get("free_parallel"), dict):
         saved["free_parallel"] = dict(saved["free_parallel"])
     oc.IP_ROTATION["station_count"] = 2
@@ -129,10 +138,15 @@ def free_cfg():
     oc.IP_ROTATION["max_free_attempts"] = 2
     oc.IP_ROTATION["free_exception_fallback"] = "station-first"
     oc.IP_ROTATION["free_parallel"] = {
-        "enabled": False, "routing": "round-robin", "mode": "load-balance",
-        "hedge_delay_ms": 300, "hedge_max_attempts": 1}
+        "enabled": False,
+        "routing": "round-robin",
+        "mode": "load-balance",
+        "hedge_delay_ms": 300,
+        "hedge_max_attempts": 1,
+    }
     try:
         import config.settings as _st
+
         _st.FREE_PARALLEL.clear()
         _st.FREE_PARALLEL.update(_st._normalize_free_parallel(oc.IP_ROTATION["free_parallel"]))
     except Exception:
@@ -151,6 +165,7 @@ def _free_body():
 
 def _resp_json(resp):
     import json as _j
+
     return _j.loads(bytes(resp.body).decode())
 
 
@@ -161,8 +176,9 @@ async def test_E1_free_503_strict_free_refuse_503(free_vpn_env, free_cfg, monkey
     oc.IP_ROTATION["max_free_attempts"] = 1
     a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
     monkeypatch.setattr(oc, "_free_ip_pool", _PoolMulti([a]))
-    monkeypatch.setattr(oc, "_do_free_request_curl_cffi",
-                        _FakeFreeCurl([_FakeResp(503, {}, text="Service Unavailable upstream")]))
+    monkeypatch.setattr(
+        oc, "_do_free_request_curl_cffi", _FakeFreeCurl([_FakeResp(503, {}, text="Service Unavailable upstream")])
+    )
     monkeypatch.setattr(oc, "_log_free_model_usage", lambda *a_, **k: None)
     with pytest.raises(oc.FreeRefusal) as ei:
         await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
@@ -188,8 +204,9 @@ async def test_E2_true_429_keeps_real_retry_after(free_vpn_env, free_cfg, monkey
     oc.IP_ROTATION["max_free_attempts"] = 1
     a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
     monkeypatch.setattr(oc, "_free_ip_pool", _PoolMulti([a]))
-    monkeypatch.setattr(oc, "_do_free_request_curl_cffi",
-                        _FakeFreeCurl([_FakeResp(429, {"retry-after": "45"}, text="rate limited")]))
+    monkeypatch.setattr(
+        oc, "_do_free_request_curl_cffi", _FakeFreeCurl([_FakeResp(429, {"retry-after": "45"}, text="rate limited")])
+    )
     monkeypatch.setattr(oc, "_log_free_model_usage", lambda *a_, **k: None)
     with pytest.raises(oc.FreeRefusal) as ei:
         await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
@@ -210,9 +227,13 @@ async def test_E2b_two_429_propagates_last_retry_after(free_vpn_env, free_cfg, m
     a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
     b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
     monkeypatch.setattr(oc, "_free_ip_pool", _PoolMulti([a, b]))
-    monkeypatch.setattr(oc, "_do_free_request_curl_cffi", _FakeFreeCurl([
-        _FakeResp(429, {"retry-after": "30"}, text="rl1"),
-        _FakeResp(429, {"retry-after": "60"}, text="rl2")]))
+    monkeypatch.setattr(
+        oc,
+        "_do_free_request_curl_cffi",
+        _FakeFreeCurl(
+            [_FakeResp(429, {"retry-after": "30"}, text="rl1"), _FakeResp(429, {"retry-after": "60"}, text="rl2")]
+        ),
+    )
     monkeypatch.setattr(oc, "_log_free_model_usage", lambda *a_, **k: None)
     with pytest.raises(oc.FreeRefusal) as ei:
         await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
@@ -228,8 +249,9 @@ async def test_E3_tunnel_failures_refuse_503(free_vpn_env, free_cfg, monkeypatch
     a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
     b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
     monkeypatch.setattr(oc, "_free_ip_pool", _PoolMulti([a, b]))
-    monkeypatch.setattr(oc, "_do_free_request_curl_cffi",
-                        _FakeFreeCurl([RuntimeError("SOCKS5 dead A"), RuntimeError("SOCKS5 dead B")]))
+    monkeypatch.setattr(
+        oc, "_do_free_request_curl_cffi", _FakeFreeCurl([RuntimeError("SOCKS5 dead A"), RuntimeError("SOCKS5 dead B")])
+    )
     monkeypatch.setattr(oc, "_log_free_model_usage", lambda *a_, **k: None)
     with pytest.raises(oc.FreeRefusal) as ei:
         await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
@@ -257,6 +279,7 @@ def test_E4_collect_stream_503_anthropique_veridique():
     assert "quota" not in err.get("message", "").lower()
     # décision C1 documentée en code (HTTP JSON véridique, pas SSE)
     import inspect
+
     src = inspect.getsource(oc)
     assert "Lot C1" in src and "_free_refusal_response" in src
 
@@ -269,15 +292,17 @@ async def test_E5_503_then_200_succeeds(free_vpn_env, free_cfg, monkeypatch):
     a = _Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")
     b = _Station(2, "2.2.2.2", "socks5://127.0.0.1:1081")
     monkeypatch.setattr(oc, "_free_ip_pool", _PoolMulti([a, b]))
-    fake = _FakeFreeCurl([
-        _FakeResp(503, {}, text="flap"),
-        _FakeResp(200, {"content-type": "application/json"},
-                  usage={"prompt_tokens": 3, "completion_tokens": 5}),
-    ])
+    fake = _FakeFreeCurl(
+        [
+            _FakeResp(503, {}, text="flap"),
+            _FakeResp(200, {"content-type": "application/json"}, usage={"prompt_tokens": 3, "completion_tokens": 5}),
+        ]
+    )
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
     usage_calls = []
-    monkeypatch.setattr(oc, "_log_free_model_usage",
-                        lambda *a_, **k: usage_calls.append(a_[4] if len(a_) > 4 else k.get("status")))
+    monkeypatch.setattr(
+        oc, "_log_free_model_usage", lambda *a_, **k: usage_calls.append(a_[4] if len(a_) > 4 else k.get("status"))
+    )
     result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is not None and result[0].status_code == 200
     assert [s for _, s in fake.calls] == [a, b], "station 1 (503) puis station 2 (200)"
@@ -299,9 +324,7 @@ def test_E6_no_fabricated_retry_after():
     assert "quota" not in str(_resp_json(r)).lower()
     assert "Free model request failed with status 429" in str(_resp_json(r))
     # Un VRAI corps quota garde le message historique.
-    e429_quota = oc.FreeRefusal(
-        status=429, body='{"error": {"message": "Rate limit exceeded"}}', retry_after=""
-    )
+    e429_quota = oc.FreeRefusal(status=429, body='{"error": {"message": "Rate limit exceeded"}}', retry_after="")
     r_q = oc._free_refusal_response(e429_quota, "openai")
     assert r_q.status_code == 429
     assert "Retry-After" not in r_q.headers, "429 sans RA upstream → pas de header inventé"

@@ -48,9 +48,7 @@ async def main():
                 yield c
 
     # Chunk boundaries land mid-token and BETWEEN \r and \n.
-    mid = [
-        i for i in range(3, len(payload) - 3) if payload[i - 1 : i + 1] == b"\r\n"
-    ]  # cut between \r and \n
+    mid = [i for i in range(3, len(payload) - 3) if payload[i - 1 : i + 1] == b"\r\n"]  # cut between \r and \n
     mid += [3, 15, 40, 52, 66, 79, 90, 105]
     chunks = _chunks(payload, sorted(set(mid)))
     assert any(c.endswith(b"\r") and n.startswith(b"\n") for c, n in zip(chunks, chunks[1:], strict=False)), (

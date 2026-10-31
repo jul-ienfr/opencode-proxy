@@ -45,3 +45,36 @@ def test_auto_budget_covers_all_configured_stations(monkeypatch):
     n = oc._cfg_settings.resolved_station_count(oc.IP_ROTATION)
     assert 1 <= n <= 10
     assert oc.effective_free_max_attempts() == max(1, min(n, 10))
+
+
+class _UsableStation:
+    status = "connected"
+    current_ip = "10.0.0.1"
+
+
+class _UsablePool:
+    socks5_mode = False
+
+    def __init__(self, n):
+        self._stations = [_UsableStation() for _ in range(n)]
+
+    def _station_usable(self, st, *, exclude_approaching=False, forced_pool=None):
+        return True
+
+
+def test_strict_free_manual_budget_tries_all_usable_stations(monkeypatch):
+    """[2026-10-29] strict_free : 3 réglé mais 6 stations → 6 essais.
+
+    Sinon 3 IP trial-dead suffisaient à rendre « quota épuisé » alors que
+    3 stations fraîches n'avaient pas été essayées (mesuré en prod).
+    """
+    monkeypatch.setattr(oc, "_free_ip_pool", _UsablePool(6))
+    monkeypatch.setattr(oc._cfg_settings, "resolved_station_count", lambda *_a, **_k: 6)
+    monkeypatch.setitem(oc.IP_ROTATION, "auto_max_free_attempts", False)
+    monkeypatch.setitem(oc.IP_ROTATION, "max_free_attempts", 3)
+
+    monkeypatch.setitem(oc.IP_ROTATION, "strict_free", True)
+    assert oc.effective_free_max_attempts() == 6
+
+    monkeypatch.setitem(oc.IP_ROTATION, "strict_free", False)
+    assert oc.effective_free_max_attempts() == 3, "hors strict_free, le budget manuel reste souverain"

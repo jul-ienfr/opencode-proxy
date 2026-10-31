@@ -43,9 +43,7 @@ class _Station:
     the Axe 1.2 probe surface: ``_probe_tunnel_light`` returns
     ``probe_result`` and counts its calls."""
 
-    def __init__(
-        self, sid, *, proxy_mode="vpn", status="connected", current_ip=None, quota=15, probe=True
-    ):
+    def __init__(self, sid, *, proxy_mode="vpn", status="connected", current_ip=None, quota=15, probe=True):
         self._station = sid
         self.enabled = True  # FreeIPPool.get_status reads it
         self.proxy_mode = proxy_mode
@@ -170,9 +168,7 @@ def test_rotation_concurrency_one_serializes():
         await asyncio.wait_for(s1_entered.wait(), 1.0)  # rotation 1 in flight
         p._launch_rotation(s2)  # queued behind the single worker
         await asyncio.sleep(0.1)  # observation window
-        assert not s2_entered.is_set(), (
-            "with 1 worker, station 2 must NOT enter while station 1 blocks"
-        )
+        assert not s2_entered.is_set(), "with 1 worker, station 2 must NOT enter while station 1 blocks"
         gate.set()  # release rotation 1
         await asyncio.wait_for(s2_entered.wait(), 1.0)  # then 2 runs second
         await asyncio.sleep(0.05)
@@ -360,9 +356,7 @@ def test_dead_post_commit_probe_requeues_and_bad_marks():
         await asyncio.sleep(0.05)  # rotation 1: commit + dead probe
         per = p._per_station(s1)
         assert p.switched == [1, 1], "re-queued: rotation 2 already in flight"
-        assert per["post_commit_retry_count"] == 1, (
-            "rotation 2 not yet committed — counter still at 1"
-        )
+        assert per["post_commit_retry_count"] == 1, "rotation 2 not yet committed — counter still at 1"
         assert per["bad_until"] is not None, "dead fresh IP bad-marked (station 2 usable — no C1)"
         assert s1.armed == [1], "watchdog armed on the dead probe"
 
@@ -469,9 +463,7 @@ def test_any_rotation_in_flight():
         t.cancel()
         with pytest.raises(asyncio.CancelledError):
             await t
-        assert p.any_rotation_in_flight() is False, (
-            "a finished rotation no longer counts as in flight"
-        )
+        assert p.any_rotation_in_flight() is False, "a finished rotation no longer counts as in flight"
         await _shutdown(p)
 
     asyncio.run(_go())
@@ -649,9 +641,7 @@ def test_probe_timeout_only_gets_grace_attempt():
     mgr = _ProbeMgr(["timeout", "timeout", "ok"])
     assert asyncio.run(_light(mgr)) is True
     # sweep burns 2×3.0 of the 8.0 budget → grace gets the 2.0 remainder
-    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0), ("http://a", 2.0)], (
-        "grace uses budget - sweep cost"
-    )
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0), ("http://a", 2.0)], "grace uses budget - sweep cost"
     assert mgr._ip_check_idx == 0, "grace does not advance the sticky index"
 
 
@@ -666,9 +656,7 @@ def test_probe_refused_is_definitive_no_grace():
     grace phase (only timeouts mean "might be slow")."""
     mgr = _ProbeMgr(["refused", "refused"])
     assert asyncio.run(_light(mgr)) is False
-    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)], (
-        "no third (grace) attempt after refused verdicts"
-    )
+    assert mgr.calls == [("http://a", 3.0), ("http://b", 3.0)], "no third (grace) attempt after refused verdicts"
 
 
 def test_probe_error_is_definitive_no_grace():

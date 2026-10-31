@@ -23,10 +23,27 @@ def _default_dumps_str(obj, **kw) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
-#: Champs de chaînage/session exclus de la clé de cache réponse (F6) :
-#: previous_response_id unique par tour + prompt_cache_key (ses_ tournant
-#: 30 min) donneraient sinon un hit-rate ~nul sur des requêtes identiques.
-_CHAINING_KEY_FIELDS = ("previous_response_id", "conversation", "prompt_cache_key")
+#: [audit 2026-10-30] Seul ``prompt_cache_key`` est un hint de routage et
+#: peut être exclu de la clé. ``previous_response_id`` et ``conversation``
+#: désignent un historique côté serveur : les exclure servait la réponse
+#: d'une AUTRE conversation à un client stateful (fuite inter-sessions).
+_CHAINING_KEY_FIELDS = ("prompt_cache_key",)
+
+
+def _is_error_payload(body: bytes) -> bool:
+    """True only for a top-level ``{"error": ...}`` payload.
+
+    A 200 carrying an upstream error was cached for 300 s and replayed as a
+    valid answer. Never cache that shape; legitimate responses never have a
+    top-level ``error`` key.
+    """
+    if not body:
+        return False
+    try:
+        data = json.loads(body)
+    except Exception:
+        return False
+    return isinstance(data, dict) and bool(data.get("error"))
 
 
 class ResponseCache:
@@ -56,6 +73,9 @@ class ResponseCache:
         self._access_order: OrderedDict[str, None] = OrderedDict()  # O(1) LRU tracking
         self._debug_fn = debug_fn
         self._dumps_str_fn = dumps_str_fn
+        self._hits = 0
+        self._misses = 0
+        self._skipped_errors = 0
 
     def _evict(self):
         evicted = 0
@@ -78,6 +98,7 @@ class ResponseCache:
     def get(self, key: str) -> tuple[bytes, dict] | None:
         entry = self._store.get(key)
         if entry is None:
+            self._misses += 1
             return None
         ts, body, headers = entry
         if time.monotonic() - ts > self._ttl:
@@ -90,13 +111,22 @@ class ResponseCache:
                 self._total_bytes -= len(body)
             except Exception:
                 pass
+            self._misses += 1
             return None
         # Move to end of access order (most recently used) — O(1)
         self._access_order.move_to_end(key)
+        self._hits += 1
         self._debug_fn(f"  [cache] get: HIT key={key[:16]}... size={len(body)} bytes")
         return body, headers
 
     def put(self, key: str, body: bytes, headers: dict):
+        # [audit 2026-10-30] Never cache a 200 that is actually an upstream
+        # error (``{"error": ...}``). It was replayed as a successful answer
+        # for the whole TTL.
+        if _is_error_payload(body):
+            self._skipped_errors += 1
+            self._debug_fn("  [cache] put: skip error-shaped payload")
+            return
         if key in self._store:
             self._access_order.pop(key, None)
             try:
@@ -110,13 +140,27 @@ class ResponseCache:
             pass
         self._access_order[key] = None  # append to end — O(1)
         self._evict()
-        self._debug_fn(f"  [cache] put: key={key[:16]}... store_size={len(self._store)}/{self._max_size} bytes={self._total_bytes}/{self._max_bytes}")
+        self._debug_fn(
+            f"  [cache] put: key={key[:16]}... store_size={len(self._store)}/{self._max_size} bytes={self._total_bytes}/{self._max_bytes}"
+        )
 
-    def make_key(self, body: dict, body_bytes: bytes | None = None) -> str | None:
+    def make_key(
+        self,
+        body: dict,
+        body_bytes: bytes | None = None,
+        *,
+        namespace: str | None = None,
+    ) -> str | None:
         """Create cache key from request body. Returns None if not cacheable.
 
         If body_bytes is provided, hashes raw bytes directly (fast, no re-serialization).
         Falls back to json.dumps + blake2b if body_bytes is not provided.
+
+        ``namespace`` MUST carry everything outside the body that changes the
+        response shape: client endpoint/protocol, resolved model, egress leg,
+        auth tenant and protocol-version headers. Without it, the same JSON
+        posted to /v1/messages and /v1/chat/completions collided and one
+        client received the other protocol's envelope.
         """
         if body.get("stream"):
             self._debug_fn("  [cache] make_key: stream=True, returning None")
@@ -131,27 +175,36 @@ class ResponseCache:
                         self._debug_fn("  [cache] make_key: tool_result found, returning None")
                         return None
         try:
+            h = hashlib.blake2b(digest_size=16)
+            if namespace:
+                h.update(namespace.encode("utf-8", "replace"))
+                h.update(b"\x00")
             if body_bytes and not any(k in body for k in _CHAINING_KEY_FIELDS):
                 # Fast path: hash raw bytes directly (avoids json.dumps + sort_keys)
-                key = hashlib.blake2b(body_bytes, digest_size=16).hexdigest()
+                h.update(body_bytes)
             else:
-                # Champs de chaînage/session exclus : previous_response_id unique
-                # + rotation ses_ (30 min) donneraient sinon un hit-rate ~nul
-                # (requêtes identiques, clés différentes). La réponse cachée ne
-                # porte aucune donnée de session : le partage est sain.
                 scrubbed = {k: v for k, v in body.items() if k not in _CHAINING_KEY_FIELDS}
                 # Fallback: deterministic JSON serialization + blake2b
-                key = hashlib.blake2b(
-                    self._dumps_str_fn(scrubbed, separators=(",", ":"), default=str).encode(),
-                    digest_size=16,
-                ).hexdigest()
+                h.update(self._dumps_str_fn(scrubbed, separators=(",", ":"), default=str).encode())
+            key = h.hexdigest()
             self._debug_fn(f"  [cache] make_key: generated hash={key[:16]}...")
             return key
         except Exception:
             return None
 
     def stats(self) -> dict:
-        return {"size": len(self._store), "max_size": self._max_size, "ttl": self._ttl, "bytes": self._total_bytes, "max_bytes": self._max_bytes}
+        total = self._hits + self._misses
+        return {
+            "size": len(self._store),
+            "max_size": self._max_size,
+            "ttl": self._ttl,
+            "bytes": self._total_bytes,
+            "max_bytes": self._max_bytes,
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": (self._hits / total) if total else 0.0,
+            "skipped_errors": self._skipped_errors,
+        }
 
 
 # Alias historique (opencode._ResponseCache, tests) — PAS une sous-classe :

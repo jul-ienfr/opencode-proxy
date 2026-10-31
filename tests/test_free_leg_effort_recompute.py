@@ -129,8 +129,7 @@ class _Seam:
     @property
     def wire(self):
         assert self.calls, (
-            "le double amont n'a jamais été atteint : la jambe free n'a pas été exercée, "
-            "le test ne prouve rien"
+            "le double amont n'a jamais été atteint : la jambe free n'a pas été exercée, le test ne prouve rien"
         )
         return self.calls[0]["body"]
 
@@ -172,6 +171,7 @@ def free_env(monkeypatch):
     monkeypatch.setattr(oc, "_log", lambda *a, **k: None)
     monkeypatch.setattr(oc, "_log_free_model_usage", lambda *a, **k: None)
     monkeypatch.setattr(oc, "_free_ip_pool", _Pool([_Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")]))
+    monkeypatch.setitem(oc.MODELS, PAID_CHAT, {"protocol": "openai"})
     saved = {
         k: oc.IP_ROTATION.get(k)
         for k in (
@@ -208,14 +208,19 @@ def free_env(monkeypatch):
     _bypass_declared_custom_routes_for_paid(monkeypatch)
     # Le -free homonyme est mort côté amont (remappé sain en config) : le
     # témoin force le couple divergent dans la map, le temps des tests.
-    _map_had = PAID_CHAT in oc.FREE_MODEL_MAP
-    _map_saved = oc.FREE_MODEL_MAP.get(PAID_CHAT)
-    oc.FREE_MODEL_MAP[PAID_CHAT] = FREE_CHAT
+    # L'objet d'origine est gardé en main : certains tests remplacent
+    # `oc.FREE_MODEL_MAP` par un dict neuf (monkeypatch.setattr) et le
+    # teardown s'écrirait alors sur LE MAUVAIS OBJET, laissant l'entrée
+    # forcée (cible absente de MODELS) fuiter dans toute la suite.
+    _map_obj = oc.FREE_MODEL_MAP
+    _map_had = PAID_CHAT in _map_obj
+    _map_saved = _map_obj.get(PAID_CHAT)
+    _map_obj[PAID_CHAT] = FREE_CHAT
     yield oc
     if _map_had:
-        oc.FREE_MODEL_MAP[PAID_CHAT] = _map_saved
+        _map_obj[PAID_CHAT] = _map_saved
     else:
-        oc.FREE_MODEL_MAP.pop(PAID_CHAT, None)
+        _map_obj.pop(PAID_CHAT, None)
     for k, v in saved.items():
         if v is None:
             oc.IP_ROTATION.pop(k, None)
@@ -291,16 +296,14 @@ async def test_no_effort_invented_when_client_asks_none(free_env, monkeypatch):
     assert not decision.wants, "prémisse : ce corps ne porte aucune demande d'effort"
 
     await oc._try_free_model_first(dict(body), {}, "openai", PAID_CHAT)
-    assert "reasoning_effort" not in seam.wire, (
-        "un effort a été inventé là où le client n'en demandait aucun"
-    )
+    assert "reasoning_effort" not in seam.wire, "un effort a été inventé là où le client n'en demandait aucun"
 
 
 # ── 3. Un free à plafond PLUS HAUT ne relève pas le niveau demandé ──
 @pytest.mark.asyncio
 async def test_free_model_with_higher_cap_never_raises_the_level(free_env, monkeypatch):
-    """``mimo-v2.5-free`` plafonne à ``max`` : la valeur payante doit rester inchangée."""
-    monkeypatch.setattr(oc, "FREE_MODEL_MAP", {PAID_CHAT: "mimo-v2.5-free"})
+    """Un free de même famille ne relève jamais un niveau explicite bas."""
+    monkeypatch.setattr(oc, "FREE_MODEL_MAP", {PAID_CHAT: FREE_CHAT})
     seam = _Seam()
     monkeypatch.setattr(oc, "_do_free_request_curl_cffi", seam)
 

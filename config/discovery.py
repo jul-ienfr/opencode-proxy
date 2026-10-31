@@ -33,6 +33,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC
 from typing import Any
 
 logger = logging.getLogger("config.settings")
@@ -60,6 +61,33 @@ def _normalize_ids(raw) -> set:
     if not raw or not isinstance(raw, (list, tuple, set, frozenset)):
         return set()
     return {x.strip().lower() for x in raw if isinstance(x, str) and x.strip()}
+
+
+def models_endpoint_for(base: str) -> str:
+    """Return the ``/models`` URL that actually serves ``base``'s leg.
+
+    [audit 2026-10-30] The new inference bases (``/inference/openai/v1``,
+    ``/inference/go/openai/v1``) only accept generation calls: their
+    ``/models`` alias answers 404. The catalogue still lives on the legacy
+    gateway paths (``/inference/v1/models`` and ``/zen/go/v1/models``), so
+    map a configured base back to the real listing endpoint instead of
+    blindly appending ``/models``.
+    """
+    text = str(base or "").strip()
+    if not text:
+        return ""
+    for suffix in ("/chat/completions", "/messages", "/responses"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    text = text.rstrip("/")
+    host, sep, path = text.partition("/inference/")
+    if sep and path:
+        parts = [p for p in path.split("/") if p]
+        if parts and parts[0] == "go":
+            return host + "/zen/go/v1/models"
+        return host + "/inference/v1/models"
+    return text + "/models"
 
 
 def fetch_upstream_models(
@@ -97,7 +125,7 @@ def fetch_upstream_models(
                     "la découverte auto ne doit pas le ressusciter)",
                     _mid,
                 )
-        url = f"{api_base_openai.rsplit('/chat/completions', 1)[0]}/models"
+        url = models_endpoint_for(api_base_openai)
         # --max-time 3s + connect 2s : échec rapide si upstream lent
         result = subprocess.run(
             ["curl", "-s", "--max-time", str(int(timeout)), "--connect-timeout", "2", url],
@@ -192,13 +220,8 @@ def free_discovery_urls(api_base_free: str, api_base_openai: str, yaml_get_fn: C
         return [override.strip().rstrip("/")]
     urls = []
     for base in (api_base_free, api_base_openai):
-        if not base:
-            continue
-        b = base.strip()
-        if "/chat/completions" in b:
-            b = b.rsplit("/chat/completions", 1)[0]
-        u = b.rstrip("/") + "/models"
-        if u not in urls:
+        u = models_endpoint_for(base)
+        if u and u not in urls:
             urls.append(u)
     return urls
 
@@ -307,18 +330,14 @@ def fetch_models_index_sync(
                 if proxy:
                     kwargs["proxy"] = proxy
                 with _httpx.Client(**kwargs) as client:
-                    resp = client.get(
-                        url, headers={"User-Agent": "opencode-proxy/live-models"}
-                    )
+                    resp = client.get(url, headers={"User-Agent": "opencode-proxy/live-models"})
                 if resp.status_code != 200:
                     raise RuntimeError(f"HTTP {resp.status_code}")
                 data = resp.json()
             except ImportError:
                 import urllib.request as _urlreq
 
-                req = _urlreq.Request(
-                    url, headers={"User-Agent": "opencode-proxy/live-models"}
-                )
+                req = _urlreq.Request(url, headers={"User-Agent": "opencode-proxy/live-models"})
                 with _urlreq.urlopen(req, timeout=timeout) as resp:  # noqa: S310
                     data = json.loads(resp.read().decode("utf-8"))
             ids = model_ids_from_payload(data)
@@ -411,9 +430,7 @@ def fetch_free_models_sync(
                 )
                 if not is_retryable or attempt == 2:
                     if not success:
-                        log.debug(
-                            "[free-discovery] fetch failed %s attempt %d: %s", url, attempt + 1, e
-                        )
+                        log.debug("[free-discovery] fetch failed %s attempt %d: %s", url, attempt + 1, e)
                     break
                 delay = (1.5**attempt) + random.uniform(-0.1, 0.1)
                 # jitter ±10% already via random; clamp min 0
@@ -440,9 +457,7 @@ def fetch_free_models_sync(
                     _r2 = _c2.get(docs_url)
                     if _r2.status_code == 200:
                         _html = _r2.text
-                        _ids = set(
-                            re.findall(r"(?i)<td[^>]*>\s*([a-z0-9.\-]+-free)\s*</td>", _html)
-                        )
+                        _ids = set(re.findall(r"(?i)<td[^>]*>\s*([a-z0-9.\-]+-free)\s*</td>", _html))
                         if _ids:
                             free_ids = _ids
                             source_parts.append("docs:html")
@@ -463,10 +478,17 @@ def free_endpoint_for(free_id: str, api_base_free: str) -> str:
     /v1/chat/completions endpoint.
     """
     lid = free_id.lower()
+    # [audit 2026-10-30] Derive from the configured free chat base instead of
+    # hard-coding the deprecated /inference/v1 URLs. The official catalog now
+    # exposes /inference/openai/v1 (chat/responses) and /inference/v1
+    # (systemone legacy, only used when no explicit endpoint is configured).
+    _base = str(api_base_free or "").rstrip("/")
+    if _base.endswith("/chat/completions"):
+        _base = _base[: -len("/chat/completions")]
     if "muse" in lid or "spark" in lid:
-        return "https://opencode.ai/inference/v1/responses"
+        return _base + "/responses" if _base else api_base_free
     if "jev" in lid:
-        return "https://opencode.ai/inference/v1/systemone"
+        return _base + "/systemone" if _base else api_base_free
     return api_base_free
 
 
@@ -547,8 +569,7 @@ def apply_discovered_free_models(
         for _mid in sorted(blocked & set(models)):
             models.pop(_mid, None)
             log.info(
-                "[free-discovery] live-retired id %s dropped from models "
-                "(déprécié/absent du relevé vivant)",
+                "[free-discovery] live-retired id %s dropped from models (déprécié/absent du relevé vivant)",
                 _mid,
             )
         free_models -= blocked
@@ -560,9 +581,7 @@ def apply_discovered_free_models(
                 if _cur and _cur != _exp:
                     models[_fid]["endpoint"] = _exp
                     log.info("[free-discovery] corrected endpoint %s → %s", _fid, _exp)
-        log.debug(
-            "[free-discovery] no delta (still %d free ids) source=%s", len(free_ids), source
-        )
+        log.debug("[free-discovery] no delta (still %d free ids) source=%s", len(free_ids), source)
         discovery_state["detected"] = sorted(free_ids)
         discovery_state["source"] = source
         return 0, None
@@ -588,9 +607,7 @@ def apply_discovered_free_models(
                 prefix = fid.split("-")[0].split(".")[0].lower()
                 prefix_clean = re.sub(r"\d+$", "", prefix)
                 if prefix_clean not in known_protocols:
-                    log.warning(
-                        "[free-discovery] unknown family %s for %s → openai", prefix_clean, fid
-                    )
+                    log.warning("[free-discovery] unknown family %s for %s → openai", prefix_clean, fid)
             else:
                 cur = models[fid].get("endpoint", "")
                 if cur != expected and ("muse" in fid.lower() or "spark" in fid.lower()):
@@ -616,9 +633,7 @@ def apply_discovered_free_models(
         dt = default_target
         if dt and dt not in free_ids and free_ids:
             fallback = new_pool[0] if new_pool else dt
-            log.warning(
-                "[free-discovery] default_target %r not in FREE_MODELS — fallback %r", dt, fallback
-            )
+            log.warning("[free-discovery] default_target %r not in FREE_MODELS — fallback %r", dt, fallback)
         log.info(
             "[free-discovery] fetched %d free ids, added %d new MODELS, source=%s",
             len(free_ids),
@@ -656,9 +671,7 @@ def persist_free_mappings(
     blocked = _normalize_ids(blocked_ids)
     try:
         # Ensure sections exist
-        if "free_model_map" not in yaml_data or not isinstance(
-            yaml_data.get("free_model_map"), dict
-        ):
+        if "free_model_map" not in yaml_data or not isinstance(yaml_data.get("free_model_map"), dict):
             yaml_data["free_model_map"] = {}
         if "models" not in yaml_data or not isinstance(yaml_data.get("models"), dict):
             yaml_data["models"] = {}
@@ -763,9 +776,7 @@ def probe_cfg(raw: Any) -> dict:
 
     markers_raw = raw.get("dead_markers")
     if isinstance(markers_raw, (list, tuple)) and markers_raw:
-        markers = tuple(
-            str(m).lower() for m in markers_raw if isinstance(m, str) and m.strip()
-        )
+        markers = tuple(str(m).lower() for m in markers_raw if isinstance(m, str) and m.strip())
     else:
         markers = _PROBE_DEFAULT_DEAD_MARKERS
     return {
@@ -775,6 +786,8 @@ def probe_cfg(raw: Any) -> dict:
         "max_ids": int(_num("max_ids", 10.0, 1.0, 50.0)),
         "dead_ttl_s": _num("dead_ttl_s", 86400.0, 60.0, 604800.0),
         "recheck_interval_s": _num("recheck_interval_s", 1800.0, 60.0, 86400.0),
+        "limited_recheck_s": _num("limited_recheck_s", 3600.0, 60.0, 86400.0),
+        "transient_429_retry_s": _num("transient_429_retry_s", 300.0, 30.0, 3600.0),
         "skip_recent_ok_s": _num("skip_recent_ok_s", 1800.0, 0.0, 86400.0),
         "dead_status": _status_set("dead_status", [404, 410]),
         "not_free_status": _status_set("not_free_status", [401, 402]),
@@ -838,9 +851,14 @@ def free_probe_verdict(status: Any, body: str, cfg: dict) -> tuple:
 
 
 def probe_recheck_plan(results: dict, cfg: dict, now: float) -> list:
-    """Ids à RE-sonder : verdict ``unknown`` dont ``checked_epoch`` stagne
-    au-delà de ``recheck_interval_s``. Les ``dead`` suivent le dead_ttl (hors
-    plan), ``alive``/``limited`` sont frais, ``not_probeable`` est final."""
+    """Ids à RE-sonder : ``unknown`` périmés (``recheck_interval_s``) et
+    ``limited`` périmés (``limited_recheck_s``).
+
+    Un 429 n'est pas une preuve définitive — quota fenêtré ou rate-limit
+    transitoire —, donc un verdict ``limited`` doit expirer : sans TTL il
+    restait affiché indéfiniment alors que le modèle pouvait déjà répondre.
+    Les ``dead`` suivent le dead_ttl (hors plan), ``alive``/``not_probeable``
+    sont finaux."""
     out = []
     for mid, r in (results or {}).items():
         if not isinstance(r, dict):
@@ -849,9 +867,46 @@ def probe_recheck_plan(results: dict, cfg: dict, now: float) -> list:
             ts = float(r.get("checked_epoch") or 0.0)
         except (TypeError, ValueError):
             ts = 0.0
-        if r.get("verdict") == "unknown" and (now - ts) >= cfg["recheck_interval_s"]:
-            out.append(mid)
+        verdict = r.get("verdict")
+        if verdict == "unknown":
+            try:
+                not_before = float(r.get("not_before_epoch") or 0.0)
+            except (TypeError, ValueError):
+                not_before = 0.0
+            if not_before:
+                if now >= not_before:
+                    out.append(mid)
+            elif (now - ts) >= cfg["recheck_interval_s"]:
+                out.append(mid)
+        elif verdict == "limited":
+            interval = float(cfg.get("limited_recheck_s") or cfg.get("recheck_interval_s") or 1800.0)
+            if (now - ts) >= interval:
+                out.append(mid)
     return sorted(out)
+
+
+def _demote_global_429(results: dict, cfg: dict, control_row: dict | None = None) -> None:
+    """Un 429 sur TOUS les ids testés est ambigu (quota global/transitoire).
+
+    Si un modèle de contrôle connu répond 2xx, le 429 est ciblé et reste
+    ``limited``. Sinon on le remplace par ``unknown`` avec un re-test court,
+    au lieu de promouvoir un lot entier sur un rate-limit global.
+    """
+    rows = [r for r in (results or {}).values() if isinstance(r, dict) and r.get("status") is not None]
+    if not rows or not all(int(r.get("status") or 0) == 429 for r in rows):
+        return
+    if isinstance(control_row, dict) and control_row.get("verdict") == "alive":
+        for row in rows:
+            if row.get("verdict") == "limited":
+                row["reason"] = "429 ciblé (modèle de contrôle 2xx)"
+        return
+    retry_s = float(cfg.get("transient_429_retry_s") or 300.0)
+    now = time.time()
+    for row in rows:
+        if row.get("verdict") == "limited":
+            row["verdict"] = "unknown"
+            row["reason"] = "429 global/transitoire (tous les ids testés) — re-test"
+            row["not_before_epoch"] = now + retry_s
 
 
 def probe_free_models(
@@ -861,13 +916,17 @@ def probe_free_models(
     headers_fn: Callable | None,
     dispatch_fn: Callable,
     cfg: dict,
+    control_id: str | None = None,
     log=logger,
 ) -> dict:
     """Sonde SANS ÉTAT de ``ids`` → {mid: {verdict, status, reason, checked_at,
     checked_epoch}}. Borné : ``max_ids`` ids max (ordre de l'appelant),
     ``concurrency`` threads max (ThreadPoolExecutor borné). Une erreur de
     dispatch est un verdict ``unknown`` — jamais propagée. ``headers_fn`` est
-    DI-hôte (face officielle) ; à défaut, headers publics minimaux."""
+    DI-hôte (face officielle) ; à défaut, headers publics minimaux. Un lot
+    dont tous les ids répondent 429 est requalifié ``unknown`` (quota global
+    ambigu) avec un re-test court, sauf si ``control_id`` (modèle free connu,
+    hors lot) répond 2xx : le 429 est alors ciblé et reste ``limited``."""
     results: dict = {}
     if not ids:
         return results
@@ -924,15 +983,21 @@ def probe_free_models(
         with ThreadPoolExecutor(max_workers=min(conc, len(to_probe))) as ex:
             for m, r in ex.map(_one, to_probe):
                 results[m] = r
+    control_row = results.get(control_id) if control_id else None
+    _statuses = [r.get("status") for r in results.values() if isinstance(r, dict) and r.get("status") is not None]
+    _all_429 = bool(_statuses) and all(int(s) == 429 for s in _statuses)
+    if _all_429 and control_id and control_row is None:
+        _, control_row = _one(control_id)
+    _demote_global_429(results, cfg, control_row)
     if log is not None:
         log.debug("[free-discovery] probe done: %s", results)
     return results
 
 
 def _dt_now_utc_iso() -> str:
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
 
-    return _dt.now(_tz.utc).isoformat()
+    return _dt.now(UTC).isoformat()
 
 
 __all__ = [
@@ -948,10 +1013,10 @@ __all__ = [
     "free_probe_shaping",
     "free_probe_verdict",
     "is_free_model",
+    "models_endpoint_for",
     "persist_free_mappings",
     "probe_cfg",
     "probe_free_models",
     "probe_recheck_plan",
     "start_background_fetch",
 ]
-

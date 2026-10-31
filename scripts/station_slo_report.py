@@ -67,17 +67,9 @@ def build_report(
     errors = [r for r in rows if not _valid(r)]
     times = [r.get("at") for r in rows if r.get("at")]
     ms = [float(r["ms"]) for r in valid if isinstance(r.get("ms"), (int, float))]
-    ages = [
-        float(r["status_age_s"])
-        for r in valid
-        if isinstance(r.get("status_age_s"), (int, float))
-    ]
+    ages = [float(r["status_age_s"]) for r in valid if isinstance(r.get("status_age_s"), (int, float))]
     n = len(valid) or 1
-    full = [
-        r
-        for r in valid
-        if r.get("healthy") == r.get("total") and r.get("routable") == r.get("total")
-    ]
+    full = [r for r in valid if r.get("healthy") == r.get("total") and r.get("routable") == r.get("total")]
     routable = [r for r in valid if r.get("routable") == r.get("total")]
     boot_errors = [r for r in valid if r.get("boot_error")]
     stale = [r for r in valid if r.get("stale")]
@@ -131,18 +123,14 @@ def build_report(
         lines.append(f"- Fenêtre : `{times[0]}` → `{times[-1]}` ({len(rows)} échantillons)")
     lines.append(f"- Échantillons valides : {len(valid)} / erreurs : {len(errors)}")
     if ms:
-        lines.append(
-            f"- Latence API : p50 {_pct(ms, 50):.0f} ms · p95 {_pct(ms, 95):.0f} ms · max {max(ms):.0f} ms"
-        )
+        lines.append(f"- Latence API : p50 {_pct(ms, 50):.0f} ms · p95 {_pct(ms, 95):.0f} ms · max {max(ms):.0f} ms")
     if ages:
-        lines.append(
-            f"- Âge de l'état : p95 {_pct(ages, 95):.0f} s · max {max(ages):.0f} s"
-        )
-    lines.append(f"- Flotte complète (healthy+routable) : {len(full)}/{n} = {100*len(full)/n:.1f} %")
-    lines.append(f"- Routable 6/6 : {len(routable)}/{n} = {100*len(routable)/n:.1f} %")
-    lines.append(f"- `boot_error` : {len(boot_errors)}/{n} = {100*len(boot_errors)/n:.1f} %")
-    lines.append(f"- `stale` : {len(stale)}/{n} = {100*len(stale)/n:.1f} %")
-    lines.append(f"- `refresh_error` : {len(refresh_errors)}/{n} = {100*len(refresh_errors)/n:.1f} %")
+        lines.append(f"- Âge de l'état : p95 {_pct(ages, 95):.0f} s · max {max(ages):.0f} s")
+    lines.append(f"- Flotte complète (healthy+routable) : {len(full)}/{n} = {100 * len(full) / n:.1f} %")
+    lines.append(f"- Routable 6/6 : {len(routable)}/{n} = {100 * len(routable) / n:.1f} %")
+    lines.append(f"- `boot_error` : {len(boot_errors)}/{n} = {100 * len(boot_errors) / n:.1f} %")
+    lines.append(f"- `stale` : {len(stale)}/{n} = {100 * len(stale) / n:.1f} %")
+    lines.append(f"- `refresh_error` : {len(refresh_errors)}/{n} = {100 * len(refresh_errors) / n:.1f} %")
     lines.append("")
     lines.append("| Station | Disponible | Avec IP | Degraded | Error | Secondary | Flap max | Rotations |")
     lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|")
@@ -153,9 +141,9 @@ def build_report(
         if d["switches_first"] is not None and d["switches_last"] is not None:
             rotations = d["switches_last"] - d["switches_first"]
         lines.append(
-            f"| {sid} | {100*ok/d['samples']:.1f} % | {100*d['with_ip']/d['samples']:.1f} % | "
-            f"{100*d['degraded']/d['samples']:.1f} % | {100*d['error']/d['samples']:.1f} % | "
-            f"{100*d['secondary']/d['samples']:.1f} % | {d['max_flap']} | {rotations if rotations is not None else '—'} |"
+            f"| {sid} | {100 * ok / d['samples']:.1f} % | {100 * d['with_ip'] / d['samples']:.1f} % | "
+            f"{100 * d['degraded'] / d['samples']:.1f} % | {100 * d['error'] / d['samples']:.1f} % | "
+            f"{100 * d['secondary'] / d['samples']:.1f} % | {d['max_flap']} | {rotations if rotations is not None else '—'} |"
         )
     # ── Qualité (TTFB/probe, succès, 429) et compteurs upstream ──
     qper: dict[int, dict] = defaultdict(
@@ -205,30 +193,22 @@ def build_report(
                 d["scores"].append(float(score))
 
     m_first = next(
-        (
-            r["metrics"]
-            for r in valid
-            if isinstance(r.get("metrics"), dict) and "error" not in r["metrics"]
-        ),
+        (r["metrics"] for r in valid if isinstance(r.get("metrics"), dict) and "error" not in r["metrics"]),
         None,
     )
     m_last = next(
-        (
-            r["metrics"]
-            for r in reversed(valid)
-            if isinstance(r.get("metrics"), dict) and "error" not in r["metrics"]
-        ),
+        (r["metrics"] for r in reversed(valid) if isinstance(r.get("metrics"), dict) and "error" not in r["metrics"]),
         None,
     )
-    metrics_delta = None
+    metrics_delta: dict | None = None
     if isinstance(m_first, dict) and isinstance(m_last, dict):
         metrics_delta = {"rotations": {}, "fallback": {}, "free_status": {}}
         for section in metrics_delta:
             for key in set(m_first.get(section, {})) | set(m_last.get(section, {})):
                 try:
-                    metrics_delta[section][key] = float(
-                        m_last.get(section, {}).get(key, 0.0)
-                    ) - float(m_first.get(section, {}).get(key, 0.0))
+                    metrics_delta[section][key] = float(m_last.get(section, {}).get(key, 0.0)) - float(
+                        m_first.get(section, {}).get(key, 0.0)
+                    )
                 except Exception:
                     continue
 
@@ -241,48 +221,36 @@ def build_report(
                 f"p95 {_pct(probe_all, 95):.0f} ms · max {max(probe_all):.0f} ms"
             )
         if ewma_all:
-            lines.append(
-                f"- TTFB requêtes (EWMA) : p50 {_pct(ewma_all, 50):.0f} ms · "
-                f"p95 {_pct(ewma_all, 95):.0f} ms"
-            )
+            lines.append(f"- TTFB requêtes (EWMA) : p50 {_pct(ewma_all, 50):.0f} ms · p95 {_pct(ewma_all, 95):.0f} ms")
         if p95_all:
             lines.append(
-                f"- TTFB requêtes (p95 échantillonné) : p50 {_pct(p95_all, 50):.0f} ms · "
-                f"p95 {_pct(p95_all, 95):.0f} ms"
+                f"- TTFB requêtes (p95 échantillonné) : p50 {_pct(p95_all, 50):.0f} ms · p95 {_pct(p95_all, 95):.0f} ms"
             )
         if success_rates:
             lines.append(
-                f"- Taux de succès (snapshots) : moyenne {100*sum(success_rates)/len(success_rates):.1f} % · "
-                f"min {100*min(success_rates):.1f} %"
+                f"- Taux de succès (snapshots) : moyenne {100 * sum(success_rates) / len(success_rates):.1f} % · "
+                f"min {100 * min(success_rates):.1f} %"
             )
         max_429 = max((d["max_429"] for d in qper.values()), default=0)
         lines.append(f"- 429 récents : max {max_429} / station")
         if metrics_delta:
             rot = metrics_delta["rotations"]
             if rot:
-                lines.append(
-                    "- Rotations (fenêtre) : "
-                    + " · ".join(f"{k}={v:.0f}" for k, v in sorted(rot.items()))
-                )
+                lines.append("- Rotations (fenêtre) : " + " · ".join(f"{k}={v:.0f}" for k, v in sorted(rot.items())))
             else:
                 lines.append("- Rotations (fenêtre) : 0")
             fb = metrics_delta["fallback"]
             fb_total = sum(fb.values())
             fb_detail = ", ".join(f"{k}={v:.0f}" for k, v in sorted(fb.items()) if v)
             lines.append(
-                f"- Fallback payant (fenêtre) : total {fb_total:.0f}"
-                + (f" ({fb_detail})" if fb_detail else "")
+                f"- Fallback payant (fenêtre) : total {fb_total:.0f}" + (f" ({fb_detail})" if fb_detail else "")
             )
             free = metrics_delta["free_status"]
             free_detail = ", ".join(f"{k}={v:+.0f}" for k, v in sorted(free.items()) if v)
-            lines.append(
-                "- Statuts free (fenêtre) : " + (free_detail if free_detail else "aucun changement")
-            )
+            lines.append("- Statuts free (fenêtre) : " + (free_detail if free_detail else "aucun changement"))
         if qper:
             lines.append("")
-            lines.append(
-                "| Station | Probe p50 | Probe p95 | EWMA p50 | EWMA p95 | Succès | 429 max | Score moyen |"
-            )
+            lines.append("| Station | Probe p50 | Probe p95 | EWMA p50 | EWMA p95 | Succès | 429 max | Score moyen |")
             lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|")
             for sid in sorted(qper):
                 d = qper[sid]
@@ -290,13 +258,12 @@ def build_report(
                 if d["last_success"] is not None and d["last_errors"] is not None:
                     tot = d["last_success"] + d["last_errors"]
                     succ_rate = (100.0 * d["last_success"] / tot) if tot else None
-                _fmt_ms = lambda v: f"{v:.0f} ms" if v is not None else "—"
+
+                def _fmt_ms(v):
+                    return f"{v:.0f} ms" if v is not None else "—"
+
                 succ_txt = f"{succ_rate:.1f} %" if succ_rate is not None else "—"
-                score_txt = (
-                    f"{sum(d['scores']) / len(d['scores']):.3f}"
-                    if d["scores"]
-                    else "—"
-                )
+                score_txt = f"{sum(d['scores']) / len(d['scores']):.3f}" if d["scores"] else "—"
                 lines.append(
                     f"| {sid} | "
                     f"{_fmt_ms(_pct(d['probe'], 50))} | {_fmt_ms(_pct(d['probe'], 95))} | "
@@ -304,12 +271,7 @@ def build_report(
                     f"{succ_txt} | {d['max_429']} | {score_txt} |"
                 )
 
-    reasons = Counter(
-        str(st.get("reason"))
-        for r in valid
-        for st in (r.get("stations") or [])
-        if st.get("reason")
-    )
+    reasons = Counter(str(st.get("reason")) for r in valid for st in (r.get("stations") or []) if st.get("reason"))
     if reasons:
         lines.append("")
         lines.append("## Motifs non-routables")
@@ -320,7 +282,7 @@ def build_report(
 
 def main() -> int:
     try:
-        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     except Exception:
         pass
     ap = argparse.ArgumentParser()

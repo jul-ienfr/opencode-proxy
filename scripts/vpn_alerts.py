@@ -14,6 +14,7 @@ Usage :
 Fail-soft : jamais d'exit !=0 sur sonde KO (log seulement), exit 2 si args invalides.
 Env : VPN_ALERT_WEBHOOK (fallback --webhook), VPN_ALERT_BASE (fallback --base).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -65,7 +66,7 @@ def check(base: str) -> tuple[list[str], dict]:
         slo = ((h.get("slo") or {}).get("status") if isinstance(h.get("slo"), dict) else None) or h.get("slo_status")
         if slo == "breached":
             alerts.append("slo breached")
-        can = (h.get("canary") or {})
+        can = h.get("canary") or {}
         if isinstance(can, dict) and can.get("status") == "failing":
             alerts.append("canary failing")
         elif "failing" in health.lower() and "canary" in health.lower():
@@ -78,8 +79,9 @@ def check(base: str) -> tuple[list[str], dict]:
 
 def push(webhook: str, text: str, timeout: float = 10.0) -> bool:
     try:
-        req = urllib.request.Request(webhook, data=json.dumps({"text": text}).encode(),
-                                     headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            webhook, data=json.dumps({"text": text}).encode(), headers={"Content-Type": "application/json"}
+        )
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return 200 <= r.status < 300
     except Exception as e:

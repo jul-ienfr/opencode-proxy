@@ -66,9 +66,7 @@ _BODY_SECRET_RE = re.compile(
     r'[a-z0-9_.-]*"\s*:\s*")([^"\\]*(?:\\.[^"\\]*)*)(")'
 )
 _BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/\-=]+")
-_FORM_SECRET_RE = re.compile(
-    r"(?i)([?&](?:api[_-]?key|go_auth_cookie|auth|token|password|secret|credential)=)[^&\s]+"
-)
+_FORM_SECRET_RE = re.compile(r"(?i)([?&](?:api[_-]?key|go_auth_cookie|auth|token|password|secret|credential)=)[^&\s]+")
 
 
 def _redact_text(text: str) -> str:
@@ -214,9 +212,7 @@ class TrafficCapture:
         self._bytes = 0
         self._last_ts: float | None = None
         if any(v is not None for v in (max_frames, body_cap, max_bytes, enabled)):
-            self.configure(
-                enabled=enabled, max_frames=max_frames, body_cap=body_cap, max_bytes=max_bytes
-            )
+            self.configure(enabled=enabled, max_frames=max_frames, body_cap=body_cap, max_bytes=max_bytes)
 
     def configure(
         self,
@@ -260,9 +256,7 @@ class TrafficCapture:
         self._last_ts = now
         # Query strings can carry credentials (?api_key=...) — redact.
         query = _FORM_SECRET_RE.sub(r"\1[REDACTED]", query)
-        frame = _Frame(
-            self._counter, now, delta, method, path, query, version, client_ip, client_port, headers
-        )
+        frame = _Frame(self._counter, now, delta, method, path, query, version, client_ip, client_port, headers)
         self._frames.append(frame)
         self._by_id[frame.id] = frame
         while len(self._frames) > self.max_frames:
@@ -585,9 +579,7 @@ class TrafficCaptureMiddleware:
                 f"request aborted: {type(error).__name__}" if error else "request aborted",
             )
 
-        cap._finish(
-            frame, status, frame.ttfb_ms, (time.monotonic() - start) * 1000.0, aborted, reason
-        )
+        cap._finish(frame, status, frame.ttfb_ms, (time.monotonic() - start) * 1000.0, aborted, reason)
 
         if error is not None:
             raise error

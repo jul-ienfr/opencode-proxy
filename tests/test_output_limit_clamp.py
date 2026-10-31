@@ -183,9 +183,7 @@ def test_clamp_applies_on_the_anthropic_target_too(isolated_models):
     champ unique."""
     isolated_models({"kimi-k2.6": {"output_limit": 65536}})
     target = {}
-    _set_output_token_limit(
-        target, {"max_tokens": 200000}, "kimi-k2.6", target_protocol="anthropic"
-    )
+    _set_output_token_limit(target, {"max_tokens": 200000}, "kimi-k2.6", target_protocol="anthropic")
     assert target.get("max_tokens") == 65536
     assert "max_completion_tokens" not in target
 
@@ -260,3 +258,19 @@ def test_real_config_clamp_is_never_an_increase():
             clamped = cl.clamp_output_token_limit(asked, mid)
             assert clamped <= asked, f"{mid}: {asked} → {clamped}"
             assert clamped <= cap, f"{mid}: {asked} → {clamped} > limite {cap}"
+
+
+def test_context_limit_reads_catalog_limits():
+    from config.limits import context_limit
+
+    # The refreshed catalogue carries limit.context for every routed model.
+    assert context_limit("deepseek-v4.1-flash") == 1_000_000
+    assert context_limit("definitely-not-a-model") is None
+
+
+def test_context_limit_local_override(monkeypatch):
+    import config.settings as cs
+    from config.limits import context_limit
+
+    monkeypatch.setitem(cs._yaml_data, "models", {"deepseek-v4.1-flash": {"context_limit": 64000}})
+    assert context_limit("deepseek-v4.1-flash") == 64000

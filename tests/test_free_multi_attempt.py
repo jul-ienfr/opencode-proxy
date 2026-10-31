@@ -63,7 +63,7 @@ PAID_HEADERS = {
     "anthropic-version": "2023-06-01",
     "Content-Type": "application/json",
 }
-FREE_MODEL = "free-test-model"
+FREE_MODEL = "paid-test-model-free"
 PAID_MODEL = "paid-test-model"
 
 
@@ -84,12 +84,8 @@ def assert_no_paid_artifacts(label, headers, body=""):
         f"{label}: Authorization must be exactly 'Bearer public', got {headers.get('authorization')!r}"
     )
     for name, value in headers.items():
-        assert not name.startswith("x-stainless-"), (
-            f"{label}: SDK identifier {name!r} reached API_BASE_FREE"
-        )
-        assert PAID_KEY_MARKER not in value, (
-            f"{label}: paid key leaked in header {name!r} (value={value!r})"
-        )
+        assert not name.startswith("x-stainless-"), f"{label}: SDK identifier {name!r} reached API_BASE_FREE"
+        assert PAID_KEY_MARKER not in value, f"{label}: paid key leaked in header {name!r} (value={value!r})"
     ua = headers.get("user-agent", "")
     assert "claude-cli" not in ua and "python-httpx" not in ua, (
         f"{label}: client UA leaked to the free endpoint: {ua!r}"
@@ -100,9 +96,8 @@ def assert_no_paid_artifacts(label, headers, body=""):
     # sur l'autre version).
     try:
         from free.identities import KNOWN_CLIENT_VERSIONS as _KCV
-        _ok_uas = {
-            f"opencode/{_v} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14" for _v in _KCV
-        } | {
+
+        _ok_uas = {f"opencode/{_v} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14" for _v in _KCV} | {
             f"opencode/{_v} ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14" for _v in _KCV
         }
     except Exception:
@@ -112,17 +107,14 @@ def assert_no_paid_artifacts(label, headers, body=""):
         _ok_uas.add(oc._OPENCODE_OFFICIAL_UA_RESPONSES)
     except Exception:
         pass
-    assert ua in _ok_uas, (
-        f"{label}: official per-IP UA expected (one of {sorted(_ok_uas)}), got {ua!r}"
-    )
+    assert ua in _ok_uas, f"{label}: official per-IP UA expected (one of {sorted(_ok_uas)}), got {ua!r}"
     # [ALIGNEMENT 2026-10-20] Wire officiel 1.19.3 — identité de session portée
     # par x-opencode-session-id / x-session-affinity / x-session-id, quartet
     # 1.18.x abandonné (mesuré non requis par la porte).
     from config import free_gate
 
     assert free_gate.identity_ok(headers), (
-        f"{label}: aucun en-tête d'identité de session free "
-        f"(attendu l'un de {free_gate.SESSION_IDENTITY_HEADERS})"
+        f"{label}: aucun en-tête d'identité de session free (attendu l'un de {free_gate.SESSION_IDENTITY_HEADERS})"
     )
     _sid = (
         headers.get("x-opencode-session-id")
@@ -130,9 +122,7 @@ def assert_no_paid_artifacts(label, headers, body=""):
         or headers.get("x-session-id")
         or headers.get("x-opencode-session")
     )
-    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", _sid or ""), (
-        f"{label}: bad free session ID: {_sid!r}"
-    )
+    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", _sid or ""), f"{label}: bad free session ID: {_sid!r}"
     if body:
         assert PAID_KEY_MARKER not in body, f"{label}: paid key leaked in request body"
 
@@ -236,10 +226,7 @@ class _PoolMulti:
     def pick_candidates(self, forced_pool=None):
         """[Lot G] hedge wiring calls pick_candidates — mirror the real
         pool: all usable stations, routing preference = list order."""
-        return [
-            st for st in self._stations
-            if self._station_usable(st, exclude_approaching=False)
-        ]
+        return [st for st in self._stations if self._station_usable(st, exclude_approaching=False)]
 
     def on_quota_exhausted(self, station):
         self.rotated.append(station)
@@ -291,9 +278,7 @@ def free_cfg(monkeypatch):
     monkeypatch.setattr(
         _st,
         "get_429_action",
-        lambda default="both": _st.normalize_429_action(
-            oc.IP_ROTATION.get("on_429_action") or default, default
-        ),
+        lambda default="both": _st.normalize_429_action(oc.IP_ROTATION.get("on_429_action") or default, default),
     )
     saved = {
         k: oc.IP_ROTATION.get(k)
@@ -610,9 +595,7 @@ async def test_non_stream_tunnel_failure_retries_station(free_vpn_env, free_cfg,
     result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is not None
     assert result[0].status_code == 200
-    assert [s for _p, s in fake.calls] == [a, b], (
-        "station-first: dead tunnel on A must retry B, not go direct"
-    )
+    assert [s for _p, s in fake.calls] == [a, b], "station-first: dead tunnel on A must retry B, not go direct"
     assert direct_calls == [], "direct residential fallback never reached"
 
 
@@ -648,9 +631,7 @@ async def test_non_stream_exception_fallback_ignored_in_vpn_mode(free_vpn_env, f
 
     result = await oc._try_free_model_first(_free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL)
     assert result is None, "budget exhausted → paid fallback (None), never direct"
-    assert [s for _p, s in fake.calls] == [a, b], (
-        "both stations struck before giving up (knob ignored in vpn mode)"
-    )
+    assert [s for _p, s in fake.calls] == [a, b], "both stations struck before giving up (knob ignored in vpn mode)"
     assert direct_calls == [], "proxy_mode=vpn → NO residential direct fallback"
 
 
@@ -754,9 +735,7 @@ async def test_stream_429_retry_marks_rate_limited_for_pool(free_vpn_env, free_c
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
     oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
 
-    decision, refuse = await oc._free_429_stream_decision(
-        FREE_MODEL, _FakeStream429Resp(), 0, None, PAID_MODEL
-    )
+    decision, refuse = await oc._free_429_stream_decision(FREE_MODEL, _FakeStream429Resp(), 0, None, PAID_MODEL)
     assert decision == "retry_free", "budget restant → station fraîche"
     assert refuse is False
     attempt = oc._current_free_attempt.get() or {}
@@ -785,9 +764,7 @@ async def test_stream_429_budget_exhausted_strict_refuses_not_paid(free_vpn_env,
     oc._set_free_cooldown(FREE_MODEL, 9999, b)
     oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
 
-    decision, refuse = await oc._free_429_stream_decision(
-        FREE_MODEL, _FakeStream429Resp(), 1, None, PAID_MODEL
-    )
+    decision, refuse = await oc._free_429_stream_decision(FREE_MODEL, _FakeStream429Resp(), 1, None, PAID_MODEL)
     assert decision == "fallback_paid"
     assert refuse is True, "strict_free + tunnel → aucune jambe payante"
 
@@ -804,9 +781,7 @@ async def test_stream_429_budget_exhausted_not_strict_falls_back_paid(free_vpn_e
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
     oc._current_free_attempt.set({"station": a, "proxy_url": a.socks5_url})
 
-    decision, refuse = await oc._free_429_stream_decision(
-        FREE_MODEL, _FakeStream429Resp(), 1, None, PAID_MODEL
-    )
+    decision, refuse = await oc._free_429_stream_decision(FREE_MODEL, _FakeStream429Resp(), 1, None, PAID_MODEL)
     assert decision == "fallback_paid"
     assert refuse is False
 
@@ -953,9 +928,7 @@ class _FakeStreamResp:
 
 
 @pytest.mark.asyncio
-async def test_stream_tunnel_failure_raises_free_tunnel_failure(
-    free_vpn_env, free_cfg, monkeypatch
-):
+async def test_stream_tunnel_failure_raises_free_tunnel_failure(free_vpn_env, free_cfg, monkeypatch):
     """station-first stream: a tunnel exception with direct_fallback=False
     RE-RAISES _FreeTunnelFailure (carrying the dead station) instead of
     falling through to the direct httpx path — the caller's loop then
@@ -977,9 +950,7 @@ async def test_stream_tunnel_failure_raises_free_tunnel_failure(
             oc.API_BASE_FREE, body, dict(PAID_HEADERS), use_free=True, direct_fallback=False
         ):
             raise AssertionError("the CM must not yield on a dead tunnel in station-first mode")
-    assert excinfo.value.station is a, (
-        "the re-raised failure must carry the DEAD station (next attempt excludes it)"
-    )
+    assert excinfo.value.station is a, "the re-raised failure must carry the DEAD station (next attempt excludes it)"
     assert "tunnel dead" in str(excinfo.value.cause)
     # Tunnel branch really ran with the station's tunnel
     assert len(_FakeCurlSessionRaise.created) == 1
@@ -1072,9 +1043,7 @@ def test_excluding_many_skips_bad_station_even_when_excluded_empty():
     b.status = "disconnected"  # tunnel down
     pool = _pool_with([a, b])
     assert pool._best_station_excluding_many(set()) is a
-    assert pool._best_station_excluding_many({a}) is None, (
-        "no usable station left → None (caller goes direct/paid)"
-    )
+    assert pool._best_station_excluding_many({a}) is None, "no usable station left → None (caller goes direct/paid)"
 
 
 # ── [PLAN-corrections-429 §5 Lot G] hedge / strict / failover-cascade ─────
@@ -1131,10 +1100,13 @@ async def test_hedge_loser_429_badmarked(free_vpn_env, free_cfg, monkeypatch):
         if next(order) == "fast429":
             # la perdante répond 429 AVANT la gagnante (pas de sleep) —
             # le filet §14.1.5 la retient sans clore la course
-            return _FakeResp(429, {"retry-after": "30"}, text='{"error": {"message": "Rate limit exceeded for free tier"}}')
+            return _FakeResp(
+                429, {"retry-after": "30"}, text='{"error": {"message": "Rate limit exceeded for free tier"}}'
+            )
         await asyncio.sleep(0.05)  # la gagnante répond APRES la 429 perdante
         return _FakeResp(
-            200, {"content-type": "application/json"},
+            200,
+            {"content-type": "application/json"},
             usage={"prompt_tokens": 1, "completion_tokens": 1},
         )
 
@@ -1145,7 +1117,8 @@ async def test_hedge_loser_429_badmarked(free_vpn_env, free_cfg, monkeypatch):
         # production swaps paid→free model BEFORE the hedge (free_body) —
         # _hedged_fetch derives the 429-cooldown model key from body["model"]
         {**_free_body(), "model": FREE_MODEL},
-        dict(PAID_HEADERS), "openai",
+        dict(PAID_HEADERS),
+        "openai",
     )
     assert resp.status_code == 200
     loser = b if winner is a else a
@@ -1172,7 +1145,9 @@ async def test_hedge_all_429_marks_all_stations(free_vpn_env, free_cfg, monkeypa
 
     async def _fake_hedge(cands_arg, body, headers, endpoint, forced_pool=None):
         assert cands_arg == cands
-        return _FakeResp(429, {"retry-after": "45"}, text='{"error": {"message": "Rate limit exceeded for free tier"}}'), a
+        return _FakeResp(
+            429, {"retry-after": "45"}, text='{"error": {"message": "Rate limit exceeded for free tier"}}'
+        ), a
 
     monkeypatch.setattr(oc, "_hedged_fetch", _fake_hedge)
     monkeypatch.setattr(oc, "_free_parallel_should_hedge", lambda *a_, **k: True)

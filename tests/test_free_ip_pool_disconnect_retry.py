@@ -149,7 +149,7 @@ class TestDualStationSwitch:
         await p.on_disconnect_retry(st1)
 
         assert p._per_station(st1)["request_count"] == 7
-        assert p._per_station(st2)["request_count"] == 3
+        assert p._per_station(st2)["request_count"] == 4  # nouveau serveur = nouveau slot
 
     @pytest.mark.asyncio
     async def test_c1_never_bad_mark_last_standing(self):
@@ -163,12 +163,8 @@ class TestDualStationSwitch:
 
         proxy, station = await p.on_disconnect_retry(st1)
 
-        assert proxy is None and station is None, (
-            "none usable → caller falls back to direct/paid instead of a dead IP"
-        )
-        assert p._per_station(st1)["bad_until"] is None, (
-            "C1: last standing station must NOT be bad-marked"
-        )
+        assert proxy is None and station is None, "none usable → caller falls back to direct/paid instead of a dead IP"
+        assert p._per_station(st1)["bad_until"] is None, "C1: last standing station must NOT be bad-marked"
         # The failed station still rotates in the background (plus the down
         # station's reconnect from ensure_connected — a reconnect IS a rotation).
         assert st1 in p.rotated, "the failed station still rotates in the background"
@@ -217,9 +213,7 @@ class TestSingleStation:
         proxy, station = await p.on_disconnect_retry(st1)
 
         assert proxy is None and station is None
-        assert p._per_station(st1)["bad_until"] is None, (
-            "single station = last standing → must not be bad-marked"
-        )
+        assert p._per_station(st1)["bad_until"] is None, "single station = last standing → must not be bad-marked"
         assert p.rotated == [st1]
 
     @pytest.mark.asyncio
@@ -234,3 +228,38 @@ class TestSingleStation:
         assert proxy == st1.socks5_url
         assert p._per_station(st1)["bad_until"] is None
         assert p.rotated == []
+
+
+class TestExcludedTrialDeadFallback:
+    """[2026-10-29] Toutes les stations trial-dead ne doivent pas rendre None.
+
+    Le chemin streaming passait ``excluded={stations trial-exhausted}``. Si
+    toutes etaient exclues, le pool rendait ``(None, None)`` -> 502 « empty
+    stream » sans rotation. Le repli doit retenter une station pour obtenir le
+    vrai 429 amont et declencher sa rotation.
+    """
+
+    @staticmethod
+    async def _noop_connected():
+        return None
+
+    @pytest.mark.asyncio
+    async def test_on_request_all_excluded_falls_back(self):
+        st1, st2 = _StubStation(1), _StubStation(2)
+        p = _pool(st1, st2)
+        p.ensure_connected = self._noop_connected
+
+        proxy, station = await p.on_request(excluded={st1, st2})
+
+        assert station is not None, "toutes exclues -> repli, jamais (None, None)"
+        assert proxy == station.socks5_url
+
+    @pytest.mark.asyncio
+    async def test_on_disconnect_retry_all_excluded_avoids_failed(self):
+        st1, st2 = _StubStation(1), _StubStation(2)
+        p = _pool(st1, st2)
+
+        proxy, station = await p.on_disconnect_retry(st1, excluded={st1, st2})
+
+        assert station is st2, "le repli doit eviter la station qui vient d'echouer"
+        assert proxy == st2.socks5_url

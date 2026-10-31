@@ -124,8 +124,10 @@ MODELS_URL = "https://opencode.ai/zen/go/v1/models"
 
 _models_cache: list[str] | None = None
 
-API_BASE_OPENAI = "https://opencode.ai/zen/go/v1/chat/completions"
-API_BASE_ANTHROPIC = "https://opencode.ai/zen/go/v1/messages"
+# [audit 2026-10-30] Align with the current catalogue bases. These are only
+# fallbacks for the tier payload of ids discovered upstream but not configured.
+API_BASE_OPENAI = "https://opencode.ai/inference/go/openai/v1/chat/completions"
+API_BASE_ANTHROPIC = "https://opencode.ai/inference/go/anthropic/v1/messages"
 
 
 async def fetch_available_models() -> list[str]:
@@ -185,23 +187,126 @@ async def fetch_available_models() -> list[str]:
         raise
 
 
+_DASH_ROUTE_CACHE: dict = {}
+_DASH_ROUTE_SEEN_VERSION = -1
+
+
+def _route_target_for(model_id: str) -> str:
+    """Cible réelle d'un alias de route (une seule résolution, comme le proxy)."""
+    global _DASH_ROUTE_SEEN_VERSION
+    try:
+        from app.router import route_for as _route_for
+        from config.settings import (
+            CUSTOM_ROUTES,
+            DISABLE_MAPPING,
+            MODELS,
+            ROUTE_VERSION,
+            SORTED_CUSTOM_ROUTES,
+            SORTED_ROUTES,
+        )
+
+        res, _DASH_ROUTE_SEEN_VERSION = _route_for(
+            model_id,
+            models=MODELS,
+            custom_routes=CUSTOM_ROUTES,
+            disable_mapping=DISABLE_MAPPING,
+            route_cache=_DASH_ROUTE_CACHE,
+            route_cache_max=2048,
+            seen_version=_DASH_ROUTE_SEEN_VERSION,
+            current_version=ROUTE_VERSION,
+            sorted_routes=SORTED_ROUTES,
+            sorted_custom_routes=SORTED_CUSTOM_ROUTES,
+        )
+        return str(res.get("model") or "").strip() if isinstance(res, dict) else ""
+    except Exception:
+        return ""
+
+
+def _model_tier_payload(
+    model_id: str,
+    endpoint: str,
+    protocol: str | None = None,
+    source: str | None = None,
+) -> dict:
+    """Champs de classement Gratuit/Payant pour la GUI (fail-soft)."""
+    try:
+        from config.live_models import get_model_entry
+        from config.model_tier import (
+            classify_model,
+            classify_route_alias,
+            public_tier_fields,
+        )
+        from config.settings import (
+            FREE_MODEL_MAP,
+            FREE_MODELS,
+            get_free_substitution_policy,
+        )
+
+        cfg = {"endpoint": endpoint, "protocol": protocol, "source": source}
+        target = _route_target_for(model_id)
+        if target and target != model_id:
+            from config.settings import get_model_config
+
+            target_cfg = get_model_config(target)
+            verdict = classify_route_alias(
+                model_id,
+                target,
+                cfg=cfg,
+                entry=get_model_entry(model_id),
+                target_cfg=target_cfg,
+                target_entry=get_model_entry(target),
+                free_models=FREE_MODELS,
+                free_model_map=FREE_MODEL_MAP,
+                policy=get_free_substitution_policy(),
+            )
+        else:
+            verdict = classify_model(
+                model_id,
+                cfg,
+                get_model_entry(model_id),
+                free_models=FREE_MODELS,
+                free_model_map=FREE_MODEL_MAP,
+                policy=get_free_substitution_policy(),
+            )
+        return public_tier_fields(verdict)
+    except Exception:
+        return {
+            "tier": "unknown",
+            "tier_source": "unknown",
+            "route_leg": "unknown",
+            "catalog_legs": [],
+            "free_first": False,
+            "free_target": None,
+            "free_mapping": None,
+            "free_mapping_active": False,
+            "route_mismatch": False,
+            "catalog_mismatch": False,
+            "route_target": None,
+        }
+
+
 def get_available_models() -> dict:
     """Return merged model info: local config + auto-discovered upstream."""
-    from config.settings import MODELS
+    from config.settings import MODELS, get_model_config
 
     try:
         from config import live_models as _lm
     except Exception:
-        _lm = None
+        # échec de l'import = pas de filtre live ; mypy voit ici `Module | None`
+        _lm = None  # type: ignore[assignment]
 
     result = {}
     for mid, cfg in list(MODELS.items()):
         if _lm is not None and _lm.is_removed(mid):
             continue
+        full = get_model_config(mid)
+        endpoint = full.get("endpoint") or cfg.get("endpoint", "")
+        protocol = full.get("protocol") or cfg.get("protocol")
         result[mid] = {
-            "protocol": cfg["protocol"],
-            "endpoint": cfg["endpoint"].rsplit("/", 1)[-1],
+            "protocol": protocol,
+            "endpoint": str(endpoint).rsplit("/", 1)[-1],
             "source": "local",
+            **_model_tier_payload(mid, endpoint, protocol, full.get("source")),
         }
     if _models_cache:
         for mid in _models_cache:
@@ -222,6 +327,7 @@ def get_available_models() -> dict:
                     "protocol": proto,
                     "endpoint": ep.rsplit("/", 1)[-1],
                     "source": "upstream",
+                    **_model_tier_payload(mid, ep, proto),
                 }
     return result
 
@@ -307,42 +413,45 @@ async def fetch_model_limits() -> dict[str, list[int]]:
 
         html = resp.text
 
-        # Find the first table — it contains the model limits
-        table_match = re.search(r"<table[^>]*>(.*?)</table>", html, re.DOTALL)
-        if not table_match:
+        # [audit 2026-10-30] The docs page no longer starts with the limits
+        # table (plans/clients/pricing tables come first). Pick the FIRST
+        # table whose header is the base-plan "Requests per 5 hours" one.
+        tables = re.findall(r"<table[^>]*>(.*?)</table>", html, re.DOTALL)
+        if not tables:
             raise RuntimeError("No table found in docs page")
 
-        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", table_match.group(1), re.DOTALL)
-        if not rows:
-            raise RuntimeError("No rows found in docs table")
-
         result: dict[str, list[int]] = {}
-
-        for row in rows[1:]:  # skip header
-            cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.DOTALL)
-            if len(cells) < 4:
+        for table_html in tables:
+            rows = re.findall(r"<tr[^>]*>(.*?)</tr>", table_html, re.DOTALL)
+            if not rows:
                 continue
-
-            # Clean HTML tags from cells
-            name = re.sub(r"<[^>]+>", "", cells[0]).strip()
-            if not name:
+            header = [
+                re.sub(r"<[^>]+>", "", c).strip().lower()
+                for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", rows[0], re.DOTALL)
+            ]
+            if not any("requests per 5" in h for h in header):
                 continue
-
-            # Normalize model name: strip parenthetical notes, lowercase, spaces→hyphens
-            name_clean = re.sub(r"\s*\(.*?\)\s*", "", name).strip()
-            model_id = name_clean.lower().replace(" ", "-")
-
-            # Parse numbers (French format: "2,150" → 2150)
-            try:
-                limits = [
-                    int(re.sub(r"[^\d]", "", cells[1])),
-                    int(re.sub(r"[^\d]", "", cells[2])),
-                    int(re.sub(r"[^\d]", "", cells[3])),
-                ]
-            except (ValueError, IndexError):
-                continue
-
-            result[model_id] = limits
+            for row in rows[1:]:  # skip header
+                cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.DOTALL)
+                if len(cells) < 4:
+                    continue
+                name = re.sub(r"<[^>]+>", "", cells[0]).strip()
+                if not name:
+                    continue
+                name_clean = re.sub(r"\s*\(.*?\)\s*", "", name).strip()
+                model_id = name_clean.lower().replace(" ", "-")
+                try:
+                    limits = [
+                        int(re.sub(r"[^\d]", "", cells[1])),
+                        int(re.sub(r"[^\d]", "", cells[2])),
+                        int(re.sub(r"[^\d]", "", cells[3])),
+                    ]
+                except (ValueError, IndexError):
+                    continue
+                result[model_id] = limits
+            # Base plan only: the following tables are higher tiers.
+            if result:
+                break
 
         if not result:
             raise RuntimeError("No model limits parsed from docs table")
@@ -568,12 +677,16 @@ def parse_quota_html(html: str) -> dict:
         if w:
             result[key] = w
 
-    if not result:
-        raise ValueError("Could not parse quota data from the OpenCode Go page. The page format may have changed.")
-
-    # Fill in any missing windows with zeroed data
-    for key in ("rolling", "weekly", "monthly"):
-        result.setdefault(key, {"usage_percent": 0.0, "reset_in_sec": 0})
+    _missing = [k for k in ("rolling", "weekly", "monthly") if k not in result]
+    if _missing:
+        # [audit 2026-10-30] A partial parse used to fill missing windows with
+        # 0 % and status="ok": the dashboard showed green bars and "100 %
+        # restant" while the page had changed or a window was absent. Treat a
+        # partial page as an error so the operator sees it.
+        raise ValueError(
+            "Could not parse quota data from the OpenCode Go page "
+            f"(missing windows: {', '.join(_missing)}). The page format may have changed."
+        )
 
     return result
 
@@ -726,6 +839,19 @@ async def fetch_quotas(workspace_id: str, auth_cookie: str) -> dict:
         if resp.status_code in (401, 403):
             logger.debug("[quota] auth failed for workspace %s (HTTP %d)", workspace_id[:8], resp.status_code)
             raise RuntimeError("OpenCode Go authentication failed. Refresh your auth cookie.")
+        # [audit 2026-10-30] An expired cookie is redirected to /console/login
+        # with HTTP 200; parsing then failed with a misleading "page format
+        # may have changed". Detect the login page explicitly.
+        try:
+            _final_url = str(getattr(resp, "url", "") or "")
+        except Exception:
+            _final_url = ""
+        if "/console/login" in _final_url or "/login" in _final_url:
+            logger.debug("[quota] auth expired for workspace %s (redirected to login)", workspace_id[:8])
+            raise RuntimeError(
+                "OpenCode Go authentication expired (redirected to the login page). "
+                "Refresh the workspace auth cookie."
+            )
         if resp.status_code >= 500 and attempt < 2:
             last_err = RuntimeError(f"OpenCode Go request failed with HTTP {resp.status_code}.")
             await asyncio.sleep(1.5 * (2**attempt))
@@ -837,8 +963,22 @@ async def _refresh_all_now() -> None:
                         _caches[wid] = _new_cache("error", str(e))
                 get_event_manager().publish("quotas_updated", {"workspace_id": wid, "status": "error", "error": str(e)})
 
-    await asyncio.gather(*(_fetch_one(ws) for ws in workspaces))
-    _mark_refreshed()
+    _any_ok = False
+
+    async def _fetch_one_tracked(ws):
+        nonlocal _any_ok
+        await _fetch_one(ws)
+        async with _cache_lock:
+            _st = (_caches.get(ws.get("go_workspace_id", "")) or {}).get("status")
+        if _st == "ok":
+            _any_ok = True
+
+    await asyncio.gather(*(_fetch_one_tracked(ws) for ws in workspaces))
+    # [audit 2026-10-30] Only a successful fetch refreshes the SWR clock.
+    # Marking fresh after an all-error cycle stopped the next GET from
+    # retrying and let the UI display stale/zero data as healthy.
+    if _any_ok:
+        _mark_refreshed()
 
 
 # ── Background poller ──

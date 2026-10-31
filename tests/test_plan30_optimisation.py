@@ -164,17 +164,17 @@ class TestRotationStorm:
     def test_seuil_clamp_1_720(self):
         # même clamp utilisé en __init__/update_config
         for raw, expected in ((0, 1), (1000, 720)):
-            v = int(vm._clamp_cfg_number(
-                {"station_max_rotations_per_hour": raw},
-                "station_max_rotations_per_hour", 10.0, 1.0, 720.0
-            ))
+            v = int(
+                vm._clamp_cfg_number(
+                    {"station_max_rotations_per_hour": raw}, "station_max_rotations_per_hour", 10.0, 1.0, 720.0
+                )
+            )
             assert v == expected
 
     def test_cooldown_clamp_30_7200(self):
         for raw, expected in ((10, 30.0), (99999.0, 7200.0)):
             v = vm._clamp_cfg_number(
-                {"rotation_storm_cooldown_s": raw},
-                "rotation_storm_cooldown_s", 600.0, 30.0, 7200.0
+                {"rotation_storm_cooldown_s": raw}, "rotation_storm_cooldown_s", 600.0, 30.0, 7200.0
             )
             assert v == expected
 
@@ -246,9 +246,7 @@ class TestHealthDetail:
             assert r.status_code == 200
             assert r.json().get("usage") == {}
             r2 = client.get("/health?detail=full")
-            assert r2.json().get("usage", {}).get("test-health-model") == {
-                "input": 1, "output": 2, "cache": 0
-            }
+            assert r2.json().get("usage", {}).get("test-health-model") == {"input": 1, "output": 2, "cache": 0}
         finally:
             oc._token_usage.pop("test-health-model", None)
 
@@ -312,12 +310,8 @@ class TestWeeklyPurge:
 
         db_path = tmp_path / "w.db"
         conn = sqlite3.connect(db_path)
-        conn.execute(
-            "CREATE TABLE requests (id TEXT PRIMARY KEY, timestamp TEXT NOT NULL)"
-        )
-        conn.execute(
-            "CREATE TABLE free_model_usage (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL)"
-        )
+        conn.execute("CREATE TABLE requests (id TEXT PRIMARY KEY, timestamp TEXT NOT NULL)")
+        conn.execute("CREATE TABLE free_model_usage (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL)")
         for i, ts in rows:
             conn.execute("INSERT INTO requests(id, timestamp) VALUES (?, ?)", (f"r{i}", ts))
             conn.execute("INSERT INTO free_model_usage(timestamp) VALUES (?)", (ts,))
@@ -340,9 +334,7 @@ class TestWeeklyPurge:
     def test_purge_0_desactivee(self, tmp_path):
         import datetime as _dt
 
-        ts = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=400)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        ts = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=400)).strftime("%Y-%m-%dT%H:%M:%SZ")
         conn = self._db(tmp_path, [(1, ts)])
         purged = _app_db._purge_old_rows_locked(conn, days=0)
         assert purged == 0
@@ -352,9 +344,7 @@ class TestWeeklyPurge:
         import datetime as _dt
         import sqlite3
 
-        old = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=365)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        old = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
         db = tmp_path / "legacy.db"
         conn = sqlite3.connect(db)
         conn.execute("CREATE TABLE requests (id TEXT, timestamp TEXT)")

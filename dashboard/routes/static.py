@@ -67,6 +67,23 @@ def _is_fresh(pre_path: str, src_path: str) -> bool:
         return False
 
 
+def _iter_compressible(static_dir):
+    """Parcourt `static_dir` en profondeur et rend ``(chemin_source, rel)``.
+
+    Récursif depuis le découpage du front-end (Vite) : les bundles compilés
+    vivent dans ``static/dist/assets/*.js|css``. ``rel`` est toujours séparé
+    par ``/`` pour composer l'URL, quel que soit l'OS.
+    """
+    for root, dirs, files in os.walk(static_dir):
+        dirs.sort()
+        for name in sorted(files):
+            if not name.endswith(_COMPRESSIBLE_EXT):
+                continue
+            src_path = os.path.join(root, name)
+            rel = os.path.relpath(src_path, static_dir).replace(os.sep, "/")
+            yield src_path, rel
+
+
 def load_precompressed(static_dir) -> dict[str, dict[str, tuple[bytes, str]]]:
     """Charge les assets pré-compressés : ``{path: {"br": (bytes, ctype), "gz": ...}}``.
 
@@ -79,21 +96,16 @@ def load_precompressed(static_dir) -> dict[str, dict[str, tuple[bytes, str]]]:
     pu être lue : ``gz`` est le fallback universel même si `.br` existe.
     """
     out: dict[str, dict[str, tuple[bytes, str]]] = {}
-    try:
-        names = sorted(os.listdir(static_dir))
-    except Exception:
+    if not os.path.isdir(static_dir):
         return out
-    for name in names:
-        if not name.endswith(_COMPRESSIBLE_EXT):
-            continue
-        src_path = os.path.join(static_dir, name)
+    for src_path, rel in _iter_compressible(static_dir):
         try:
             with open(src_path, "rb") as f:
                 raw = f.read()
         except Exception:
             continue
-        ctype = _content_type(name)
-        url = "/static/" + name
+        ctype = _content_type(rel)
+        url = "/static/" + rel
         entry: dict[str, tuple[bytes, str]] = {}
         # brotli (build) — pas de fallback à la volée : quality=11 coûte
         # ~150 ms/fichier, hors de question au démarrage.

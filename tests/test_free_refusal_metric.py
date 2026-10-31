@@ -54,9 +54,7 @@ class TestRefusalReachesTheMetric:
     def test_a_refusal_is_recorded_with_the_upstream_status(self):
         oc._current_free_refusal.set(("jev-1.13-free", 400))
         _log("jev-1.13-free", 200)
-        assert "jev-1.13-free" not in metrics.leg_ok_models(), (
-            "un refus amont ne doit jamais apparaître comme servi"
-        )
+        assert "jev-1.13-free" not in metrics.leg_ok_models(), "un refus amont ne doit jamais apparaître comme servi"
 
     def test_a_genuine_success_is_recorded(self):
         _log("big-pickle", 200)

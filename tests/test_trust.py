@@ -124,9 +124,7 @@ def test_origin_same_host_ok():
 
 
 def test_origin_cross_site_blocked():
-    assert not origin_host_matches(
-        _scope_with_headers({"Origin": "https://evil.example", "Referer": ""})
-    )
+    assert not origin_host_matches(_scope_with_headers({"Origin": "https://evil.example", "Referer": ""}))
 
 
 def test_referer_cross_site_blocked():
@@ -165,12 +163,7 @@ async def test_dash_external_blocked_403(monkeypatch):
 async def test_dash_external_with_valid_token_passes(monkeypatch):
     set_cfg(monkeypatch, "dashboard_trust", {"mode": "lan"})
     mw = DashboardTrustMiddleware(None, token_getter=lambda: "tok123")
-    assert (
-        await run_through(
-            mw, make_scope(ip="203.0.113.9", headers={"X-Dashboard-Token": "tok123"})
-        )
-        == 200
-    )
+    assert await run_through(mw, make_scope(ip="203.0.113.9", headers={"X-Dashboard-Token": "tok123"})) == 200
 
 
 @pytest.mark.asyncio
@@ -180,12 +173,7 @@ async def test_dash_external_token_configured_missing_or_wrong_is_401(monkeypatc
     set_cfg(monkeypatch, "dashboard_trust", {"mode": "lan"})
     mw = DashboardTrustMiddleware(None, token_getter=lambda: "tok123")
     assert await run_through(mw, make_scope(ip="203.0.113.9")) == 401
-    assert (
-        await run_through(
-            mw, make_scope(ip="203.0.113.9", headers={"X-Dashboard-Token": "nope"})
-        )
-        == 401
-    )
+    assert await run_through(mw, make_scope(ip="203.0.113.9", headers={"X-Dashboard-Token": "nope"})) == 401
 
 
 @pytest.mark.asyncio
@@ -222,30 +210,14 @@ async def test_dash_mutation_rate_limited(monkeypatch):
     limiter = _MutationRateLimiter(limit=2, window=60.0)
     mw = DashboardTrustMiddleware(None, token_getter=lambda: "", rate_limiter=limiter)
     base = {"Origin": "http://localhost:4000"}
-    assert (
-        await run_through(
-            mw, make_scope(method="POST", ip="192.168.1.50", headers=base)
-        )
-        == 200
+    assert await run_through(mw, make_scope(method="POST", ip="192.168.1.50", headers=base)) == 200
+    assert await run_through(mw, make_scope(method="POST", ip="192.168.1.50", headers=base)) == 200
+    assert await run_through(mw, make_scope(method="POST", ip="192.168.1.50", headers=base)) == 429, (
+        "3e mutation dans la fenêtre → 429"
     )
-    assert (
-        await run_through(
-            mw, make_scope(method="POST", ip="192.168.1.50", headers=base)
-        )
-        == 200
+    assert await run_through(mw, make_scope(method="POST", ip="10.0.0.99", headers=base)) == 200, (
+        "autre IP non impactée"
     )
-    assert (
-        await run_through(
-            mw, make_scope(method="POST", ip="192.168.1.50", headers=base)
-        )
-        == 429
-    ), "3e mutation dans la fenêtre → 429"
-    assert (
-        await run_through(
-            mw, make_scope(method="POST", ip="10.0.0.99", headers=base)
-        )
-        == 200
-    ), "autre IP non impactée"
 
 
 @pytest.mark.asyncio
@@ -273,10 +245,7 @@ async def test_client_lan_mode(monkeypatch):
     assert await run_through(mw, make_scope(path="/v1/messages", ip="192.168.1.7")) == 200
     assert await run_through(mw, make_scope(path="/v1/messages", ip="203.0.113.9")) == 403
     assert (
-        await run_through(
-            mw, make_scope(path="/api/circuit-breakers/reset", method="POST", ip="203.0.113.9")
-        )
-        == 403
+        await run_through(mw, make_scope(path="/api/circuit-breakers/reset", method="POST", ip="203.0.113.9")) == 403
     ), "endpoints reset protégés aussi"
 
 
@@ -292,13 +261,9 @@ async def test_client_key_mode(monkeypatch):
         headers={"Authorization": "Bearer sk-client-secret"},
     )
     assert await run_through(mw, bearer) == 200
-    xkey = make_scope(
-        path="/v1/messages", ip="203.0.113.9", headers={"x-api-key": "sk-client-secret"}
-    )
+    xkey = make_scope(path="/v1/messages", ip="203.0.113.9", headers={"x-api-key": "sk-client-secret"})
     assert await run_through(mw, xkey) == 200
-    wrong = make_scope(
-        path="/v1/messages", ip="203.0.113.9", headers={"Authorization": "Bearer nope"}
-    )
+    wrong = make_scope(path="/v1/messages", ip="203.0.113.9", headers={"Authorization": "Bearer nope"})
     assert await run_through(mw, wrong) == 401
 
 

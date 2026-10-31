@@ -4,7 +4,7 @@ Référence (re-vérifiée 2026-10-15 sur le binaire natif 1.18.31 (mitmproxy :
 `opencode run`, provider `opencode`,
   * client  : packages/opencode/src/session/llm/request.ts (jeu des headers)
   * wire    : captures octet-exact du VRAI client natif (POST
-              https://opencode.ai/inference/v1/responses + /chat/completions) : 7 headers
+              https://opencode.ai/inference/openai/v1/responses + /chat/completions) : 7 headers
               Authorization, Content-Type, User-Agent, x-opencode-client/
               project/request/session (SANS session-id : le natif ne l'envoie jamais), puis
               transport Bun (Connection, Accept, Host, AE, Content-Length) ;
@@ -20,8 +20,9 @@ Référence (re-vérifiée 2026-10-15 sur le binaire natif 1.18.31 (mitmproxy :
 
 Règles verrouillées ici :
   1. Jeu exact : 8 headers, ni plus ni moins — AUCUN header navigateur
-     (Accept-Language, sec-ch-ua, Cookie…) même si le profil d'identité en
-     porte (la diversité navigateur ne sert que le chemin geo), et PAS
+     (Accept-Language, sec-ch-ua, Cookie…) même si un profil legacy en
+     porte (les profils sont nettoyés en amont et la diversité ne génère
+     plus de variantes navigateur), et PAS
      d'Accept explicite (transport Bun l'ajoute en 10ᵉ ; explicite = trié
      premier = copie trahie).
   2. Ordre wire réel : Authorization, Content-Type, User-Agent,
@@ -150,7 +151,7 @@ def test_header_set_exact(official_env):
     Le mode `legacy` (wire 1.18.x) reste disponible et est verifie plus bas.
     Aucun en-tete navigateur, et jamais x-api-key (invariant A.0).
     """
-    h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
+    h = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions")
     assert list(h.keys()) == OFFICIAL_ORDER
     lower = {k.lower() for k in h}
     for banned in (
@@ -175,7 +176,7 @@ def test_header_set_exact(official_env):
 def test_legacy_style_restores_the_1_18_wire(official_env, monkeypatch):
     """Rollback : `OPENCODE_FREE_WIRE_STYLE=legacy` restaure le wire 1.18.x."""
     monkeypatch.setattr(oc, "_FREE_WIRE_STYLE", "legacy")
-    h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
+    h = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions")
     assert list(h.keys()) == LEGACY_ORDER
     assert h["x-opencode-client"] == oc._OPENCODE_CLIENT_NAME
     assert MSG_RE.fullmatch(h["x-opencode-request"])
@@ -191,7 +192,7 @@ def test_header_values_official(official_env):
     Hors depot git, l'ancien client envoyait `x-opencode-project: global` ;
     cet en-tete n'existe plus dans le wire officiel.
     """
-    h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
+    h = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions")
     assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA
     assert h["User-Agent"] == "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
     assert h["Authorization"] == "Bearer public"
@@ -240,8 +241,8 @@ def test_project_id_derivation_matches_official(official_env, monkeypatch, tmp_p
 
 def test_ua_per_endpoint(official_env):
     """Le client envoie provider-utils/4.0.40 sur /responses (mesuré)."""
-    chat = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
-    resp = oc._official_free_headers("https://opencode.ai/inference/v1/responses")
+    chat = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions")
+    resp = oc._official_free_headers("https://opencode.ai/inference/openai/v1/responses")
     assert chat["User-Agent"] == oc._OPENCODE_OFFICIAL_UA
     assert "4.0.23" in chat["User-Agent"]
     assert resp["User-Agent"] == oc._OPENCODE_OFFICIAL_UA_RESPONSES
@@ -283,7 +284,7 @@ async def test_msg_distinct_across_tasks(official_env, monkeypatch):
 
 
 def test_hostile_profile_extras_never_reach_free(official_env):
-    """Un profil diversité navigateur (Accept-Language, sec-ch-ua…) ne peut
+    """Un profil legacy hostile (Accept-Language, sec-ch-ua…) ne peut
     pas polluer la jambe free : le jeu officiel est fermé."""
     hostile = {
         "impersonate": "firefox144",
@@ -294,7 +295,7 @@ def test_hostile_profile_extras_never_reach_free(official_env):
             "Cookie": "session=abc",
         },
     }
-    h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
+    h = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions")
     lower = {k.lower(): v for k, v in h.items()}
     for k in hostile["extra_headers"]:
         assert k.lower() not in lower, f"profile extra {k!r} leaked to free"
@@ -306,15 +307,17 @@ def test_hostile_profile_extras_never_reach_free(official_env):
 
 class _FakeCurlResp:
     status_code = 200
-    headers = {}
+    headers: dict = {}
     content = b'{"choices": [{"message": {"role": "assistant", "content": "echo"}}]}'
 
     async def aiter_lines(self):
         # [gate body] le non-stream force stream:true sur le wire : le fake
         # rejoue un mini-SSE que le collecteur reconstitue.
-        yield ('data: {"id":"echo","object":"chat.completion.chunk","model":"m",'
-               '"choices":[{"index":0,"delta":{"content":"echo"},'
-               '"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}')
+        yield (
+            'data: {"id":"echo","object":"chat.completion.chunk","model":"m",'
+            '"choices":[{"index":0,"delta":{"content":"echo"},'
+            '"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}'
+        )
         yield "data: [DONE]"
 
     async def aclose(self):
@@ -328,8 +331,7 @@ class _FakeSlot:
 
     async def post(self, url, content=None, headers=None, timeout=None, **kwargs):
         self._post_log.append(
-            {"url": url, "headers": dict(headers or {}), "content": content,
-             "stream": kwargs.get("stream", False)}
+            {"url": url, "headers": dict(headers or {}), "content": content, "stream": kwargs.get("stream", False)}
         )
         return _FakeCurlResp()
 
@@ -500,9 +502,9 @@ def test_free_wire_body_chat_appends_shim(official_env):
     wire, forced = oc._free_wire_body(body, force_stream=True)
     assert forced is True
     assert wire["stream"] is True
-    # [2026-10-25] gate re-mesuré : `read` + prompt officiel suffisent.
-    assert _chat_names(wire["tools"]) == {"read"}
-    # Client sans outils : le read technique ne doit pas être appelé.
+    # [2026-10-30] gate re-mesuré : les 10 noms officiels sont exiges.
+    assert _chat_names(wire["tools"]) == OFFICIAL_TOOL_NAMES
+    # Client sans outils : la grille technique ne doit pas être appelée.
     assert wire["tool_choice"] == "none"
     assert wire["messages"][0]["role"] == "system"
     assert "You are opencode, an interactive CLI tool" in wire["messages"][0]["content"]
@@ -510,20 +512,22 @@ def test_free_wire_body_chat_appends_shim(official_env):
     assert "tools" not in body and body.get("stream") is not True  # entrée intacte
     wire2, forced2 = oc._free_wire_body(wire, force_stream=True)
     assert forced2 is False  # déjà conforme : inchangé
-    assert _chat_names(wire2["tools"]) == {"read"}
+    assert _chat_names(wire2["tools"]) == OFFICIAL_TOOL_NAMES
 
 
 def test_free_wire_body_chat_keeps_client_tools(official_env):
     """Le `read` officiel est ajouté DEVANT les outils du client, qui sont
     conservés tels quels (mesuré : read + outil client -> 200)."""
-    mine = {"type": "function", "function": {"name": "Bash", "description": "x",
-            "parameters": {"type": "object", "properties": {}}}}
+    mine = {
+        "type": "function",
+        "function": {"name": "Bash", "description": "x", "parameters": {"type": "object", "properties": {}}},
+    }
     body = {"model": "m", "messages": [], "tools": [mine], "stream": True}
     wire, forced = oc._free_wire_body(body, force_stream=True)
     assert forced is False  # déjà stream:true
     names = [t["function"]["name"] for t in wire["tools"]]
-    assert names == ["read", "Bash"]
-    assert wire["tools"][1] is mine
+    assert names == sorted(OFFICIAL_TOOL_NAMES) + ["Bash"]
+    assert wire["tools"][-1] is mine
     assert wire["tool_choice"] == "auto"
 
 
@@ -547,16 +551,23 @@ def test_free_wire_body_passthrough():
     """
     assert oc._free_wire_body(b"raw") == (b"raw", False)
     assert oc._free_wire_body({"model": "m"}) == ({"model": "m"}, False)
-    full = {"model": "m", "messages": [],
-            "tools": [{"type": "function", "function": {"name": n}} for n in ("bash", "read")],
-            "tool_choice": "auto",
-            "stream": True}
+    full = {
+        "model": "m",
+        "messages": [],
+        "tools": [{"type": "function", "function": {"name": n}} for n in ("bash", "read")],
+        "tool_choice": "auto",
+        "stream": True,
+    }
     wire, forced = oc._free_wire_body(full, force_stream=True)
     # Deja conforme : grille complete + tool_choice pose + stream vrai.
     assert forced is False
     assert wire["tool_choice"] == "auto"
     assert wire == full or list(wire) == [
-        "model", "messages", "tools", "tool_choice", "stream",
+        "model",
+        "messages",
+        "tools",
+        "tool_choice",
+        "stream",
     ]
 
 
@@ -586,8 +597,10 @@ def test_collect_responses_object():
         'data: {"type":"response.created","response":{"id":"r1"}}',
         'data: {"type":"response.output_text.delta","delta":"po"}',
         'data: {"type":"response.output_text.delta","delta":"ng"}',
-        ('data: {"type":"response.completed","response":{"id":"r1","object":"response",'
-         '"output":[{"type":"message","content":[{"type":"output_text","text":"pong"}]}]}}'),
+        (
+            'data: {"type":"response.completed","response":{"id":"r1","object":"response",'
+            '"output":[{"type":"message","content":[{"type":"output_text","text":"pong"}]}]}}'
+        ),
     ]
     data = oc._collect_responses_object(full, "m")
     assert data["id"] == "r1"
@@ -660,8 +673,8 @@ async def test_do_free_direct_request_collects(official_env, monkeypatch):
 
     wire = json.loads(sent["content"].decode())
     assert wire["stream"] is True
-    # [2026-10-25] gate re-mesuré : `read` + prompt officiel suffisent.
-    assert _chat_names(wire["tools"]) == {"read"}
+    # [2026-10-30] gate re-mesuré : les 10 noms officiels sont exiges.
+    assert _chat_names(wire["tools"]) == OFFICIAL_TOOL_NAMES
     assert "tools" not in body
 
 
@@ -680,6 +693,4 @@ async def test_do_free_direct_request_empty_raises(official_env, monkeypatch):
     fake = _FakeHttpxStreamClient(_FakeHttpxStreamResp(200, ["data: [DONE]"]))
     monkeypatch.setattr(oc, "_ensure_http_client", lambda: fake)
     with pytest.raises(oc.UpstreamError):
-        await oc._do_free_direct_request(
-            "https://h/inference/v1/chat/completions", {"model": "m", "messages": []}, {}
-        )
+        await oc._do_free_direct_request("https://h/inference/v1/chat/completions", {"model": "m", "messages": []}, {})

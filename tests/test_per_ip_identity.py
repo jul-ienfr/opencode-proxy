@@ -9,7 +9,7 @@ import re
 import pytest
 
 import opencode as oc
-from free.identities import IdentityVault, KNOWN_CLIENT_VERSIONS
+from free.identities import KNOWN_CLIENT_VERSIONS, IdentityVault
 
 
 @pytest.fixture(autouse=True)
@@ -76,15 +76,9 @@ def test_official_headers_differ_per_ip(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENCODE_IDENTITIES_DIR", str(tmp_path / "identities"))
     # 86.104.249.192 → 1.19.3 (trio), 186.247.163.125 → 1.18.31 (quartet) :
     # distribution mesurée du vault (cf. test_vault_version_client...).
-    h19 = oc._official_free_headers(
-        "https://opencode.ai/inference/v1/chat/completions", None, "86.104.249.192"
-    )
-    h18 = oc._official_free_headers(
-        "https://opencode.ai/inference/v1/chat/completions", None, "186.247.163.125"
-    )
-    h19b = oc._official_free_headers(
-        "https://opencode.ai/inference/v1/chat/completions", None, "86.104.249.192"
-    )
+    h19 = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, "86.104.249.192")
+    h18 = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, "186.247.163.125")
+    h19b = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, "86.104.249.192")
     assert "opencode/1.19.3" in h19["User-Agent"]
     assert "opencode/1.18.31" in h18["User-Agent"]
     # [wire cohérent par version] 1.19.3 → trio, jamais le quartet ;
@@ -109,9 +103,7 @@ def test_installation_anchor_is_per_ip(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENCODE_IDENTITIES_DIR", str(tmp_path / "identities"))
     seen = {"dir": set(), "ws": set()}
     for ip in ("186.247.163.125", "187.13.8.129", "86.104.21.99"):
-        h = oc._official_free_headers(
-            "https://opencode.ai/inference/v1/chat/completions", None, ip
-        )
+        h = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, ip)
         d = h.get("x-opencode-directory", "")
         w = h.get("x-opencode-workspace", "")
         assert d, f"x-opencode-directory absent pour {ip}"
@@ -121,7 +113,7 @@ def test_installation_anchor_is_per_ip(monkeypatch, tmp_path):
         seen["dir"].add(d)
         seen["ws"].add(w)
     # Hors chemin per-IP (sondes/tests) : aucun ancrage invente.
-    h0 = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions", None)
+    h0 = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None)
     assert "x-opencode-directory" not in h0
 
 
@@ -133,12 +125,11 @@ def test_each_ip_gets_full_distinct_client(monkeypatch, tmp_path):
     ips = ["186.247.163.125", "187.13.8.129"]  # 1.18.31 : quartet visible
     seen = {"project": set(), "request": set(), "session": set()}
     for ip in ips:
-        h = oc._official_free_headers(
-            "https://opencode.ai/inference/v1/chat/completions", None, ip
-        )
+        h = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, ip)
         for key in seen:
-            col = {"project": "x-opencode-project", "request": "x-opencode-request",
-                   "session": "x-opencode-session"}[key]
+            col = {"project": "x-opencode-project", "request": "x-opencode-request", "session": "x-opencode-session"}[
+                key
+            ]
             val = h.get(col, "")
             assert val, f"{col} vide pour {ip} — client amputé"
             assert val not in seen[key], f"{col} partagé entre IPs : {val!r}"
@@ -151,5 +142,5 @@ def test_global_fallback_unchanged(monkeypatch, tmp_path):
     monkeypatch.setattr(oc, "_FREE_SESSION_FILE", str(tmp_path / "_free_session_id"))
     oc._FREE_SESSION_CACHE = None
     oc._FREE_SESSION_TS = 0.0
-    h = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions", None)
+    h = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None)
     assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA

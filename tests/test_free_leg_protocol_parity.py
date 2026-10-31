@@ -28,8 +28,8 @@ import pytest
 import config.settings as st
 import opencode as oc
 
-PAID_ANTHROPIC = "claude-haiku-4-5"
-FREE_CHAT = "mimo-v2.5-free"
+PAID_ANTHROPIC = "mimo-v2.6-flash"
+FREE_CHAT = "mimo-v2.6-flash-free"
 FREE_RESPONSES = "muse-spark-1.2-contributor-free"
 
 LONG_TOOL_NAME = "mcp__plugin_very_long_tool_name_exceeding_sixty_four_characters_witness"
@@ -299,8 +299,8 @@ async def test_p1_long_tool_name_sanitized_on_wire_and_restored_to_client(free_e
 @pytest.mark.asyncio
 async def test_chat_client_path_is_unchanged(free_env, monkeypatch):
     """Un client Chat vers un endpoint Chat doit rester un passthrough (mesuré 200)."""
-    chat_body = {"model": "mimo-v2.5", "messages": [{"role": "user", "content": "salut"}]}
-    seam, out = await _run_free(monkeypatch, "openai", "mimo-v2.5", FREE_CHAT, chat_body, _chat_reply())
+    chat_body = {"model": "mimo-v2.6-flash", "messages": [{"role": "user", "content": "salut"}]}
+    seam, out = await _run_free(monkeypatch, "openai", "mimo-v2.6-flash", FREE_CHAT, chat_body, _chat_reply())
     assert seam.wire.get("messages"), "corps Chat altéré"
     assert "system" not in seam.wire
     assert out is not None

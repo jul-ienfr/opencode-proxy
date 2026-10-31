@@ -62,11 +62,7 @@ def compute(catalog_ids, routed_ids, leg: str = "") -> dict:
 def summarise(sections) -> dict:
     """Vue d'ensemble multi-jambes : ``{"status", "legs", "orphans", "candidates"}``."""
     legs = [s for s in (sections or []) if isinstance(s, dict)]
-    orphans = {
-        f"{s.get('leg') or '?'}::{name}"
-        for s in legs
-        for name in (s.get("orphans") or [])
-    }
+    orphans = {f"{s.get('leg') or '?'}::{name}" for s in legs for name in (s.get("orphans") or [])}
     candidates = sum(len(s.get("candidates") or []) for s in legs)
     if orphans:
         status = "orphans"

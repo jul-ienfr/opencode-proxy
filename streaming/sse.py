@@ -194,7 +194,7 @@ async def sse_pump(
                 timer_task = None
                 # Parité officielle Anthropic Messages SSE : `event: ping` + `data: {"type":"ping"}`
                 # (l'ancien `: ping` n'est qu'un commentaire SSE, ignoré par le SDK qui attend l'event).
-                yield b"event: ping\ndata: {\"type\": \"ping\"}\n\n"
+                yield b'event: ping\ndata: {"type": "ping"}\n\n'
     finally:
         if timer_task is not None and not timer_task.done():
             timer_task.cancel()

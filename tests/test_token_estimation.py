@@ -46,9 +46,7 @@ def test_estimate_is_monotonic_in_media_size():
     """Propriété : le compte ne redescend jamais quand la charge grandit."""
     sizes = [1, 10, 100, 1000, 10000]
     counts = [
-        estimate_input_tokens(
-            _body([{"type": "image", "source": {"type": "base64", "data": PDF_B64 * n}}])
-        )
+        estimate_input_tokens(_body([{"type": "image", "source": {"type": "base64", "data": PDF_B64 * n}}]))
         for n in sizes
     ]
     assert counts == sorted(counts), f"estimation non monotone : {counts}"
@@ -118,9 +116,7 @@ def test_media_inside_tool_result_is_counted():
 def test_data_uri_header_is_not_billed_as_payload():
     """L'en-tête `data:...;base64,` n'est pas de la charge utile facturée."""
     raw = PDF_B64 * 100
-    with_header = _media_token_cost(
-        {"type": "input_file", "file_data": f"data:application/pdf;base64,{raw}"}
-    )
+    with_header = _media_token_cost({"type": "input_file", "file_data": f"data:application/pdf;base64,{raw}"})
     without_header = _media_token_cost({"type": "input_file", "file_data": raw})
     assert with_header == without_header, "l'en-tête du data URI est compté à tort"
 
@@ -162,6 +158,67 @@ def test_estimation_survives_malformed_body():
         {},
     ]:
         estimate_input_tokens(broken)  # ne doit pas lever
+
+
+def test_chat_tool_schema_is_counted():
+    """Le schéma d'outil Chat (`function.parameters`) doit peser dans le budget."""
+    small = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "read", "parameters": {}}}],
+    }
+    big = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {f"arg{i}": {"type": "string", "description": "x" * 100} for i in range(30)},
+                    },
+                },
+            }
+        ],
+    }
+    assert estimate_input_tokens(big) > estimate_input_tokens(small) + 500
+
+
+def test_chat_tool_call_arguments_are_counted():
+    base = {"messages": [{"role": "user", "content": "hi"}]}
+    with_call = {
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "write", "arguments": "x" * 4000}}
+                ],
+            },
+        ]
+    }
+    assert estimate_input_tokens(with_call) > estimate_input_tokens(base) + 1000
+
+
+def test_responses_instructions_and_input_are_counted():
+    """La porte Responses met le contexte dans `instructions` + `input`."""
+    base = {"model": "m", "input": []}
+    full = {
+        "model": "m",
+        "instructions": "consigne " * 500,
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "conversation " * 2000}],
+            },
+            {"type": "function_call", "name": "read", "arguments": "y" * 3000, "call_id": "c1"},
+            {"type": "function_call_output", "output": "z" * 3000, "call_id": "c1"},
+        ],
+    }
+    assert estimate_input_tokens(full) > estimate_input_tokens(base) + 2000
 
 
 def test_document_costs_more_than_image_for_same_size():

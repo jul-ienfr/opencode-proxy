@@ -84,9 +84,7 @@ class TestValidation:
         assert "courte" in reason
 
     def test_empty_properties_are_refused(self):
-        clean, reason = validate_entry(
-            "x", entry(parameters={"type": "object", "properties": {}})
-        )
+        clean, reason = validate_entry("x", entry(parameters={"type": "object", "properties": {}}))
         assert clean is None
         assert "propriétés" in reason
 
@@ -189,14 +187,13 @@ class TestWireShapes:
 
 
 class TestInjection:
-    """2026-10-25 (re-mesuré) — ce qui part réellement sur le fil.
+    """2026-10-30 (re-mesuré) — ce qui part réellement sur le fil.
 
-    La règle du gate, mesurée avec témoins intercalés : un prompt système
-    OFFICIEL reconnu (1.18.31 ou 2.1.4) + l'outil ``read`` -> 200, quels que
-    soient les autres outils. Système court -> 429 ; sans ``read`` -> 429.
-
-    On n'injecte donc plus les 10 outils v1 : seulement le ``read`` officiel,
-    en conservant les outils du client.
+    Le gate exige la **grille officielle** (bash, edit, glob, grep, read,
+    skill, task, todowrite, webfetch, write). Un client sans ces noms (Hermes :
+    read_file/terminal/patch...) prenait un faux quota avec `read` seul. On
+    injecte les 10 officiels + au plus 8 outils client ; les noms officiels
+    absents du client sont des placeholders « ne pas appeler ».
     """
 
     def _wire(self, body):
@@ -205,19 +202,25 @@ class TestInjection:
         wire, _ = oc._free_wire_body(body, "big-pickle")
         return wire
 
-    def test_read_seul_est_injecte(self):
-        wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})
-        names = [t["function"]["name"] for t in wire.get("tools") or []]
-        assert names == ["read"], f"outils injectés : {names}"
+    def test_grille_officielle_est_injectee(self):
+        import opencode as oc
 
-    def test_les_outils_v1_ne_sont_plus_imposes(self):
-        """Un client générique ne doit pas se voir offrir bash/task/todowrite."""
+        official = [t["function"]["name"] for t in oc._official_free_payload()["tools"]]
         wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})
         names = [t["function"]["name"] for t in wire.get("tools") or []]
-        assert "bash" not in names and "task" not in names and "todowrite" not in names
+        assert names == official, f"outils injectés : {names}"
+
+    def test_les_outils_officiels_sont_imposes(self):
+        """Un client générique reçoit la grille exigée par le gate."""
+        wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})
+        names = [t["function"]["name"] for t in wire.get("tools") or []]
+        assert "bash" in names and "task" in names and "todowrite" in names
 
     def test_client_tools_are_preserved_after_the_official_set(self):
-        """Le `read` officiel d'abord, puis les outils du client tels quels."""
+        """La grille officielle d'abord, puis les outils du client."""
+        import opencode as oc
+
+        official = [t["function"]["name"] for t in oc._official_free_payload()["tools"]]
         wire = self._wire(
             {
                 "messages": [{"role": "user", "content": "hi"}],
@@ -234,7 +237,7 @@ class TestInjection:
             }
         )
         names = [t["function"]["name"] for t in wire.get("tools") or []]
-        assert names == ["read", "my_tool"]
+        assert names == official + ["my_tool"]
 
     def test_tool_choice_none_quand_le_client_n_a_aucun_outil(self):
         """Le `read` technique ne doit jamais être appelé par un client de chat."""
@@ -248,8 +251,11 @@ class TestInjection:
                 "tools": [
                     {
                         "type": "function",
-                        "function": {"name": "my_tool", "description": "x",
-                                     "parameters": {"type": "object", "properties": {}}},
+                        "function": {
+                            "name": "my_tool",
+                            "description": "x",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
                     }
                 ],
             }

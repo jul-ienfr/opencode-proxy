@@ -106,7 +106,10 @@ def test_trial_dead_stations_helper(monkeypatch, _clean_ledger):
     oc._set_free_cooldown("test-trial-m", 3600.0, dead, scope="trial-exhausted")
     oc._set_free_cooldown("test-trial-m", 60.0, live, scope="rate-limited")
     got = oc._trial_dead_stations("test-trial-m")
-    assert got == {dead}
+    # [audit 2026-10-30] ANY active (model, IP) cooldown is skipped, not only
+    # the long trial-exhausted scope: a rate-limited station must not be
+    # re-struck and re-arm its timer.
+    assert got == {dead, live}
 
 
 def test_quota_states_dashboard_shape(_clean_ledger):

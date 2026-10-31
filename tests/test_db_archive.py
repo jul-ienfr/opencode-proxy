@@ -18,9 +18,7 @@ def _live_db(tmp_path, rows):
     db_path = tmp_path / "logs" / "requests.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        "CREATE TABLE requests (id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, model TEXT NOT NULL)"
-    )
+    conn.execute("CREATE TABLE requests (id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, model TEXT NOT NULL)")
     conn.executemany("INSERT INTO requests (id, timestamp, model) VALUES (?, ?, 'm')", rows)
     conn.commit()
     return db_path, conn
@@ -79,9 +77,7 @@ def test_weekly_maintain_archives_before_purge(tmp_path):
     db_path, conn = _live_db(tmp_path, [("a70", _fmt(70)), ("a120", _fmt(120)), ("keep", _fmt(10))])
     import threading
 
-    size = odb.weekly_maintain(
-        conn, threading.Lock(), purge_days=90, archive_days=60, db_path=str(db_path)
-    )
+    size = odb.weekly_maintain(conn, threading.Lock(), purge_days=90, archive_days=60, db_path=str(db_path))
     assert isinstance(size, float)
     live = sorted(r[0] for r in conn.execute("SELECT id FROM requests").fetchall())
     assert live == ["keep"], live  # 70 j archivée, 120 j archivée+hors purge

@@ -292,9 +292,7 @@ class ToolCompatibilityTester:
             print(f"    [{i + 1}/{len(tool_names)}] Testing {tool_name}...", end=" ", flush=True)
             result = await self.test_single_tool(model, tool_name)
             status = "OK" if result["called"] else ("PARTIAL" if result["accepted"] else "FAIL")
-            print(
-                f"{status} (accepted={result['accepted']}, called={result['called']}, args={result['args_valid']})"
-            )
+            print(f"{status} (accepted={result['accepted']}, called={result['called']}, args={result['args_valid']})")
             if result.get("error"):
                 print(f"         error: {result['error'][:100]}")
             results.append(result)
@@ -381,9 +379,7 @@ class ToolCompatibilityTester:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Test tool compatibility across models via opencode-proxy"
-    )
+    parser = argparse.ArgumentParser(description="Test tool compatibility across models via opencode-proxy")
     parser.add_argument("--proxy", default="http://localhost:4000", help="Proxy base URL")
     parser.add_argument("--output", default="tool_compat_results.json", help="Output file path")
     parser.add_argument("--delay", type=float, default=1.0, help="Delay between requests (seconds)")

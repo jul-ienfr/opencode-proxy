@@ -53,9 +53,15 @@ def test_classify_daemon_down():
         )
     )
     assert vm.is_daemon_unreachable_error(
-        RuntimeError("Cannot connect to the Docker daemon at npipe:////./pipe/docker_engine. Is the docker daemon running?")
+        RuntimeError(
+            "Cannot connect to the Docker daemon at npipe:////./pipe/docker_engine. Is the docker daemon running?"
+        )
     )
-    assert vm.is_daemon_unreachable_error(RuntimeError("error during connect: Get http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/v1.49/containers/json: open //./pipe/dockerDesktopLinuxEngine"))
+    assert vm.is_daemon_unreachable_error(
+        RuntimeError(
+            "error during connect: Get http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/v1.49/containers/json: open //./pipe/dockerDesktopLinuxEngine"
+        )
+    )
     assert not vm.is_daemon_unreachable_error(None)
     assert not vm.is_daemon_unreachable_error(RuntimeError(""))
 

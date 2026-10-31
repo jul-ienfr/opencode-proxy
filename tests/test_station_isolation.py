@@ -105,9 +105,9 @@ def test_should_soft_rotate_now_live():
     # 1ʳᵉ requête = warm-up exclu, puis lentes consécutives ≥3
     for _ in range(5):
         tr.record(20000, slow_threshold_ms=1000)
-    assert (
-        s.should_soft_rotate("glm", {"default": 4000, "p95": 5000}) is True
-    ), "Lot 3 : décision active (consecutive_slow >= 3)"
+    assert s.should_soft_rotate("glm", {"default": 4000, "p95": 5000}) is True, (
+        "Lot 3 : décision active (consecutive_slow >= 3)"
+    )
 
 
 # ── sync registry → superviseurs ────────────────────────────────────────
@@ -230,6 +230,4 @@ async def test_set_stations_prunes_by_max_active_sid(monkeypatch):
     pool._station_ids = set()
     pool.update_config = lambda *a, **k: None
     pool.set_stations([_fake_manager(1), _fake_manager(3)])
-    assert pruned_with == [3], (
-        "max(1,3)=3 et non count=2 — sinon prune_stations(2) tuerait la station 3 active"
-    )
+    assert pruned_with == [3], "max(1,3)=3 et non count=2 — sinon prune_stations(2) tuerait la station 3 active"

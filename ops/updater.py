@@ -96,9 +96,7 @@ async def apply_fleet_update(managers: list[Any], host: Any) -> dict:
             if str(getattr(m, "status", "")) not in ("connected", "degraded"):
                 raise RuntimeError(f"statut {getattr(m, 'status', '?')} après update")
             m._update_available = False
-            m._update_applied_at = __import__("time").strftime(
-                "%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()
-            )
+            m._update_applied_at = __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
             m.save_state()
             updated.append(sid)
             logger.info("[vpn-update] fleet: station %s mise à jour", sid)
@@ -115,9 +113,7 @@ async def apply_fleet_update(managers: list[Any], host: Any) -> dict:
                 sid = int(getattr(m, "_station", -1))
                 if sid not in updated:
                     continue
-                env = host._compose_env(
-                    stations=[sid], stack=str(getattr(m, "_stack_effective", "openvpn"))
-                )
+                env = host._compose_env(stations=[sid], stack=str(getattr(m, "_stack_effective", "openvpn")))
                 await _docker(
                     host,
                     ["compose", "-f", compose, "up", "-d", "--force-recreate", "--pull", "never", m._compose_service],

@@ -281,6 +281,14 @@ async def test_apply_station_count_downscale_cancels_before_stop(tmp_path, monke
     import dashboard.api as dapi
     import opencode
 
+    # [hygiène 2026-10-27] `_apply_station_count` finit par `_sync_stack_env`,
+    # qui écrit `.env` À CÔTÉ du compose file. Sans cette redirection, le
+    # chemin par défaut (ROOT/docker-compose.yml) faisait réécrire le VRAI
+    # `.env` du dépôt à chaque exécution (contenu identique — read-modify-write
+    # — mais mtime de l'utilisateur touchée). Convention du dépôt : même
+    # paravent que test_gluetun_control_api / test_vpn_stack_nstation.
+    monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(tmp_path / "docker-compose.yml"))
+
     ms = [FakeVPNManager(_cfg(tmp_path), station=s, tmp_path=tmp_path) for s in range(1, 4)]
     pool = fip.FreeIPPool(ms[0], ms[1])
     pool.set_stations(ms)

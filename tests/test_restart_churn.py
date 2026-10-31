@@ -179,9 +179,7 @@ async def test_watchdog_tick_churn_recovers_immediately(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="vpn_manager"):
         await mgr._watchdog_tick()
 
-    assert any("healthcheck restart loop" in r.getMessage() for r in caplog.records), (
-        "kind du failing block"
-    )
+    assert any("healthcheck restart loop" in r.getMessage() for r in caplog.records), "kind du failing block"
     assert mgr.calls["restart"] == 1
     assert mgr.calls["compose_up"] == 0, "recovery légère suffit"
     assert mgr._status == vm.VPNState.CONNECTED
@@ -258,7 +256,9 @@ async def test_rollback_snaps_churn_scan_after_recreate(tmp_path):
     res = await mgr.apply_update(check_opportune=False)
 
     assert res.get("ok") is False
-    assert ("tunnel not healthy" in res.get("error", "") or "tunnel non sain" in res.get("error", "")), "rollback déclenché"
+    assert "tunnel not healthy" in res.get("error", "") or "tunnel non sain" in res.get("error", ""), (
+        "rollback déclenché"
+    )
     scans = [a for a in mgr.docker_log_args if a[:2] == ["logs", "--since"]]
     assert scans, "le refresh du rollback a scanné les logs"
     assert scans[-1][2] == "1s", "rollback: fenêtre bornée APRÈS le recreate (anti stale-marker)"

@@ -577,6 +577,7 @@ services:
       # endpoint fails, the next country is tried before declaring FAIL.
       # (spaced name — gluetun enum, see comment on SERVER_COUNTRIES above).
       - SERVER_COUNTRIES=Switzerland,Germany,Netherlands
+      - WIREGUARD_MTU=1280
       - UPDATER_PERIOD=480h
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8898

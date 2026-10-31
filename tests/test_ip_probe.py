@@ -112,9 +112,7 @@ class TestStickyFirstProbe:
         ip = await mgr.get_public_ip()
 
         assert ip == "1.1.1.1"
-        assert record == ["http://ip-a"], (
-            "le cas nominal = exactement un GET sur l'endpoint sticky"
-        )
+        assert record == ["http://ip-a"], "le cas nominal = exactement un GET sur l'endpoint sticky"
         assert mgr._ip_check_idx == 0  # succès sticky → index inchangé
         assert len(fake.clients) == 1, "client réutilisé, pas recréé"
 
@@ -137,9 +135,7 @@ class TestStickyFirstProbe:
         assert ip == "2.2.2.2"
         assert mgr._ip_check_idx == 2
         assert record.count("http://ip-b") == 1, "sticky essayé une fois"
-        assert set(record) >= {"http://ip-b", "http://ip-c"}, (
-            "fallback : les autres endpoints sont sondés"
-        )
+        assert set(record) >= {"http://ip-b", "http://ip-c"}, "fallback : les autres endpoints sont sondés"
         assert len(fake.clients) == 1
 
     @pytest.mark.asyncio
@@ -185,9 +181,7 @@ class TestStickyFirstProbe:
         réutilisé n'est PAS fermé (par design — cache par socks5_url)."""
         mgr = self._mgr(tmp_path, budget=0.2)
         # ip-a absent → erreur immédiate (sticky rapide) ; b/c pendent
-        fake, record = self._patch(
-            monkeypatch, {}, hang_urls={"http://ip-b", "http://ip-c"}
-        )
+        fake, record = self._patch(monkeypatch, {}, hang_urls={"http://ip-b", "http://ip-c"})
 
         t0 = time.monotonic()
         ip = await mgr.get_public_ip()
@@ -234,7 +228,5 @@ class TestFinalizePerRoundBound:
         elapsed = time.monotonic() - t0
 
         assert ok is False
-        assert healthy_calls == [0.05, 0.05], (
-            "both recovery rounds run, each bounded at the config timeout"
-        )
+        assert healthy_calls == [0.05, 0.05], "both recovery rounds run, each bounded at the config timeout"
         assert elapsed < 2.0, "the old flat 120 s bound would take ~240 s here"

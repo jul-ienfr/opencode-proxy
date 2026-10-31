@@ -69,7 +69,13 @@ class KeyPauser:
         self._max_pause = float(max_pause) if max_pause is not None else DEFAULT_MAX_PAUSE
         self._paused: dict[str, float] = {}  # key_prefix -> monotonic expiry
         self._reasons: dict[str, str] = {}  # key_prefix -> reason string
+        # [audit 2026-10-30] Model-scoped pauses: a 403 region/model refusal
+        # must not freeze a still-valid key for other models.
+        self._model_paused: dict[tuple[str, str], float] = {}
+        self._model_reasons: dict[tuple[str, str], str] = {}
         self._lock = threading.Lock()
+        # [audit 2026-10-30] serialize writers on the shared .tmp file
+        self._write_lock = threading.Lock()
         self._prefix_cache = prefix_cache if prefix_cache is not None else {}
         self._prefix_cache_max = prefix_cache_max
         self._alias_fn = alias_fn or _default_alias
@@ -107,8 +113,11 @@ class KeyPauser:
         try:
             with self._lock:
                 snapshot = [
-                    (prefix, mono_expiry, self._reasons.get(prefix, ""))
-                    for prefix, mono_expiry in self._paused.items()
+                    (prefix, mono_expiry, self._reasons.get(prefix, "")) for prefix, mono_expiry in self._paused.items()
+                ]
+                model_snapshot = [
+                    (key, mono_expiry, self._model_reasons.get(key, ""))
+                    for key, mono_expiry in self._model_paused.items()
                 ]
             now_mono = time.monotonic()
             now_wall = time.time()
@@ -117,12 +126,24 @@ class KeyPauser:
                 remaining = mono_expiry - now_mono
                 if remaining > 0:
                     data[prefix] = {"expiry": now_wall + remaining, "reason": reason}
+            model_data = {}
+            for (prefix, model), mono_expiry, reason in model_snapshot:
+                remaining = mono_expiry - now_mono
+                if remaining > 0:
+                    model_data[f"{prefix}|{model}"] = {
+                        "expiry": now_wall + remaining,
+                        "reason": reason,
+                        "model": model,
+                    }
             # Offload file I/O to thread pool (non-blocking)
             payload = {"paused_keys": data}
+            if model_data:
+                payload["model_paused_keys"] = model_data
             file_path = self._PAUSED_FILE
 
             def _write_yaml():
-                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with self._write_lock:
+                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
                 # [plan v10 §9.1.2] tmp+fsync+replace — l'écriture directe
                 # pouvait laisser un YAML tronqué sur crash/kill (les clés
                 # pausées disparaissaient alors au prochain load).
@@ -156,12 +177,22 @@ class KeyPauser:
             with open(self._PAUSED_FILE, encoding="utf-8") as f:
                 raw = yaml.safe_load(f) or {}
             entries = raw.get("paused_keys", {})
-            if not entries:
+            model_entries = raw.get("model_paused_keys", {})
+            if not entries and not model_entries:
                 return
             now_wall = time.time()
             now_mono = time.monotonic()
+            _valid = set()
+            for _k in api_keys or []:
+                _ak = _k.get("api_key", "") if isinstance(_k, dict) else str(_k or "")
+                if _ak:
+                    _valid.add(self._prefix(_ak))
             loaded = 0
-            for prefix, info in entries.items():
+            for prefix, info in (entries or {}).items():
+                # [audit 2026-10-30] Do not resurrect pauses of keys that no
+                # longer exist in api_keys.json; they kept /health degraded.
+                if _valid and prefix not in _valid:
+                    continue
                 wall_expiry = info.get("expiry", 0)
                 if wall_expiry <= now_wall:
                     continue  # already expired
@@ -171,14 +202,43 @@ class KeyPauser:
                     self._paused[prefix] = mono_expiry
                     self._reasons[prefix] = info.get("reason", "")
                 loaded += 1
+            for composite, info in (model_entries or {}).items():
+                if "|" not in str(composite):
+                    continue
+                prefix, model = str(composite).split("|", 1)
+                model = str(info.get("model") or model or "").strip().lower()
+                if not model:
+                    continue
+                if _valid and prefix not in _valid:
+                    continue
+                wall_expiry = info.get("expiry", 0)
+                if wall_expiry <= now_wall:
+                    continue
+                remaining = wall_expiry - now_wall
+                mono_expiry = now_mono + remaining
+                with self._lock:
+                    self._model_paused[(prefix, model)] = mono_expiry
+                    self._model_reasons[(prefix, model)] = info.get("reason", "")
+                loaded += 1
             if loaded:
                 self._debug_fn(f"  [keypauser] loaded {loaded} persisted pauses from disk")
                 self._log_fn(f"  KEY PAUSER: restored {loaded} pauses from disk")
         except Exception as e:
             self._debug_fn(f"  [keypauser] load error: {e}")
 
-    def pause_key(self, api_key: str, duration: float, reason: str = "", quota_based: bool = False):
+    def pause_key(
+        self,
+        api_key: str,
+        duration: float,
+        reason: str = "",
+        quota_based: bool = False,
+        model: str = "",
+    ):
         """Pause a key for `duration` seconds from now.
+
+        ``model`` scopes the pause to one model (403 region/model refusal):
+        the key remains usable for every other model. Empty ``model`` keeps
+        the historical global pause.
 
         Only quota_based pauses (auto-computed reset times) are capped at
         max_pause — the quota estimate can be wrong (e.g. a free-endpoint
@@ -188,50 +248,84 @@ class KeyPauser:
         pause only creates churn.
         """
         prefix = self._prefix(api_key)
+        scope_model = str(model or "").strip().lower()
         if quota_based:
             duration = min(duration, self._max_pause)
         expiry = time.monotonic() + duration
         changed = False
         with self._lock:
-            existing = self._paused.get(prefix, 0)
-            if expiry > existing:  # only extend, never shorten
-                self._paused[prefix] = expiry
-                self._reasons[prefix] = reason
-                changed = True
+            if scope_model:
+                key = (prefix, scope_model)
+                existing = self._model_paused.get(key, 0)
+                if expiry > existing:  # only extend, never shorten
+                    self._model_paused[key] = expiry
+                    self._model_reasons[key] = reason
+                    changed = True
+            else:
+                existing = self._paused.get(prefix, 0)
+                if expiry > existing:  # only extend, never shorten
+                    self._paused[prefix] = expiry
+                    self._reasons[prefix] = reason
+                    changed = True
         if changed:
             self._save()  # [P1-8] hors lock (I/O jamais sous le verrou)
         alias = self._alias_fn(api_key)
+        scope = f" model={scope_model}" if scope_model else ""
         self._debug_fn(
-            f"  [keypauser] PAUSED alias={alias} prefix={prefix} for {duration:.0f}s reason={reason}"
+            f"  [keypauser] PAUSED alias={alias} prefix={prefix}{scope} for {duration:.0f}s reason={reason}"
         )
-        self._log_fn(f"  KEY PAUSED: alias={alias} for {duration:.0f}s ({reason})")
+        self._log_fn(f"  KEY PAUSED: alias={alias}{scope} for {duration:.0f}s ({reason})")
 
-    def is_paused(self, api_key: str) -> bool:
-        """Check if a key is currently paused (and not yet expired)."""
+    def is_paused(self, api_key: str, model: str = "") -> bool:
+        """Check if a key is currently paused globally or for ``model``."""
         prefix = self._prefix(api_key)
+        scope_model = str(model or "").strip().lower()
+        now = time.monotonic()
         with self._lock:
             expiry = self._paused.get(prefix, 0)
-            if expiry > 0 and time.monotonic() < expiry:
+            if expiry > 0 and now < expiry:
                 return True
             if expiry > 0:
                 del self._paused[prefix]
                 self._reasons.pop(prefix, None)
+            if scope_model:
+                key = (prefix, scope_model)
+                mexpiry = self._model_paused.get(key, 0)
+                if mexpiry > 0 and now < mexpiry:
+                    return True
+                if mexpiry > 0:
+                    del self._model_paused[key]
+                    self._model_reasons.pop(key, None)
         return False
 
-    def remaining(self, api_key: str) -> float:
-        """Return seconds remaining on pause, or 0 if not paused."""
+    def remaining(self, api_key: str, model: str = "") -> float:
+        """Return seconds remaining on the global/model pause, or 0."""
         prefix = self._prefix(api_key)
+        scope_model = str(model or "").strip().lower()
+        now = time.monotonic()
+        best = 0.0
         with self._lock:
             expiry = self._paused.get(prefix, 0)
             if expiry > 0:
-                rem = expiry - time.monotonic()
+                rem = expiry - now
                 if rem > 0:
-                    return rem
-                del self._paused[prefix]
-                self._reasons.pop(prefix, None)
-        return 0.0
+                    best = max(best, rem)
+                else:
+                    del self._paused[prefix]
+                    self._reasons.pop(prefix, None)
+            if scope_model:
+                key = (prefix, scope_model)
+                mexpiry = self._model_paused.get(key, 0)
+                if mexpiry > 0:
+                    rem = mexpiry - now
+                    if rem > 0:
+                        best = max(best, rem)
+                    else:
+                        del self._model_paused[key]
+                        self._model_reasons.pop(key, None)
+        return best
 
-    def best_available(self, keys: list) -> dict | None:
+    def best_available(self, keys: list, model: str = "") -> dict | None:
         """Among keys, return the one with shortest remaining pause.
 
         Returns None if any key is fully available (meaning normal selection
@@ -240,16 +334,16 @@ class KeyPauser:
         best = None
         best_remaining = float("inf")
         for k in keys:
-            if not self.is_paused(k.get("api_key", "")):
+            if not self.is_paused(k.get("api_key", ""), model=model):
                 return None  # at least one key is available
-            rem = self.remaining(k.get("api_key", ""))
+            rem = self.remaining(k.get("api_key", ""), model=model)
             if rem < best_remaining:
                 best_remaining = rem
                 best = k
         return best
 
     def get_all_status(self) -> dict:
-        """Return status of all paused keys (for dashboard/health endpoint)."""
+        """Return status of all paused keys (global + model-scoped)."""
         now = time.monotonic()
         with self._lock:
             status = {}
@@ -266,19 +360,40 @@ class KeyPauser:
             for prefix in expired:
                 del self._paused[prefix]
                 self._reasons.pop(prefix, None)
+            expired_models = []
+            for key, expiry in self._model_paused.items():
+                remaining = expiry - now
+                if remaining <= 0:
+                    expired_models.append(key)
+                    continue
+                prefix, model = key
+                status[f"{prefix}|{model}"] = {
+                    "remaining_seconds": round(remaining, 1),
+                    "reason": self._model_reasons.get(key, ""),
+                    "model": model,
+                }
+            for key in expired_models:
+                del self._model_paused[key]
+                self._model_reasons.pop(key, None)
         return status
 
     def cleanup_expired(self):
-        """Remove all expired entries. Called periodically."""
+        """Remove all expired global/model entries. Called periodically."""
         now = time.monotonic()
         with self._lock:
             expired = [k for k, v in self._paused.items() if v <= now]
             for k in expired:
                 del self._paused[k]
                 self._reasons.pop(k, None)
-        if expired:
+            expired_models = [k for k, v in self._model_paused.items() if v <= now]
+            for k in expired_models:
+                del self._model_paused[k]
+                self._model_reasons.pop(k, None)
+        if expired or expired_models:
             self._save()  # [P1-8] hors lock
-            self._debug_fn(f"  [keypauser] cleanup: {len(expired)} expired pauses removed")
+            self._debug_fn(
+                f"  [keypauser] cleanup: {len(expired) + len(expired_models)} expired pauses removed"
+            )
 
     def unpause_all(self) -> int:
         """[V8.8] Annuler TOUS les pauses et **persister** la suppression.
@@ -294,20 +409,26 @@ class KeyPauser:
             Le nombre de pauses effectivement retirés.
         """
         with self._lock:
-            count = len(self._paused)
+            count = len(self._paused) + len(self._model_paused)
             self._paused.clear()
             self._reasons.clear()
+            self._model_paused.clear()
+            self._model_reasons.clear()
         self._save()  # hors lock, comme cleanup_expired/unpause_if_paused
         return count
 
     def unpause_if_paused(self, api_key: str) -> bool:
-        """Remove a pause for a key if it exists. Returns True if removed."""
+        """Remove global and model-scoped pauses for a key. Returns True if removed."""
         prefix = self._prefix(api_key)
         removed = False
         with self._lock:
             if prefix in self._paused:
                 del self._paused[prefix]
                 self._reasons.pop(prefix, None)
+                removed = True
+            for key in [k for k in self._model_paused if k[0] == prefix]:
+                del self._model_paused[key]
+                self._model_reasons.pop(key, None)
                 removed = True
         if removed:
             self._save()  # [P1-8] hors lock
@@ -328,7 +449,7 @@ def enabled_keys(api_keys: list) -> list:
     return [k for k in api_keys if k.get("enabled", True)]
 
 
-def env_key_or_raise(env_key: str, pauser: KeyPauser, debug_fn=_noop_debug) -> dict:
+def env_key_or_raise(env_key: str, pauser: KeyPauser, debug_fn=_noop_debug, model: str = "") -> dict:
     """Return the .env fallback key, or raise AllKeysPausedError if paused.
 
     [CRITIC(9)] The .env fallback must not be hammered while paused: when
@@ -336,27 +457,27 @@ def env_key_or_raise(env_key: str, pauser: KeyPauser, debug_fn=_noop_debug) -> d
     the caller surfaces a clean retry-after instead of sending a request
     with a known-dead key.
     """
-    if pauser.is_paused(env_key):
-        remaining = pauser.remaining(env_key)
+    if pauser.is_paused(env_key, model=model):
+        remaining = pauser.remaining(env_key, model=model)
         debug_fn(f"  [apikey] .env fallback key paused ({remaining:.0f}s) — raising AllKeysPausedError")
         raise AllKeysPausedError(remaining if remaining > 0 else 1)
     return {"api_key": env_key}
 
 
 def find_alternative_key(
-    api_keys: list, pauser: KeyPauser, failed_key: str, debug_fn=_noop_debug
+    api_keys: list, pauser: KeyPauser, failed_key: str, debug_fn=_noop_debug, model: str = ""
 ) -> dict | None:
     """Return the first enabled, non-paused key different from failed_key, or None."""
     for k in api_keys:
         if k.get("api_key") != failed_key and k.get("enabled", True):
-            if not pauser.is_paused(k.get("api_key", "")):
+            if not pauser.is_paused(k.get("api_key", ""), model=model):
                 debug_fn(f"  [apikey] alternative key found alias={k.get('alias', '?')}")
                 return k
     debug_fn(f"  [apikey] no alternative key for {failed_key[:8]}...")
     return None
 
 
-def has_usable_paid_key(api_keys: list, env_key: str, pauser: KeyPauser) -> bool:
+def has_usable_paid_key(api_keys: list, env_key: str, pauser: KeyPauser, model: str = "") -> bool:
     """True iff ≥1 enabled, non-paused paid key exists (API_KEYS or .env).
 
     [Étape 2A — A1/A2] Garde no-valid-keys : toute jambe paid est condamnée
@@ -369,10 +490,10 @@ def has_usable_paid_key(api_keys: list, env_key: str, pauser: KeyPauser) -> bool
         if not k.get("enabled", True):
             continue
         ak = k.get("api_key", "")
-        if ak and not pauser.is_paused(ak):
+        if ak and not pauser.is_paused(ak, model=model):
             return True
     env_key = env_key or ""
-    if env_key and not pauser.is_paused(env_key):
+    if env_key and not pauser.is_paused(env_key, model=model):
         return True
     return False
 
@@ -394,6 +515,7 @@ def select_next_key(
     cycle_index: int,
     cycle_lock,
     debug_fn=_noop_debug,
+    model: str = "",
 ) -> tuple[dict, int, list, int]:
     """Sélectionne la prochaine clé API (failover sticky ou round-robin).
 
@@ -409,30 +531,36 @@ def select_next_key(
     """
     if not api_keys:
         debug_fn("  [apikey] no API_KEYS configured, falling back to .env key")
-        return env_key_or_raise(env_key, pauser, debug_fn), failover_index, cycle_keys, cycle_index
+        return env_key_or_raise(env_key, pauser, debug_fn, model=model), failover_index, cycle_keys, cycle_index
     enabled = enabled_keys(api_keys)
     if not enabled:
         debug_fn("  [apikey] no enabled keys, falling back to .env key")
-        return env_key_or_raise(env_key, pauser, debug_fn), failover_index, cycle_keys, cycle_index
+        return env_key_or_raise(env_key, pauser, debug_fn, model=model), failover_index, cycle_keys, cycle_index
 
     # Filter out paused keys
-    available = [k for k in enabled if not pauser.is_paused(k.get("api_key", ""))]
+    available = [k for k in enabled if not pauser.is_paused(k.get("api_key", ""), model=model)]
 
     if not available:
+        # [audit 2026-10-30] All LISTED keys paused does not mean the .env
+        # fallback is unusable. has_usable_paid_key() already counts a
+        # non-paused env key as valid; the old code raised here and never
+        # reached env_key_or_raise(), so the valid .env key was ignored.
+        _env = env_key or ""
+        if _env and not pauser.is_paused(_env, model=model):
+            debug_fn("  [apikey] all listed keys paused — using the non-paused .env fallback")
+            return env_key_or_raise(_env, pauser, debug_fn, model=model), failover_index, cycle_keys, cycle_index
         # All paused — raise with shortest wait time instead of reusing a paused key
-        min_rem = min((pauser.remaining(k.get("api_key", "")) for k in enabled), default=0)
+        min_rem = min((pauser.remaining(k.get("api_key", ""), model=model) for k in enabled), default=0)
         if min_rem > 0:
             debug_fn(f"  [apikey] ALL keys paused, min remaining={min_rem:.0f}s — raising AllKeysPausedError")
             raise AllKeysPausedError(min_rem)
         debug_fn("  [apikey] no keys available, falling back to .env key")
-        return env_key_or_raise(env_key, pauser, debug_fn), failover_index, cycle_keys, cycle_index
+        return env_key_or_raise(env_key, pauser, debug_fn, model=model), failover_index, cycle_keys, cycle_index
 
     if routing == "failover":
         for i in range(len(api_keys)):
             idx = (failover_index + i) % len(api_keys)
-            if api_keys[idx].get("enabled", True) and not pauser.is_paused(
-                api_keys[idx].get("api_key", "")
-            ):
+            if api_keys[idx].get("enabled", True) and not pauser.is_paused(api_keys[idx].get("api_key", ""), model=model):
                 # [plan Lot 2] sticky + avance sur pause : quand la clé
                 # d'index courant est pausée/sautée (i > 0), persister la
                 # nouvelle position — pas de retour automatique à la clé 0
@@ -441,16 +569,14 @@ def select_next_key(
                 if i > 0:
                     failover_index = idx
                     debug_fn(f"  [apikey] failover index avance → {idx} (clé précédente pausée)")
-                debug_fn(
-                    f"  [apikey] failover selected alias={api_keys[idx].get('alias', '?')} (idx={idx})"
-                )
+                debug_fn(f"  [apikey] failover selected alias={api_keys[idx].get('alias', '?')} (idx={idx})")
                 return api_keys[idx], failover_index, cycle_keys, cycle_index
         # Fallback to shortest-paused
-        min_rem = min((pauser.remaining(k.get("api_key", "")) for k in enabled), default=0)
+        min_rem = min((pauser.remaining(k.get("api_key", ""), model=model) for k in enabled), default=0)
         if min_rem > 0:
             raise AllKeysPausedError(min_rem)
         debug_fn("  [apikey] failover exhausted, falling back to .env key")
-        return env_key_or_raise(env_key, pauser, debug_fn), failover_index, cycle_keys, cycle_index
+        return env_key_or_raise(env_key, pauser, debug_fn, model=model), failover_index, cycle_keys, cycle_index
 
     # Round-robin: atomic index modulo under threading.Lock (no itertools.cycle)
     with cycle_lock:

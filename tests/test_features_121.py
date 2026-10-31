@@ -114,9 +114,7 @@ def test_validate_payload_ok_and_errors():
     assert v({"latency_rotation": {"soft_cooldown_sec": 600, "stream_metric": "ttfb"}}) == []
     errs = v({"station_count": 99})
     assert errs and "station_count" in errs[0]
-    errs = v({"latency_rotation": {"slow_cooldown_sec": "abc"}}) or v(
-        {"latency_rotation": {"floor_ms": -5}}
-    )
+    errs = v({"latency_rotation": {"slow_cooldown_sec": "abc"}}) or v({"latency_rotation": {"floor_ms": -5}})
     assert errs, "valeur hors bornes détectée"
     errs = v({"per_station": {"11": {"quota_per_ip": 1}}})
     assert errs and "station invalide" in errs[0]
@@ -142,9 +140,7 @@ def test_validate_endpoint_dry_run_does_not_apply():
     import dashboard.api as api
 
     reg_src = inspect.getsource(api.register_dashboard)
-    m = re.search(
-        r"async def validate_vpn_config.*?(?=\n    @|\Z)", reg_src, re.S
-    )
+    m = re.search(r"async def validate_vpn_config.*?(?=\n    @|\Z)", reg_src, re.S)
     assert m, "handler validate introuvable"
     block = m.group(0)
     assert "update_config" not in block

@@ -318,9 +318,7 @@ def resolve_effort(
     # envoyer `reasoning_effort` est au mieux inutile, au pire un 400. On
     # n'émet rien — le raisonnement reste piloté par le modèle.
     if _live_effort_supported(model) is False:
-        return EffortDecision(
-            wants=False, level=None, source=source or "unsupported", explicit=explicit
-        )
+        return EffortDecision(wants=False, level=None, source=source or "unsupported", explicit=explicit)
 
     if level == MODEL_MAX:
         # « Le maximum du modèle » : décision différée au modèle cible. Le

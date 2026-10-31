@@ -31,8 +31,8 @@ CATALOG_URL = "https://models.opencode.ai/api.json"
 CATALOG_TIMEOUT = 30.0
 
 # Nos deux providers, dans le catalogue live.
-PAID_PROVIDER = "opencode-go"    # https://opencode.ai/zen/go/v1  (jambe payée)
-FREE_PROVIDER = "opencode"       # https://opencode.ai/inference/v1 (jambe anonyme)
+PAID_PROVIDER = "opencode-go"  # https://opencode.ai/zen/go/v1  (jambe payée)
+FREE_PROVIDER = "opencode"  # https://opencode.ai/inference/v1 (jambe anonyme)
 OUR_PROVIDERS = (PAID_PROVIDER, FREE_PROVIDER)
 
 # Exception de périmètre : servis sur l'infra opencode (`/inference/v1/systemone`)
@@ -135,9 +135,7 @@ def free_bases() -> frozenset[str]:
 def paid_bases() -> frozenset[str]:
     """Les endpoints de la jambe payée (les trois variantes)."""
     s = _settings()
-    return frozenset(
-        {s.API_BASE_OPENAI, s.API_BASE_ANTHROPIC, s._RESPONSES_ENDPOINT}
-    ) - free_bases()
+    return frozenset({s.API_BASE_OPENAI, s.API_BASE_ANTHROPIC, s._RESPONSES_ENDPOINT}) - free_bases()
 
 
 def resolved_endpoint(model_id: str, cfg: dict | None = None) -> str:
@@ -178,10 +176,7 @@ def fetch_catalog(url: str = CATALOG_URL, timeout: float = CATALOG_TIMEOUT) -> d
 
 def legs(catalog: dict) -> dict[str, dict]:
     """`{provider: {model_id: entrée}}` restreint à NOS deux providers."""
-    return {
-        provider: ((catalog.get(provider) or {}).get("models") or {})
-        for provider in OUR_PROVIDERS
-    }
+    return {provider: ((catalog.get(provider) or {}).get("models") or {}) for provider in OUR_PROVIDERS}
 
 
 # ─────────── Matrice npm → API, et périmètre de fourniture ──────────────────
@@ -311,6 +306,8 @@ FAMILY_TO_PROTOCOL = {
     "chat": "openai",
     "responses": "openai",
     "messages": "anthropic",
+    # [audit 2026-10-30] Native Google dialect, handled by app.protocol.gemini.
+    "gemini": "gemini",
 }
 
 
@@ -336,10 +333,7 @@ def route_for_model(catalog: dict, provider: str, model_id: str) -> dict | None:
 
 def is_servable(model_id: str, catalog: dict) -> bool:
     """Règle de périmètre : servi par un provider opencode, ou exception interne."""
-    return (
-        serving_provider(model_id, catalog) is not None
-        or model_id in INTERNAL_IDS
-    )
+    return serving_provider(model_id, catalog) is not None or model_id in INTERNAL_IDS
 
 
 def hosts_of(model_id: str, catalog: dict) -> tuple[str, ...]:
@@ -352,9 +346,7 @@ def hosts_of(model_id: str, catalog: dict) -> tuple[str, ...]:
         sorted(
             provider
             for provider, entry in catalog.items()
-            if provider not in OUR_PROVIDERS
-            and isinstance(entry, dict)
-            and model_id in (entry.get("models") or {})
+            if provider not in OUR_PROVIDERS and isinstance(entry, dict) and model_id in (entry.get("models") or {})
         )
     )
 
@@ -375,10 +367,7 @@ def refusal_reason(model_id: str, catalog: dict) -> str | None:
         return None
     hosts = sorted(hosts_of(model_id, catalog))
     if not hosts:
-        return (
-            f'model "{model_id}" is not provided by this proxy: '
-            "unknown to the opencode catalog."
-        )
+        return f'model "{model_id}" is not provided by this proxy: unknown to the opencode catalog.'
     details = []
     for provider in hosts[:MAX_NAMED_HOSTS]:
         npm = provider_npm(catalog, provider)
@@ -386,10 +375,7 @@ def refusal_reason(model_id: str, catalog: dict) -> str | None:
         if not npm:
             details.append(f"{provider} (no npm declared)")
         elif family is None:
-            details.append(
-                f"{provider} (npm {npm}, outside the known table: "
-                "no endpoint can be derived)"
-            )
+            details.append(f"{provider} (npm {npm}, outside the known table: no endpoint can be derived)")
         else:
             details.append(f"{provider} (npm {npm}, api {family})")
     where = ", ".join(details)
@@ -555,13 +541,9 @@ def format_report(report: dict) -> str:
     missing = report.get("missing_from_config") or []
     if missing:
         out.append("")
-        out.append(
-            "ABSENTS DE CONFIG (%d) — le repli implicite les routerait côté payant :"
-            % len(missing)
-        )
+        out.append("ABSENTS DE CONFIG (%d) — le repli implicite les routerait côté payant :" % len(missing))
         for row in missing:
             out.append(
-                "  %-34s catalogue=%s  repli=%s"
-                % (row["id"], row["jambe_catalogue"], row["repli_jambe"] or "interne")
+                "  %-34s catalogue=%s  repli=%s" % (row["id"], row["jambe_catalogue"], row["repli_jambe"] or "interne")
             )
     return "\n".join(out)

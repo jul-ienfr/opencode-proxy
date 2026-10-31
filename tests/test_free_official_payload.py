@@ -46,10 +46,10 @@ def test_un_corps_minimal_recoit_la_copie_integrale():
 
     assert forced is True
     assert wire["stream"] is True
-    # Client sans AUCUN outil : `read` technique pour le gate, et tool_choice
-    # "none" pour que le modèle ne l'appelle jamais (le client ne l'a pas).
+    # Client sans AUCUN outil : grille officielle pour le gate, et tool_choice
+    # "none" pour que le modèle ne l'appelle jamais (le client ne les a pas).
     assert wire["tool_choice"] == "none"
-    assert [t["function"]["name"] for t in wire["tools"]] == ["read"]
+    assert [t["function"]["name"] for t in wire["tools"]] == OFFICIAL_TOOL_NAMES
     assert wire["messages"][0]["role"] == "system"
     assert SYSTEM_MARKER in wire["messages"][0]["content"]
     # Les messages du client sont conservés après le prompt officiel.
@@ -77,9 +77,8 @@ def test_un_corps_deja_conforme_traverse_sans_etre_modifie():
     assert oc._serialize_json_body(wire) == oc._serialize_json_body(body)
 
 
-def test_les_outils_du_client_sont_conserves_apres_le_read_officiel():
-    """Le gate ne demande que `read` : on ajoute le read officiel et on garde
-    les outils du client, au lieu d'imposer les 10 outils v1."""
+def test_les_outils_du_client_sont_conserves_apres_la_grille_officielle():
+    """Le gate exige les 10 noms officiels ; l'outil client reste derriere."""
     mine = {
         "type": "function",
         "function": {
@@ -95,9 +94,8 @@ def test_les_outils_du_client_sont_conserves_apres_le_read_officiel():
     }
     wire, _ = oc._free_wire_body(body, force_stream=True)
     names = [t["function"]["name"] for t in wire["tools"]]
-    assert names == ["read", "get_weather"]
-    # L'outil du client n'est pas copié : c'est le même objet.
-    assert wire["tools"][1] is mine
+    assert names == OFFICIAL_TOOL_NAMES + ["get_weather"]
+    assert wire["tools"][-1] == mine
     assert wire["tool_choice"] == "auto"
 
 
@@ -114,14 +112,25 @@ def test_le_read_du_client_est_conserve_tel_quel():
     body = {"model": "m", "messages": [], "tools": [mine]}
     wire, _ = oc._free_wire_body(body, force_stream=True)
     names = [t["function"]["name"] for t in wire["tools"]]
-    assert names == ["read"]
-    assert wire["tools"][0] is mine
+    assert names == OFFICIAL_TOOL_NAMES
+    read_index = OFFICIAL_TOOL_NAMES.index("read")
+    assert wire["tools"][read_index] == mine
 
 
 V2_SYSTEM = "You are an AI agent running in OpenCode, a coding agent harness. Help the user."
 V2_TOOLS = [
-    "edit", "glob", "grep", "question", "read", "shell",
-    "skill", "subagent", "webfetch", "websearch", "write", "execute",
+    "edit",
+    "glob",
+    "grep",
+    "question",
+    "read",
+    "shell",
+    "skill",
+    "subagent",
+    "webfetch",
+    "websearch",
+    "write",
+    "execute",
 ]
 
 
@@ -159,17 +168,18 @@ def test_corps_officiel_v2_traverse_tel_quel():
 def test_systeme_v2_sans_read_recoit_les_outils_officiels():
     body = {
         "model": "m",
-        "messages": [{"role": "system", "content": V2_SYSTEM},
-                     {"role": "user", "content": "salut"}],
+        "messages": [{"role": "system", "content": V2_SYSTEM}, {"role": "user", "content": "salut"}],
         "tools": [_tool("edit")],
         "stream": True,
     }
     wire, _ = oc._free_wire_body(body, force_stream=True)
     names = [t["function"]["name"] for t in wire["tools"]]
-    # Le `read` officiel est ajouté ; l'outil du client est conservé.
-    assert names == ["read", "edit"]
+    # La grille officielle est ajoutée ; l'outil `edit` du client est conservé
+    # à sa place officielle (son schéma reste exécutable côté client).
+    assert names == OFFICIAL_TOOL_NAMES
+    assert wire["tools"][OFFICIAL_TOOL_NAMES.index("edit")] == body["tools"][0]
     # Le prompt v2 est conservé : pas de prompt v1 ajouté par-dessus.
-    assert wire["messages"][0]["content"] == V2_SYSTEM
+    assert wire["messages"][0]["content"].startswith(V2_SYSTEM)
 
 
 def test_systeme_custom_avec_read_recoit_le_prompt_officiel():
@@ -177,8 +187,7 @@ def test_systeme_custom_avec_read_recoit_le_prompt_officiel():
     et la consigne d'outils est ajoutée à la fin du système du client."""
     body = {
         "model": "m",
-        "messages": [{"role": "system", "content": "Tu es bref."},
-                     {"role": "user", "content": "salut"}],
+        "messages": [{"role": "system", "content": "Tu es bref."}, {"role": "user", "content": "salut"}],
         "tools": [_tool("read")],
         "stream": True,
     }
@@ -186,9 +195,10 @@ def test_systeme_custom_avec_read_recoit_le_prompt_officiel():
     assert "You are opencode, an interactive CLI tool" in wire["messages"][0]["content"]
     client_system = wire["messages"][1]["content"]
     assert client_system.startswith("Tu es bref.")
-    assert "Only the tools declared in this request" in client_system
-    # Le read du client est conservé (même objet).
-    assert wire["tools"][0] is body["tools"][0]
+    assert "Call ONLY these client tools" in client_system
+    # Le read du client est conservé à sa place officielle.
+    read_index = OFFICIAL_TOOL_NAMES.index("read")
+    assert wire["tools"][read_index] == body["tools"][0]
 
 
 def test_l_ordre_des_cles_reste_celui_du_client():
@@ -283,11 +293,7 @@ def test_le_collecteur_accepte_le_dialecte_reasoning():
 
 
 def test_le_normaliseur_de_chunk_ajoute_l_alias_sans_ecraser():
-    chunk = {
-        "choices": [
-            {"delta": {"reasoning": "abc", "reasoning_details": [{"text": "abc"}]}}
-        ]
-    }
+    chunk = {"choices": [{"delta": {"reasoning": "abc", "reasoning_details": [{"text": "abc"}]}}]}
     assert oc._normalize_chat_reasoning_chunk(chunk) is True
     d = chunk["choices"][0]["delta"]
     assert d["reasoning_content"] == "abc"

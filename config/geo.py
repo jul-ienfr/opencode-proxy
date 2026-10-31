@@ -234,9 +234,7 @@ def resolve_geo(
             effective = set()
         else:
             # only blocked declared but all invalid => nothing to block
-            return _cached(
-                set(server_set) if server_set else set(), mode, require_vpn, "ok"
-            )
+            return _cached(set(server_set) if server_set else set(), mode, require_vpn, "ok")
     geo_status = "misconfigured" if (not effective and mode == "strict") else "ok"
     return _cached(effective, mode, require_vpn, geo_status)
 
@@ -272,11 +270,7 @@ def geo_strict_union(
             )
         except Exception:
             continue
-        if (
-            _info.get("mode") == "strict"
-            and _info.get("require_vpn")
-            and _info.get("geo_status") != "misconfigured"
-        ):
+        if _info.get("mode") == "strict" and _info.get("require_vpn") and _info.get("geo_status") != "misconfigured":
             eff = _info.get("effective_allowed")
             if isinstance(eff, set):
                 union |= eff

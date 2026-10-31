@@ -17,7 +17,17 @@ from __future__ import annotations
 # Couvre les shapes qui ne sont PAS 100 % user-only :
 # - Hermes Agent : "[CONTEXT COMPACTION – REFERENCE ONLY]"
 # - Claude-Code   : "<conversation-checkpoint>"
-_MARKERS = ("conversation-checkpoint", "context compaction")
+# - OpenCode V2   : prompt de résumé ajouté à la conversation réelle
+#   ("You MUST summarize the conversation above…", "Update the existing
+#   checkpoint…"), y compris la corrective NUDGE.
+_MARKERS = (
+    "conversation-checkpoint",
+    "context compaction",
+    "you must summarize the conversation above",
+    "update the existing checkpoint",
+    "summarize only what the user and the assistant said",
+    "previous response did not fill in the required summary template",
+)
 
 # Taille minimale (caractères) du texte cumulé pour les shapes implicites
 # (user-only sans marqueur) — voir docstring du module. Valeur par défaut ;
@@ -94,18 +104,41 @@ def _no_system(body: dict) -> bool:
     return False
 
 
+def _looks_like_implicit_compaction(text: str) -> bool:
+    """True when a long user-only body reads like a summary/compaction request.
+
+    [audit 2026-10-30] The old implicit rule matched ANY user-only text over
+    ``min_chars_implicit`` (e.g. a pasted article / long question), which
+    bypassed the response cache and the strict-free 503 for a normal turn.
+    Official clients name the operation ("summarize the conversation",
+    "compact", "checkpoint"); require that vocabulary.
+    """
+    low = (text or "").lower()
+    if not low:
+        return False
+    if "compact" in low or "checkpoint" in low:
+        return True
+    # A summary/compaction prompt always names the operation. A generic long
+    # user prompt (pasted article, code, question) does not.
+    return any(token in low for token in ("summar", "résumé", "resume"))
+
+
 def _messages_shape(body: dict, min_chars_implicit: int = _DEFAULT_MIN_CHARS_IMPLICIT) -> bool:
     """Shape messages/chat : body['messages'] non vide, 100 % user texte pur."""
     msgs = body.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return False
     total = 0
+    texts: list[str] = []
     for m in msgs:
         ok, txt = _is_text_only_message(m)
         if not ok:
             return False
         total += len(txt)
+        texts.append(txt)
     if total < min_chars_implicit:
+        return False
+    if not _looks_like_implicit_compaction("\n".join(texts)):
         return False
     return _no_tools(body) and _no_system(body)
 
@@ -116,6 +149,7 @@ def _responses_shape(body: dict, min_chars_implicit: int = _DEFAULT_MIN_CHARS_IM
     if not isinstance(inp, list) or not inp:
         return False
     total = 0
+    texts: list[str] = []
     for it in inp:
         if not isinstance(it, dict):
             return False
@@ -130,11 +164,14 @@ def _responses_shape(body: dict, min_chars_implicit: int = _DEFAULT_MIN_CHARS_IM
         if not txt:
             return False
         total += len(txt)
+        texts.append(txt)
         if isinstance(content, list):
             for b in content:
                 if isinstance(b, dict) and b.get("type") not in ("text", "input_text", "output_text"):
                     return False
     if total < min_chars_implicit:
+        return False
+    if not _looks_like_implicit_compaction("\n".join(texts)):
         return False
     if not _no_tools(body):
         return False
@@ -216,6 +253,18 @@ def is_native_compaction(body: dict) -> bool:
                 for e in edits:
                     if isinstance(e, dict) and "compact" in str(e.get("type", "")).lower():
                         return True
+        elif isinstance(cm, list):
+            # Official V2 OpenAI Responses shape: context_management is an
+            # ARRAY of `{type: "compaction", compact_threshold}` edits
+            # (openai-responses.ts:111-118/208). The dict-only check missed it,
+            # so a native compaction request was not flagged (cache/503 gate).
+            for edit in cm:
+                if not isinstance(edit, dict):
+                    continue
+                if "compact" in str(edit.get("type", "")).lower():
+                    return True
+                if "compact_threshold" in edit:
+                    return True
         # compaction explicite demandée (beta compact-*) : {"compaction": {"type": "summarize"}}
         comp = body.get("compaction")
         if isinstance(comp, dict) and str(comp.get("type", "")).lower() in ("summarize", "auto"):

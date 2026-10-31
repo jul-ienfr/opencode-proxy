@@ -20,8 +20,8 @@ import pytest
 
 from observability.metrics import (
     LEG_LAT_MAX_KEYS,
-    leg_latency_key,
     latency_snapshot,
+    leg_latency_key,
     observe_leg_call,
 )
 

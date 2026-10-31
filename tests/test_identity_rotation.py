@@ -6,9 +6,11 @@ prochaine tentative passe ; sinon la rotation d'IP (bras armé en parallèle)
 prend le relais.
 """
 
+import contextlib
+
 import pytest
 
-from free.identities import IdentityVault, IpIdentity
+from free.identities import IdentityVault
 
 
 def _vault(tmp_path):
@@ -24,13 +26,11 @@ def _vault(tmp_path):
     os.environ.pop("OPENCODE_IDENTITIES_DIR", None)
 
 
-import contextlib
-
-
 @contextlib.contextmanager
 def _vault_ctx(tmp_path):
-    import free.identities as _fi
     import os
+
+    import free.identities as _fi
 
     _fi._VAULT = None
     os.environ["OPENCODE_IDENTITIES_DIR"] = str(tmp_path / "ids")
@@ -84,8 +84,9 @@ def test_rotate_never_raises_on_garbage(tmp_path):
 
 def test_hook_rotates_vault_on_quota_not_on_transient(monkeypatch):
     """_mark_free_stations_429 : quota → nouvelle installation ; transitoire → rien."""
-    import opencode as oc
     from test_free_multi_attempt import _Station
+
+    import opencode as oc
 
     oc._free_model_cooldowns.clear()
     try:
@@ -112,8 +113,6 @@ def test_hook_rotates_vault_on_quota_not_on_transient(monkeypatch):
     monkeypatch.setattr(oc, "_log", lambda *a, **k: None)
     monkeypatch.setattr(oc, "_debug", lambda *a, **k: None)
 
-    import free.identities as _fi
-
     before = oc._ip_vault().get("9.9.9.9").snapshot()
 
     quota_body = '{"error":{"message":"usage_not_included: plan does not include this usage"}}'
@@ -126,7 +125,9 @@ def test_hook_rotates_vault_on_quota_not_on_transient(monkeypatch):
 
     transient_body = '{"error":{"type":"server_error","message":"Endpoint is unavailable. Please try again later."}}'
     oc._mark_free_stations_429("m", "", stations=[st], body=transient_body)
-    assert oc._ip_vault().get("9.9.9.9").snapshot()["ses"] == after["ses"], "transitoire → on ne touche pas à l'identité"
+    assert oc._ip_vault().get("9.9.9.9").snapshot()["ses"] == after["ses"], (
+        "transitoire → on ne touche pas à l'identité"
+    )
 
 
 @pytest.mark.asyncio

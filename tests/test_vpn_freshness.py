@@ -876,9 +876,7 @@ class TestWatchdogTick:
         compose wall."""
         shared = _shared(tmp_path)
         shared.record_ip("1.1.1.1", 1)
-        mgr = FakeVPNManager(
-            _cfg(tmp_path, vpn_stack="wireguard"), shared=shared, tmp_path=tmp_path
-        )
+        mgr = FakeVPNManager(_cfg(tmp_path, vpn_stack="wireguard"), shared=shared, tmp_path=tmp_path)
         mgr.probe_alive = False
         mgr.ips = ["1.1.1.1"] * 4  # tick1 refresh + 3 finalize rounds
         seuil = mgr._auto_wg_egress_ticks
@@ -1189,9 +1187,7 @@ class TestArmEgressWatchdog:
 
         await mgr._watchdog_tick()  # skip — rotation in flight
 
-        assert mgr._skipped_rotation_task is rotation, (
-            "the skip is traced per rotation task (not a resettable flag)"
-        )
+        assert mgr._skipped_rotation_task is rotation, "the skip is traced per rotation task (not a resettable flag)"
         assert mgr.calls["restart"] == 0
         assert mgr.escalations == 0
         assert mgr._egress_failures == mgr._auto_wg_egress_ticks  # unchanged
@@ -1353,7 +1349,7 @@ class TestApplyUpdate:
         mgr._finalize_ip = self._finalize_stub(mgr, False, log)
         result = await mgr.apply_update()
         assert result["ok"] is False
-        assert ("could not finalize a fresh IP" in result["error"] or "impossible de finaliser" in result["error"])
+        assert "could not finalize a fresh IP" in result["error"] or "impossible de finaliser" in result["error"]
         assert log["calls"] == 1
         assert log["allow_stale"] is False
         assert mgr.calls["docker_run"] == 3

@@ -1,4 +1,5 @@
 """Tests V4 100% : traitements 10-17 + strict:false (calm-rossum)."""
+
 import copy
 import json
 
@@ -7,6 +8,7 @@ import pytest
 import protocol_mapping as pm
 
 _N = pm._normalize_tool_schema
+
 
 # ── 10 : root type ────────────────────────────────────────────────
 class TestRootType:
@@ -27,6 +29,7 @@ class TestRootType:
         out = _N(schema, "minimax-m2.5")
         assert "type" not in out
 
+
 # ── 11 : properties type fallback ─────────────────────────────────
 class TestPropertiesTypeFallback:
     def test_missing_type_becomes_string(self):
@@ -38,7 +41,12 @@ class TestPropertiesTypeFallback:
         schema = {"type": "object", "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "number"}]}}}
         out = _N(schema, "muse-spark-1.2-contributor")
         # anyOf résiduel non-null sera strippé en 15, mais 11 ne doit pas forcer type
-        assert "type" not in out["properties"]["q"] or out["properties"]["q"].get("type") == "string" or "anyOf" in out["properties"]["q"]
+        assert (
+            "type" not in out["properties"]["q"]
+            or out["properties"]["q"].get("type") == "string"
+            or "anyOf" in out["properties"]["q"]
+        )
+
 
 # ── 12 : required ⊆ properties ────────────────────────────────────
 class TestRequiredSubset:
@@ -52,6 +60,7 @@ class TestRequiredSubset:
         out = _N(schema, "muse-spark-1.2-contributor")
         assert "required" not in out
 
+
 # ── 13 : @schema_version strip ────────────────────────────────────
 class TestSchemaVersionStrip:
     def test_at_schema_version_stripped(self):
@@ -63,6 +72,7 @@ class TestSchemaVersionStrip:
         schema = {"type": "object", "properties": {"x": {"type": "string", "@schema_version": "invalid json schema"}}}
         out = _N(schema, "muse-spark-1.2-contributor")
         assert "@schema_version" not in out["properties"]["x"]
+
 
 # ── 14 : additionalProperties jamais forcé (parité v2) ──────────
 class TestAdditionalPropertiesFalse:
@@ -81,6 +91,7 @@ class TestAdditionalPropertiesFalse:
         out = _N(schema, "minimax-m2.5")
         assert "additionalProperties" not in out
 
+
 # ── 15 : anyOf/oneOf résiduel strip ───────────────────────────────
 class TestAnyOfResidual:
     def test_anyof_string_number_stripped_strict(self):
@@ -94,6 +105,7 @@ class TestAnyOfResidual:
         out = _N(schema, "minimax-m2.5")
         assert "anyOf" in out
 
+
 # ── 16 : keywords strip ───────────────────────────────────────────
 class TestUnsupportedKeywords:
     def test_const_stripped(self):
@@ -102,9 +114,15 @@ class TestUnsupportedKeywords:
         assert "const" not in json.dumps(out)
 
     def test_title_schema_stripped(self):
-        schema = {"type": "object", "title": "MyTitle", "$schema": "http://json-schema.org/draft-07/schema#", "properties": {"x": {"type": "string"}}}
+        schema = {
+            "type": "object",
+            "title": "MyTitle",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "properties": {"x": {"type": "string"}},
+        }
         out = _N(schema, "muse-spark-1.2-contributor")
         assert "title" not in out and "$schema" not in out
+
 
 # ── 17 : array items type ─────────────────────────────────────────
 class TestArrayItems:
@@ -113,26 +131,77 @@ class TestArrayItems:
         out = _N(schema, "muse-spark-1.2-contributor")
         assert out["items"]["type"] == "string"
 
+
 # ── strict:false sur tool émis ────────────────────────────────────
 class TestStrictFalse:
     def test_chat_to_responses_sets_strict_false(self):
         # V5.1 sémantique : strict:false seulement si fallback (anyOf/const/title)
-        chat = {"model": "muse-spark-1.2-contributor", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string", "anyOf": [{"type": "string"}, {"type": "number"}]}}, "required": ["command"]}}}]}
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "run",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "command": {"type": "string", "anyOf": [{"type": "string"}, {"type": "number"}]}
+                            },
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ],
+        }
         r = pm._chat_to_responses_request(chat)
         assert r["tools"][0]["strict"] is False
         # Parité v2 : pas de `additionalProperties:false` forcé.
         assert "additionalProperties" not in r["tools"][0]["parameters"]
 
     def test_chat_to_responses_simple_no_strict(self):
-        chat = {"model": "muse-spark-1.2-contributor", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]}
+        chat = {
+            "model": "muse-spark-1.2-contributor",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "run",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ],
+        }
         r = pm._chat_to_responses_request(chat)
         # simple sans anyOf/const → pas de strict:false (laisse implicite)
         assert "strict" not in r["tools"][0]
 
     def test_chat_to_responses_qwen_no_strict(self):
-        chat = {"model": "qwen3.5-plus", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}}]}
+        chat = {
+            "model": "qwen3.5-plus",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "run",
+                        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                    },
+                }
+            ],
+        }
         r = pm._chat_to_responses_request(chat)
         assert "strict" not in r["tools"][0]
+
 
 # ── 18 : strict-subset e2e (jambe Responses) ───────────────────
 # Certitude : AUCUN `pattern` ne sort sur le wire en strict, même
@@ -141,11 +210,33 @@ class TestUnsafePatternE2E:
     def test_chat_to_responses_strips_all_patterns(self):
         offending = r"^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}\"\\./[\]]{1,200}$"
         lookahead = r"^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$"
-        chat = {"model": "muse-spark-1.3-contributor-free", "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "Artifact", "description": "artifact", "parameters": {"type": "object", "properties": {"field": {"type": "string", "pattern": offending}, "collection": {"type": "string", "pattern": lookahead}, "simple": {"type": "string", "pattern": r"^[a-z]+$"}}, "required": ["field"]}}}]}
+        chat = {
+            "model": "muse-spark-1.3-contributor-free",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Artifact",
+                        "description": "artifact",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "field": {"type": "string", "pattern": offending},
+                                "collection": {"type": "string", "pattern": lookahead},
+                                "simple": {"type": "string", "pattern": r"^[a-z]+$"},
+                            },
+                            "required": ["field"],
+                        },
+                    },
+                }
+            ],
+        }
         r = pm._chat_to_responses_request(chat)
         params = r["tools"][0]["parameters"]
         assert "pattern" not in json.dumps(params)
         assert params["properties"]["field"]["type"] == "string"
+
 
 # ── Garantie strict-subset sur les 7 outils réels des dumps 400 ──
 # C'est CE test qui porte la certitude : il charge les paramètres tels
@@ -157,16 +248,30 @@ class TestStrictSubsetGuarantee:
     NAMES = ("Artifact", "SendMessage", "Monitor", "Workflow", "CronList", "EnterPlanMode", "AskUserQuestion")
     MODEL = "muse-spark-1.3-contributor-free"
     FORBIDDEN_KEYS = (
-        "pattern", "propertyNames", "prefixItems",
-        "allOf", "anyOf", "oneOf",
-        "const", "title", "$schema", "$id",
-        "if", "then", "else",
-        "unevaluatedProperties", "patternProperties",
-        "examples", "example", "exclusiveMaximum", "exclusiveMinimum",
+        "pattern",
+        "propertyNames",
+        "prefixItems",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "const",
+        "title",
+        "$schema",
+        "$id",
+        "if",
+        "then",
+        "else",
+        "unevaluatedProperties",
+        "patternProperties",
+        "examples",
+        "example",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
     )
 
     def _load_wire_params(self):
         import pathlib
+
         p = pathlib.Path(__file__).resolve().parent.parent / self.DUMP
         if not p.exists():
             return None
@@ -232,21 +337,79 @@ class TestStrictSubsetGuarantee:
         }
         out = _N(copy.deepcopy(schema), self.MODEL)
         assert self._scan(out) == []
-        assert out["properties"]["empty"] == {"type": "string", "additionalProperties": False} or out["properties"]["empty"].get("type") == "string"
+        assert (
+            out["properties"]["empty"] == {"type": "string", "additionalProperties": False}
+            or out["properties"]["empty"].get("type") == "string"
+        )
+
 
 # ── 9 tools end-to-end ────────────────────────────────────────────
 class TestNineTools:
     def test_nine_tools_all_valid(self):
         tools = [
-            {"name": "bash", "description": "x"*1100, "input_schema": {"properties": {"command": {"type": "string"}}, "required": ["command"], "@schema_version": "invalid json schema"}},
-            {"name": "edit", "description": "edit", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"description": "c"}}, "required": ["path", "ghost"]}},
-            {"name": "glob", "description": "glob", "input_schema": {"type": "object", "properties": {"pattern": {"type": "string", "const": "x"}}, "additionalProperties": True}},
-            {"name": "grep", "description": "grep", "input_schema": {"type": "object", "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "number"}]}}}},
-            {"name": "plan_exit", "description": "plan", "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}, "title": "t"}},
-            {"name": "question", "description": "q", "input_schema": {"type": "object", "properties": {"a": {"type": "array", "items": {"description": "i"}}}}},
-            {"name": "read", "description": "read", "input_schema": {"type": "object", "properties": {"file": {"type": "string", "format": "uri"}}}},
-            {"name": "skill", "description": "skill", "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-            {"name": "write", "description": "write", "input_schema": {"type": "object", "properties": {"p": {"type": "string"}}, "required": ["p"]}},
+            {
+                "name": "bash",
+                "description": "x" * 1100,
+                "input_schema": {
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                    "@schema_version": "invalid json schema",
+                },
+            },
+            {
+                "name": "edit",
+                "description": "edit",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "content": {"description": "c"}},
+                    "required": ["path", "ghost"],
+                },
+            },
+            {
+                "name": "glob",
+                "description": "glob",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"pattern": {"type": "string", "const": "x"}},
+                    "additionalProperties": True,
+                },
+            },
+            {
+                "name": "grep",
+                "description": "grep",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "number"}]}},
+                },
+            },
+            {
+                "name": "plan_exit",
+                "description": "plan",
+                "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}, "title": "t"},
+            },
+            {
+                "name": "question",
+                "description": "q",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"a": {"type": "array", "items": {"description": "i"}}},
+                },
+            },
+            {
+                "name": "read",
+                "description": "read",
+                "input_schema": {"type": "object", "properties": {"file": {"type": "string", "format": "uri"}}},
+            },
+            {
+                "name": "skill",
+                "description": "skill",
+                "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+            },
+            {
+                "name": "write",
+                "description": "write",
+                "input_schema": {"type": "object", "properties": {"p": {"type": "string"}}, "required": ["p"]},
+            },
         ]
         body = {"model": "muse-spark-1.2-contributor", "messages": [{"role": "user", "content": "hi"}], "tools": tools}
         r = pm.anthropic_to_openai(body, "muse-spark-1.2-contributor")

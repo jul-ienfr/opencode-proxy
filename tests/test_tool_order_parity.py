@@ -77,9 +77,29 @@ def test_sorted_chat_tools_ignores_short_and_non_list_inputs():
 # que E3 est justement censé supprimer.
 
 _LOCALE_COMPARE_ORDER = [
-    "_", "_wPht", "_x", "_z1", "-", "-B", "-x", "a_b", "a-b", "aab",
-    "alpha", "ask", "Ask", "ask2", "Bash", "bash_tool", "m1", "M1",
-    "read", "Read", "x2", "X2", "Zed",
+    "_",
+    "_wPht",
+    "_x",
+    "_z1",
+    "-",
+    "-B",
+    "-x",
+    "a_b",
+    "a-b",
+    "aab",
+    "alpha",
+    "ask",
+    "Ask",
+    "ask2",
+    "Bash",
+    "bash_tool",
+    "m1",
+    "M1",
+    "read",
+    "Read",
+    "x2",
+    "X2",
+    "Zed",
 ]
 
 
@@ -95,9 +115,9 @@ def test_tool_sort_key_is_not_a_code_point_sort():
     by_codepoint = sorted(shuffled)
     assert by_key != by_codepoint
     # les deux inversions qui font tout le sujet du test
-    assert by_key.index("alpha") < by_key.index("Zed")      # casse mixte
-    assert by_key.index("A") < by_key.index("a_b")          # préfixe avant casse
-    assert by_key.index("_x") < by_key.index("Bash")        # ponctuation avant lettres
+    assert by_key.index("alpha") < by_key.index("Zed")  # casse mixte
+    assert by_key.index("A") < by_key.index("a_b")  # préfixe avant casse
+    assert by_key.index("_x") < by_key.index("Bash")  # ponctuation avant lettres
 
 
 def test_tool_sort_key_is_total_and_never_raises():
@@ -136,7 +156,11 @@ def test_free_wire_shims_are_sorted_with_the_rest():
         "tools": [_tool("zzz"), _tool("aaa")],
     }
     wire, _forced = oc._free_wire_body(body)
-    assert _names(wire["tools"]) == ["read", "zzz", "aaa"]
+    # [audit 2026-10-30] La copie officielle (10 outils, ordre officiel) est
+    # envoy?e devant les outils client ; le client garde son ordre.
+    assert _names(wire["tools"]) == [
+        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write", "zzz", "aaa"
+    ]
     # Le corps d'origine n'est jamais muté (idempotence des retries/hedges).
     assert _names(body["tools"]) == ["zzz", "aaa"]
 
@@ -150,7 +174,9 @@ def test_free_wire_is_idempotent_once_sorted():
     }
     first, _ = oc._free_wire_body(body)
     second, _ = oc._free_wire_body(first)
-    assert _names(second["tools"]) == _names(first["tools"]) == ["read", "zzz", "aaa"]
+    assert _names(second["tools"]) == _names(first["tools"]) == [
+        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write", "zzz", "aaa"
+    ]
 
 
 def test_free_wire_responses_leg_is_left_alone():

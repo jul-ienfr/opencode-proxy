@@ -502,9 +502,7 @@ def test_axis_strict_is_never_fabricated(path):
     tools, _body = convert([make_tool()])
     inner = tools[0].get("function", tools[0])
 
-    assert inner.get("strict") is not True, (
-        f"{path}: `strict: true` fabriqué alors que le client ne l'a pas demandé"
-    )
+    assert inner.get("strict") is not True, f"{path}: `strict: true` fabriqué alors que le client ne l'a pas demandé"
 
 
 # ── Parité tool_choice (toutes formes, tous chemins) ──────────────────────
@@ -593,7 +591,5 @@ def test_tool_choice_dict_forms_mapped_p6(incoming, expected):
     """P6 : dict auto/any/none → objet {type}, jamais de string nue."""
     from app.protocol.mapping import openai_responses_to_anthropic
 
-    out = openai_responses_to_anthropic(
-        _responses_body(tools=[responses_tool()], tool_choice=incoming)
-    )
+    out = openai_responses_to_anthropic(_responses_body(tools=[responses_tool()], tool_choice=incoming))
     assert out.get("tool_choice") == expected

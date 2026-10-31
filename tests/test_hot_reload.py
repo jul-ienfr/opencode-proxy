@@ -43,9 +43,7 @@ def isolated_routes(tmp_path, monkeypatch):
 
 
 def test_reload_picks_up_new_routes(isolated_routes):
-    isolated_routes.write_text(
-        json.dumps({"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}), encoding="utf-8"
-    )
+    isolated_routes.write_text(json.dumps({"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}), encoding="utf-8")
     _cfg.maybe_reload_custom_routes()
     assert _cfg.ROUTES.get("kimi", {}).get("model") == "glm-5.1"
     assert _cfg.CUSTOM_ROUTES.get("kimi", {}).get("match") == ["kimi-k2.6"]
@@ -68,9 +66,7 @@ def test_reload_removes_deleted_routes(isolated_routes, monkeypatch):
 
 def test_reload_rate_limited(isolated_routes, monkeypatch):
     _cfg.maybe_reload_custom_routes()  # arms the 5 s rate limit
-    isolated_routes.write_text(
-        json.dumps({"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}), encoding="utf-8"
-    )
+    isolated_routes.write_text(json.dumps({"kimi": {"match": ["kimi-k2.6"], "model": "glm-5.1"}}), encoding="utf-8")
     # Force mtime and last_check to be older (NTFS may coalesce, and rate limit would block)
     monkeypatch.setattr(_cfg, "_custom_routes_mtime", 0.0)
     monkeypatch.setattr(_cfg, "_custom_routes_last_check", 0.0)
@@ -192,8 +188,13 @@ def test_route_version_bumped_on_mutations(isolated_yaml):
     assert _cfg.CUSTOM_ROUTES.get("c", {}).get("model") == "mimo-v2.5-free"
 
 
-def test_save_env_rebuilds_sorted_routes_and_bumps():
+def test_save_env_rebuilds_sorted_routes_and_bumps(tmp_path, monkeypatch):
     """[B4] save_env doit rebâtir SORTED_ROUTES et invalider les caches."""
+    # [hygiène 2026-10-27] `save_env` écrit `ENV_PATH` : sans redirection, ce
+    # test réécrivait le VRAI `.env` du dépôt à chaque exécution de la suite
+    # (capture par hook d'audit : config/settings.py:2328). Même paravent que
+    # `isolated_yaml` pour le YAML.
+    monkeypatch.setattr(_cfg, "ENV_PATH", str(tmp_path / ".env"))
     old_sorted = _cfg.SORTED_ROUTES
     old_version = _cfg.ROUTE_VERSION
     _cfg.save_env({"OPUS_MAP_MODEL": _cfg.load_routes().get("opus", {}).get("model", "kimi-k2.6")})
@@ -215,9 +216,7 @@ def test_warm_cache_reroutes_immediately_on_inprocess_change(isolated_yaml):
         first = _oc._route_for("zz-model-warm")
         assert first is None  # pas de route encore
 
-        _cfg.save_custom_routes(
-            {"warm": {"match": ["zz-model-warm"], "model": "glm-5.1"}}
-        )
+        _cfg.save_custom_routes({"warm": {"match": ["zz-model-warm"], "model": "glm-5.1"}})
 
         second = _oc._route_for("zz-model-warm")
         assert second is not None and second.get("model") == "glm-5.1"

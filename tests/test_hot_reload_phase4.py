@@ -327,9 +327,7 @@ async def test_port_hot_restart_not_full_restart(config_path, monkeypatch):
     import threading as _th
 
     seen_threads = []
-    mock_mgr.restart.side_effect = lambda *a, **kw: seen_threads.append(
-        _th.current_thread().name
-    )
+    mock_mgr.restart.side_effect = lambda *a, **kw: seen_threads.append(_th.current_thread().name)
 
     resp2 = client.post("/api/config", json=payload)
     assert resp2.status_code == 200

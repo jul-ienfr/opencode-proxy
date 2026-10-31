@@ -427,7 +427,7 @@ def _run_refuse(monkeypatch, status_code, body: bytes, protocol="openai"):
     assert out.endswith(b"data: [DONE]\n\n")
     first = out.split(b"\n")[0]
     assert first.startswith(b"data: ")
-    return out, _json.loads(first[len(b"data: "):].decode())
+    return out, _json.loads(first[len(b"data: ") :].decode())
 
 
 def test_stream_transient_429_does_not_claim_quota_exhausted(monkeypatch):

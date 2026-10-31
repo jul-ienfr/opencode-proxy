@@ -70,6 +70,10 @@ from config import (
     maybe_reload_custom_routes,
     yaml_get,
 )
+from config.free_policy import is_free_subject as _is_free_subject
+from config.model_tier import classify_model as _classify_model_tier
+from config.model_tier import classify_route_alias as _classify_route_alias
+from config.model_tier import tier_counts as _tier_counts
 
 # P2 geo: dynamic GEO_ENABLED via settings (hot-reload), base resolver alias
 
@@ -149,8 +153,15 @@ def _env_key_or_raise() -> dict:
     return _keys_mod.env_key_or_raise(API_KEY, _key_pauser, _debug)
 
 
-def get_next_api_key() -> dict:
+def get_next_api_key(model_id: str = "") -> dict:
     global _key_cycle_keys, _key_failover_index, _key_cycle_index
+    if not model_id:
+        # [audit 2026-10-30] Model-scoped pauses: the request's model is set
+        # by _mark_requested_model() before key selection in every handler.
+        try:
+            model_id = str(_current_requested_model.get() or _current_actual_model.get() or "")
+        except Exception:
+            model_id = ""
     key, _key_failover_index, _key_cycle_keys, _key_cycle_index = _keys_mod.select_next_key(
         api_keys=API_KEYS,
         env_key=API_KEY,
@@ -161,13 +172,14 @@ def get_next_api_key() -> dict:
         cycle_index=_key_cycle_index,
         cycle_lock=_key_cycle_lock,
         debug_fn=_debug,
+        model=model_id,
     )
     return key
 
 
-def _find_alternative_key(failed_key: str) -> dict | None:
+def _find_alternative_key(failed_key: str, model: str = "") -> dict | None:
     """Return the first enabled, non-paused key different from failed_key, or None."""
-    return _keys_mod.find_alternative_key(API_KEYS, _key_pauser, failed_key, _debug)
+    return _keys_mod.find_alternative_key(API_KEYS, _key_pauser, failed_key, _debug, model=model)
 
 
 _key_alias_cache: dict[str, str] = {}
@@ -267,7 +279,13 @@ async def _pause_key_for_quota_reset(api_key: str):
                 ws_entry = k
                 break
         if not ws_entry:
-            return  # No workspace configured for this key, can't fetch quotas
+            # [audit 2026-10-30] No workspace metadata must NOT mean "no
+            # pause": the old early return skipped the default pause below,
+            # so a key without go_workspace_id/go_auth_cookie was re-selected
+            # on every round-robin and re-429ed forever.
+            _default_pause = float(yaml_get("key_pause", "default_pause", 60))
+            _key_pauser.pause_key(api_key, _default_pause, "429 (no workspace configured)")
+            return
 
         wid = ws_entry["go_workspace_id"]
         cookie = ws_entry["go_auth_cookie"]
@@ -281,16 +299,26 @@ async def _pause_key_for_quota_reset(api_key: str):
             reset_sec = q.get("reset_in_sec", 0)
             if usage >= 95 and reset_sec > 0:
                 alias = _alias_for_key(api_key)
-                re_enable_at = time.time() + reset_sec
+                # [audit 2026-10-30] pause_key(quota_based=True) caps the pause
+                # at max_pause; the message must announce the EFFECTIVE
+                # re-enable time, not the upstream reset hours later.
+                try:
+                    _cap = float(_key_pauser._max_pause)
+                except Exception:
+                    _cap = float(reset_sec)
+                effective_pause = min(float(reset_sec), _cap)
+                re_enable_at = time.time() + effective_pause
                 re_enable_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(re_enable_at))
+                _cap_note = " (cap max_pause)" if effective_pause < float(reset_sec) else ""
                 _key_pauser.pause_key(
                     api_key,
                     reset_sec,
-                    f"quota {window} {usage:.0f}% → réactivation {re_enable_str}",
+                    f"quota {window} {usage:.0f}% → réactivation {re_enable_str}{_cap_note}",
                     quota_based=True,
                 )
                 _log(
-                    f"  QUOTA {window.upper()} AT {usage:.0f}% — key {alias} paused until {re_enable_str} (in {reset_sec:.0f}s)"
+                    f"  QUOTA {window.upper()} AT {usage:.0f}% — key {alias} paused until "
+                    f"{re_enable_str} (in {effective_pause:.0f}s{_cap_note})"
                 )
                 return
 
@@ -350,6 +378,10 @@ _ANTHROPIC_BETA = "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2
 # via l'union de `_ensure_anthropic_beta` (client betas / header entrant) — pas
 # par cette constante.
 _ANTHROPIC_BINDING_BETA = "thinking-binding-controls-2026-08-01"
+# Parité client officiel (`anthropic-messages.ts:requiredBetaHeaders`) : le beta
+# compact est ajouté dès qu'un corps porte `context_management.edits` ou replay
+# un bloc `compaction`, même si le client a oublié de le demander.
+_ANTHROPIC_COMPACT_BETA = "compact-2026-01-12"
 
 
 def _body_has_thinking_block_binding(body) -> bool:
@@ -359,6 +391,35 @@ def _body_has_thinking_block_binding(body) -> bool:
             return False
         _th = body.get("thinking")
         return isinstance(_th, dict) and isinstance(_th.get("blockBinding"), dict)
+    except Exception:
+        return False
+
+
+def _body_requests_compact_beta(body) -> bool:
+    """True si le corps demande/rejoue un compactage Anthropic natif."""
+    try:
+        if not isinstance(body, dict):
+            return False
+        cm = body.get("context_management")
+        if isinstance(cm, dict):
+            edits = cm.get("edits")
+            if isinstance(edits, list):
+                for edit in edits:
+                    if isinstance(edit, dict) and "compact" in str(edit.get("type", "")).lower():
+                        return True
+        for key in ("messages", "input"):
+            seq = body.get(key)
+            if not isinstance(seq, list):
+                continue
+            for message in seq:
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and str(block.get("type", "")).lower() == "compaction":
+                            return True
+        return False
     except Exception:
         return False
 
@@ -389,7 +450,12 @@ def _ensure_anthropic_beta(headers: dict, body=None) -> dict:
             _client_betas = {}
         _beta_key = next((k for k in headers if str(k).lower() == "anthropic-beta"), "anthropic-beta")
         _merged: list = []
-        _extra_betas = (_ANTHROPIC_BINDING_BETA,) if _body_has_thinking_block_binding(body) else ()
+        _extra: list[str] = []
+        if _body_has_thinking_block_binding(body):
+            _extra.append(_ANTHROPIC_BINDING_BETA)
+        if _body_requests_compact_beta(body):
+            _extra.append(_ANTHROPIC_COMPACT_BETA)
+        _extra_betas = tuple(_extra)
         for _src in (
             str(headers.get(_beta_key, "")),
             _ANTHROPIC_BETA,
@@ -536,6 +602,7 @@ from app.compaction import maybe_condense as _maybe_condense  # noqa: E402  # [P
 from app.compaction.classify import has_free_leg as _classify_has_free_leg  # noqa: E402  # [Compaction voie unifiée]
 from app.compaction.classify import is_free_class as _classify_is_free_class  # noqa: E402
 from app.compaction.overflow import huge_context_check as _huge_context_check  # noqa: E402
+from app.compaction.overflow import is_overflow as _is_overflow  # noqa: E402
 from app.compaction.plan import summarizer_plan as _plan_summarizer_plan  # noqa: E402
 from app.compaction.streaming import anthropic_sse_from_completion as _compact_anthropic_sse  # noqa: E402
 from app.compaction.streaming import chat_sse_from_completion as _compact_chat_sse  # noqa: E402
@@ -652,7 +719,32 @@ _null_lock = contextlib.nullcontext()
 _db_state = _app_db.BatchState(commit_interval=_DB_COMMIT_INTERVAL, commit_batch=_DB_COMMIT_BATCH)
 # Ultra-fast async DB queue — single writer, no per-request to_thread
 _db_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
+_db_queue_bytes: int = 0
+_DB_QUEUE_BYTES_MAX: int = 256 * 1024 * 1024
 _db_writer_task: asyncio.Task | None = None
+
+
+def _db_item_bytes(item) -> int:
+    try:
+        return _db_row_bytes(item[1]) if item and item[0] == "requests" else 0
+    except Exception:
+        return 0
+
+
+def _db_row_bytes(row) -> int:
+    """Taille approximative des corps d'une DbRowRaw (cap mémoire queue)."""
+    try:
+        req = getattr(row, "request_body", None)
+        resp = getattr(row, "response_body", None)
+        n = 0
+        for b in (req, resp):
+            if isinstance(b, (str, bytes, bytearray)):
+                n += len(b)
+            elif b is not None:
+                n += 4096
+        return n
+    except Exception:
+        return 0
 
 # Context variable to pass client user-agent from endpoint handlers to _save_request
 # without threading it through every intermediate function call.
@@ -726,10 +818,8 @@ def _warn_huge_context(request, where: str = "") -> None:
             _path = str(getattr(getattr(request, "url", None), "path", "") or "") or where
         except Exception:
             _ua, _path = "", where
-        _log(
-            f"  WARN huge-context: {_path} body={_size}b (~{_size // 4} tok) "
-            f"ua={_ua} — session à compacter ?"
-        )
+        _log(f"  WARN huge-context: {_path} body={_size}b (~{_size // 4} tok) ua={_ua} — session à compacter ?")
+
 
 # [PC-16 audit 2026-09-08] IP cliente de la requête courante (F9) — lue par
 # _log_free_model_usage pour lever l'ambiguïté ip= (client vs egress).
@@ -762,6 +852,22 @@ _current_free_refusal: contextvars.ContextVar[tuple | None] = contextvars.Contex
 # Geo direct → VPN fallback context (IP+pays direct, allowed, via flag)
 # Set by _enforce_geo_gate per request, read by _save_request / _geo_headers / tray.
 _current_geo: contextvars.ContextVar[dict | None] = contextvars.ContextVar("_current_geo", default=None)
+
+# [Tier headers] Jambe réellement utilisée par la requête courante.
+# Renseignés par _try_free_model_first (free) et _do_request_with_retry (paid),
+# lus par ModelTierHeaderMiddleware au moment de http.response.start.
+_current_requested_model: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_requested_model", default=None
+)
+_current_requested_tier: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_requested_tier", default=None
+)
+_current_actual_model: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_actual_model", default=None
+)
+_current_actual_tier: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_actual_tier", default=None)
+_current_fallback: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_fallback", default=None)
+_current_free_attempted: contextvars.ContextVar[bool] = contextvars.ContextVar("_current_free_attempted", default=False)
 
 # [P4 correctesse] flag « contenu non-déterministe injecté APRÈS la capture
 # des bytes bruts » (résultats DuckDuckGo / web_fetch). La clé de cache de
@@ -909,9 +1015,9 @@ def _bump_token_counters_sync(model, timestamp, tokens_input, tokens_output, tok
             _null_lock,
             model=str(model),
             date=date,
-            tokens_input=int(tokens_input or 0),
-            tokens_output=int(tokens_output or 0),
-            tokens_cache=int(tokens_cache or 0),
+            tokens_input=max(0, int(tokens_input or 0)),
+            tokens_output=max(0, int(tokens_output or 0)),
+            tokens_cache=max(0, int(tokens_cache or 0)),
         )
     except Exception:
         pass
@@ -937,14 +1043,17 @@ def _db_execute_batch_sync(batch: list):
 
 async def _db_writer_loop():
     """Single writer: batches DB inserts from queue, no per-request to_thread."""
+    global _db_queue_bytes
     batch: list[tuple] = []
     while True:
         try:
             item = await _db_queue.get()
+            _db_queue_bytes = max(0, _db_queue_bytes - _db_item_bytes(item))
             batch.append(item)
             while len(batch) < 32:
                 try:
                     nxt = await asyncio.wait_for(_db_queue.get(), timeout=0.05)
+                    _db_queue_bytes = max(0, _db_queue_bytes - _db_item_bytes(nxt))
                     batch.append(nxt)
                 except TimeoutError:
                     break
@@ -1011,6 +1120,9 @@ async def _save_request(
     # None = pas de fallback (paid direct ou free direct).
     free_status=None,
     paid_status=None,
+    ttfb_ms=None,
+    stop_reason=None,
+    aborted=False,
 ):
     # [D1 perf] plus de sérialisation inline : tools_json / truncate / redact
     # sont exécutés dans le thread writer (_materialize_db_row). Estimation
@@ -1019,6 +1131,7 @@ async def _save_request(
         request_body = _compact_body_stub(request_body)
     if response_body is not None and _quick_body_size(response_body) > _DB_RAW_SIZE_CAP:
         response_body = _compact_body_stub(response_body)
+    global _db_queue_bytes
     client_user_agent = _current_user_agent.get()
     # Leaf reader for the free-channel stamp: the two writers set
     # _current_free_attempt (IP + identity profile) right before the free
@@ -1039,6 +1152,17 @@ async def _save_request(
             station = int(getattr(_att_st, "_station", 0) or 0) or None
         except Exception:
             station = None
+    # [P0.5] Attribution de secours par IP : le ContextVar peut être vide au
+    # moment du save (tâche de fond, retry, rotation), mais l'IP qui a servi
+    # reste dans l'historique du pool. Sans cela, ~56 % des lignes sont
+    # inexploitables pour le diagnostic par station.
+    if station is None and free_model_ip:
+        try:
+            _pool_st = _free_ip_pool.station_for_ip(free_model_ip) if _free_ip_pool else None
+            if _pool_st is not None:
+                station = int(getattr(_pool_st, "_station", 0) or 0) or None
+        except Exception:
+            pass
     # [30] UTC everywhere — Z suffix
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     timestamp = _normalize_timestamp_utc(timestamp)
@@ -1119,6 +1243,9 @@ async def _save_request(
         station,
         free_status,
         paid_status,
+        ttfb_ms,
+        stop_reason,
+        1 if aborted else 0,
     )
     item = _DbRowRaw(
         head,
@@ -1128,6 +1255,24 @@ async def _save_request(
         tools=tools,
         tools_used=tools_used,
     )
+    _row_sz = _db_row_bytes(item)
+    if _row_sz and _db_queue_bytes + _row_sz > _DB_QUEUE_BYTES_MAX:
+        # [P0.7] La queue est bornée en lignes (10 000) mais pas en octets :
+        # 10 000 corps de 0,5–2 Mo = plusieurs Go de RSS. On garde la ligne
+        # (métadonnées, station, latence) et on jette les corps.
+        _bump_misc_counter("db_queue_bytes_drop")
+        _debug(
+            f"  [db] queue bytes cap ({_db_queue_bytes // 1048576} Mo) — corps droppés req_id={req_id}"
+        )
+        item = _DbRowRaw(
+            head,
+            tail,
+            request_body=None,
+            response_body=None,
+            tools=tools,
+            tools_used=tools_used,
+        )
+        _row_sz = 0
     try:
         _db_queue.put_nowait(("requests", item))
     except asyncio.QueueFull:
@@ -1151,6 +1296,7 @@ async def _save_request(
             logging.warning("[db] fallback insert FAILED req_id=%s: %s: %s", req_id, type(e).__name__, e)
             _debug(f"  [db] fallback insert failed: {e}")
     else:
+        _db_queue_bytes += _row_sz
         _debug(
             f"  [db] _save_request: queued req_id={req_id} model={model} success={success} qsize={_db_queue.qsize()}"
         )
@@ -1258,9 +1404,7 @@ def _log_free_model_usage(
                     _statut_reel = _refus[1]
             except Exception:
                 pass
-            _metrics_mod.mark_leg_status(
-                _metrics_mod.leg_latency_key("free", free_model), _statut_reel
-            )
+            _metrics_mod.mark_leg_status(_metrics_mod.leg_latency_key("free", free_model), _statut_reel)
         except Exception:
             pass
         row = (
@@ -1317,13 +1461,18 @@ def _restore_token_counters():
         n_models = 0
         for model, vals in counts.items():
             if model in _token_usage:
-                _token_usage[model]["input"] = vals["input"]
-                _token_usage[model]["output"] = vals["output"]
-                _token_usage[model]["cache"] = vals["cache"]
-                _debug(f"  [db] restored {model}: in={vals['input']} out={vals['output']} cache={vals['cache']}")
-                total_in += vals["input"]
-                total_out += vals["output"]
-                total_cache += vals["cache"]
+                # [audit 2026-10-30] Old rows may contain negative deltas;
+                # never restore a negative dashboard counter.
+                _vin = max(0, int(vals["input"] or 0))
+                _vout = max(0, int(vals["output"] or 0))
+                _vcache = max(0, int(vals["cache"] or 0))
+                _token_usage[model]["input"] = _vin
+                _token_usage[model]["output"] = _vout
+                _token_usage[model]["cache"] = _vcache
+                _debug(f"  [db] restored {model}: in={_vin} out={_vout} cache={_vcache}")
+                total_in += _vin
+                total_out += _vout
+                total_cache += _vcache
                 n_models += 1
         if not counts:
             # Première exécution après migration : l'agrégat n'existe pas
@@ -1643,8 +1792,13 @@ def _curl_timeout() -> tuple:
     return (10, read)
 
 
-async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str, fp_override: dict | None = None,
-                                   egress_ip: str | None = None):
+async def _get_pooled_curl_session(
+    proxy_url: str | None,
+    impersonate: str,
+    fp_override: dict | None = None,
+    egress_ip: str | None = None,
+    variant: str = "",
+):
     """Emprunte une session du pool pour (proxy, face réseau, IP).
 
     Retourne (pool, slot) : l'appelant POSTe via ``slot.sess`` SANS tenir de
@@ -1658,12 +1812,16 @@ async def _get_pooled_curl_session(proxy_url: str | None, impersonate: str, fp_o
     IP, comme une installation distincte — jamais de session TLS partagée
     entre deux IPs) au lieu de ``<proxy>|<preset>``. ``egress_ip=None``
     (sondes, tests) retombe sur l'ancienne clé ``<proxy>|bun``.
+    ``variant`` distingue deux politiques d'en-têtes sur la MÊME face TLS
+    (ex. free avec ``header_order`` 12 en-têtes vs geo sans, qui partage
+    sinon la même clé et hériterait d'une session configurée pour l'autre).
     """
     if fp_override:
+        _suffix = f"|{variant}" if variant else ""
         if egress_ip:
-            key = f"{proxy_url or ''}|{egress_ip}|bun"
+            key = f"{proxy_url or ''}|{egress_ip}|bun{_suffix}"
         else:
-            key = f"{proxy_url or ''}|bun"
+            key = f"{proxy_url or ''}|bun{_suffix}"
     else:
         key = f"{proxy_url or ''}|{impersonate}"
     # [E2 perf] dict.get mono-thread — pas de lock global ; seul l'état du
@@ -1786,22 +1944,26 @@ def _ensure_http_client() -> "httpx.AsyncClient":
 # (upstream.clients.default_role_timeout, mémoïsé) — cf. RoleClientStore.acquire.
 _ROLE_CLIENT_CLOSE_GRACE_S = 60.0
 
+# [V6.1.2] Quel facteur de la porte a refusé (egress / identity / body).
+from config.free_gate import diagnose as _free_gate_diagnose  # noqa: E402
 from upstream.clients import RoleClientStore as _RoleClientStore  # noqa: E402
 from upstream.clients import (  # noqa: E402
     aclose_role_client_after as _aclose_role_client_after,  # noqa: F401  # re-export (test_role_clients.py)
 )
+
+# [V6.3.1] Classification des échecs free (gate / quota / transit / auth / model).
+from upstream.free_failures import classify_free_failure as _classify_free_failure  # noqa: E402
+from upstream.free_failures import (  # noqa: E402
+    free_failure_stats,
+    gate_factor_stats,
+)
+from upstream.free_failures import note_free_failure as _note_free_failure  # noqa: E402
+from upstream.free_failures import note_gate_factors as _note_gate_factors  # noqa: E402
+from upstream.retry import RETRYABLE_STATUSES  # noqa: E402
 from upstream.retry import compute_retry_delay as _compute_retry_delay  # noqa: E402
 from upstream.retry import parse_retry_after as _parse_retry_after  # noqa: E402
 from upstream.retry import resolve_max_retries as _resolve_max_retries  # noqa: E402
-from upstream.retry import RETRYABLE_STATUSES  # noqa: E402
-# [V6.3.1] Classification des échecs free (gate / quota / transit / auth / model).
-from upstream.free_failures import classify_free_failure as _classify_free_failure  # noqa: E402
-from upstream.free_failures import free_failure_stats  # noqa: E402
-from upstream.free_failures import note_free_failure as _note_free_failure  # noqa: E402
-# [V6.1.2] Quel facteur de la porte a refusé (egress / identity / body).
-from config.free_gate import diagnose as _free_gate_diagnose  # noqa: E402
-from upstream.free_failures import gate_factor_stats  # noqa: E402
-from upstream.free_failures import note_gate_factors as _note_gate_factors  # noqa: E402
+
 # [V6.3.2] Imputer une panne à une station — et seulement quand c'est elle.
 from upstream.station_faults import attributable_fault as _station_attributable_fault  # noqa: E402
 from upstream.station_faults import cooldown_seconds as _station_cooldown_seconds  # noqa: E402
@@ -1949,6 +2111,14 @@ async def _apply_station_count(new_n: int) -> None:
     entries remain no-ops.
     """
     new_n = max(1, min(10, new_n))
+    # [audit 2026-10-30] --no-vpn / fail-closed are kill-switches: a GUI
+    # upscale must never start tunnels while they are active.
+    if BOOT_OPTS.get("no_vpn") or IP_ROTATION.get("_fail_closed"):
+        _debug("  [vpn] station_count change ignored (--no-vpn / fail-closed)")
+        return
+    _disabled_stations = {
+        int(x) for x in (IP_ROTATION.get("disabled_stations") or []) if str(x).strip().isdigit()
+    }
     async with _apply_station_lock:
         import shared_state
 
@@ -1971,6 +2141,12 @@ async def _apply_station_count(new_n: int) -> None:
                 for k in missing:
                     mm = _VM(IP_ROTATION, station=k, shared=shared_state.shared_rotation)
                     mm.enabled = IP_ROTATION.get("enabled", False)
+                    if BOOT_OPTS.get("no_vpn") or IP_ROTATION.get("_fail_closed"):
+                        mm.enabled = False
+                        mm._disabled = True
+                    if k in _disabled_stations:
+                        mm.enabled = False
+                        mm._disabled = True
                     managers.append(mm)
                 managers.sort(key=lambda m: m._station)
                 shared_state.vpn_managers = managers
@@ -2022,6 +2198,23 @@ async def _apply_station_count(new_n: int) -> None:
                         await asyncio.gather(*(_connect_one_up(m) for m in _real))
                 except Exception as e:
                     _debug(f"  [vpn] idempotent start failed: {e}")
+            # [audit 2026-10-30] Persist the requested count even when the
+            # runtime registry already matches. The historical short-circuit
+            # returned here without writing config.yaml: a stale mirror (e.g.
+            # runtime 6, config.yaml 4) stayed stale forever, and the next
+            # reboot silently came back with the old count. The write is
+            # last, as in the resize path, so a partial convergence never
+            # claims a count the runtime does not have.
+            try:
+                from dashboard.api import _persist_vpn_config as _pvc_sync
+
+                _res_sync = _pvc_sync({"station_count": new_n})
+                if asyncio.iscoroutine(_res_sync):
+                    await _res_sync
+                if _res_sync:
+                    _debug(f"  [vpn] station_count persist failed (idempotent): {_res_sync}")
+            except Exception as e:
+                _debug(f"  [vpn] station_count persist failed (idempotent): {e}")
             return
         # [Phase 6] chemin HISTORIQUE (shim) volontaire : les tests patchent
         # vpn_manager.VPNManager (stub) — une résolution via le canonique
@@ -2037,6 +2230,12 @@ async def _apply_station_count(new_n: int) -> None:
                 for k in range(old_n + 1, new_n + 1):
                     m = VPNManager(IP_ROTATION, station=k, shared=shared_state.shared_rotation)
                     m.enabled = IP_ROTATION.get("enabled", False)
+                    if BOOT_OPTS.get("no_vpn") or IP_ROTATION.get("_fail_closed"):
+                        m.enabled = False
+                        m._disabled = True
+                    if k in _disabled_stations:
+                        m.enabled = False
+                        m._disabled = True
                     managers.append(m)
                 # Registry + pool converge BEFORE any docker call: _apply_stack
                 # reads the registry for the active set.
@@ -2049,9 +2248,8 @@ async def _apply_station_count(new_n: int) -> None:
                 # SON slot (WG/OV-TCP/OV-UDP), puis le .env est synchronisé
                 # par station. L'ancien _apply_stack(stations=None) réécrivait
                 # toutes les clés avec la stack de la station 1.
-                _mixed_up = (
-                    str(IP_ROTATION.get("vpn_stack", "auto") or "auto").lower() == "auto"
-                    and bool(IP_ROTATION.get("auto_mixed_stacks", True))
+                _mixed_up = str(IP_ROTATION.get("vpn_stack", "auto") or "auto").lower() == "auto" and bool(
+                    IP_ROTATION.get("auto_mixed_stacks", True)
                 )
                 # Ne pas convertir une flotte homogène en flotte mixte lors
                 # d'un simple upscale. Le mode mixte s'applique si la flotte
@@ -2078,9 +2276,7 @@ async def _apply_station_count(new_n: int) -> None:
                         except Exception:
                             pass
                 if managers:
-                    managers[0]._sync_stack_env(
-                        {m._station: m._stack_effective for m in managers}
-                    )
+                    managers[0]._sync_stack_env({m._station: m._stack_effective for m in managers})
                 # [fix] Parallélise les compose up — 1→10 en // (gain 5-40s, 1 clic suffit)
                 # Use connect() for new stations so the container is actually up (start() only schedules background task)
                 if managers[old_n:]:
@@ -2089,8 +2285,9 @@ async def _apply_station_count(new_n: int) -> None:
                     # [fix 09/09] fail-soft comme connect() : une station lente
                     # (compose/docker) ne doit pas faire rollback TOTAL de
                     # l'upscale — le watchdog healera la station fautive.
-                    _start_results = await asyncio.gather(*(m.start() for m in new_managers), return_exceptions=True)
-                    for _m, _r in zip(new_managers, _start_results):
+                    _startable = [m for m in new_managers if getattr(m, "enabled", True)]
+                    _start_results = await asyncio.gather(*(m.start() for m in _startable), return_exceptions=True)
+                    for _m, _r in zip(_startable, _start_results):
                         if isinstance(_r, Exception):
                             _debug(
                                 f"  [vpn] upscale start soft-failed "
@@ -2120,6 +2317,20 @@ async def _apply_station_count(new_n: int) -> None:
             except Exception as e:
                 # rollback to old_n — config stays at old_n, runtime converges
                 _debug(f"  [vpn] upscale {old_n}→{new_n} failed, rollback: {e}")
+                # [audit watchdog 2026-10-30] Les managers créés avant
+                # l'échec ont déjà un watchdog (setter enabled) et peut-être
+                # un conteneur : les arrêter AVANT de restaurer la registry,
+                # sinon ils continuent à recréer leur tunnel hors registry.
+                for _orphan in (m for m in managers if m not in _snapshot):
+                    try:
+                        await _orphan.stop()
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(_orphan, "stop_container"):
+                            await _orphan.stop_container()
+                    except Exception:
+                        pass
                 shared_state.vpn_managers = _snapshot
                 _sync_station_supervisors(shared_state)
                 pool = getattr(shared_state, "free_ip_pool", None)
@@ -2157,17 +2368,11 @@ async def _apply_station_count(new_n: int) -> None:
                 )
                 await asyncio.gather(*(m.stop() for m in _retired))
                 _stop_order = list(reversed(_retired))
-                _stop_results = await asyncio.gather(
-                    *(m.stop_container() for m in _stop_order), return_exceptions=True
-                )
+                _stop_results = await asyncio.gather(*(m.stop_container() for m in _stop_order), return_exceptions=True)
                 # [roadmap] Le rm -f de secours ne s'exécute QUE si
                 # stop_container a échoué : il était auparavant relancé pour
                 # chaque station saine (2 rm -f + faux log « orphan »).
-                _orphans = [
-                    m
-                    for m, _res in zip(_stop_order, _stop_results)
-                    if isinstance(_res, Exception)
-                ]
+                _orphans = [m for m, _res in zip(_stop_order, _stop_results) if isinstance(_res, Exception)]
             else:
                 _orphans = []
             for m in _orphans:
@@ -2192,9 +2397,7 @@ async def _apply_station_count(new_n: int) -> None:
             _sync_station_supervisors(shared_state)
             try:
                 if managers:
-                    managers[0]._sync_stack_env(
-                        {m._station: m._stack_effective for m in managers}
-                    )
+                    managers[0]._sync_stack_env({m._station: m._stack_effective for m in managers})
             except Exception:
                 pass
             pool = getattr(shared_state, "free_ip_pool", None)
@@ -2275,6 +2478,24 @@ _REDACT_PATTERNS = [
 ]
 
 
+# Pré-test littéral : la très grande majorité des corps (conversations
+# d'agent, sorties d'outils) ne contient AUCUN secret. Les 6 regex coûtent
+# ~5,5 ms / 100 Ko ; ce test (~0,2 ms) permet de sortir sans les exécuter.
+# ``\bsk-`` est vérifié par ``_has_bounded_token`` pour éviter les faux
+# positifs « task- », « risk- », « disk- » sans payer un re.search par octet.
+_REDACT_MARKERS_CI = ("bearer", "x-api-key", "authorization", "cookie", "api_key", "api-key", "apikey")
+
+
+def _has_bounded_token(text: str, token: str) -> bool:
+    """True si ``token`` apparaît après une frontière de mot (équiv. ``\\b``)."""
+    i = text.find(token)
+    while i >= 0:
+        if i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"):
+            return True
+        i = text.find(token, i + 1)
+    return False
+
+
 def _redact(text, max_len=None) -> str:
     """Mask secrets (API keys, bearer tokens, sensitive header values) in log text."""
     if text is None:
@@ -2283,6 +2504,12 @@ def _redact(text, max_len=None) -> str:
         text = text.decode("utf-8", errors="replace")
     elif not isinstance(text, str):
         text = str(text)
+    if not (_has_bounded_token(text, "sk-") or _has_bounded_token(text, "ses_") or _has_bounded_token(text, "msg_")):
+        low = text.lower()
+        if not any(m in low for m in _REDACT_MARKERS_CI):
+            if max_len is not None and len(text) > max_len:
+                return text[:max_len] + f"... [{len(text) - max_len} chars truncated]"
+            return text
     for pat, repl in _REDACT_PATTERNS:
         text = pat.sub(repl, text)
     if max_len is not None and len(text) > max_len:
@@ -2296,10 +2523,66 @@ def _redact(text, max_len=None) -> str:
 # (seams de test oc._response_cache / oc._ResponseCache).
 from server.cache import ResponseCache as _ResponseCache  # noqa: E402
 
-_response_cache = _ResponseCache(debug_fn=_debug, dumps_str_fn=_json_dumps_str)
+# [audit 2026-10-30] Honor cache.max_size/cache.ttl instead of relying on
+# defaults that happened to match; editing config.yaml used to do nothing.
+try:
+    _response_cache_max_size = max(1, int(yaml_get("cache", "max_size", 1000) or 1000))
+except Exception:
+    _response_cache_max_size = 1000
+try:
+    _response_cache_ttl = max(1.0, float(yaml_get("cache", "ttl", 300) or 300))
+except Exception:
+    _response_cache_ttl = 300.0
+_response_cache = _ResponseCache(
+    max_size=_response_cache_max_size,
+    ttl=_response_cache_ttl,
+    debug_fn=_debug,
+    dumps_str_fn=_json_dumps_str,
+)
+
+
+def _response_cache_namespace(request, model_id: str, endpoint: str | None, kind: str) -> str:
+    """Namespace de cache : tout ce qui n'est pas dans le corps.
+
+    [audit 2026-10-30] Le cache était global et ne hachait que le JSON : le
+    même corps posté sur ``/v1/messages`` et ``/v1/chat/completions`` (ou par
+    deux tenants) recevait la réponse de l'autre protocole. On y met le chemin,
+    le modèle résolu, l'endpoint/jambe, le type de handler et un hash des
+    en-têtes qui changent la conversion (auth, betas, versions).
+    """
+    import hashlib as _hashlib
+
+    parts = [
+        str(kind or ""),
+        getattr(getattr(request, "url", None), "path", "") or "",
+        str(model_id or ""),
+        str(endpoint or ""),
+    ]
+    for _h in (
+        "authorization",
+        "x-api-key",
+        "anthropic-beta",
+        "anthropic-version",
+        "openai-beta",
+        # [audit 2026-10-30] Official session/sub-session identity: two
+        # sessions with the same short body must not share a response.
+        "x-opencode-session-id",
+        "x-session-affinity",
+        "x-session-id",
+        "x-opencode-session",
+    ):
+        _v = ""
+        try:
+            _v = request.headers.get(_h) or ""
+        except Exception:
+            _v = ""
+        if _v:
+            parts.append(f"{_h}={_hashlib.blake2b(_v.encode('utf-8', 'replace'), digest_size=8).hexdigest()}")
+    return "|".join(parts)
 
 
 # ── [live-models] Notices clients + boucle de rafraîchissement ──────────────
+
 
 def _live_clients_for_model_sync(model_id: str, days: int = 30, limit: int = 500) -> list[dict]:
     """Clients (IP/alias) qui ont réellement utilisé ``model_id`` récemment.
@@ -2308,9 +2591,9 @@ def _live_clients_for_model_sync(model_id: str, days: int = 30, limit: int = 500
     une base indisponible rend une liste vide (aucune notice inventée).
     """
     try:
-        cutoff = (
-            datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=max(1, int(days)))
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=max(1, int(days)))).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         conn = globals().get("_conn")
         lock = globals().get("_db_commit_lock")
         if conn is None or lock is None:
@@ -2414,9 +2697,7 @@ async def _live_models_refresh_once(force_catalog: bool = False) -> dict:
         app.state._live_models_lock = asyncio.Lock()
         lock = app.state._live_models_lock
     async with lock:
-        result = await asyncio.to_thread(
-            _cfg_settings.refresh_live_models_sync, bool(force_catalog)
-        )
+        result = await asyncio.to_thread(_cfg_settings.refresh_live_models_sync, bool(force_catalog))
         await _process_live_models_result(result)
         if result.get("changed"):
             # Le compteur de clients notifiés est ajouté par _process ; on
@@ -2447,10 +2728,7 @@ async def _live_models_loop():
             sleep_s = interval * jitter
             try:
                 _cfg_live.set_next_refresh(
-                    (
-                        datetime.datetime.now(datetime.UTC)
-                        + datetime.timedelta(seconds=sleep_s)
-                    ).isoformat()
+                    (datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=sleep_s)).isoformat()
                 )
             except Exception:
                 pass
@@ -2602,9 +2880,19 @@ async def lifespan(app):
     # resolved count >= N; _apply_station_count() grows/shrinks this set at
     # runtime (start/stop_container) without a proxy restart.
     n = _cfg_settings.resolved_station_count(IP_ROTATION)
+    # [P0.5] Stations explicitement désactivées (ex. s4 : AUTH_FAILED en
+    # boucle sur des hôtes frais alors que les 5 autres sont saines). Le
+    # manager existe (IDs contigus, hot-reload stable) mais n'est ni démarré
+    # ni sélectionné par le pool : plus de watchdog ni de log scan.
+    _disabled_stations = {
+        int(x) for x in (IP_ROTATION.get("disabled_stations") or []) if str(x).strip().isdigit()
+    }
     _managers = [VPNManager(IP_ROTATION, station=k, shared=shared_state.shared_rotation) for k in range(1, n + 1)]
     for m in _managers:
         m.enabled = False if IP_ROTATION.get("_fail_closed") else IP_ROTATION.get("enabled", False)
+        if m._station in _disabled_stations:
+            m.enabled = False
+            m._disabled = True
     # [Phase 6] --no-vpn : flotte désactivée (proxy direct only). Les managers
     # existent toujours (contrat shared_state.vpn_managers) mais ne démarrent
     # aucun conteneur — _boot_fanout ne garde que les managers `enabled`.
@@ -2674,9 +2962,7 @@ async def lifespan(app):
     # effective, jamais la stack globale de la station 1.
     try:
         if _managers:
-            _managers[0]._sync_stack_env(
-                {m._station: m._stack_effective for m in _managers}
-            )
+            _managers[0]._sync_stack_env({m._station: m._stack_effective for m in _managers})
     except Exception as _e_env_sync:
         _debug(f"  [lifespan] stack env sync failed (fail-soft): {_e_env_sync}")
     _sync_station_supervisors(shared_state)
@@ -2780,6 +3066,17 @@ async def lifespan(app):
                 if getattr(shared_state, "docker_ready", None) is not None:
                     break
                 await asyncio.sleep(1.0)
+            # [audit 2026-10-30] A station disabled in config must not keep a
+            # container from a previous run alive (its tunnel still burns
+            # NordVPN sessions). _boot_fanout only starts enabled managers,
+            # so retire the leftovers here.
+            for _m in _managers:
+                if not _m.enabled and getattr(_m, "_disabled", False):
+                    try:
+                        await _m.stop_container()
+                        _debug(f"  [lifespan] disabled station {getattr(_m, '_station', '?')} container removed")
+                    except Exception as _e_stop:
+                        _debug(f"  [lifespan] disabled station stop failed (fail-soft): {_e_stop}")
             _gather_results = await asyncio.gather(
                 *(_start_one(m) for m in _managers if m.enabled), return_exceptions=True
             )
@@ -2789,7 +3086,10 @@ async def lifespan(app):
             # boot garde: 1/4 vs 4/4 visible même si 0 tunnel
             try:
                 _n_expected = (
-                    _cfg_settings.resolved_station_count(IP_ROTATION)
+                    # [audit 2026-10-30] Disabled stations are not expected:
+                    # 4 stations with 1 disabled reported a permanent
+                    # "boot 3/4" error while everything was healthy.
+                    sum(1 for _m in _managers if _m.enabled)
                     if IP_ROTATION.get("enabled")
                     else len(_managers)
                 )
@@ -2826,9 +3126,12 @@ async def lifespan(app):
 
         try:
             _watcher = DockerEventWatcher({m._docker_container: m for m in _managers})
+            # [audit watchdog 2026-10-30] Publier AVANT le start : sinon un
+            # shutdown entre `start()` et l'affectation laissait le watcher
+            # (et son sous-processus docker events) orphelin.
+            shared_state.docker_event_watcher = _watcher
             _watcher_started = _watcher.start()
             await _watcher_started
-            shared_state.docker_event_watcher = _watcher
             _debug(f"  [lifespan] docker event watcher started ({len(_watcher._managers)} containers, bg)")
         except Exception as e:
             _debug(f"  [lifespan] docker event watcher failed to start (bg): {e}")
@@ -2954,6 +3257,9 @@ async def lifespan(app):
 
                 _ip_rot_new = _new.get("ip_rotation") or {}
                 _ip_rot_changed = _ip_rot_new != (_cfg._yaml_data.get("ip_rotation") or {})
+                _health_new = ((_new.get("stations") or {}).get("health") or {})
+                _health_old = ((_cfg._yaml_data.get("stations") or {}).get("health") or {})
+                _health_changed = _health_new != _health_old
 
                 # Source de vérité + dicts importés par référence (opencode,
                 # dashboard, free_discovery lisent ces objets partagés).
@@ -2975,34 +3281,68 @@ async def lifespan(app):
 
                 # Fan-out ip_rotation → managers + pool (le pool forward
                 # latency_rotation au moteur) — identique à POST /vpn-config.
-                if _ip_rot_changed:
+                if _ip_rot_changed or _health_changed:
                     _managers = getattr(shared_state, "vpn_managers", None) or []
                     for _mgr in _managers:
+                        if _ip_rot_changed:
+                            try:
+                                await _mgr.update_config(_ip_rot_new)
+                            except Exception as _e_mgr:
+                                _debug(f"  [config-watch] station {_mgr._station}: {_e_mgr}")
+                        if _health_changed:
+                            try:
+                                _mgr.update_health_policy(_health_new)
+                            except Exception as _e_h:
+                                _debug(f"  [config-watch] health station {_mgr._station}: {_e_h}")
+                    if _ip_rot_changed:
+                        _pool = getattr(shared_state, "free_ip_pool", None)
+                        if _pool is not None:
+                            try:
+                                _pool.update_config(_ip_rot_new)
+                            except Exception as _e_pool:
+                                _debug(f"  [config-watch] pool: {_e_pool}")
+                        # [audit watchdog 2026-10-30] Une édition directe de
+                        # `station_count` dans config.yaml doit créer/arrêter
+                        # les stations, pas seulement mettre à jour le miroir.
                         try:
-                            await _mgr.update_config(_ip_rot_new)
-                        except Exception as _e_mgr:
-                            _debug(f"  [config-watch] station {_mgr._station}: {_e_mgr}")
-                    _pool = getattr(shared_state, "free_ip_pool", None)
-                    if _pool is not None:
-                        try:
-                            _pool.update_config(_ip_rot_new)
-                        except Exception as _e_pool:
-                            _debug(f"  [config-watch] pool: {_e_pool}")
-                    _debug("  [config-watch] config.yaml rechargé (ip_rotation fan-out)")
+                            _target_n = _cfg.resolved_station_count(_ip_rot_new)
+                            _cur_n = len(getattr(shared_state, "vpn_managers", None) or [])
+                            if _target_n != _cur_n:
+                                _debug(f"  [config-watch] station_count {_cur_n} → {_target_n} (hot-reload)")
+                                await _apply_station_count(_target_n)
+                        except Exception as _e_sc:
+                            _debug(f"  [config-watch] station_count: {type(_e_sc).__name__}: {_e_sc}")
+                    _debug(
+                        "  [config-watch] config.yaml rechargé "
+                        f"(ip_rotation={_ip_rot_changed}, health={_health_changed})"
+                    )
             except Exception as e:
                 _debug(f"  [config-watch] error: {type(e).__name__}: {e}")
 
     config_watch_task = asyncio.create_task(_periodic_config_watch())
 
-    # Periodic DB body cleanup (daily) — removes old request/response bodies to save disk
+    # Periodic DB body cleanup — [P0.4] 04:00 local, jamais au démarrage.
+    # L'ancien « once at startup » rejouait un UPDATE de ~2 Go à chaque
+    # redémarrage : WAL 2,4 Go, RSS 3,6 Go, disque sous pression.
     async def _periodic_db_cleanup():
-        # Run cleanup once at startup, then every 24h
-        await asyncio.sleep(60)  # wait 60s after startup before first cleanup
+        import datetime as _dt
+
         while True:
             try:
-                retention = yaml_get("database", "body_retention_days", 7)
+                now = _dt.datetime.now()
+                target = now.replace(hour=4, minute=0, second=0, microsecond=0)
+                if target <= now:
+                    target += _dt.timedelta(days=1)
+                # Dormir par tranches d'1 h : annulation propre au shutdown.
+                while True:
+                    remaining = (target - _dt.datetime.now()).total_seconds()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(3600.0, remaining))
+                retention = int(yaml_get("database", "body_retention_days", 7) or 7)
                 await asyncio.to_thread(_db_cleanup_old_bodies, retention)
-                await asyncio.sleep(yaml_get("background", "db_cleanup_interval", 86400))
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 _debug(f"  [db] periodic cleanup error: {type(e).__name__}: {e}")
                 await asyncio.sleep(3600)
@@ -3147,6 +3487,12 @@ async def lifespan(app):
                 _debug(f"  [free-discovery] loop error: {type(e).__name__}: {e}")
                 await asyncio.sleep(60)
 
+    # [free-probe cache] Restaure les promotions de la sonde live APRÈS
+    # l'import (jamais pendant) pour ne pas polluer les tests/imports.
+    try:
+        _cfg_settings.load_probed_free_models()
+    except Exception as e:
+        _debug(f"  [lifespan] probed free cache load failed: {e}")
     if _cfg_settings.FREE_DISCOVERY_ENABLED:
         # [Phase 3b-1] 1er fetch free-discovery : plus au niveau module de
         # config.settings (il lançait un fetch HTTP + `import httpx` pendant la
@@ -3162,9 +3508,7 @@ async def lifespan(app):
     # est fire-and-forget ; la boucle ne planifie que les cycles suivants.
     if _cfg_settings.LIVE_MODELS_ENABLED:
         app.state._live_models_lock = asyncio.Lock()
-        app.state._live_models_boot_task = asyncio.create_task(
-            _live_models_refresh_once()
-        )
+        app.state._live_models_boot_task = asyncio.create_task(_live_models_refresh_once())
         app.state._live_models_task = asyncio.create_task(_live_models_loop())
         _debug("  [lifespan] live-models loop started")
 
@@ -3212,8 +3556,9 @@ async def lifespan(app):
     # liée à la boucle morte → « Queue is bound to a different event loop »
     # en boucle (6 878 occurrences le 22/10) et écritures DB perdues. On
     # recrée la queue à chaque lifespan, avant de relancer le writer.
-    global _db_queue, _db_writer_task
+    global _db_queue, _db_writer_task, _db_queue_bytes
     _db_queue = asyncio.Queue(maxsize=10000)
+    _db_queue_bytes = 0
     _db_writer_task = asyncio.create_task(_db_writer_loop())
     _debug("  [lifespan] DB writer loop started (queue batch 32, 50ms)")
 
@@ -3240,6 +3585,12 @@ async def lifespan(app):
         _p_shutdown = getattr(shared_state, "free_ip_pool", None)
         if _p_shutdown is not None:
             await asyncio.to_thread(_p_shutdown.save_pool_state, True)
+            # [audit watchdog 2026-10-30] Arrêt des workers de rotation avant
+            # les managers : plus de rotation qui recrée un conteneur pendant
+            # le shutdown.
+            _close = getattr(_p_shutdown, "close", None)
+            if callable(_close):
+                await _close()
     except Exception:
         pass
     # Drain DB queue via writer before flush
@@ -3256,12 +3607,22 @@ async def lifespan(app):
 
     # Cancel background tasks (Phase 1 : warmup + loops — borné, pas de
     # "task destroyed pending").
-    for _bg_attr in ("_balance_task", "_docker_task", "_watcher_task", "_db_migrate_task", "_pool_persist_task", "_station_probe_task"):
+    for _bg_attr in (
+        "_balance_task",
+        "_docker_task",
+        "_watcher_task",
+        "_db_migrate_task",
+        "_pool_persist_task",
+        "_station_probe_task",
+    ):
         _bg = getattr(app.state, _bg_attr, None)
         if _bg is not None:
             _bg.cancel()
             try:
-                await asyncio.wait_for(asyncio.shield(_bg), timeout=5.0)
+                # [audit watchdog 2026-10-30] Pas de shield au shutdown : au
+                # timeout, la tâche doit vraiment être annulée, pas continuer
+                # à démarrer/reconciler des stations après le lifespan.
+                await asyncio.wait_for(_bg, timeout=5.0)
             except (asyncio.CancelledError, TimeoutError):
                 pass
             except Exception:
@@ -3271,7 +3632,7 @@ async def lifespan(app):
         if _bg is not None:
             _bg.cancel()
             try:
-                await asyncio.wait_for(asyncio.shield(_bg), timeout=5.0)
+                await asyncio.wait_for(_bg, timeout=5.0)
             except (asyncio.CancelledError, TimeoutError):
                 pass
             except Exception:
@@ -3489,17 +3850,24 @@ def _vpn_warmup_gate_active() -> bool:
 def _is_free_model_route(model: str) -> bool:
     """Le modèle est-il servi par la voie « free » (tunnel obligatoire) ?
 
+    Cœur pur : ``config/free_policy.is_free_subject``. Un mapping **explicite**
+    de ``free_model_map`` est souverain (décision humaine) : il rend la route
+    free quel que soit le mode de substitution. La politique ne s'applique
+    qu'aux candidats automatiques. Le wrapper ne garde que la lecture des
+    globales et le fail-soft historique.
+
     Modèle inconnu/illisible → False : on ne bloque jamais par défaut (le pire
     cas est l'erreur métier historique, jamais un 503 injustifié).
     """
     if not model:
         return False
     try:
-        if model in (FREE_MODEL_MAP or {}):
-            return True
-        if str(model).endswith("-free"):
-            return True
-        return model in (getattr(_cfg_settings, "FREE_MODELS", None) or set())
+        return _is_free_subject(
+            model,
+            free_models=getattr(_cfg_settings, "FREE_MODELS", None),
+            free_model_map=FREE_MODEL_MAP,
+            policy=_cfg_settings.get_free_substitution_policy(),
+        )
     except Exception:
         return str(model).endswith("-free")
 
@@ -3774,6 +4142,8 @@ def _build_metrics_text() -> str:
         restart_rows = []
         flap_rows = []
         secondary_rows = []
+        heartbeat_rows = []
+        skipped_rows = []
         for m in mgrs:
             status = str(getattr(m, "status", "") or "")
             st_rows.append((f'station="{m._station}"', 1 if status == "connected" else 0))
@@ -3798,6 +4168,18 @@ def _build_metrics_text() -> str:
             except Exception:
                 _n = 0
             restart_rows.append((f'station="{m._station}"', _n))
+            # [audit watchdog 2026-10-30] Heartbeat et fenêtres aveugles.
+            try:
+                _hb_at = float(getattr(m, "_last_watchdog_hb_at", 0.0) or 0.0)
+                _hb_age = max(0.0, time.monotonic() - _hb_at) if _hb_at else -1.0
+            except Exception:
+                _hb_age = -1.0
+            heartbeat_rows.append((f'station="{m._station}"', _hb_age))
+            try:
+                _sk = int(getattr(m, "_watchdog_skipped_ticks", 0) or 0)
+            except Exception:
+                _sk = 0
+            skipped_rows.append((f'station="{m._station}"', _sk))
             try:
                 _db = getattr(m, "_status_debouncer", None)
                 _flaps = _db.flap_count(time.monotonic()) if _db is not None else 0
@@ -3831,6 +4213,8 @@ def _build_metrics_text() -> str:
                 "restarts": restart_rows,
                 "flaps": flap_rows,
                 "secondary": secondary_rows,
+                "heartbeat_age": heartbeat_rows,
+                "skipped": skipped_rows,
                 "ewma": ewma_rows,
                 "p95": p95_rows,
                 "slow": slow_rows,
@@ -3849,6 +4233,8 @@ def _build_metrics_text() -> str:
                 "restarts": restart_rows,
                 "flaps": flap_rows,
                 "secondary": secondary_rows,
+                "heartbeat_age": heartbeat_rows,
+                "skipped": skipped_rows,
                 "has_engine": False,
             }
     except Exception as e:
@@ -4092,6 +4478,96 @@ class ModelDeprecationNoticeMiddleware:
 app.add_middleware(ModelDeprecationNoticeMiddleware)
 
 
+_TIER_HEADER_NAMES = {
+    b"x-opencode-proxy-tier",
+    b"x-opencode-proxy-requested-tier",
+    b"x-opencode-proxy-model",
+    b"x-opencode-proxy-requested-model",
+    b"x-opencode-proxy-fallback",
+}
+
+
+def _tier_headers() -> list[tuple[str, str]]:
+    """En-têtes de jambe à injecter (vide si aucun contexte de complétion)."""
+    out: list[tuple[str, str]] = []
+    actual = _current_actual_tier.get()
+    if actual in ("free", "paid"):
+        out.append(("x-opencode-proxy-tier", actual))
+    requested = _current_requested_tier.get()
+    if requested in ("free", "paid"):
+        out.append(("x-opencode-proxy-requested-tier", requested))
+    actual_model = _current_actual_model.get()
+    if actual_model:
+        out.append(("x-opencode-proxy-model", str(actual_model)))
+    requested_model = _current_requested_model.get()
+    if requested_model:
+        out.append(("x-opencode-proxy-requested-model", str(requested_model)))
+    fallback = _current_fallback.get()
+    if fallback in ("paid_to_free", "free_to_paid"):
+        out.append(("x-opencode-proxy-fallback", fallback))
+    return out
+
+
+class ModelTierHeaderMiddleware:
+    """Expose la jambe réellement utilisée (free/paid) sur chaque complétion.
+
+    ASGI pur : les en-têtes sont posés à ``http.response.start``, donc visibles
+    en streaming sans bufferiser. Limite assumée : si un flux free casse APRÈS
+    le premier octet, l'en-tête décrit la jambe au démarrage de la réponse.
+    """
+
+    PREFIXES = ("/v1/", "/anthropic/")
+    EXCLUDE = ("/v1/models", "/v1/messages/count_tokens")
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path") or "")
+        if not path.startswith(self.PREFIXES) or path.startswith(self.EXCLUDE):
+            await self.app(scope, receive, send)
+            return
+
+        resets = [
+            (_current_actual_tier, _current_actual_tier.set(None)),
+            (_current_actual_model, _current_actual_model.set(None)),
+            (_current_requested_tier, _current_requested_tier.set(None)),
+            (_current_requested_model, _current_requested_model.set(None)),
+            (_current_fallback, _current_fallback.set(None)),
+            (_current_free_attempted, _current_free_attempted.set(False)),
+        ]
+
+        async def send_wrapper(message_obj):
+            if message_obj.get("type") == "http.response.start":
+                try:
+                    headers = [
+                        (name, value)
+                        for name, value in (message_obj.get("headers") or [])
+                        if name.lower() not in _TIER_HEADER_NAMES
+                    ]
+                    for name, value in _tier_headers():
+                        headers.append((name.encode("latin-1"), value.encode("latin-1", "replace")))
+                    message_obj["headers"] = headers
+                except Exception:
+                    pass
+            await send(message_obj)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            for var, token in reversed(resets):
+                try:
+                    var.reset(token)
+                except Exception:
+                    pass
+
+
+app.add_middleware(ModelTierHeaderMiddleware)
+
+
 # ── Circuit Breaker (per-endpoint) ──────────────────────────────
 
 _CB_FAILURE_THRESHOLD = yaml_get("circuit_breaker", "failure_threshold", 5)  # trips open after N consecutive failures
@@ -4158,9 +4634,32 @@ def _get_cb(endpoint: str) -> _CircuitBreaker:
     return cb
 
 
+def _is_free_cb_endpoint(endpoint: str) -> bool:
+    """La jambe free ne doit pas être couverte par le breaker global.
+
+    Un 429 `FreeUsageLimitError`, un flux vide ou une station épuisée est une
+    limite de quota/modèle, pas une panne d'endpoint. Avant, 8 échecs free
+    ouvraient le breaker `opencode.ai/inference/...` et TOUTES les requêtes
+    free recevaient 503 « circuit open », même quand le quota était revenu.
+    """
+    low = str(endpoint or "").strip().lower()
+    if not low:
+        return False
+    try:
+        if low == str(API_BASE_FREE).strip().lower():
+            return True
+    except Exception:
+        pass
+    # Couvre /inference/v1/chat/completions et /inference/v1/responses ;
+    # exclut la jambe payante /inference/go/.
+    return "opencode.ai/inference/" in low and "/inference/go/" not in low
+
+
 def _cb_should_allow(endpoint: str) -> bool:
     """Check if the circuit breaker allows a request to this endpoint."""
     if not _cb_enabled():
+        return True
+    if _is_free_cb_endpoint(endpoint):
         return True
     return _get_cb(endpoint).should_allow()
 
@@ -4172,6 +4671,10 @@ def _cb_record_success(endpoint: str):
 
 def _cb_record_failure(endpoint: str):
     """Record a failed request to this endpoint."""
+    if _is_free_cb_endpoint(endpoint):
+        # Quota/modèle/station free : la jambe free a ses propres cooldowns et
+        # rotations. Ne jamais ouvrir le breaker global pour ces échecs.
+        return
     _get_cb(endpoint).record_failure()
 
 
@@ -5166,68 +5669,67 @@ async def _forward_post(endpoint, json, headers):
 # ── Shared helper functions for endpoint handlers ──────────────
 
 # ── Identity rotation for free requests ─────────────────────────
-# Each successful IP rotation advances an identity profile (curl_cffi
-# impersonation target + User-Agent + optional extra headers) so the
-# free endpoint sees a coherent browser "face" instead of the same
-# fingerprint on every fresh IP. The profile list and index are owned
-# by vpn_manager (config `ip_rotation.identity_profiles`).
-
-# Curated real User-Agents for the default-profile targets live in
-# vpn_manager (module-level _UA_BY_IMPERSONATE, derived by family from the
-# full supported-impersonation list so the httpx fallback paths stay
-# coherent with the curl_cffi bundles). Re-exported here: _apply_identity
-# reads it, and tests reference oc._UA_BY_IMPERSONATE.
-from vpn.manager import _UA_BY_IMPERSONATE  # noqa: E402  # after identity docstring (lazy import avoids circular)
+# [2026-10-25] Les profils d'identité sont désormais des identités du client
+# OFFICIEL OpenCode (`opencode/<channel>/<version>/<client>`), plus des faces
+# navigateur : la gateway rejette les UA/sec-ch-ua/Accept-Language des
+# anciens profils. `impersonate` ne sert plus que de PORTEUR TLS curl_cffi ;
+# l'UA/les en-têtes viennent de la couche wire (vault par IP sur la jambe
+# free, wire v2 sur la jambe payée/geo).
 
 
 def _current_free_identity(station=None) -> dict:
-    """Active identity profile for free requests (vpn_manager ownership).
+    """Active identity profile (vpn_manager ownership).
 
     Station-aware: returns the identity of the station that will (or did)
     serve the request. With dual station the two tunnels MUST expose
     different identities — reading station 1 unconditionally would serve
-    the same fingerprint from both stations. ``station`` defaults to the
-    pool's last-picked station, then station 1. Falls back to the chrome131
-    default when no VPN manager is present — identical behavior to before
-    identity rotation existed.
+    the same face from both stations. ``station`` defaults to the pool's
+    last-picked station, then station 1. Falls back to the chrome131
+    carrier (UA officiel par défaut) when no VPN manager is present.
     """
     mgr = station if station is not None else (_free_ip_pool.active_station if _free_ip_pool else None) or _vpn_manager
     if mgr:
         # [Axe 3.1] A static SOCKS5 proxy has no docker identity machinery
-        # (no current_identity) — the chrome131 default below is correct
-        # for it too: the proxy still needs a coherent browser fingerprint.
+        # (no current_identity) — the chrome131 carrier below is correct for
+        # it too: the wire layer still stamps the official UA.
         identity = getattr(mgr, "current_identity", None)
         if identity:
             return identity
     return {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
 
 
-def _apply_identity(headers: dict, profile: dict, use_curated_ua: bool = True) -> dict:
-    """Stamp a free-request header dict with the identity profile.
+def _apply_identity(headers: dict, profile: dict) -> dict:
+    """Stamp a request header dict with the official-client identity profile.
 
-    The outgoing User-Agent ALWAYS comes from the identity, never from
-    the paid client (invariant A.0):
-      - explicit profile user_agent wins,
-      - else curated UA map (httpx paths),
-      - else (use_curated_ua=False, curl_cffi bundle paths) the incoming
-        client UA is removed so the impersonation bundle injects its own
-        coherent browser UA — curl_cffi only fills headers that are absent.
-    extra_headers are applied last so they can override anything.
+    [2026-10-25] Plus de face navigateur : l'UA de sortie est TOUJOURS
+    l'identité du client officiel OpenCode (ou l'UA officiel explicitement
+    porté par le profil), jamais un UA Chrome/Firefox/Safari. Un profil
+    legacy avec UA navigateur est nettoyé en amont par
+    `_normalize_identity_profiles`.
+
+    Réservé à la jambe payée/geo (wire v2) : la jambe free garde son builder
+    fermé `_official_free_headers` (wire v1 mesuré, couplage UA↔TLS Bun).
+
+    Le nom de client (`cli`/`desktop`) est dérivé de l'UA v2
+    (`opencode/<channel>/<version>/<client>`) et posé dans
+    `x-opencode-client` s'il manque : sans ça l'UA et l'en-tête de client
+    pourraient se contredire (ex. UA desktop + x-opencode-client cli).
+
     `x-opencode-session` (instance UUID stable, cf. _proxy_session_id) est
     ajouté sauf si déjà présent : exigé par la gateway Zen (sinon 400
-    MissingSessionID côté provider). Inoffensif sur le paid (la gateway
-    le supprime pour les providers legacy, s'en sert pour le sticky
-    sinon) — un seul choke point pour tout le trafic Zen.
+    MissingSessionID côté provider). Les `extra_headers` du profil sont
+    appliqués en dernier (uniquement des extras non navigateur).
     """
     out = dict(headers)
     ua = profile.get("user_agent")
-    if not ua and use_curated_ua:
-        ua = _UA_BY_IMPERSONATE.get(profile.get("impersonate") or "")
-    if ua:
-        out["User-Agent"] = ua
-    elif not use_curated_ua:
-        out.pop("User-Agent", None)
-        out.pop("user-agent", None)
+    if not isinstance(ua, str) or not ua.strip():
+        ua = _OPENCODE_OFFICIAL_UA_V2
+    out["User-Agent"] = ua
+    # Cohérence UA ↔ x-opencode-client (setdefault : un appelant garde la main).
+    if not any(k.lower() == "x-opencode-client" for k in out):
+        parts = ua.strip().split("/")
+        if len(parts) == 4 and parts[0] == "opencode":
+            out["x-opencode-client"] = parts[-1]
     # [correctif 2026-09-07 — incident MissingSessionID] la gateway Zen lit
     # `x-opencode-session` et le substitue dans les headers provider
     # (`$session`) ; ABSENT → provider « Console » = 400 MissingSessionID
@@ -5366,10 +5868,10 @@ _OPENCODE_OFFICIAL_UA_RESPONSES = os.getenv(
 )
 # Parité officielle v2 (`packages/core/src/app.ts:useragent`) :
 # `opencode/<channel>/<version>/<name>` — plus de `ai-sdk/provider-utils`,
-# plus de `runtime/bun`. Ex. `opencode/prod/2.0.28/cli`.
+# plus de `runtime/bun`. Ex. `opencode/prod/2.2.2/cli`.
 # Jambe free verrouillée sur v1 (capture 243 req, couplage UA↔TLS I3) ;
 # jambe paid basculée v2 (headers seuls, sans replay TLS).
-_OPENCODE_OFFICIAL_UA_V2 = os.getenv("OPENCODE_OFFICIAL_UA_V2", "opencode/prod/2.0.28/cli")
+_OPENCODE_OFFICIAL_UA_V2 = os.getenv("OPENCODE_OFFICIAL_UA_V2", "opencode/prod/2.2.2/cli")
 # Nom de client officiel. Enum RÉELLE extraite du binaire 1.18.31 :
 #   ["app","cli","desktop"].includes(t.client)
 # Le natif `opencode run` (provider `opencode`, mesuré mitmproxy 2026-10-15)
@@ -5403,9 +5905,7 @@ def _official_project_id() -> str:
 
     def _git(*args: str) -> str:
         try:
-            r = _sp.run(
-                ["git", *args], capture_output=True, text=True, timeout=5, check=False
-            )
+            r = _sp.run(["git", *args], capture_output=True, text=True, timeout=5, check=False)
             return r.stdout.strip() if r.returncode == 0 else ""
         except Exception:
             return ""
@@ -5507,9 +6007,7 @@ _FREE_WIRE_FULL_HEADERS = os.getenv("OPENCODE_FREE_WIRE_FULL_HEADERS", "1") not 
 # Accept-Encoding du client Bun — MESURÉ sur 243 requêtes. On l'annonce
 # maintenant qu'on sait que curl_cffi décode zstd (libcurl/8.21.0 zstd/1.5.7 ;
 # 6/6 cas gzip/br/zstd décodés avec AE explicite, probe E2).
-_OPENCODE_ACCEPT_ENCODING = os.getenv(
-    "OPENCODE_ACCEPT_ENCODING", "gzip, deflate, br, zstd"
-)
+_OPENCODE_ACCEPT_ENCODING = os.getenv("OPENCODE_ACCEPT_ENCODING", "gzip, deflate, br, zstd")
 # ── [ALIGNEMENT 2026-10-20] Style du jeu d'en-têtes de la jambe free ─────────
 # Mesuré le 2026-10-20 en faisant parler le binaire officiel 1.19.3 à un
 # serveur de capture local (`_research/oc-1.19.3/capture.jsonl`) : le client
@@ -5519,9 +6017,7 @@ _OPENCODE_ACCEPT_ENCODING = os.getenv(
 # (200), tout comme l'ancien — donc le quartet n'est pas load-bearing et
 # l'alignement est sans risque. `legacy` restaure l'ancien wire à chaud,
 # sans redéploiement, si la passerelle change d'avis.
-_FREE_WIRE_STYLE = (
-    os.getenv("OPENCODE_FREE_WIRE_STYLE", "official").strip().lower() or "official"
-)
+_FREE_WIRE_STYLE = os.getenv("OPENCODE_FREE_WIRE_STYLE", "official").strip().lower() or "official"
 
 # [ordre exact] Ordre des en-têtes sur le fil — MESURÉ au mitmproxy sur le
 # vrai client 1.18.31 natif le 2026-10-15 (`opencode run`, provider `opencode`,
@@ -5636,7 +6132,6 @@ from config.free_shims import shims as _free_shims_registry  # noqa: E402
 _FREE_SHIM_DEFS = _free_shims_registry()
 
 
-
 def _free_shim_tool(name: str, responses: bool) -> dict:
     """Shim conforme-grille : nom exact + définition réaliste (gate inference)."""
     definition = _FREE_SHIM_DEFS.get(name) or {
@@ -5679,7 +6174,8 @@ def _official_free_payload() -> dict:
             body = (json.load(f) or {}).get("body") or {}
     except Exception:
         body = {}
-    tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+    _raw_tools = body.get("tools")
+    tools = _raw_tools if isinstance(_raw_tools, list) else []
     system = None
     for m in body.get("messages") or []:
         if isinstance(m, dict) and m.get("role") == "system":
@@ -5773,6 +6269,671 @@ def _has_official_system(messages) -> bool:
     return False
 
 
+#: Outils que la porte free refuse, mesurés en direct (2026-10-29) :
+#: ``safe8 + subagent_fork`` -> 429/FreeUsageLimitError ;
+#: ``safe8 + subagent`` -> 200 ; ``safe8 + skill`` -> 200 ;
+#: ``safe8 + workflow`` -> 200. Le refus est déguisé en quota et empoisonne
+#: TOUTE la requête : on retire ces noms avant l'envoi free, jamais côté client.
+_FREE_BLOCKED_TOOL_NAMES = frozenset({"subagent_fork", "subagent-fork"})
+
+#: Plafond de sortie de la jambe free = valeur MESUREE du client officiel
+#: (``free/official_payload.json`` : ``max_tokens: 32000``).
+#:
+#: [2026-10-30] Hermes (SDK Anthropic) demande ``max_tokens: 128000`` ; le
+#: harnais DeepSeek, qui fonctionne, demande ``max_completion_tokens: 32768``.
+#: Sur une conversation de ~299 messages (~318 Ko, ~80k tokens), 128k de sortie
+#: depasse la fenetre du modele free et l'amont refuse en ``FreeUsageLimitError``
+#: (429 deguise). On clampe la COPIE d'envoi, jamais le corps client : le client
+#: garde sa valeur pour son propre budget, et l'amont recoit le plafond officiel.
+_FREE_MAX_OUTPUT_TOKENS = 32000
+
+#: Budget de la copie free finale (system + outils + historique).
+#:
+#: [2026-10-31] Mesure directe du gate : des copies de **450 Ko à 900 Ko**
+#: (24 outils, 28 messages) passent en **200** sans compaction. La borne
+#: historique de 96 Ko était une hypothèse trop prudente. On aligne le
+#: plafond sur la fenêtre free officielle : 200k tokens, seuil de compaction
+#: 180k, soit ~900 Ko de corps ; 0 désactive la troncature.
+_FREE_MAX_WIRE_BYTES = 900000
+
+#: Longueur max du prompt systeme CLIENT conserve sur la jambe free. Le gate
+#: exige le prompt officiel (21,6 Ko) ; le prompt Hermes complet (31 Ko) fait
+#: depasser le budget. On garde son debut (identite/consignes) et on ajoute la
+#: note « n'utilise que les outils declares ».
+_FREE_MAX_CLIENT_SYSTEM_CHARS = 4096
+
+#: Budget de l'appel de compaction Hermes. Mesure 2026-10-30 : le summary
+#: complet de 54 Ko / 32000 max_tokens a pris 152 s et 5 882 tokens de sortie.
+#: En gardant 16 Ko d'entree (debut + fin) et 4096 max_tokens, il rend un
+#: resume structure de ~10 000 caracteres en ~31 s : 5x plus rapide, et il
+#: libere la station/quota pour les tours normaux.
+_FREE_MAX_SUMMARY_CHARS = 16384
+_FREE_SUMMARY_MAX_TOKENS = 4096
+
+
+def _free_max_wire_bytes() -> int:
+    """Budget effectif de la copie free (``free.max_wire_bytes``, 0 = off)."""
+    try:
+        return max(0, int(yaml_get("free", "max_wire_bytes", _FREE_MAX_WIRE_BYTES) or 0))
+    except Exception:
+        return _FREE_MAX_WIRE_BYTES
+
+
+def _free_max_client_system_chars() -> int:
+    """Longueur max du prompt systeme client free (0 = pas de coupe)."""
+    try:
+        return max(
+            0,
+            int(yaml_get("free", "max_client_system_chars", _FREE_MAX_CLIENT_SYSTEM_CHARS) or 0),
+        )
+    except Exception:
+        return _FREE_MAX_CLIENT_SYSTEM_CHARS
+
+
+def _free_max_summary_chars() -> int:
+    """Entree max de l'appel de compaction (0 = pas de coupe)."""
+    try:
+        return max(0, int(yaml_get("free", "max_summary_chars", _FREE_MAX_SUMMARY_CHARS) or 0))
+    except Exception:
+        return _FREE_MAX_SUMMARY_CHARS
+
+
+def _free_summary_max_tokens() -> int:
+    """Sortie max de l'appel de compaction (0 = pas de plafond)."""
+    try:
+        return max(0, int(yaml_get("free", "summary_max_tokens", _FREE_SUMMARY_MAX_TOKENS) or 0))
+    except Exception:
+        return _FREE_SUMMARY_MAX_TOKENS
+
+
+#: Ordre de priorite des outils CLIENT conservees derriere la grille officielle
+#: de 10 outils. Le gate free exige les noms officiels ; Hermes utilise des
+#: noms differents (`read_file`, `terminal`, `patch`...). On injecte donc les
+#: 10 officiels et on ne garde que les 8 outils client les plus utiles, sinon
+#: le total (10 + 18) depasse le budget du gate et prend un faux quota.
+_FREE_CORE_CLIENT_TOOL_PRIORITY = (
+    "terminal",
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+    "execute_code",
+    "delegate_task",
+    "web_search",
+    "skill_view",
+    "subagent",
+    "web_extract",
+    "memory",
+    "skill_manage",
+    "todowrite",
+    "todo_write",
+    "tool_search",
+    "tool_describe",
+    "tool_call",
+)
+
+
+def _free_max_client_tools() -> int:
+    """Nombre max d'outils client ajoutes aux 10 officiels (defaut 8)."""
+    try:
+        return max(0, int(yaml_get("free", "max_client_tools", 8) or 0))
+    except Exception:
+        return 8
+
+
+def _select_free_client_tools(tools, max_tools: int):
+    """Selectionne les outils client par priorite (ordre stable)."""
+    if not isinstance(tools, list) or max_tools <= 0:
+        return []
+    ranked = []
+    for index, tool in enumerate(tools):
+        name = _free_tool_name(tool)
+        try:
+            priority = _FREE_CORE_CLIENT_TOOL_PRIORITY.index(name)
+        except ValueError:
+            priority = len(_FREE_CORE_CLIENT_TOOL_PRIORITY) + index
+        ranked.append((priority, index, tool))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [tool for _, _, tool in ranked[:max_tools]]
+
+
+def _free_official_placeholder_defs(official_defs):
+    """Définitions minimales des 10 outils officiels exigés par le gate.
+
+    Le gate free vérifie les **noms** ; le modèle doit utiliser les outils du
+    client. L'ancienne copie conservait les schémas officiels complets
+    (~6,9 Ko de placeholders, `bash` seul ~1,4 Ko de schéma) et mangeait le
+    budget du gate au détriment de l'historique. On ne garde que le nom, une
+    description « ne pas appeler » et un schéma vide.
+    """
+    out = []
+    for tool in official_defs or []:
+        if not isinstance(tool, dict):
+            continue
+        _fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        name = str(_fn.get("name") or "").strip()
+        if not name:
+            continue
+        out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": (
+                        "Gateway compatibility placeholder. DO NOT CALL. "
+                        "Use the client's tools (terminal, read_file, patch, ...) instead."
+                    ),
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        )
+    return out
+
+
+def _free_client_tools_note(client_names, forbidden_names=None) -> str:
+    """Note finale : liste les outils reellement appelables, interdit le reste."""
+    names = ", ".join(str(n) for n in client_names if n) or "(none)"
+    forbidden = ", ".join(str(n) for n in (forbidden_names or ()) if n)
+    prefix = ""
+    if forbidden:
+        prefix = (
+            f"The tools {forbidden} are gateway compatibility placeholders and "
+            "MUST NOT be called. "
+        )
+    return (
+        "\n\nIMPORTANT - FREE GATEWAY COMPATIBILITY: "
+        f"{prefix}Call ONLY these client tools: {names}. Never invent a tool name."
+    )
+
+
+def _replace_free_tools_note(content: str, note: str) -> str:
+    """Remplace la note d'outils par defaut par la note client."""
+    if isinstance(content, str) and content.endswith(_AVAILABLE_TOOLS_NOTE):
+        content = content[: -len(_AVAILABLE_TOOLS_NOTE)]
+    return str(content or "") + note
+
+
+#: Marqueur du prompt de compaction/summary de Hermes. Ces requetes n'ont ni
+#: outils ni prompt systeme : le proxy doit injecter la grille officielle, mais
+#: avec `tool_choice: auto` (le gate refuse `none`) et un `max_tokens` officiel.
+_FREE_SUMMARY_MARKER = "You are a summarization agent creating a context checkpoint"
+_FREE_SUMMARY_NOTE = (
+    "\n\nThis is a summarization request. Do not call any tools; produce only "
+    "the structured summary requested above."
+)
+
+
+def _free_is_summary_request(body) -> bool:
+    """La requete est-elle un appel de compression de contexte ?
+
+    Couvre le prompt Hermes historique et le prompt officiel V2 (ajouté à la
+    conversation réelle, donc souvent accompagné de tools/system).
+    """
+    if not isinstance(body, dict):
+        return False
+
+    def _is_summary_text(text: str) -> bool:
+        low = str(text or "")[:8000].lower()
+        if _FREE_SUMMARY_MARKER.lower() in low:
+            return True
+        return any(
+            marker in low
+            for marker in (
+                "you must summarize the conversation above",
+                "update the existing checkpoint",
+                "summarize only what the user and the assistant said",
+                "previous response did not fill in the required summary template",
+                "summarize the following conversation",
+                "conversation to summarize",
+            )
+        )
+
+    messages = body.get("messages")
+    if isinstance(messages, list) and messages:
+        # Official V2 appends the summary prompt to the real conversation:
+        # inspect the LAST user message, tools/system do not disqualify it.
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and _is_summary_text(content):
+                return True
+            if isinstance(content, list):
+                text = "\n".join(
+                    str(block.get("text") or "")
+                    for block in content
+                    if isinstance(block, dict)
+                )
+                if _is_summary_text(text):
+                    return True
+            break
+        # Legacy single-user transcript shape.
+        if len(messages) == 1:
+            content = messages[0].get("content") if isinstance(messages[0], dict) else None
+            return isinstance(content, str) and "<conversation>" in content[:4000].lower() and _is_summary_text(
+                content
+            )
+        return False
+    # Responses-shaped summary bodies carry their text in ``input``.
+    _resp_input = body.get("input")
+    if isinstance(_resp_input, str):
+        return _is_summary_text(_resp_input)
+    if isinstance(_resp_input, list):
+        texts = []
+        for item in _resp_input:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                texts.append(
+                    "\n".join(str(p.get("text") or "") for p in content if isinstance(p, dict))
+                )
+            elif isinstance(content, str):
+                texts.append(content)
+        return _is_summary_text("\n".join(texts))
+    return False
+
+
+def _summary_paid_bypass_enabled(body) -> bool:
+    """`server_compaction.summary_paid_bypass` (opt-in Hermes).
+
+    When enabled, a detected client compaction request skips the free leg so
+    the client can use the paid leg even under strict_free. Default false
+    keeps the historical strict_free behavior.
+    """
+    try:
+        if not bool(get_server_compaction("summary_paid_bypass", False)):
+            return False
+        if _free_is_summary_request(body):
+            return True
+        return bool(_is_compaction_shape(body, min_chars_implicit=10**9))
+    except Exception:
+        return False
+
+
+def _free_tool_name(tool) -> str:
+    """Nom d'un outil, forme chat (``function.name``) ou responses (``name``)."""
+    if not isinstance(tool, dict):
+        return ""
+    fn = tool.get("function")
+    if isinstance(fn, dict):
+        return str(fn.get("name") or "").strip().lower()
+    return str(tool.get("name") or "").strip().lower()
+
+
+def _filter_free_tools(tools):
+    """Retire les outils bloqués par la porte free. Rend (outils, retirés)."""
+    if not isinstance(tools, list):
+        return tools, []
+    kept = []
+    removed = []
+    for tool in tools:
+        name = _free_tool_name(tool)
+        if name in _FREE_BLOCKED_TOOL_NAMES:
+            removed.append(name)
+            continue
+        kept.append(tool)
+    return kept, removed
+
+
+def _free_message_size(message) -> int:
+    """Taille JSON d'un message (best-effort, jamais bloquant)."""
+    try:
+        return len(_serialize_json_body(message))
+    except Exception:
+        try:
+            return len(json.dumps(message, ensure_ascii=False).encode("utf-8"))
+        except Exception:
+            return 0
+
+
+#: Marqueur des contenus tronques dans la COPIE free (jamais le corps client).
+_FREE_TRIM_MARKER = "\n[... truncated by proxy to fit free gateway ...]\n"
+
+
+def _shrink_free_text(text: str, max_bytes: int) -> str | None:
+    """Garde tete+queue d'un texte pour tenir dans ``max_bytes`` UTF-8.
+
+    [2026-10-30] Un resultat d'outil de 120 Ko ne doit pas faire disparaitre
+    tout le tour courant (assistant tool_calls + resultat + question). On
+    tronque son contenu au lieu de jeter le message. ``None`` si meme le
+    marqueur ne tient pas.
+    """
+    if not isinstance(text, str):
+        return None
+    raw = text.encode("utf-8", "replace")
+    if len(raw) <= max_bytes:
+        return text
+    marker = _FREE_TRIM_MARKER.encode("utf-8")
+    if max_bytes <= len(marker) + 128:
+        return None
+    room = max_bytes - len(marker)
+    head = int(room * 0.6)
+    tail = room - head
+    # Decoupe sur les octets puis decode en ignorant un eventuel demi-caractere.
+    head_text = raw[:head].decode("utf-8", "ignore")
+    tail_text = raw[-tail:].decode("utf-8", "ignore") if tail > 0 else ""
+    return head_text + _FREE_TRIM_MARKER + tail_text
+
+
+def _shrink_free_message(message, max_bytes: int):
+    """Copie d'un message texte tenant dans ``max_bytes`` (ou ``None``).
+
+    Ne traite que ``content`` texte ; les blocs structures et les
+    ``tool_calls`` sont laisses intacts. La taille est remesuree apres
+    serialisation (les echappements JSON peuvent gonfler le texte).
+    """
+    if not isinstance(message, dict) or max_bytes <= 0:
+        return None
+    if _free_message_size(message) <= max_bytes:
+        return message
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    probe = dict(message)
+    probe["content"] = ""
+    overhead = _free_message_size(probe)
+    room = int(max_bytes) - overhead - 32
+    for _ in range(8):
+        if room < 128:
+            return None
+        shrunk = _shrink_free_text(content, room)
+        if shrunk is None:
+            return None
+        candidate = dict(message)
+        candidate["content"] = shrunk
+        if _free_message_size(candidate) <= max_bytes:
+            return candidate
+        room = int(room * 0.8)
+    return None
+
+
+def _free_structural_indices(messages) -> set[int]:
+    """Indices des messages appartenant a une chaine d'outils Chat COMPLETE.
+
+    Un ``tool`` orphelin (sans assistant ``tool_calls``) ou un appel sans
+    resultat n'est PAS protege : il sera retire en tete de suffixe. Seules les
+    paires reellement appariables sont conservees/tronquees ensemble.
+    """
+    out: set[int] = set()
+    if not isinstance(messages, list):
+        return out
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            index += 1
+            continue
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list) or not calls:
+            index += 1
+            continue
+        wanted = {tc.get("id") for tc in calls if isinstance(tc, dict) and tc.get("id")}
+        got: set = set()
+        cursor = index + 1
+        while cursor < len(messages) and isinstance(messages[cursor], dict) and messages[cursor].get("role") == "tool":
+            got.add(messages[cursor].get("tool_call_id"))
+            cursor += 1
+        if wanted and wanted <= got:
+            out.add(index)
+            out.update(range(index + 1, cursor))
+        index = max(cursor, index + 1)
+    return out
+
+
+def _fit_free_wire_out(out: dict, max_bytes: int) -> dict:
+    """Ramene la copie free sous ``max_bytes`` en tronquant, jamais en jetant."""
+    try:
+        if _free_message_size(out) <= max_bytes:
+            return out
+    except Exception:
+        return out
+    messages = out.get("messages")
+    if not isinstance(messages, list):
+        return out
+    # Tronque les plus gros contenus structurels d'abord.
+    candidates = sorted(
+        (
+            (index, message)
+            for index, message in enumerate(messages)
+            if isinstance(message, dict)
+            and message.get("role") != "system"
+            and isinstance(message.get("content"), str)
+            and len(message["content"]) > 512
+        ),
+        key=lambda item: _free_message_size(item[1]),
+        reverse=True,
+    )
+    for index, message in candidates:
+        overflow = _free_message_size(out) - max_bytes
+        if overflow <= 0:
+            break
+        old_size = _free_message_size(message)
+        target = max(512, old_size - overflow - 64)
+        shrunk = _shrink_free_message(message, target)
+        if shrunk is None or _free_message_size(shrunk) >= old_size:
+            continue
+        messages[index] = shrunk
+    return out
+
+
+def _trim_free_wire_messages(wire: dict, max_bytes: int) -> tuple[dict, int]:
+    """Tronque l'historique de la copie free, jamais le corps client.
+
+    [2026-10-30] Hermes envoie 299 messages (~318 Ko) a chaque tour ; le
+    harnais DeepSeek, qui passe, en envoie 3 (~30 Ko). Les requetes Hermes qui
+    passaient plus tot faisaient ~73-100 Ko. On garde donc les systemes, tous
+    les outils, le premier message utilisateur (tache/summary) et la fin de
+    l'historique, dans ``max_bytes``. Les paires assistant/tool_calls et
+    tool/resultat restent contigues : on ne coupe qu'en tete de suffixe.
+
+    Ne touche pas aux corps Anthropic non convertis (blocs ``tool_use`` /
+    ``tool_result``) : la conversion Chat est faite avant l'appel principal.
+    Retourne ``(wire, nombre_de_messages_retires)``.
+    """
+    if max_bytes <= 0:
+        return wire, 0
+    messages = wire.get("messages")
+    if not isinstance(messages, list) or len(messages) <= 1:
+        return wire, 0
+    for message in messages:
+        if not isinstance(message, dict):
+            return wire, 0
+        if isinstance(message.get("content"), list):
+            return wire, 0
+    systems = [m for m in messages if m.get("role") == "system"]
+    rest = [m for m in messages if m.get("role") != "system"]
+    if not rest:
+        return wire, 0
+    try:
+        base = {k: v for k, v in wire.items() if k != "messages"}
+        base_size = len(_serialize_json_body(base))
+    except Exception:
+        return wire, 0
+    # Marge pour la cle/crochets du tableau `messages` (nulle sur les petits
+    # budgets de test, plafonnee sur les vrais budgets).
+    margin = 256 if int(max_bytes) > 4096 else 0
+    budget = int(max_bytes) - base_size - sum(_free_message_size(m) for m in systems) - margin
+    if budget <= 0:
+        return wire, 0
+    first_user = next((m for m in rest if m.get("role") == "user"), None)
+    first_user_size = _free_message_size(first_user) if first_user is not None else 0
+    # Budget du suffixe : on reserve la place du premier message utilisateur
+    # (tache/summary) seulement si elle reste MINORITAIRE (<= 25 % du budget)
+    # ET si le tour courant est deja entierement dans le suffixe. L'ancien
+    # code reservait sa taille pleine : un resume de compaction de 18 Ko
+    # pouvait amputer le tour precedent pour un message qui ne tenait meme
+    # pas. Ici, tant qu'on est dans le tour courant (dernier user + la chaine
+    # assistant/tools qui le precede), on ne reserve rien : on ne coupe
+    # jamais l'appel d'outil dont le resultat est juste apres.
+    last_user_idx = max((i for i, m in enumerate(rest) if m.get("role") == "user"), default=-1)
+    prev_user_idx = max(
+        (i for i in range(last_user_idx) if rest[i].get("role") == "user"), default=-1
+    )
+    protect_count = len(rest) - prev_user_idx  # dernier user + tour courant
+    reserve = first_user_size if 0 < first_user_size <= budget // 4 else 0
+    # Indices (dans `rest`) des messages d'une chaine d'outils complete : seuls
+    # ceux-la sont tronques plutot que jetes. Un tool orphelin reste jetable.
+    structural = _free_structural_indices(rest)
+    kept_rev: list = []
+    kept_indices: list[int] = []
+    used = 0
+    first_user_kept = False
+    modified = False
+    # [2026-10-30] Un resultat d'outil geant (dump de fichier, 120 Ko) faisait
+    # `break` ici : l'assistant tool_calls ET le resultat disparaissaient, le
+    # modele ne voyait plus que la question courante. On ne coupe pas une
+    # chaine d'outils structurelle : on tronque son contenu pour la garder.
+    for index in range(len(rest) - 1, -1, -1):
+        message = rest[index]
+        size = _free_message_size(message)
+        effective_budget = budget if len(kept_rev) < protect_count else budget - reserve
+        if kept_rev and used + size > effective_budget:
+            if index not in structural:
+                break
+            room = max(512, effective_budget - used)
+            shrunk = _shrink_free_message(message, room)
+            # Si meme tronque il ne tient pas, on garde quand meme le message :
+            # perdre le tour courant est pire qu'un corps legerement trop gros.
+            if shrunk is not None and shrunk is not message:
+                message = shrunk
+                modified = True
+            size = _free_message_size(message)
+        kept_rev.append(message)
+        kept_indices.append(index)
+        if message is first_user:
+            first_user_kept = True
+        used += size
+        # Le dernier message est toujours conserve, meme s'il depasse seul le
+        # budget : un corps sans tour courant serait inutile.
+    kept = list(reversed(kept_rev))
+    kept_indices = list(reversed(kept_indices))
+    # Un resultat d'outil sans son appel assistant, ou un appel sans son
+    # resultat, rend le corps invalide : on retire les tetes non appariables.
+    # Boucle UNIQUE : apres avoir retire un assistant tool_calls, le tool qui
+    # suit redevient la tete et doit aussi partir (sinon on garde un orphelin).
+    #
+    # [2026-10-30] Un assistant NORMAL en tete est une reponse precedente
+    # valide : on la GARDE. L'ancien code la supprimait, donc le modele ne
+    # voyait que le message courant (« continue ») et perdait le fil entre
+    # deux tours. On ne retire que les tetes structurellement inutilisables.
+    while kept:
+        head = kept[0]
+        role = head.get("role")
+        if role == "tool":
+            kept.pop(0)
+            kept_indices.pop(0)
+            continue
+        if role == "assistant":
+            calls = head.get("tool_calls")
+            if calls:
+                wanted = {
+                    tc.get("id")
+                    for tc in calls
+                    if isinstance(tc, dict) and tc.get("id")
+                }
+                got = set()
+                index = 1
+                while index < len(kept) and kept[index].get("role") == "tool":
+                    got.add(kept[index].get("tool_call_id"))
+                    index += 1
+                if wanted and wanted <= got:
+                    break  # chaine complete : on la garde
+                kept.pop(0)
+                kept_indices.pop(0)
+                continue
+            if not str(head.get("content") or "").strip():
+                kept.pop(0)
+                kept_indices.pop(0)
+                continue
+            break  # reponse assistant normale : contexte utile
+        break
+    # Le nettoyage de tete a pu retirer des messages : on remesure le suffixe
+    # reel avant de decider si l'ancre (tache/summary) tient dans le budget.
+    used = sum(_free_message_size(m) for m in kept)
+    if (
+        first_user is not None
+        and not first_user_kept
+        and not any(m is first_user for m in kept)
+        and used + first_user_size <= budget
+    ):
+        kept.insert(0, first_user)
+    elif first_user is not None and not first_user_kept and reserve > 0 and kept:
+        # La tache/summary initiale ne tient pas parce qu'un resultat d'outil a
+        # mange le budget. On tronque CE resultat (jamais la tache) pour lui
+        # faire de la place : c'est l'ancre du fil, le dump est recupable.
+        candidates = sorted(
+            (
+                (idx, message)
+                for idx, (origin, message) in enumerate(zip(kept_indices, kept))
+                if origin in structural
+                and isinstance(message.get("content"), str)
+                and _free_message_size(message) > 512
+            ),
+            key=lambda item: _free_message_size(item[1]),
+            reverse=True,
+        )
+        for idx, message in candidates:
+            missing = used + first_user_size - budget
+            if missing <= 0:
+                break
+            old_size = _free_message_size(message)
+            target = max(512, old_size - missing - 64)
+            shrunk = _shrink_free_message(message, target)
+            if shrunk is None or _free_message_size(shrunk) >= old_size:
+                continue
+            kept[idx] = shrunk
+            modified = True
+            used = sum(_free_message_size(m) for m in kept)
+        if used + first_user_size <= budget:
+            kept.insert(0, first_user)
+    if not kept:
+        for message in reversed(rest):
+            if message.get("role") == "user":
+                kept = [message]
+                break
+    new_messages = systems + kept
+    if len(new_messages) >= len(messages) and not modified:
+        return wire, 0
+    out = dict(wire)
+    out["messages"] = new_messages
+    size_before_fit = _free_message_size(out)
+    out = _fit_free_wire_out(out, int(max_bytes))
+    if _free_message_size(out) != size_before_fit:
+        modified = True
+    return out, len(messages) - len(new_messages)
+
+
+def _truncate_summary_middle(text: str, max_chars: int) -> str:
+    """Tronque un transcript de résumé en gardant début, milieu et fin.
+
+    L'ancien découpage ne gardait que début+fin : les décisions au milieu d'un
+    long historique disparaissaient du résumé. On prélève trois segments
+    répartis dans le milieu, sans augmenter le budget de caractères.
+    """
+    if not isinstance(text, str) or len(text) <= max_chars or max_chars <= 0:
+        return text if isinstance(text, str) else ""
+    marker = "\n\n[... summary input truncated by proxy to fit free gateway ...]\n\n"
+    if max_chars <= len(marker) * 4 + 300:
+        return text[:max_chars]
+    head = int(max_chars * 0.32)
+    tail = int(max_chars * 0.32)
+    middle = text[head : len(text) - tail]
+    mid_budget = max_chars - head - tail - len(marker) * 4
+    if not middle or mid_budget <= 0:
+        return text[: head + (max_chars - head - len(marker))] + marker + text[-tail:]
+    take = max(1, mid_budget // 3)
+    segment = max(1, len(middle) // 3)
+    samples = []
+    for i in range(3):
+        # Échantillon centré dans chaque tiers : un fait au milieu d'une
+        # section n'est pas perdu comme avec un prélèvement en début de bloc.
+        start = i * segment + max(0, (segment - take) // 2)
+        samples.append(middle[start : start + take])
+    out = text[:head] + marker + marker.join(samples) + marker + text[-tail:]
+    return out[:max_chars] if len(out) > max_chars else out
+
+
 def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = None):
     """Copie d'envoi jambe free : copie officielle + stream (±prompt_cache_key).
 
@@ -5804,10 +6965,29 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     """
     if not isinstance(body, dict):
         return body, False
+    # [2026-10-30] Plafond de sortie officiel (32000). Voir la constante :
+    # Hermes demande 128000 et se fait refuser sur les gros contextes, alors
+    # que le harnais DeepSeek (32768) passe. On ne touche qu'a la copie free.
+    _clamped = {
+        _k: _FREE_MAX_OUTPUT_TOKENS
+        for _k in ("max_tokens", "max_completion_tokens", "max_output_tokens")
+        if isinstance(body.get(_k), int)
+        and not isinstance(body.get(_k), bool)
+        and body.get(_k) > _FREE_MAX_OUTPUT_TOKENS
+    }
+    need_clamp = bool(_clamped)
     is_resp = "input" in body
     is_chat = "messages" in body
     if not is_resp and not is_chat:
         return body, False
+    # [2026-10-29] La porte free refuse certains outils (mesuré : subagent_fork)
+    # en renvoyant un faux quota. On les retire de la copie d'envoi, sans
+    # toucher au corps client ni aux autres outils.
+    _filtered_tools, _removed_tools = _filter_free_tools(body.get("tools"))
+    if _removed_tools:
+        body = dict(body)
+        body["tools"] = _filtered_tools
+        _log(f"  [free] outil(s) retiré(s) avant envoi (non autorisés upstream) : {', '.join(sorted(set(_removed_tools)))}")
     tools = body.get("tools")
     if isinstance(tools, list):
         if is_chat:
@@ -5841,8 +7021,11 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     _has_official_sys = _has_official_system(body.get("messages"))
     _signature_ok = bool(_has_official_sys and "read" in have)
     _client_tools = tools if isinstance(tools, list) else []
+    _is_summary = bool(is_chat and _free_is_summary_request(body))
     need_tools = is_chat and bool(_payload["tools"]) and not _signature_ok
     need_system = is_chat and isinstance(_payload.get("system"), dict) and not _has_official_sys
+    _summary_token_cap = _free_summary_max_tokens() if _is_summary else 0
+    need_summary_tokens = bool(_is_summary and _summary_token_cap > 0)
     missing = [n for n in ("read",) if n not in have] if is_resp else []
     need_stream = force_stream and body.get("stream") is not True
     need_key = is_resp and not body.get("prompt_cache_key")
@@ -5856,6 +7039,7 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     # Idem pour l'ordre des clés : un corps officiel (signature ok) traverse
     # tel quel, quel que soit son ordre (v2 utilise max_completion_tokens).
     need_order = is_chat and will_have_tools and not _signature_ok
+    _wire_cap = _free_max_wire_bytes()
     if (
         not missing
         and not need_tools
@@ -5864,24 +7048,139 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         and not need_key
         and not need_tc
         and not need_order
+        and not need_clamp
+        and not need_summary_tokens
     ):
         return body, False
     wire = dict(body)
-    if need_tools:
-        # [2026-10-25] Le gate ne demande QUE `read` + prompt officiel (mesuré).
-        # On n'injecte plus les 10 outils v1 : on garantit la présence de
-        # `read` et on CONSERVE les outils du client (son function calling).
-        # Si le client fournit déjà `read`, on garde SA définition : son schéma
-        # (ex. file_path vs filePath) est celui que son exécuteur comprend.
-        if "read" in have:
-            wire["tools"] = list(_client_tools)
+    if need_summary_tokens:
+        # Le summary Hermes n'a pas de max_tokens ; le gate/officiel en attend
+        # un. On plafonne la sortie pour reduire le temps de generation free.
+        _existing_max = wire.get("max_tokens")
+        if isinstance(_existing_max, int) and not isinstance(_existing_max, bool) and _existing_max > 0:
+            wire["max_tokens"] = min(_existing_max, _summary_token_cap)
         else:
-            _read_def = None
-            for _t in _payload["tools"]:
-                if isinstance(_t, dict) and _t.get("function", {}).get("name") == "read":
-                    _read_def = _t
-                    break
-            wire["tools"] = ([copy.deepcopy(_read_def)] if _read_def else []) + list(_client_tools)
+            wire["max_tokens"] = _summary_token_cap
+        for _max_key in ("max_completion_tokens", "max_output_tokens"):
+            _max_val = wire.get(_max_key)
+            if isinstance(_max_val, int) and not isinstance(_max_val, bool) and _max_val > _summary_token_cap:
+                wire[_max_key] = _summary_token_cap
+        wire.setdefault("reasoning_effort", "none")
+    if _is_summary:
+        # La compaction Hermes peut envoyer 54-96 Ko de transcript. On garde
+        # le debut (instructions) et la fin (template), et on coupe le milieu :
+        # 5x plus rapide, resume encore structure/usable.
+        _max_summary = _free_max_summary_chars()
+        if _max_summary > 0 and isinstance(wire.get("messages"), list):
+            _new_summary_messages = []
+            for _summary_msg in wire["messages"]:
+                if (
+                    isinstance(_summary_msg, dict)
+                    and _summary_msg.get("role") == "user"
+                    and isinstance(_summary_msg.get("content"), str)
+                    and len(_summary_msg["content"]) > _max_summary
+                ):
+                    _summary_msg = dict(_summary_msg)
+                    _summary_msg["content"] = _truncate_summary_middle(
+                        _summary_msg["content"], _max_summary
+                    )
+                _new_summary_messages.append(_summary_msg)
+            wire["messages"] = _new_summary_messages
+    if _clamped:
+        _clamp_apply = _clamped
+        if _is_summary:
+            # Le summary a son propre plafond (4096) : ne pas le réécraser
+            # avec le plafond général 32000.
+            _clamp_apply = {
+                k: v
+                for k, v in _clamped.items()
+                if k not in ("max_tokens", "max_completion_tokens", "max_output_tokens")
+            }
+        wire.update(_clamp_apply)
+        # La copie est superficielle : `ensure_deepseek_reasoning` peut annoter
+        # les messages. On isole l'entree client avant de lui passer la liste.
+        if isinstance(wire.get("messages"), list):
+            wire["messages"] = copy.deepcopy(wire["messages"])
+        _debug(
+            "  [free] plafond de sortie clampé "
+            f"{ {k: body.get(k) for k in _clamped} } -> {_FREE_MAX_OUTPUT_TOKENS} (officiel)"
+        )
+    if need_tools:
+        # [2026-10-30] Le gate free exige la GRILLE OFFICIELLE (les 10 noms
+        # mesures : bash, edit, glob, grep, read, skill, task, todowrite,
+        # webfetch, write). L'ancien code n'injectait que `read` : Hermes
+        # (read_file/terminal/patch...) n'avait aucun nom officiel et prenait
+        # un faux quota, alors que le harnais DeepSeek (bash/edit/read/glob/
+        # grep/write...) passait. On restaure la fusion documentee : 10
+        # officiels devant, puis au plus `free.max_client_tools` outils client
+        # (defaut 8) pour ne pas depasser le budget du gate.
+        _official_defs = [t for t in (_payload.get("tools") or []) if isinstance(t, dict)]
+        _official_names = {_free_tool_name(t) for t in _official_defs}
+        _have_official = len(_official_names & have)
+        _extras = []
+        _gate_allowed_names = []
+        _gate_forbidden_names = []
+        if not _official_defs:
+            # Repli historique si le payload officiel est absent.
+            wire["tools"] = list(_client_tools)
+            _gate_allowed_names = [_free_tool_name(t) for t in _client_tools]
+        elif _have_official >= 5:
+            # Client deja aligne sur la grille officielle (harnais DeepSeek) :
+            # on conserve ses outils tels quels, on ne les remplace pas.
+            wire["tools"] = list(_client_tools)
+            if "read" not in have:
+                _read_def = next(
+                    (t for t in _official_defs if _free_tool_name(t) == "read"),
+                    None,
+                )
+                if _read_def is not None:
+                    wire["tools"] = [copy.deepcopy(_read_def)] + list(_client_tools)
+        else:
+            # Grille officielle (noms exiges par le gate) + outils client.
+            # Si le client fournit deja un nom officiel (read, bash...), on
+            # garde SA definition (schema executable cote client) ; sinon on
+            # met un placeholder « ne pas appeler ».
+            # Preserver un outil client au nom officiel EXACT (casse comprise) :
+            # `Bash` n'est pas `bash`, le gate exige `bash`. On garde alors
+            # `Bash` en extra appelable et `bash` en placeholder interdit.
+            _client_by_exact_name = {}
+            for _client_tool in _client_tools:
+                if not isinstance(_client_tool, dict):
+                    continue
+                _client_fn = _client_tool.get("function")
+                if isinstance(_client_fn, dict):
+                    _client_by_exact_name[str(_client_fn.get("name") or "").strip()] = _client_tool
+            _official_exact_names = {
+                str(t.get("function", {}).get("name") or "").strip() for t in _official_defs
+            }
+            _grid = []
+            _preserved_official = []
+            _placeholder_official = []
+            for _official in _official_defs:
+                _name = str(_official.get("function", {}).get("name") or "").strip()
+                _client_def = _client_by_exact_name.get(_name)
+                if _client_def is not None:
+                    _preserved_official.append(_name)
+                    _grid.append(copy.deepcopy(_client_def))
+                else:
+                    _placeholder_official.append(_name)
+                    _grid.append(_free_official_placeholder_defs([_official])[0])
+            _extras = [
+                t
+                for t in _client_tools
+                if isinstance(t, dict)
+                and str((t.get("function") or {}).get("name") or "").strip()
+                not in _official_exact_names
+            ]
+            _extras = _select_free_client_tools(_extras, _free_max_client_tools())
+            wire["tools"] = _grid + _extras
+            _gate_allowed_names = _preserved_official + [_free_tool_name(t) for t in _extras]
+            _gate_forbidden_names = _placeholder_official
+            _log(
+                f"  [free] grille officielle injectee ({len(_grid)} outils, "
+                f"{len(_placeholder_official)} placeholder(s)) "
+                f"+ {len(_extras)} outil(s) client (max {_free_max_client_tools()})"
+            )
     elif missing:
         base = list(tools) if isinstance(tools, list) else []
         base.extend(_free_shim_tool(n, is_resp) for n in missing)
@@ -5890,14 +7189,56 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         # Prompt officiel en tête (obligatoire pour le gate) + consigne qui
         # limite le modèle aux outils réellement déclarés.
         wire["messages"] = _inject_official_system(wire.get("messages"), _payload["system"])
+    if need_tools and not _signature_ok and _have_official < 5:
+        # [2026-10-30] Prompt client Hermes = 31 Ko ; le gate free n'a pas le
+        # budget. On garde son debut (identite/consignes) et la note finale qui
+        # interdit d'appeler les outils officiels de compatibilite.
+        _max_sys = _free_max_client_system_chars()
+        _messages = wire.get("messages")
+        if isinstance(_messages, list):
+            _gate_note = (
+                _FREE_SUMMARY_NOTE
+                if _is_summary
+                else _free_client_tools_note(_gate_allowed_names, _gate_forbidden_names)
+            )
+            _sys_indices = [
+                i
+                for i, m in enumerate(_messages)
+                if isinstance(m, dict) and m.get("role") == "system"
+            ]
+            _last_sys_idx = _sys_indices[-1] if _sys_indices else -1
+            _new_sys_messages = []
+            for _sys_idx, _sys_msg in enumerate(_messages):
+                if not isinstance(_sys_msg, dict) or _sys_msg.get("role") != "system":
+                    _new_sys_messages.append(_sys_msg)
+                    continue
+                _sys_content = _sys_msg.get("content")
+                if _sys_idx == 0:
+                    # Le prompt OFFICIEL ne doit JAMAIS etre tronque : c'est la
+                    # signature du gate. Un summary Hermes n'a pas de systeme
+                    # client ; l'ancien code le coupait a 4 Ko et prenait un
+                    # faux 429 (mesure 2026-10-30).
+                    _sys_copy = dict(_sys_msg)
+                    if _last_sys_idx == 0:
+                        _sys_copy["content"] = _replace_free_tools_note(_sys_content, _gate_note)
+                    _new_sys_messages.append(_sys_copy)
+                    continue
+                if _max_sys > 0 and isinstance(_sys_content, str) and len(_sys_content) > _max_sys:
+                    _sys_content = _sys_content[:_max_sys].rstrip()
+                _sys_copy = dict(_sys_msg)
+                _sys_copy["content"] = _replace_free_tools_note(_sys_content, _gate_note)
+                _new_sys_messages.append(_sys_copy)
+            wire["messages"] = _new_sys_messages
     if is_chat and need_order and not need_tools:
         # Tri ICU de parité v1, uniquement sur des tools fournis par le client :
         # la copie officielle, elle, garde son ordre exact.
-        wire["tools"] = _sorted_chat_tools(wire.get("tools"))
+        wire["tools"] = _sorted_chat_tools(wire.get("tools") or [])
     if need_tc:
-        # Client sans aucun outil : le `read` technique ajouté pour le gate ne
-        # doit jamais être appelé (le client ne saurait pas l'exécuter).
-        wire["tool_choice"] = "none" if not _client_tools else "auto"
+        # Client sans aucun outil : la grille technique ne doit pas être
+        # appelée. Exception : le summary Hermes, dont le gate refuse `none`
+        # (mesuré 2026-10-30) ; la note finale lui interdit explicitement les
+        # outils et lui demande le résumé.
+        wire["tool_choice"] = "auto" if (_is_summary or _client_tools) else "none"
     if need_key:
         try:
             # Parité options() : promptCacheKey = sessionID de la conversation
@@ -5905,7 +7246,9 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
             # un chaînage `conversation` ; repli global sinon).
             _conv = body.get("conversation") if isinstance(body, dict) else None
             wire["prompt_cache_key"] = (
-                _conversation_session_id(_conv, egress_ip) if isinstance(_conv, str) and _conv else _free_session_id(egress_ip)
+                _conversation_session_id(_conv, egress_ip)
+                if isinstance(_conv, str) and _conv
+                else _free_session_id(egress_ip)
             )
         except Exception:
             pass
@@ -5918,6 +7261,26 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         forced = True
     if need_order:
         wire = _reorder_client_body(wire)
+    # [2026-10-31] Le plafond gate s'applique à la COPIE FREE FINALE
+    # (system officiel + outils + messages), pas au corps client. L'ancien
+    # test comparait `body` AVANT injection : un corps de 80 Ko + 25 Ko
+    # d'ossature (105 Ko wire) passait sans trim et se prenait le gate.
+    if _wire_cap > 0:
+        try:
+            _wire_size = _quick_body_size(wire)
+        except Exception:
+            _wire_size = 0
+        if _wire_size > _wire_cap:
+            # Hermes rejoue 299 messages (~318 Ko) a chaque tour et prend un
+            # 429. On tronque la COPIE free (systemes + outils + fin de
+            # l'historique), jamais le corps client.
+            wire, _trimmed_messages = _trim_free_wire_messages(wire, _wire_cap)
+            if _trimmed_messages:
+                _log(
+                    f"  [free] historique tronqué pour la jambe free : "
+                    f"{_trimmed_messages} message(s) retiré(s) "
+                    f"(wire={_wire_size} o, budget {_wire_cap} o)"
+                )
     # ── [ALIGNEMENT 2026-10-20] DeepSeek « thinking mode » ──────────────────
     # L'amont exige que CHAQUE message assistant porte `reasoning_content`,
     # même vide : sans lui, 400 « The `reasoning_content` in the thinking mode
@@ -5932,7 +7295,7 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     try:
         from app.protocol.mapping import ensure_deepseek_reasoning as _ensure_ds_reasoning
 
-        _ensure_ds_reasoning(wire.get("messages"), str(wire.get("model") or ""))
+        _ensure_ds_reasoning(wire.get("messages") or [], str(wire.get("model") or ""))
     except Exception:
         pass  # jamais bloquant : un corps sans défaut vaut mieux qu'un 500 local
     return wire, forced
@@ -6011,9 +7374,7 @@ def _normalize_chat_reasoning_chunk(chunk: dict) -> bool:
                 det = d.get("reasoning_details")
                 if isinstance(det, list):
                     alt = "".join(
-                        p.get("text", "")
-                        for p in det
-                        if isinstance(p, dict) and isinstance(p.get("text"), str)
+                        p.get("text", "") for p in det if isinstance(p, dict) and isinstance(p.get("text"), str)
                     )
             if isinstance(alt, str) and alt:
                 d["reasoning_content"] = alt
@@ -6035,15 +7396,19 @@ def _tool_schema_index(tools) -> list[dict]:
     for _t in tools or []:
         if not isinstance(_t, dict):
             continue
-        _fn = _t.get("function") if isinstance(_t.get("function"), dict) else _t
+        _raw_fn = _t.get("function")
+        _fn = _raw_fn if isinstance(_raw_fn, dict) else _t
         _name = _fn.get("name")
         if not isinstance(_name, str) or not _name.strip():
             continue
         _params = _fn.get("parameters")
         if not isinstance(_params, dict):
-            _params = _fn.get("input_schema") if isinstance(_fn.get("input_schema"), dict) else {}
-        _props = _params.get("properties") if isinstance(_params.get("properties"), dict) else {}
-        _req = _params.get("required") if isinstance(_params.get("required"), list) else []
+            _raw_schema = _fn.get("input_schema")
+            _params = _raw_schema if isinstance(_raw_schema, dict) else {}
+        _raw_props = _params.get("properties")
+        _props = _raw_props if isinstance(_raw_props, dict) else {}
+        _raw_req = _params.get("required")
+        _req = _raw_req if isinstance(_raw_req, list) else []
         out.append(
             {
                 "name": _name.strip(),
@@ -6298,9 +7663,7 @@ class _ChatToolCallHealer:
         if not st["id"]:
             st["id"] = _fast_id("call")
         base = {
-            k: v
-            for k, v in (template or {}).items()
-            if k not in ("choices", "usage") and not str(k).startswith("_")
+            k: v for k, v in (template or {}).items() if k not in ("choices", "usage") and not str(k).startswith("_")
         }
         base["choices"] = [
             {
@@ -6505,9 +7868,7 @@ def _collect_chat_completion(lines, model, tools=None) -> dict | None:
                         if isinstance(det, list):
                             details_seen = True
                             alt = "".join(
-                                p.get("text", "")
-                                for p in det
-                                if isinstance(p, dict) and isinstance(p.get("text"), str)
+                                p.get("text", "") for p in det if isinstance(p, dict) and isinstance(p.get("text"), str)
                             )
                     rc = alt
                 elif isinstance(d.get("reasoning_details"), list):
@@ -6555,14 +7916,13 @@ def _collect_chat_completion(lines, model, tools=None) -> dict | None:
         # `reasoning_details`, on le restitue aussi (forme compacte, un seul
         # bloc avec le texte complet) — les SDK OpenRouter le lisent.
         if details_seen:
-            message["reasoning_details"] = [
-                {"type": "reasoning.text", "text": message["reasoning_content"]}
-            ]
+            message["reasoning_details"] = [{"type": "reasoning.text", "text": message["reasoning_content"]}]
     if tool_calls:
         ordered = []
         for tc in (tool_calls[i] for i in sorted(tool_calls)):
             tc.pop("index", None)
-            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            _raw_tc_fn = tc.get("function")
+            fn = _raw_tc_fn if isinstance(_raw_tc_fn, dict) else {}
             if not isinstance(fn.get("arguments"), str):
                 fn["arguments"] = _json_dumps_str(fn["arguments"]) if isinstance(fn.get("arguments"), dict) else "{}"
             if not fn["arguments"].lstrip().startswith(("{", "[")):
@@ -6729,6 +8089,7 @@ def _ip_vault():
     except Exception:
         try:
             from free.identities import get_vault as _get_vault2
+
             return _get_vault2()
         except Exception:
             return None
@@ -6865,8 +8226,9 @@ def _body_conversation_key(body) -> str | None:
     return None
 
 
-def _official_free_headers(endpoint: str = "", conversation_key: str | None = None,
-                             egress_ip: str | None = None) -> dict:
+def _official_free_headers(
+    endpoint: str = "", conversation_key: str | None = None, egress_ip: str | None = None
+) -> dict:
     """Jeu de headers officiel complet pour UN envoi jambe free.
 
     `egress_ip` renseigné (chemin nominal via vault) → identité COMPLÈTE de
@@ -7061,6 +8423,7 @@ def _official_free_headers(endpoint: str = "", conversation_key: str | None = No
 # ``_ensure_free_models_sync`` (rendu via asyncio.to_thread → jamais dans le
 # chemin requête client).
 
+
 def _probe_ms_iso() -> str:
     import datetime as _dt
 
@@ -7076,9 +8439,7 @@ def _free_probe_dispatch(url: str, headers: dict, payload: bytes) -> tuple:
     ``(None, "")`` = transport error → verdict ``unknown`` par le classifieur.
     """
     try:
-        timeout = float(
-            (yaml_get("free_discovery", "probe", {}) or {}).get("timeout", 8.0) or 8.0
-        )
+        timeout = float((yaml_get("free_discovery", "probe", {}) or {}).get("timeout", 8.0) or 8.0)
     except Exception:
         timeout = 8.0
     if timeout < 2.0:
@@ -7117,15 +8478,13 @@ def _free_probe_dispatch(url: str, headers: dict, payload: bytes) -> tuple:
         for _k, _v in (headers or {}).items():
             _cmd += ["-H", f"{_k}: {_v}"]
         _cmd += ["--data-binary", payload.decode("utf-8", "replace")]
-        _r = _subprocess.run(
-            _cmd, capture_output=True, text=True, timeout=timeout + 5, creationflags=_flags
-        )
-        out = _r.stdout or ""
+        _cp = _subprocess.run(_cmd, capture_output=True, text=True, timeout=timeout + 5, creationflags=_flags)
+        out = _cp.stdout or ""
         body, _, code = out.rpartition("FreeProbeStatus:")
         try:
             return int(code.strip() or 0) or None, (body or out)[:400]
         except ValueError:
-            return None, (out or _r.stderr or "")[:400]
+            return None, (out or _cp.stderr or "")[:400]
     except Exception:
         return None, ""
 
@@ -7138,9 +8497,7 @@ def _free_probe_recently_ok(model_ids: list, seconds: float) -> set:
     try:
         import datetime as _dt
 
-        _since = (
-            _dt.datetime.now(_dt.UTC) - _dt.timedelta(seconds=float(seconds))
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _since = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(seconds=float(seconds))).strftime("%Y-%m-%dT%H:%M:%SZ")
         _conn_probe = globals().get("_conn")
         _lock_probe = globals().get("_db_commit_lock")
         if _conn_probe is None:
@@ -7165,6 +8522,22 @@ def _free_probe_recently_ok(model_ids: list, seconds: float) -> set:
 _PROBE_RESULTS_LIMIT = 300  # bornage mémoire de l'état results (observability)
 
 
+def _free_probe_control_id(exclude: set | None = None) -> str | None:
+    """Id free connu pour distinguer un 429 global d'un 429 ciblé."""
+    try:
+        free_models = set(getattr(_cfg_settings, "FREE_MODELS", set()) or ())
+        excluded = {str(mid) for mid in (exclude or ())}
+        for preferred in ("big-pickle", "mimo-v2.6-flash-free", "glm-5.3-flash-free"):
+            if preferred in free_models and preferred not in excluded:
+                return preferred
+        for mid in sorted(free_models):
+            if mid not in excluded and "jev" not in str(mid).lower():
+                return str(mid)
+    except Exception:
+        pass
+    return None
+
+
 def _free_probe_gate(announced: set, known: set, api_base_free: str) -> tuple:
     """Verdict live AVANT promotion (voir doc config/settings._FREE_PROBE_GATE).
 
@@ -7187,20 +8560,24 @@ def _free_probe_gate(announced: set, known: set, api_base_free: str) -> tuple:
             return None, None
         _go_only = set(getattr(_cfg_settings, "GO_ONLY_IDS", None) or ())
         _purged = set(getattr(_cfg_settings, "PURGED_IDS", None) or ())
-        announced = {
-            m for m in (announced or ()) if isinstance(m, str) and m
-        }
+        announced = {m for m in (announced or ()) if isinstance(m, str) and m}
         known = {m for m in (known or ()) if isinstance(m, str) and m}
         fresh = sorted((announced - known) - _go_only - _purged)
         _st_pstate = dict(_cfg_settings._FREE_DISCOVERY_STATE.get("probe") or {})
         results = dict(_st_pstate.get("results") or {})
         now = time.time()
-        # Re-sonde des ``unknown`` périmés (borné au budget global)
+        # Re-sonde des ``unknown``/``limited`` périmés. Un id free CONNU reste
+        # éligible même s'il n'est plus annoncé ce cycle : son verdict est une
+        # mémoire de santé, pas une propriété de l'annonce.
         rechecks = [
             m
             for m in _disc.probe_recheck_plan(results, cfg, now)
-            if m in announced and m not in _go_only and m not in _purged
+            if (m in announced or m in known) and m not in _go_only and m not in _purged
         ]
+        # Ids free connus mais JAMAIS sondés (dashboard ``unproven``) : la gate
+        # ne sonde historiquement que les NOUVEAUX ids (announced - known), donc
+        # un id connu sans verdict le restait à vie. On les rattrape ici.
+        unproven = sorted((known - set(results)) - _go_only - _purged)
         # Mémoire dead : ré-annoncé avant dead_ttl_s → suspendu sans sonde
         dead_frozen = {
             m
@@ -7209,14 +8586,16 @@ def _free_probe_gate(announced: set, known: set, api_base_free: str) -> tuple:
             and r.get("verdict") == "dead"
             and (now - float(r.get("checked_epoch") or 0.0)) < cfg["dead_ttl_s"]
         }
-        budget = [m for m in fresh if m not in dead_frozen]
-        _rem = cfg["max_ids"] - len(budget)
-        if _rem > 0:
-            # Dédupe ordre-stable : fresh d'abord, rechecks PAS déjà budgetés
+        # Priorité : maintenance des connus (rechecks/unproven) avant les
+        # nouvelles annonces — les états affichés au dashboard se corrigent au
+        # boot, pas après plusieurs cycles de découverte.
+        budget: list[str] = []
+        for group in (rechecks, unproven, fresh):
+            _rem = cfg["max_ids"] - len(budget)
+            if _rem <= 0:
+                break
             _in_budget = set(budget)
-            budget += [
-                m for m in rechecks if m not in dead_frozen and m not in _in_budget
-            ][:_rem]
+            budget += [m for m in group if m not in dead_frozen and m not in _in_budget][:_rem]
         budget = budget[: cfg["max_ids"]]
         # Skips par usage DB récent (le trafic réel est un meilleur signal)
         try:
@@ -7230,6 +8609,7 @@ def _free_probe_gate(announced: set, known: set, api_base_free: str) -> tuple:
             headers_fn=_official_free_headers,
             dispatch_fn=_free_probe_dispatch,
             cfg=cfg,
+            control_id=_free_probe_control_id(set(to_probe)),
             log=None,
         )
         for m in _recently_ok:
@@ -7244,7 +8624,17 @@ def _free_probe_gate(announced: set, known: set, api_base_free: str) -> tuple:
         accepted = set(announced & known) | {
             m
             for m, r in probe_results.items()
-            if r.get("verdict") in ("alive", "limited", "not_probeable")
+            if isinstance(r, dict)
+            and _free_probe_accepts(
+                m,
+                r,
+                map_targets={
+                    str(target)
+                    for target in (getattr(_cfg_settings, "FREE_MODEL_MAP", {}) or {}).values()
+                    if isinstance(target, str) and target
+                },
+                models=_cfg_settings.MODELS,
+            )
         }
         results.update(probe_results)
         if len(results) > _PROBE_RESULTS_LIMIT:
@@ -7267,6 +8657,7 @@ def _free_probe_gate(announced: set, known: set, api_base_free: str) -> tuple:
             "recheck_interval_s": cfg["recheck_interval_s"],
             "run_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
             "candidates_new": fresh,
+            "candidates_unproven": unproven,
             "probed": to_probe,
             "skipped_recent_ok": sorted(_recently_ok),
             "dead_frozen": sorted(dead_frozen & announced),
@@ -7282,9 +8673,187 @@ def _free_probe_gate(announced: set, known: set, api_base_free: str) -> tuple:
         return None, None
 
 
+_FREE_PROBE_NEW_LOCK = threading.Lock()
+_FREE_PROBE_NEW_ACTIVE: set[str] = set()
+_FREE_PROBE_STATE_LOCK = threading.Lock()
+
+
+def _free_probe_new_candidates(ids: list[str]) -> dict:
+    """Planifie la sonde free-leg des modèles auto-détectés (non bloquant).
+
+    Appelée par ``config.settings.apply_live_snapshot`` : le relevé catalogue
+    ne doit jamais attendre le réseau. Les ids déjà en cours sont dédupliqués;
+    le worker ignore ensuite ceux déjà testés (alive/limited/not_free/dead).
+    """
+    clean = sorted({str(mid) for mid in (ids or ()) if isinstance(mid, str) and mid})
+    blocked = set(getattr(_cfg_settings, "GO_ONLY_IDS", set()) or ()) | set(
+        getattr(_cfg_settings, "PURGED_IDS", set()) or ()
+    )
+    clean = [mid for mid in clean if mid not in blocked]
+    if not clean:
+        return {"scheduled": 0}
+    with _FREE_PROBE_NEW_LOCK:
+        pending = [mid for mid in clean if mid not in _FREE_PROBE_NEW_ACTIVE]
+        _FREE_PROBE_NEW_ACTIVE.update(pending)
+    if not pending:
+        return {"scheduled": 0}
+    threading.Thread(
+        target=_free_probe_new_worker,
+        args=(pending,),
+        daemon=True,
+        name="free-probe-new",
+    ).start()
+    return {"scheduled": len(pending)}
+
+
+def _free_probe_accepts(
+    mid: str,
+    row: dict,
+    *,
+    map_targets: set[str] | None = None,
+    models: dict | None = None,
+) -> bool:
+    """Un verdict de sonde vaut-il promotion dans ``FREE_MODELS`` ?
+
+    ``alive``/``limited`` sont des preuves directes. ``not_probeable`` ne
+    prouve rien : il n'est accepté que pour un id déjà free par suffixe,
+    cible de mapping ou ``free_verified`` (sinon un alias payant SystemOne
+    comme ``jev-1.13`` entrerait dans le registre free).
+    """
+    verdict = (row or {}).get("verdict")
+    if verdict in ("alive", "limited"):
+        return True
+    if verdict == "not_probeable":
+        if str(mid).lower().endswith("-free") or mid in (map_targets or set()):
+            return True
+        cfg = (models or {}).get(mid) or {}
+        return cfg.get("source") == "free_verified"
+    return False
+
+
+def _free_probe_new_worker(ids: list[str]) -> None:
+    """Sonde free-only des candidats, puis promeut les verdicts positifs.
+
+    Aucun appel payant : ``_free_probe_dispatch`` ne cible que la jambe free
+    avec ``Bearer public``. Les refus sont mémorisés dans l'état de probe et
+    re-testés après ``dead_ttl_s``; les ``unknown`` après ``recheck_interval_s``.
+    """
+    try:
+        import config.discovery as _disc
+
+        cfg = _disc.probe_cfg(yaml_get("free_discovery", "probe", {}) or {})
+        if not cfg["enabled"]:
+            return
+        state = _cfg_settings._FREE_DISCOVERY_STATE.setdefault("probe", {})
+        results = dict(state.get("results") or {})
+        now = time.time()
+        limited_ttl = float(cfg.get("limited_recheck_s") or cfg.get("recheck_interval_s") or 1800.0)
+        pending: list[str] = []
+        for mid in ids:
+            row = results.get(mid)
+            verdict = row.get("verdict") if isinstance(row, dict) else None
+            try:
+                age = now - float((row or {}).get("checked_epoch") or 0.0)
+            except (TypeError, ValueError):
+                age = 1e12
+            if verdict in ("alive", "not_probeable"):
+                continue
+            if verdict == "limited":
+                # Un 429 n'est pas définitif : re-sonde après TTL.
+                if age < limited_ttl:
+                    continue
+            else:
+                try:
+                    not_before = float((row or {}).get("not_before_epoch") or 0.0)
+                except (TypeError, ValueError):
+                    not_before = 0.0
+                if not_before:
+                    if now < not_before:
+                        continue
+                elif verdict in ("not_free", "dead") and age < cfg["dead_ttl_s"]:
+                    continue
+                elif verdict == "unknown" and age < cfg["recheck_interval_s"]:
+                    continue
+            pending.append(mid)
+        if not pending:
+            return
+        # Un relevé live peut annoncer des dizaines de candidats (tous les
+        # modèles de la jambe gratuite, souvent payants → 401). Borner à
+        # ``max_ids`` par passage évite la rafale de ~50 sondes au boot ; le
+        # relevé suivant reprend les candidats restants.
+        pending = pending[: max(1, int(cfg["max_ids"]))]
+        accepted: dict[str, dict] = {}
+        map_targets = {
+            str(target)
+            for target in (getattr(_cfg_settings, "FREE_MODEL_MAP", {}) or {}).values()
+            if isinstance(target, str) and target
+        }
+        for start in range(0, len(pending), 50):
+            chunk = pending[start : start + 50]
+            probe_cfg = dict(cfg)
+            probe_cfg["max_ids"] = len(chunk)
+            probe_results = _disc.probe_free_models(
+                chunk,
+                api_base_free=_cfg_settings.API_BASE_FREE,
+                headers_fn=_official_free_headers,
+                dispatch_fn=_free_probe_dispatch,
+                cfg=probe_cfg,
+                control_id=_free_probe_control_id(set(pending)),
+                log=None,
+            )
+            results.update(probe_results)
+            accepted.update(
+                {
+                    mid: row
+                    for mid, row in probe_results.items()
+                    if isinstance(row, dict)
+                    and _free_probe_accepts(
+                        mid,
+                        row,
+                        map_targets=map_targets,
+                        models=_cfg_settings.MODELS,
+                    )
+                }
+            )
+            with _FREE_PROBE_STATE_LOCK:
+                summary: dict = {}
+                for row in results.values():
+                    verdict = (row or {}).get("verdict", "?")
+                    summary[verdict] = summary.get(verdict, 0) + 1
+                state.update(
+                    {
+                        "enabled": True,
+                        "run_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "probed": pending,
+                        "results": results,
+                        "summary": summary,
+                    }
+                )
+                _cfg_settings._FREE_DISCOVERY_STATE["probe"] = state
+        if accepted:
+            with _cfg_settings._reload_lock:
+                _cfg_settings.FREE_MODELS.update(accepted)
+                if isinstance(getattr(_cfg_settings, "FREE_MODEL_POOL", None), list):
+                    _cfg_settings.FREE_MODEL_POOL[:] = sorted(_cfg_settings.FREE_MODELS)
+                _cfg_settings.record_probed_free_models(accepted)
+                _cfg_settings.get_model_config.cache_clear()
+            _debug(
+                f"  [free-probe-new] promus={len(accepted)} {sorted(accepted)}"
+            )
+    except Exception as e:
+        try:
+            _debug(f"  [free-probe-new] FAILED: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+    finally:
+        with _FREE_PROBE_NEW_LOCK:
+            _FREE_PROBE_NEW_ACTIVE.difference_update(ids)
+
+
 # DI G4 : l'hôte settings lit ``._FREE_PROBE_GATE`` à l'appel (jamais l'inverse).
 try:
     _cfg_settings._FREE_PROBE_GATE = _free_probe_gate
+    _cfg_settings._FREE_PROBE_NEW = _free_probe_new_candidates
 except Exception:
     pass
 
@@ -7336,7 +8905,7 @@ def _enrich_paid_wire_headers(headers: dict, endpoint: str = "", conversation_ke
     """Aligne les headers paid sur l'identité du client officiel v2 (parité wire).
 
     Officiel v2 (`model-request.ts:282-295`, `app.ts:useragent`) :
-    `User-Agent: opencode/<channel>/<version>/<name>` (ex. `opencode/prod/2.0.28/cli`),
+    `User-Agent: opencode/<channel>/<version>/<name>` (ex. `opencode/prod/2.2.2/cli`),
     `x-opencode-session-id` (= session.id), `x-session-affinity` + `X-Session-Id`
     (= affinité), `x-opencode-session` (= affinité), `x-opencode-project`,
     `x-opencode-client`, `x-opencode-request`, `promptCacheKey` (body).
@@ -7486,7 +9055,9 @@ async def _do_free_request_curl_cffi(
         _egress_ip = ""
     if not _egress_ip:
         try:
-            _egress_ip = str((vpn.current_ip if (vpn := (station or _vpn_manager)) and getattr(vpn, "current_ip", "") else "") or "")
+            _egress_ip = str(
+                (vpn.current_ip if (vpn := (station or _vpn_manager)) and getattr(vpn, "current_ip", "") else "") or ""
+            )
         except Exception:
             _egress_ip = ""
     _egress_ip = (_egress_ip or "").strip() or None
@@ -7518,8 +9089,7 @@ async def _do_free_request_curl_cffi(
     last_exc: Exception | None = None
     for attempt_i, attempt_proxy in enumerate(proxies_to_try):
         is_last = attempt_i == len(proxies_to_try) - 1
-        pool, slot = await _get_pooled_curl_session(attempt_proxy, _free_impersonate, _free_fp,
-                                                     egress_ip=_egress_ip)
+        pool, slot = await _get_pooled_curl_session(attempt_proxy, _free_impersonate, _free_fp, egress_ip=_egress_ip)
         if endpoint:
             _ep = endpoint
         else:
@@ -7602,9 +9172,7 @@ async def _do_free_request_curl_cffi(
             if _fcode != 200:
                 try:
                     _etext = "\n".join(
-                        ln.decode("utf-8", "replace")
-                        if isinstance(ln, (bytes, bytearray))
-                        else str(ln)
+                        ln.decode("utf-8", "replace") if isinstance(ln, (bytes, bytearray)) else str(ln)
                         for ln in (_forced_lines or [])
                     )
                 except Exception:
@@ -7622,7 +9190,9 @@ async def _do_free_request_curl_cffi(
             if "/responses" in _ep:
                 _forced_data = _collect_responses_object(_forced_lines, wire_body.get("model", ""))
             else:
-                _forced_data = _collect_chat_completion(_forced_lines, wire_body.get("model", ""), tools=body.get("tools"))
+                _forced_data = _collect_chat_completion(
+                    _forced_lines, wire_body.get("model", ""), tools=body.get("tools")
+                )
             if not _forced_data:
                 # SSE vide (tunnel tronqué ?) → proxy suivant, comme une
                 # erreur transport (pas de bad-mark : pas un connect-error).
@@ -7691,6 +9261,20 @@ class _CompactionTunnelDone(Exception):
         self.headers = headers
 
 
+def _effective_free_model_map() -> dict:
+    """``FREE_MODEL_MAP`` effective : toutes les entrées explicites.
+
+    La politique de substitution (``homonym``/``family``) ne filtre que les
+    candidats automatiques ; un mapping déployé par l'utilisateur reste actif.
+    Le filtrage historique ici désactivait silencieusement
+    ``glm-5.1 → glm-5.3-flash-free`` : les alias Claude partaient payant.
+    """
+    try:
+        return dict(FREE_MODEL_MAP or {})
+    except Exception:
+        return {}
+
+
 def _has_free_leg(model_id: str) -> bool:
     """Ce modèle a-t-il une jambe free (id déjà free, ou équivalent mappé) ?
     Délégué fin vers ``app.compaction.classify.has_free_leg`` (logique pure,
@@ -7698,11 +9282,19 @@ def _has_free_leg(model_id: str) -> bool:
     (``FREE_MODEL_MAP`` patché, ``FREE_MODELS``) continuent de couler.
     """
     try:
+        # [audit 2026-10-30] Homonym/auto candidates count as a free leg
+        # too; the old check only saw explicit map/suffix entries, so a
+        # paid id with a live ``X-free`` homonym was classified paid.
+        if _resolve_free_model(model_id):
+            return True
+    except Exception:
+        pass
+    try:
         return bool(
             _classify_has_free_leg(
                 model_id,
                 is_free_route_fn=_is_free_model_route,
-                free_model_map=FREE_MODEL_MAP,
+                free_model_map=_effective_free_model_map(),
                 free_models=getattr(_cfg_settings, "FREE_MODELS", None),
             )
         )
@@ -7717,11 +9309,16 @@ def _compaction_is_free_class(model_id: str) -> bool:
     free → résumeur free ; sinon résumeur payant.
     """
     try:
+        if _resolve_free_model(model_id):
+            return True
+    except Exception:
+        pass
+    try:
         return bool(
             _classify_is_free_class(
                 model_id,
                 is_free_route_fn=_is_free_model_route,
-                free_model_map=FREE_MODEL_MAP,
+                free_model_map=_effective_free_model_map(),
                 free_models=getattr(_cfg_settings, "FREE_MODELS", None),
             )
         )
@@ -7885,6 +9482,730 @@ async def _compaction_summarizer_request(
     )
 
 
+# ?? [audit 2026-10-30] Proactive compaction (official auto trigger) ??????
+# Official client: compact at context_limit - max(16k, 15%) and keep 15k.
+# The proxy is stateless, so a condensed prefix is cached by session header
+# and reused while the client's message prefix still matches.
+_PROACTIVE_CACHE: dict = {}
+_PROACTIVE_CACHE_MAX = 128
+_PROACTIVE_TTL = 3600.0
+_PROACTIVE_HEADERS = (
+    "x-opencode-session-id",
+    "x-session-affinity",
+    "x-session-id",
+    "x-opencode-session",
+)
+
+
+def _proactive_session_key(request, model_id: str) -> str:
+    try:
+        headers = getattr(request, "headers", None) or {}
+        for name in _PROACTIVE_HEADERS:
+            value = headers.get(name)
+            if value:
+                return f"{str(value)[:200]}|{model_id}"
+    except Exception:
+        pass
+    return ""
+
+
+def _proactive_content_key(messages, model_id: str) -> str:
+    """Clé de checkpoint sans en-tête de session (harnais tiers).
+
+    Le harnais DeepSeek n'émet pas `x-opencode-*` : sans repli, la compaction
+    proactive free ne tournait jamais et le trimmer jetait l'historique. On
+    dérive une clé stable des deux premiers messages (tâche/contexte), puis
+    `_proactive_cache_get` vérifie déjà première + dernière borne du préfixe.
+    """
+    try:
+        if not isinstance(messages, list) or not messages:
+            return ""
+        import hashlib
+        import json as _json
+
+        payload = _json.dumps(messages[:2], ensure_ascii=False, sort_keys=True, default=str)
+        digest = hashlib.blake2b(payload.encode("utf-8", "replace"), digest_size=12).hexdigest()
+        return f"content:{digest}|{model_id}"
+    except Exception:
+        return ""
+
+
+def _message_fingerprint(messages, index: int) -> str:
+    try:
+        import hashlib
+        import json as _json
+
+        payload = _json.dumps(messages[index], ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.blake2b(payload.encode("utf-8", "replace"), digest_size=8).hexdigest()
+    except Exception:
+        return ""
+
+
+def _proactive_cache_get(key: str, messages) -> dict | None:
+    try:
+        entry = _PROACTIVE_CACHE.get(key)
+        if not entry:
+            return None
+        if float(entry.get("expires") or 0.0) <= time.monotonic():
+            _PROACTIVE_CACHE.pop(key, None)
+            return None
+        covered = int(entry.get("covered") or 0)
+        if covered <= 0 or covered > len(messages):
+            return None
+        if _message_fingerprint(messages, covered - 1) != entry.get("last_hash"):
+            return None
+        # Le checkpoint ne résume que le préfixe couvert : si le PREMIER
+        # message a changé (client qui compacte/réécrit son début), le
+        # checkpoint ne correspond plus. Full-prefix exact trop coûteux ;
+        # première + dernière borne suffisent à détecter ce cas.
+        first_hash = entry.get("first_hash")
+        if first_hash and _message_fingerprint(messages, 0) != first_hash:
+            return None
+        return entry
+    except Exception:
+        return None
+
+
+def _proactive_cache_put(key: str, messages, condensed) -> None:
+    try:
+        if not key or not isinstance(condensed, list) or not condensed:
+            return
+        raw_tail = condensed[1:]
+        covered = len(messages) - len(raw_tail)
+        if covered <= 0 or covered > len(messages):
+            return
+        if len(_PROACTIVE_CACHE) >= _PROACTIVE_CACHE_MAX:
+            # Drop expired first, then the oldest insertion.
+            now = time.monotonic()
+            for old_key in [k for k, v in _PROACTIVE_CACHE.items() if float(v.get("expires") or 0) <= now]:
+                _PROACTIVE_CACHE.pop(old_key, None)
+            while len(_PROACTIVE_CACHE) >= _PROACTIVE_CACHE_MAX:
+                _PROACTIVE_CACHE.pop(next(iter(_PROACTIVE_CACHE)), None)
+        _PROACTIVE_CACHE[key] = {
+            "checkpoint": condensed[0],
+            "covered": covered,
+            "first_hash": _message_fingerprint(messages, 0),
+            "last_hash": _message_fingerprint(messages, covered - 1),
+            "expires": time.monotonic() + _PROACTIVE_TTL,
+        }
+    except Exception:
+        pass
+
+
+#: `RESERVE_MIN` officiel (`compaction.ts`).
+_PROACTIVE_RESERVE_MIN = 16000
+
+
+def _proactive_buffer(ctx: int, configured: int = 0) -> int:
+    """Réserve sous la fenêtre avant compaction proactive (formule officielle).
+
+    ``calculateCeiling`` : ``window − max(10 %, 16k)``. Le 16k ne s'applique
+    que si la fenêtre peut le céder (>= 32k) ; en dessous, 10 % suffisent.
+    L'ancien 15 % compactait trop tôt (170k au lieu de 180k sur 200k, 4k au
+    lieu de 18k sur 20k).
+    """
+    try:
+        window = int(ctx or 0)
+    except (TypeError, ValueError):
+        window = 0
+    try:
+        buffer = int(configured or 0)
+    except (TypeError, ValueError):
+        buffer = 0
+    if buffer <= 0 or (window > 0 and buffer >= window):
+        buffer = max(
+            int(window * 0.10),
+            _PROACTIVE_RESERVE_MIN if window >= 2 * _PROACTIVE_RESERVE_MIN else 0,
+        )
+        if window > 0 and buffer >= window:
+            buffer = max(1024, int(window * 0.10))
+    return buffer
+
+
+def _proactive_free_leg(model_id: str) -> str:
+    """Cible free explicite d'un modèle (sans effet de bord de round-robin)."""
+    try:
+        target = _effective_free_model_map().get(model_id)
+        if isinstance(target, str) and target.strip():
+            return target.strip()
+    except Exception:
+        pass
+    mid = str(model_id or "").strip()
+    return mid if mid.endswith("-free") else ""
+
+
+def _free_wire_baseline_bytes(body) -> int:
+    """Taille de la copie free SANS historique (systeme + outils + champs).
+
+    Sert a calculer le budget `keep_tokens` reel de la jambe free : le gate
+    accepte ~900 Ko au total (mesure 900 Ko), aligné sur la fenêtre 200k
+    tokens du modèle free. Ne leve jamais ; 0 = inconnu.
+    """
+    try:
+        if not isinstance(body, dict):
+            return 0
+        probe = dict(body)
+        if isinstance(probe.get("messages"), list):
+            probe["messages"] = []
+        elif isinstance(probe.get("input"), list):
+            probe["input"] = []
+        else:
+            return 0
+        wire, _forced = _free_wire_body(probe, force_stream=False)
+        return _free_message_size(wire)
+    except Exception:
+        return 0
+
+
+def _proactive_tail_size(history_api: str, tail) -> int:
+    """Taille JSON approximative de la queue non couverte par le checkpoint."""
+    try:
+        if history_api == "responses":
+            return len(_serialize_json_body({"input": list(tail or [])}))
+        return len(_serialize_json_body({"messages": list(tail or [])}))
+    except Exception:
+        return 0
+
+
+async def _maybe_proactive_condense(
+    body,
+    body_bytes,
+    *,
+    model_id,
+    endpoint,
+    protocol,
+    history_api,
+    history_messages,
+    request,
+    req_id,
+    forced_pool=None,
+):
+    """Official ``auto`` trigger before forwarding (context_limit - buffer).
+
+    Stateless proxy: without a session header we do NOT summarize (the next
+    request would repeat it). With one, the checkpoint is cached and reused
+    until the client's prefix changes. Fail-open: any error returns None.
+    """
+    try:
+        cfg = get_server_compaction()
+        if not isinstance(cfg, dict) or not cfg.get("enabled") or not cfg.get("auto"):
+            return None
+        if not isinstance(history_messages, list) or len(history_messages) < 2:
+            return None
+        if _is_compaction_shape(body, min_chars_implicit=10**9):
+            return None
+        from config.limits import context_limit as _ctx_limit
+
+        # [2026-10-31] Sur la jambe free, le plafond de copie est aligné sur
+        # la fenêtre officielle du modèle free (200k tokens, seuil 180k →
+        # ~900 Ko). Sans ce déclencheur, `_trim_free_wire_messages` jetait les
+        # vieux tours au lieu de les résumer.
+        free_leg = _proactive_free_leg(model_id)
+        free_cap = _free_max_wire_bytes() if free_leg else 0
+        # Un client officiel (system + `read`) traverse le gate sans trim :
+        # le compacter ici changerait son contexte et ferait doublon avec sa
+        # propre compaction. On ne déclenche que pour la copie qui serait
+        # réellement tronquée par `_trim_free_wire_messages`.
+        _signature_ok = False
+        try:
+            if isinstance(body.get("messages"), list):
+                _have_read = any(
+                    _free_tool_name(tool) == "read" for tool in (body.get("tools") or [])
+                    if isinstance(tool, dict)
+                )
+                _signature_ok = bool(_have_read and _has_official_system(body.get("messages")))
+        except Exception:
+            _signature_ok = False
+        free_trigger = bool(
+            free_cap > 0
+            and len(body_bytes or b"") > free_cap
+            and not _signature_ok
+            # Un corps de 2 messages trop gros n'a rien à résumer (gros prompt
+            # ou gros tool result courant) : le trimmer le tronque déjà.
+            and len(history_messages) >= 4
+        )
+        free_baseline = 0
+        if free_trigger:
+            # Si l'ossature (system+outils) occupe déjà presque tout le gate,
+            # résumer l'historique n'aidera pas : on laisse le trimmer.
+            free_baseline = _free_wire_baseline_bytes(body)
+            if free_baseline > 0:
+                if free_baseline >= free_cap:
+                    free_trigger = False  # ossature seule déjà hors gate
+                else:
+                    history_room = max(4096, free_cap - free_baseline)
+                    if len(body_bytes or b"") <= free_baseline + history_room // 2:
+                        free_trigger = False
+        ctx = _ctx_limit(model_id)
+        if free_leg:
+            try:
+                free_ctx = _ctx_limit(free_leg)
+                if free_ctx:
+                    ctx = min(ctx, free_ctx) if ctx else free_ctx
+            except Exception:
+                pass
+        threshold = 0
+        estimate = 0
+        if free_trigger:
+            # Préfiltre volontairement grossier : on est déjà au-delà du gate.
+            estimate = max(1, len(body_bytes or b"") // 4)
+            threshold = max(1, free_cap // 4)
+        else:
+            if not ctx or ctx <= 0:
+                return None
+            try:
+                _configured_buffer = int(cfg.get("buffer") or 0)
+            except (TypeError, ValueError):
+                _configured_buffer = 0
+            buffer = _proactive_buffer(ctx, _configured_buffer)
+            threshold = ctx - buffer
+            if threshold <= 0:
+                return None
+            try:
+                if len(body_bytes or b"") < threshold * 2:
+                    return None
+            except Exception:
+                pass
+            estimate = int(_estimate_input_tokens(body) or 0)
+            if estimate < threshold:
+                return None
+        key = _proactive_session_key(request, model_id)
+        if not key:
+            key = _proactive_content_key(history_messages, model_id)
+        if not key:
+            _debug(f"  [compaction] proactive skipped (no cache key) model={model_id!r} est={estimate}")
+            return None
+        held = _proactive_cache_get(key, history_messages)
+        if held is not None:
+            covered = int(held["covered"])
+            # Un checkpoint free ne doit pas laisser grossir la queue au-delà
+            # de ce que le gate accepte : sinon on re-tronque et on reperd le
+            # contexte. On re-résume l'historique COMPLET du client (il n'a
+            # jamais reçu le checkpoint : rien n'est perdu).
+            if free_trigger:
+                if free_baseline > 0:
+                    # Même budget que `keep_tokens` : au-delà, le trimmer
+                    # couperait la queue avant le prochain re-résumé.
+                    free_tail_limit = max(1024, free_cap - free_baseline - 20000)
+                else:
+                    free_tail_limit = max(2048, int(free_cap * 0.45))
+            else:
+                free_tail_limit = 0
+            if not free_trigger or _proactive_tail_size(history_api, history_messages[covered:]) <= free_tail_limit:
+                _log(
+                    f"  [compaction] proactive cache hit model={model_id!r} covered={covered} "
+                    f"new={len(history_messages) - covered} free={int(free_trigger)}"
+                )
+                return [held["checkpoint"]] + history_messages[covered:]
+            _log(
+                f"  [compaction] proactive re-summarize (free tail > {free_tail_limit} B) "
+                f"model={model_id!r} covered={covered}"
+            )
+        _log(
+            f"  [compaction] proactive trigger model={model_id!r} est={estimate} "
+            f"threshold={threshold} (ctx={ctx} free={int(free_trigger)})"
+        )
+        override = cfg.get("summarizer_model_override")
+        s_model, s_ep, s_proto, s_api, s_free, s_seed = _compaction_summarizer_plan_full(
+            model_id, override, endpoint=endpoint, protocol=protocol, api=None
+        )
+        try:
+            s_api = s_api or (
+                "responses"
+                if "/responses" in str(s_ep or "")
+                else (s_proto if s_proto in ("anthropic", "openai") else "chat")
+            )
+        except Exception:
+            s_api = "chat"
+        try:
+            summary_max = int(cfg.get("summary_max_tokens", 2048))
+        except Exception:
+            summary_max = 2048
+        summary_max = min(max(summary_max, 1), 32000)
+        try:
+            keep_pairs = int(cfg.get("keep_recent_pairs", 4))
+        except Exception:
+            keep_pairs = 4
+        try:
+            timeout_s = int(cfg.get("timeout_s", 60))
+        except Exception:
+            timeout_s = 60
+        try:
+            markers = get_server_compaction("overflow_markers", None)
+        except Exception:
+            markers = None
+        keep_tokens_cfg = get_server_compaction("keep_tokens", None)
+        if free_trigger:
+            # Budget réel de la queue sur la copie free : le checkpoint et
+            # l'ossature officielle (system + outils) doivent tenir dans le
+            # gate. Avec 900 Ko, le keep officiel de 15k tokens reste la
+            # référence du client.
+            baseline = free_baseline or _free_wire_baseline_bytes(body)
+            # Réserve 20 Ko : le checkpoint (résumé) n'est pas encore connu et
+            # doit tenir avec la queue sous le plafond du gate.
+            available = max(0, free_cap - baseline - 20000)
+            free_keep = max(512, available // 6)
+            try:
+                keep_tokens_cfg = min(int(keep_tokens_cfg or 10**9), free_keep)
+            except (TypeError, ValueError):
+                keep_tokens_cfg = free_keep
+        condensed = await _maybe_condense(
+            history_messages,
+            status_code=400,
+            body_text="prompt too long",
+            model_id=s_model,
+            endpoint=s_ep,
+            protocol=s_proto,
+            auth_headers_fn=lambda proto, _f=s_free, _e=s_ep: _compaction_summarizer_headers(_f, proto, _e),
+            do_request_fn=lambda ep, b, h, pr, _f=s_free, _s=s_seed: _compaction_summarizer_request(
+                _f,
+                ep,
+                b,
+                h,
+                pr,
+                seed=_s,
+                forced_pool=forced_pool,
+                req_id=req_id,
+            ),
+            enabled=True,
+            summary_max_tokens=summary_max,
+            keep_recent_pairs=keep_pairs,
+            keep_tokens=keep_tokens_cfg,
+            estimate_tokens_fn=_estimate_input_tokens,
+            timeout_s=timeout_s,
+            markers=markers,
+            api=s_api,
+            history_api=history_api,
+            full_history=not s_free,
+            system=body.get("system") if isinstance(body, dict) else None,
+            tools=body.get("tools") if isinstance(body, dict) else None,
+            instructions=body.get("instructions") if isinstance(body, dict) else None,
+            max_attempts=get_server_compaction("max_attempts", 1),
+            keep_tail=get_server_compaction("keep_tail", True),
+            force=True,
+        )
+        if not condensed:
+            _log(f"  [compaction] proactive failed (fail-open) model={model_id!r}")
+            return None
+        _proactive_cache_put(key, history_messages, condensed)
+        _log(f"  [compaction] proactive condensed model={model_id!r} messages={len(condensed)}")
+        return condensed
+    except Exception as exc:
+        _debug(f"  [compaction] proactive error (fail-open): {type(exc).__name__}: {exc}")
+        return None
+
+
+async def _gemini_chat_request(chat_body, model_id, endpoint, *, is_free, forced_pool=None):
+    """Call a Gemini-native model with a Chat-shaped body. Returns Chat JSON."""
+    from app.protocol.gemini import chat_to_gemini, gemini_endpoint, gemini_response_to_chat
+
+    gem_body = chat_to_gemini(chat_body, model_id)
+    url = gemini_endpoint(endpoint, model_id, stream=False)
+    if not url:
+        raise RuntimeError("Gemini endpoint unavailable")
+    if is_free:
+        headers = {
+            "Authorization": "Bearer public",
+            "Content-Type": "application/json",
+            "User-Agent": "opencode/1.19.3 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+        }
+        try:
+            async with _open_via_pool(
+                url, gem_body, headers, is_stream=False, forced_pool=forced_pool
+            ) as resp:
+                if int(getattr(resp, "status_code", 0) or 0) != 200:
+                    raise RuntimeError(
+                        f"Gemini HTTP {getattr(resp, 'status_code', 0)}: "
+                        f"{str(getattr(resp, 'text', '') or '')[:300]}"
+                    )
+                data = await _resp_json_hors_boucle(resp)
+        except Exception:
+            resp, _ = await _do_request_with_retry(url, gem_body, headers, "openai")
+            if int(getattr(resp, "status_code", 0) or 0) != 200:
+                raise RuntimeError(
+                    f"Gemini HTTP {getattr(resp, 'status_code', 0)}: "
+                    f"{str(getattr(resp, 'text', '') or '')[:300]}"
+                ) from None
+            data = _resp_json_or_empty(resp)
+    else:
+        headers = _get_auth_headers("openai")
+        resp, _ = await _do_request_with_retry(url, gem_body, headers, "openai")
+        if int(getattr(resp, "status_code", 0) or 0) != 200:
+            raise RuntimeError(
+                f"Gemini HTTP {getattr(resp, 'status_code', 0)}: "
+                f"{str(getattr(resp, 'text', '') or '')[:300]}"
+            )
+        data = _resp_json_or_empty(resp)
+    return gemini_response_to_chat(data, model_id)
+
+
+def _chat_sse_from_completion(chat_resp: dict, model_id: str) -> bytes:
+    """One-shot Chat SSE from a complete Chat response (Gemini adapter)."""
+    try:
+        choice = (chat_resp.get("choices") or [{}])[0] or {}
+        msg = choice.get("message") or {}
+        delta = {"role": "assistant"}
+        if msg.get("content"):
+            delta["content"] = msg["content"]
+        if msg.get("tool_calls"):
+            delta["tool_calls"] = msg["tool_calls"]
+        chunk = {
+            "id": chat_resp.get("id") or _fast_id("chatcmpl"),
+            "object": "chat.completion.chunk",
+            "created": int(chat_resp.get("created") or time.time()),
+            "model": model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": choice.get("finish_reason") or "stop",
+                }
+            ],
+            "usage": chat_resp.get("usage") or {},
+        }
+        body = f"data: {_json_dumps_str(chunk, ensure_ascii=False)}\n\ndata: [DONE]\n\n"
+        return body.encode()
+    except Exception:
+        return b"data: [DONE]\n\n"
+
+
+async def _handle_chat_gemini(
+    body,
+    *,
+    model_id,
+    endpoint,
+    original_model,
+    request,
+    req_id,
+    is_stream,
+    client_ip,
+    thinking_type,
+    effort,
+    tool_names,
+    request_body,
+):
+    """Chat client ? Gemini-native upstream ? Chat response/SSE."""
+    try:
+        chat_resp = await _gemini_chat_request(
+            body,
+            model_id,
+            endpoint,
+            is_free=bool(_is_free_model_route(model_id)),
+            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+        )
+    except AllKeysPausedError:
+        return _openai_error(503, "All API keys exhausted. Check your billing.")
+    except Exception as exc:
+        _log(f"  [gemini] request failed model={model_id!r}: {type(exc).__name__}: {exc}")
+        return _openai_error(502, f"Gemini upstream failed: {type(exc).__name__}: {exc}")
+    usage = chat_resp.get("usage") or {}
+    req_in = int(usage.get("prompt_tokens") or 0)
+    req_out = int(usage.get("completion_tokens") or 0)
+    cached = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    try:
+        _update_token_usage(model_id, req_in, req_out, cached)
+    except Exception:
+        pass
+    try:
+        await _save_and_log_request(
+            req_id,
+            model_id,
+            original_model,
+            0.0,
+            req_in,
+            req_out,
+            cached,
+            "gemini",
+            bool(is_stream),
+            thinking_type,
+            effort,
+            client_ip,
+            "",
+            tool_names,
+            request_body=request_body,
+            response_body=chat_resp,
+        )
+    except Exception:
+        pass
+    if is_stream:
+        return Response(
+            content=_chat_sse_from_completion(chat_resp, model_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    return JSONResponse(status_code=200, content=chat_resp)
+
+
+async def _handle_messages_gemini(
+    body,
+    *,
+    model_id,
+    endpoint,
+    original_model,
+    request,
+    req_id,
+    is_stream,
+    client_ip,
+    thinking_type,
+    effort,
+    tool_names,
+    request_body,
+):
+    """Anthropic client ? Gemini-native upstream ? Anthropic response/SSE."""
+    from app.protocol.chat_sse_to_anthropic import ChatSseToAnthropicState, chat_sse_to_anthropic_events
+    from app.protocol.mapping import anthropic_to_openai, openai_to_anthropic
+
+    try:
+        chat_body = anthropic_to_openai(body, model_id)
+        chat_resp = await _gemini_chat_request(
+            chat_body,
+            model_id,
+            endpoint,
+            is_free=bool(_is_free_model_route(model_id)),
+            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+        )
+    except AllKeysPausedError:
+        return _anthropic_error(503, "All API keys exhausted. Check your billing.")
+    except Exception as exc:
+        return _anthropic_error(502, f"Gemini upstream failed: {type(exc).__name__}: {exc}")
+    usage = chat_resp.get("usage") or {}
+    req_in = int(usage.get("prompt_tokens") or 0)
+    req_out = int(usage.get("completion_tokens") or 0)
+    cached = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    if is_stream:
+        try:
+            state = ChatSseToAnthropicState(model=original_model, tool_name_map=None)
+            choice = (chat_resp.get("choices") or [{}])[0] or {}
+            msg = choice.get("message") or {}
+            chunk = {
+                "id": chat_resp.get("id") or _fast_id("chatcmpl"),
+                "object": "chat.completion.chunk",
+                "created": int(chat_resp.get("created") or time.time()),
+                "model": original_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            **({"content": msg["content"]} if msg.get("content") else {}),
+                            **({"tool_calls": msg["tool_calls"]} if msg.get("tool_calls") else {}),
+                        },
+                        "finish_reason": choice.get("finish_reason") or "stop",
+                    }
+                ],
+                "usage": usage,
+            }
+            raw = f"data: {_json_dumps_str(chunk, ensure_ascii=False)}"
+            events = chat_sse_to_anthropic_events(raw, parsed=chunk, state=state)
+            events += chat_sse_to_anthropic_events("data: [DONE]", state=state)
+            return Response(
+                content="".join(events).encode(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+        except Exception as exc:
+            return _anthropic_error(502, f"Gemini stream conversion failed: {type(exc).__name__}: {exc}")
+    anthro_resp = openai_to_anthropic(chat_resp, original_model)
+    try:
+        _update_token_usage(model_id, req_in, req_out, cached)
+        await _save_and_log_request(
+            req_id,
+            model_id,
+            original_model,
+            0.0,
+            req_in,
+            req_out,
+            cached,
+            "gemini",
+            False,
+            thinking_type,
+            effort,
+            client_ip,
+            "",
+            tool_names,
+            request_body=request_body,
+            response_body=chat_resp,
+        )
+    except Exception:
+        pass
+    return JSONResponse(status_code=200, content=anthro_resp)
+
+
+async def _handle_responses_gemini(
+    body,
+    *,
+    model_id,
+    endpoint,
+    original_model,
+    request,
+    req_id,
+    is_stream,
+    client_ip,
+    thinking_type,
+    effort,
+    tool_names,
+    request_body,
+):
+    """Responses client ? Gemini-native upstream ? Responses response/SSE."""
+    from app.protocol.mapping import (
+        anthropic_to_openai,
+        openai_chat_to_responses,
+        openai_responses_to_anthropic,
+        responses_stream_events,
+        responses_stream_sse,
+    )
+
+    try:
+        anthro_body = openai_responses_to_anthropic(body)
+        chat_body = anthropic_to_openai(anthro_body, model_id)
+        chat_resp = await _gemini_chat_request(
+            chat_body,
+            model_id,
+            endpoint,
+            is_free=bool(_is_free_model_route(model_id)),
+            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+        )
+    except AllKeysPausedError:
+        return _openai_error(503, "All API keys exhausted. Check your billing.")
+    except Exception as exc:
+        return _openai_error(502, f"Gemini upstream failed: {type(exc).__name__}: {exc}")
+    usage = chat_resp.get("usage") or {}
+    req_in = int(usage.get("prompt_tokens") or 0)
+    req_out = int(usage.get("completion_tokens") or 0)
+    cached = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    try:
+        _update_token_usage(model_id, req_in, req_out, cached)
+        await _save_and_log_request(
+            req_id,
+            model_id,
+            original_model,
+            0.0,
+            req_in,
+            req_out,
+            cached,
+            "gemini",
+            bool(is_stream),
+            thinking_type,
+            effort,
+            client_ip,
+            "",
+            tool_names,
+            request_body=request_body,
+            response_body=chat_resp,
+        )
+    except Exception:
+        pass
+    resp_obj = openai_chat_to_responses(chat_resp, original_model)
+    if is_stream:
+        sse = responses_stream_sse(responses_stream_events(resp_obj, original_model))
+        return Response(
+            content=sse,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    return JSONResponse(status_code=200, content=resp_obj)
+
+
 async def _compaction_normalize_response(resp, endpoint, body):
     """Normalise une réponse free en forme lisible par ``_extract_text``.
 
@@ -7980,32 +10301,36 @@ async def _try_free_with_tiny_retry(send_body, headers, protocol, model_id, *, f
             _content = data.get("content")
             if isinstance(_content, list):
                 _tools_used = [
-                    b.get("name") for b in _content
+                    b.get("name")
+                    for b in _content
                     if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name")
                 ]
             _choices = data.get("choices")
             if not _tools_used and isinstance(_choices, list) and _choices and isinstance(_choices[0], dict):
                 _tc = ((_choices[0].get("message") or {}).get("tool_calls")) or []
-                _tools_used = [
-                    (t.get("function") or {}).get("name", "?") for t in _tc if isinstance(t, dict)
-                ]
+                _tools_used = [(t.get("function") or {}).get("name", "?") for t in _tc if isinstance(t, dict)]
             _output = data.get("output")
             if not _tools_used and isinstance(_output, list):
                 _tools_used = [
-                    i.get("name", "?") for i in _output
-                    if isinstance(i, dict) and i.get("type") == "function_call"
+                    i.get("name", "?") for i in _output if isinstance(i, dict) and i.get("type") == "function_call"
                 ]
         except Exception:
             _tools_used = []
         if protocol == "anthropic":
-            _in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+            # [audit 2026-10-30] Anthropic input_tokens excludes cache; the
+            # tiny-output heuristic expects the full context (inclusive), as
+            # on the OpenAI path. A 100k context with 99k cached looked like
+            # a 1k prompt and never triggered the retry.
+            _in = (
+                (usage.get("input_tokens", 0) or 0)
+                + (usage.get("cache_read_input_tokens", 0) or 0)
+                + (usage.get("cache_creation_input_tokens", 0) or 0)
+            )
             _out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
         else:
             _in = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
             _out = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
-        if not _is_suspect_tiny_output(_in, _out, _tools_used) and not _compact_is_tiny(
-            _in, _out, _tools_used
-        ):
+        if not _is_suspect_tiny_output(_in, _out, _tools_used) and not _compact_is_tiny(_in, _out, _tools_used):
             return result
     except Exception:
         return result
@@ -8150,7 +10475,9 @@ async def _buffered_compaction_stream(
                     usage = final.get("usage", {}) if isinstance(final.get("usage"), dict) else {}
                     req_in = usage.get("input_tokens", 0)
                     req_out = usage.get("output_tokens", 0)
-                    _inp_det = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+                    _inp_det = (
+                        usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+                    )
                     cache = _inp_det.get("cached_tokens", 0)
                 elif "choices" in data:
                     _map = dict(_fetch).pop(_TOOL_NAME_MAP_KEY, None)
@@ -8223,8 +10550,18 @@ async def _buffered_compaction_stream(
             pass
         if porte == "messages":
             events = _compact_anthropic_sse(
-                text, model=original_model, msg_id=_fast_id("msg"),
-                input_tokens=req_in, output_tokens=req_out, cache_read=cache,
+                text,
+                model=original_model,
+                msg_id=_fast_id("msg"),
+                # [audit 2026-10-30] req_in is the NON-cached input; the SSE
+                # helper expects the inclusive OpenAI total and subtracts the
+                # cache itself. Passing req_in made it clamp to 0.
+                input_tokens=req_in + max(0, int(cache or 0)),
+                output_tokens=req_out,
+                cache_read=cache,
+                # [audit 2026-10-30] Preserve a real max_tokens/refusal stop
+                # reason instead of always claiming end_turn.
+                stop_reason=str((final or {}).get("stop_reason") or "end_turn"),
             )
             err_ev = _SSE_ERR_ANTHROPIC
         else:
@@ -8235,8 +10572,17 @@ async def _buffered_compaction_stream(
             except Exception:
                 _created = 0
             events = _compact_chat_sse(
-                text, model=original_model, msg_id=_fast_id("chatcmpl"),
-                created=_created, prompt_tokens=req_in, completion_tokens=req_out,
+                text,
+                model=original_model,
+                msg_id=_fast_id("chatcmpl"),
+                created=_created,
+                # OpenAI prompt_tokens is inclusive of cache.
+                prompt_tokens=req_in + max(0, int(cache or 0)),
+                completion_tokens=req_out,
+                finish_reason=str(
+                    ((((final or {}).get("choices") or [{}])[0] or {}).get("finish_reason"))
+                    or "stop"
+                ),
             )
             err_ev = _SSE_ERR_OPENAI
 
@@ -8428,11 +10774,19 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
         if winner_resp is not None:
             for t in list(tasks.keys()):
                 if t is not winner_task:
+                    _loser_st = tasks.get(t)
                     t.cancel()
                     try:
                         await t
                     except asyncio.CancelledError:
                         pass
+                    except Exception:
+                        pass
+                    # [audit 2026-10-30] The loser already sent its request.
+                    try:
+                        _ln = getattr(_free_ip_pool, "note_hedge_loser", None)
+                        if callable(_ln) and _loser_st is not None:
+                            _ln(_loser_st)
                     except Exception:
                         pass
         # no winner <400 : filet = la première erreur HTTP reçue (comportement
@@ -8473,8 +10827,12 @@ async def _hedged_fetch(cands, body: dict, headers: dict, endpoint: str, forced_
                 except Exception:
                     _w_inst = {}
                 _current_free_attempt.set(
-                    {"ip": ip, "identity": prof.get("impersonate") or "", "station": winner_station,
-                     "instance": _w_inst}
+                    {
+                        "ip": ip,
+                        "identity": prof.get("impersonate") or "",
+                        "station": winner_station,
+                        "instance": _w_inst,
+                    }
                 )
             except Exception:
                 pass
@@ -8639,11 +10997,27 @@ class _CurlCffiStreamResponse:
         # déclenche le record moteur (warm-up/anti-flap inclus).
         self._ttfb_ctx = None
         self._ttfb_recorded = False
+        self._ttfb_ms: int | None = None
+        self._first_chunk_seen = False
+        self._free_ip = ""
+        # [P0.2] Watchdog premier octet : un flux free qui n'a rien produit
+        # après N secondes est annulé AVANT le premier octet (retry sûr).
+        try:
+            self._first_byte_timeout_s = max(
+                0.0, float(yaml_get("streaming", "free_ttfb_timeout_s", 30) or 0)
+            )
+        except Exception:
+            self._first_byte_timeout_s = 30.0
 
     def _record_ttfb_once(self):
         if self._ttfb_recorded or not self._ttfb_ctx:
             return
         self._ttfb_recorded = True
+        try:
+            # [P0.6] TTFB persisté pour l'observabilité, même en mode total.
+            self._ttfb_ms = max(0, int((time.monotonic() - self._ttfb_ctx[1]) * 1000.0))
+        except Exception:
+            self._ttfb_ms = None
         try:
             import shared_state as _ss_lat
 
@@ -8657,11 +11031,61 @@ class _CurlCffiStreamResponse:
             station, t0, model = self._ttfb_ctx
             ttfb_ms = (time.monotonic() - t0) * 1000.0
             sid = int(getattr(station, "_station", 0) or 0)
-            ip = str((_current_free_attempt.get() or {}).get("ip") or "")
+            ip = self._free_ip or str((_current_free_attempt.get() or {}).get("ip") or "")
             eng.record_request(sid, ip, ttfb_ms, model, self.status_code)
             _record_station_quality(station, ip, ttfb_ms, self.status_code)
         except Exception:
             pass
+
+    def _record_first_byte_timeout(self) -> None:
+        """Compte l'échec dans la qualité (statut 504) sans compter un TTFB."""
+        try:
+            if not self._ttfb_ctx:
+                return
+            station = self._ttfb_ctx[0]
+            sid = int(getattr(station, "_station", 0) or 0)
+            if sid < 1:
+                return
+            ip = self._free_ip or str((_current_free_attempt.get() or {}).get("ip") or "")
+            _record_station_quality(
+                station,
+                ip,
+                self._first_byte_timeout_s * 1000.0,
+                504,
+                latency=False,
+            )
+        except Exception:
+            pass
+
+    async def _next_chunk(self, it):
+        """Prochain chunk, avec watchdog sur le PREMIER octet uniquement.
+
+        L'ancien code enregistrait le TTFB avant la première lecture : il
+        mesurait le temps jusqu'aux en-têtes, pas jusqu'au premier octet. Ici
+        la mesure part réellement du premier chunk, et le timeout ne s'applique
+        qu'avant lui — après, un flux lent reste gouverné par ``sse_idle_timeout``.
+        """
+        if not self._first_chunk_seen:
+            try:
+                if self._first_byte_timeout_s > 0:
+                    chunk = await asyncio.wait_for(
+                        it.__anext__(), timeout=self._first_byte_timeout_s
+                    )
+                else:
+                    chunk = await it.__anext__()
+            except StopAsyncIteration:
+                return None
+            except TimeoutError:
+                self._record_first_byte_timeout()
+                station = self._ttfb_ctx[0] if self._ttfb_ctx else None
+                raise _FreeTtfbTimeout(station, self._first_byte_timeout_s) from None
+            self._first_chunk_seen = True
+            self._record_ttfb_once()
+            return chunk
+        try:
+            return await it.__anext__()
+        except StopAsyncIteration:
+            return None
 
     async def aiter_lines(self):
         """Yield SSE lines as str, split manually from raw bytes ([41]).
@@ -8672,9 +11096,12 @@ class _CurlCffiStreamResponse:
         lines — so iterate aiter_content() and split on \n here,
         buffering a partial line across chunks.
         """
-        self._record_ttfb_once()
         buf = b""
-        async for chunk in self._resp.aiter_content():
+        it = self._resp.aiter_content().__aiter__()
+        while True:
+            chunk = await self._next_chunk(it)
+            if chunk is None:
+                break
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
@@ -8683,8 +11110,11 @@ class _CurlCffiStreamResponse:
             yield buf.rstrip(b"\r").decode("utf-8", errors="replace")
 
     async def aiter_bytes(self):
-        self._record_ttfb_once()
-        async for chunk in self._resp.aiter_content():
+        it = self._resp.aiter_content().__aiter__()
+        while True:
+            chunk = await self._next_chunk(it)
+            if chunk is None:
+                break
             yield chunk
 
     async def aread(self):
@@ -8712,6 +11142,17 @@ class _FreeTunnelFailure(Exception):
         super().__init__(f"free tunnel failure on station {getattr(station, '_station', '?')}: {cause}")
         self.station = station
         self.cause = cause
+
+
+class _FreeTtfbTimeout(_FreeTunnelFailure):
+    """Aucun premier octet dans le délai : retry station fraîche, pas paid.
+
+    Sous-classe de ``_FreeTunnelFailure`` pour être capturée par le chemin
+    station-first existant (aucun octet émis → retry sûr)."""
+
+    def __init__(self, station, timeout_s: float):
+        super().__init__(station, RuntimeError(f"no first byte after {timeout_s:.0f}s"))
+        self.timeout_s = timeout_s
 
 
 def effective_free_max_attempts(forced_pool=None) -> int:
@@ -8742,11 +11183,12 @@ def effective_free_max_attempts(forced_pool=None) -> int:
         # test_hot_reload_in_place_mutation) : seul l'auto suit l'infra.
         manual = max(1, min(v, 5))
         # WARN when manual exceeds usable (only when we can compute usable)
+        usable_raw = None
         try:
             if _free_ip_pool is not None and getattr(_free_ip_pool, "socks5_mode", False):
-                usable = len(_free_ip_pool._socks5_enabled_eps())
+                usable_raw = len(_free_ip_pool._socks5_enabled_eps())
             else:
-                usable = _cfg_settings.resolved_station_count(IP_ROTATION)
+                usable_raw = _cfg_settings.resolved_station_count(IP_ROTATION)
                 if forced_pool is not None and _free_ip_pool is not None:
                     # count stations whose country is in forced_pool (via
                     # the same predicate _station_usable uses for geo)
@@ -8755,15 +11197,23 @@ def effective_free_max_attempts(forced_pool=None) -> int:
                         if _free_ip_pool._station_usable(_st, exclude_approaching=False, forced_pool=forced_pool):
                             cnt += 1
                     # only narrow, never widen (None-country stations stay usable)
-                    if cnt < usable:
-                        usable = cnt
-                usable = max(1, min(int(usable or 1), 5))
-            if manual > usable:
+                    if cnt < usable_raw:
+                        usable_raw = cnt
+                usable_raw = max(1, int(usable_raw or 1))
+            usable_for_warn = max(1, min(int(usable_raw or 1), 5))
+            if manual > usable_for_warn:
                 _debug(
-                    f"  [free] WARN manual max_free_attempts={manual} > usable={usable} (auto=false) — clamping effective to {usable} would waste retries"
+                    f"  [free] WARN manual max_free_attempts={manual} > usable={usable_for_warn} (auto=false) — clamping effective to {usable_for_warn} would waste retries"
                 )
         except Exception:
-            pass
+            usable_raw = None
+        # [2026-10-29] strict_free : ne jamais refuser « quota épuisé » alors
+        # qu'une station n'a pas été essayée. Le réglage manuel reste un
+        # plancher, mais toutes les sorties utilisables sont tentées (plafond
+        # architectural 10). Mesuré : 6 stations, budget 3 → 3 IP épuisées
+        # suffisaient à rendre un 429 alors que 3 stations fraîches restaient.
+        if IP_ROTATION.get("strict_free", False) and usable_raw:
+            manual = max(manual, min(int(usable_raw), 10))
         return manual
 
     # Auto mode — derive from usable egresses
@@ -8920,8 +11370,14 @@ async def _open_free_stream_hedged(
         cands = []
     if len(cands) < 2:
         async with _open_free_stream(
-            endpoint, body, headers, use_free, count_request, fresh_station,
-            direct_fallback, forced_pool,
+            endpoint,
+            body,
+            headers,
+            use_free,
+            count_request,
+            fresh_station,
+            direct_fallback,
+            forced_pool,
         ) as resp:
             yield resp
         return
@@ -8934,8 +11390,15 @@ async def _open_free_stream_hedged(
 
     async def _probe(station):
         ctx = _open_free_stream(
-            endpoint, body, headers, use_free, False, fresh_station,
-            direct_fallback, forced_pool, forced_station=station,
+            endpoint,
+            body,
+            headers,
+            use_free,
+            False,
+            fresh_station,
+            direct_fallback,
+            forced_pool,
+            forced_station=station,
         )
         resp = await ctx.__aenter__()
         try:
@@ -9008,6 +11471,11 @@ async def _open_free_stream_hedged(
             note = getattr(pool, "note_hedge_winner", None)
             if callable(note):
                 note(winner["station"], cands[0])
+            loser_note = getattr(pool, "note_hedge_loser", None)
+            if callable(loser_note):
+                for _c in cands:
+                    if _c.get("station") is not winner.get("station"):
+                        loser_note(_c.get("station"))
         except Exception:
             pass
         try:
@@ -9093,8 +11561,14 @@ async def _open_free_stream(
         and body.get("stream")
     ):
         async with _open_free_stream_hedged(
-            endpoint, body, headers, use_free, count_request, fresh_station,
-            direct_fallback, forced_pool,
+            endpoint,
+            body,
+            headers,
+            use_free,
+            count_request,
+            fresh_station,
+            direct_fallback,
+            forced_pool,
         ) as _hedged_resp:
             yield _hedged_resp
         return
@@ -9111,6 +11585,21 @@ async def _open_free_stream(
     )
     if use_free and _free_ip_pool and _free_ip_pool.enabled:
         _debug("  [free-stream] getting proxy from pool...")
+        # [2026-10-29] Exclure les stations dont la clé (modèle, IP) est
+        # trial-exhausted. Le pool ne connaît pas le modèle ; sans cet
+        # ensemble, le chemin streaming re-strikait une IP morte alors qu'une
+        # station fraîche existait, brûlait son budget d'essais et rendait un
+        # 429 « quota épuisé » alors que la flotte avait encore du quota.
+        _free_model_name = ""
+        try:
+            if isinstance(body, dict):
+                _free_model_name = str(body.get("model") or "")
+        except Exception:
+            _free_model_name = ""
+        try:
+            _dead_stations = _trial_dead_stations(_free_model_name) if _free_model_name else set()
+        except Exception:
+            _dead_stations = set()
         if forced_station is not None:
             # [2026-10-25] Sonde de hedge : station imposée, aucun compteur
             # avancé ici (note_hedge_winner s'en charge pour le gagnant).
@@ -9118,9 +11607,14 @@ async def _open_free_stream(
             proxy_url = getattr(forced_station, "socks5_url", None)
         elif count_request:
             try:
-                proxy_url, station = await _free_ip_pool.on_request(forced_pool)
+                proxy_url, station = await _free_ip_pool.on_request(
+                    forced_pool, excluded=_dead_stations
+                )
             except TypeError:
-                proxy_url, station = await _free_ip_pool.on_request()
+                try:
+                    proxy_url, station = await _free_ip_pool.on_request(forced_pool)
+                except TypeError:
+                    proxy_url, station = await _free_ip_pool.on_request()
         elif fresh_station:
             _prev = dict(_current_free_attempt.get() or {})
             # [fix quota-vs-breaker] A previous 429 quota is marked in the
@@ -9135,15 +11629,21 @@ async def _open_free_stream(
                 _current_free_attempt.set(_prev)
             try:
                 proxy_url, station = await _free_ip_pool.on_disconnect_retry(
-                    _prev.get("station"), forced_pool, rate_limited=_rate_limited
+                    _prev.get("station"),
+                    forced_pool,
+                    rate_limited=_rate_limited,
+                    excluded=_dead_stations,
                 )
             except TypeError:
                 try:
                     proxy_url, station = await _free_ip_pool.on_disconnect_retry(
-                        _prev.get("station"), forced_pool
+                        _prev.get("station"), forced_pool, rate_limited=_rate_limited
                     )
                 except TypeError:
-                    proxy_url, station = await _free_ip_pool.on_disconnect_retry(_prev.get("station"))
+                    try:
+                        proxy_url, station = await _free_ip_pool.on_disconnect_retry(_prev.get("station"), forced_pool)
+                    except TypeError:
+                        proxy_url, station = await _free_ip_pool.on_disconnect_retry(_prev.get("station"))
         else:
             # Retry after a network error: re-use the SAME station/proxy as
             # the original attempt. Reading the fresh ``proxy_url`` property
@@ -9190,7 +11690,6 @@ async def _open_free_stream(
                     {
                         "ip": _free_usage_ip(station),
                         "identity": profile.get("impersonate") or "",
-                        "identity_browser": profile.get("impersonate") or "",
                         "wire_version": (_inst_snap or {}).get("version"),
                         "wire_client": (_inst_snap or {}).get("client"),
                         "station": station,
@@ -9215,8 +11714,9 @@ async def _open_free_stream(
                 # mort est détecté par le watchdog cancel_streams AVANT le
                 # read (filet ultime > idle SSE).
                 _debug(f"  [free-stream] creating curl_cffi session proxy={_curl_proxy_url(proxy_url)} (pooled)")
-                pool2, slot2 = await _get_pooled_curl_session(proxy_url, _free_impersonate, _free_fp,
-                                                               egress_ip=_egress_ip_s or None)
+                pool2, slot2 = await _get_pooled_curl_session(
+                    proxy_url, _free_impersonate, _free_fp, egress_ip=_egress_ip_s or None
+                )
                 # [A1 perf] emprunt SANS verrou pendant le POST : seuls les
                 # headers transitent sous l'emprunt, le corps est consommé
                 # après restitution — sémantique inchangée, parallélisme OK.
@@ -9247,6 +11747,12 @@ async def _open_free_stream(
                     _t0_ttfb,
                     str(body.get("model") or body.get("original_model") or ""),
                 )
+                # IP de l'attempt (pré-rotation) : la qualité et la mesure de
+                # débit doivent rester attachées à l'IP qui a réellement servi.
+                try:
+                    wrapped._free_ip = str((_current_free_attempt.get() or {}).get("ip") or "")
+                except Exception:
+                    wrapped._free_ip = ""
                 # [plan 18/08 §am.22] register the in-flight stream so the
                 # watchdog can cancel it the moment egress death is CONFIRMED
                 # (egress_dead) — a client reading a dead tunnel must get the
@@ -9267,6 +11773,7 @@ async def _open_free_stream(
                 except Exception:
                     _stream_station = None
                 try:
+                    _mark_actual_stream(use_free, body, wrapped)
                     yield wrapped
                 finally:
                     if _stream_station is not None and hasattr(_stream_station, "note_free_stream_end"):
@@ -9358,6 +11865,7 @@ async def _open_free_stream(
         async with _ensure_http_client().stream(
             "POST", endpoint, content=_serialize_json_body(wire_body), headers=free_headers
         ) as resp:
+            _mark_actual_stream(use_free, body, resp)
             yield resp
         return
     # [Axe A] Paid request with forced tunnel: route through VPN pool when
@@ -9366,6 +11874,7 @@ async def _open_free_stream(
     # _free_ip_pool.on_request() and streams through curl_cffi + SOCKS5.
     if forced_pool and _free_ip_pool and _free_ip_pool.enabled:
         async with _open_via_pool(endpoint, body, headers, is_stream=True, forced_pool=forced_pool) as resp:
+            _mark_actual_stream(False, body, resp)
             yield resp
         return
     # [plan-perf Lot 2] Branche paid direct (httpx stream) — watchdog TTFB :
@@ -9423,6 +11932,7 @@ async def _open_free_stream(
             # peut rester muet 10 min sur un reasoning — Jamais de watchdog.
             _observe_latency_ms("proxy_ttfb_upstream_ms", (time.monotonic() - _ttfb_t0) * 1000.0) if _ttfb_on else None
             try:
+                _mark_actual_stream(False, body, resp)
                 yield resp
             finally:
                 try:
@@ -9466,10 +11976,12 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
 
     Used when _enforce_geo_gate sets _geo_force_tunnel=True — the paid
     request must route through a VPN station in effective_allowed, not
-    via httpx direct.  Uses curl_cffi with SOCKS5 proxy (same transport
-    as free streams) but keeps paid-request headers (no free-request
-    transformation).  Falls back to vpn_manager.socks5_url if pool is
-    unavailable.  Raises UpstreamError on connection/timeout failures.
+    via httpx direct. Uses the official-client identity on this leg too:
+    the same Bun TLS fingerprint as the free stream (no browser
+    ClientHello/headers) and the v2 wire identity from
+    ``_apply_identity`` + ``_enrich_paid_wire_headers``. Falls back to
+    vpn_manager.socks5_url if pool is unavailable. Raises UpstreamError
+    on connection/timeout failures.
     """
     # 1) Get station from pool, or fall back to vpn_manager
     # When forced_pool is set (geo fallback), we must pick a station
@@ -9490,7 +12002,14 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
             pass
     if not proxy_url and _free_ip_pool is not None:
         try:
-            proxy_url, station = await _free_ip_pool.on_request(forced_pool)
+            # [audit 2026-10-30] This is the PAID geo-forwarding path. It used
+            # to call on_request(), which increments the free quota counter,
+            # feeds free ip_stats and can trigger an IP rotation: paid traffic
+            # was burning free buckets. Pick a station without counting.
+            st = _free_ip_pool._best_station(forced_pool)
+            if st is not None and getattr(st, "socks5_url", None):
+                proxy_url = st.socks5_url
+                station = st
         except Exception:
             pass
     if not proxy_url and _vpn_manager and getattr(_vpn_manager, "socks5_url", None):
@@ -9506,14 +12025,14 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
             status_code=503,
         )
 
-    # 2) Build headers: apply identity profile for impersonation
+    # 2) Build headers: official OpenCode client identity (v2), not a browser.
+    # Profil = porteur TLS + UA officiel ; aucun sec-ch-ua/Accept-Language.
     profile = _current_free_identity(station)
-    req_headers = _apply_identity(dict(headers), profile, use_curated_ua=False)
+    req_headers = _apply_identity(dict(headers), profile)
     req_headers["Content-Type"] = "application/json"
     # Parité client : beta thinking intercalé sur jambe Anthropic (x-api-key
     # présent). Sur jambe OpenAI-protocol, complète les x-opencode-* manquants
-    # (l'UA reste celle du profil d'identité tunnel — setdefault — le tunnel
-    # garde sa face navigateur qui fonctionne aujourd'hui).
+    # (l'UA officielle est déjà posée par _apply_identity).
     if any(k.lower() == "x-api-key" for k in req_headers):
         req_headers = _ensure_anthropic_beta(req_headers, body)
     else:
@@ -9522,13 +12041,30 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
     # 3) curl_cffi through SOCKS5 tunnel — POOL partagé avec le chemin free.
     # [v10 PLAN-commun 1.1] fini la AsyncSession jetable (handshake SOCKS5+TLS
     # par requête, ~300-1000 ms via tunnel). [A1 perf] checkout/checkin sans
-    # verrou pendant le transfert : M sessions par (proxy, impersonate), le
-    # POST geo non-streaming ne sérialise plus la station.
+    # verrou pendant le transfert : M sessions par (proxy, IP), le POST geo
+    # non-streaming ne sérialise plus la station.
+    # [2026-10-25] même empreinte TLS Bun que la jambe free (celle du client
+    # officiel), donc plus de ClientHello navigateur. On retire seulement
+    # `header_order` : il décrit l'ordre des 12 en-têtes FREE, pas celui de
+    # cette jambe payée (les imposer reordonnerait les en-têtes v2).
+    _geo_imp, _geo_fp = _get_free_fp_kwargs()
+    if isinstance(_geo_fp, dict):
+        _geo_fp = dict(_geo_fp)
+        _extra_fp = _geo_fp.get("extra_fp")
+        if isinstance(_extra_fp, dict):
+            _extra_fp = {k: v for k, v in _extra_fp.items() if k != "header_order"}
+            if _extra_fp:
+                _geo_fp["extra_fp"] = _extra_fp
+            else:
+                _geo_fp.pop("extra_fp", None)
+    _geo_ip = getattr(station, "current_ip", None) or None
     resp = None
     pool = None
     slot = None
     try:
-        pool, slot = await _get_pooled_curl_session(proxy_url, profile.get("impersonate", "chrome131"))
+        pool, slot = await _get_pooled_curl_session(
+            proxy_url, _geo_imp, _geo_fp, egress_ip=_geo_ip, variant="geo"
+        )
         try:
             raw = await slot.sess.post(
                 endpoint,
@@ -9769,81 +12305,86 @@ _free_model_rr: dict[str, int] = {}
 _free_429_by_model: dict[str, int] = {}
 
 
+def _free_substitution_policy() -> str:
+    try:
+        return _cfg_settings.get_free_substitution_policy()
+    except Exception:
+        return "homonym"
+
+
+def _free_target_allowed(paid_model: str, target: str) -> bool:
+    try:
+        return _cfg_settings.free_target_allowed(paid_model, target, _free_substitution_policy())
+    except Exception:
+        return False
+
+
+def _known_free_model(model_id: str) -> bool:
+    """Vrai si ``model_id`` est un free réellement connu (pas juste un suffixe)."""
+    mid = str(model_id or "").strip().lower()
+    if not mid:
+        return False
+    try:
+        if _cfg_live.is_removed(mid):
+            return False
+    except Exception:
+        pass
+    try:
+        if mid in (getattr(_cfg_settings, "FREE_MODELS", None) or set()):
+            return True
+    except Exception:
+        pass
+    try:
+        if mid in (MODELS or {}):
+            return str(mid).endswith("-free")
+    except Exception:
+        pass
+    return False
+
+
 def _free_candidates_for(paid_model: str) -> list:
-    """Liste des modèles free équivalents pour `paid_model` (config)."""
+    """Liste des modèles free AUTORISÉS pour ``paid_model`` (config + politique)."""
     try:
         cands = (IP_ROTATION or {}).get("free_model_candidates") or {}
         lst = cands.get(paid_model)
         if isinstance(lst, list) and lst:
-            return [str(m) for m in lst if m]
+            out = []
+            for m in lst:
+                ms = str(m or "").strip()
+                if ms and _free_target_allowed(paid_model, ms):
+                    out.append(ms)
+            return out
     except Exception:
         pass
     return []
 
 
 def _free_candidate_chain(paid_model: str, base: str) -> list:
-    """Chaîne ordonnée de frees à essayer pour `paid_model` (strict_free).
+    """Chaîne ordonnée des frees autorisés pour ``paid_model``.
 
-    `[base/spread-pick, ...autres candidats, ...repli global même endpoint]`
-    dédupliquée. Le repli global évite le refus quand le bucket primaire est
-    trial-mort mais un autre bucket free est vivant (cas mesuré : big-pickle
-    429 pendant que jev-1.13-free répond 200 — buckets indépendants par modèle).
-    Endpoint-aware : chat/responses/systemone ne se mélangent jamais
-    (systemone = autre protocole, jamais substituable au chat).
-    Pur sauf lecture config (fail-soft : `[base]`).
+    ``base`` est **toujours** premier : il vient de ``_resolve_free_model``
+    (entrée explicite de ``free_model_map``, homonyme ou id déjà free), donc
+    il est autoritaire même si la politique ne l'aurait pas retenu comme
+    candidat automatique. Les candidats supplémentaires viennent de
+    ``free_model_candidates`` et restent filtrés par la politique (pas de saut
+    de famille Mimo→DeepSeek en ``homonym``).
+
+    Bug mesuré le 2026-10-29 : ``big-pickle`` et ``glm-5.1 → free`` rendaient
+    une chaîne vide ; le garde strict_free en concluait « toutes les stations
+    épuisées » et fabriquait un 429 sans appel upstream.
     """
     try:
-        cands = _free_candidates_for(paid_model) or []
-        if not cands:
-            cands = _free_candidates_for(base) or []
         chain: list = []
-        for m in ([base] + list(cands)):
-            try:
-                ms = str(m or "").strip()
-            except Exception:
-                continue
-            if ms and ms not in chain:
+        _base = str(base or "").strip()
+        if _base:
+            chain.append(_base)
+        for m in _free_candidates_for(paid_model):
+            ms = str(m or "").strip()
+            if ms and ms not in chain and _free_target_allowed(paid_model, ms):
                 chain.append(ms)
-        # Repli global même endpoint (ne jamais mélanger chat/systemone).
-        try:
-            _ep = ""
-            try:
-                _ep = str(_cfg_settings._free_endpoint_for(base) or "")
-            except Exception:
-                _ep = ""
-            _is_sys = "systemone" in (_ep or "")
-            _is_resp = ("/responses" in (_ep or "")) or ("muse" in str(base).lower()) or ("spark" in str(base).lower())
-            if _is_sys:
-                _fb = ["jev-1.13-free"]
-            elif _is_resp:
-                _fb = ["muse-spark-1.3-contributor-free", "muse-spark-1.2-contributor-free"]
-            else:
-                # [2026-10-24] modèles VIVANTS uniquement (vérifié amont) :
-                # - mimo-v2.5-free = 410 ModelDeprecated (remplacement officiel
-                #   mimo-v2.6-flash-free) — mappé dans free_model_map, jamais ici ;
-                # - deepseek-v4-flash-free = 0 succès mesuré (mort) ;
-                # - space-bunny-free = 400 Model is unavailable (inexistant).
-                _fb = [
-                    "deepseek-v4.1-flash-free",
-                    "mimo-v2.6-flash-free",
-                    "glm-5.3-flash-free",
-                ]
-            for m in _fb:
-                if m not in chain:
-                    # N'ajouter que des frees connus (évite un id fantôme).
-                    try:
-                        if m in (FREE_MODEL_MAP or {}).values() or _is_free_model_route(m):
-                            chain.append(m)
-                    except Exception:
-                        chain.append(m)
-        except Exception:
-            pass
-        return chain or [base]
+        return chain
     except Exception:
-        try:
-            return [base]
-        except Exception:
-            return []
+        return []
 
 
 def _free_min_retry_after(models) -> str:
@@ -9859,7 +12400,7 @@ def _free_min_retry_after(models) -> str:
         now = _t.monotonic()
         best = None
         with _free_cooldown_lock:
-            for m in (models or []):
+            for m in models or []:
                 try:
                     pool = _free_ip_pool
                     stations = list(getattr(pool, "_stations", None) or []) if pool else []
@@ -9919,7 +12460,7 @@ async def _wait_for_fresh_free(models, timeout_s: float = 45.0, poll_s: float = 
         for st in stations:
             _dead_here = False
             try:
-                for m in (models or []):
+                for m in models or []:
                     try:
                         if _free_trial_dead_active(m, st):
                             _dead_here = True
@@ -9947,7 +12488,7 @@ async def _wait_for_fresh_free(models, timeout_s: float = 45.0, poll_s: float = 
         return False
     while True:
         try:
-            for m in (models or []):
+            for m in models or []:
                 try:
                     if not _free_stations_exhausted(m):
                         return True
@@ -9971,6 +12512,12 @@ async def _wait_for_fresh_free(models, timeout_s: float = 45.0, poll_s: float = 
 def _resolve_free_model(paid_model: str):
     """Résout le modèle free cible pour `paid_model` (O1 : effet prouvé).
 
+    Priorité : une entrée **explicite** de ``FREE_MODEL_MAP`` est souveraine
+    (décision humaine, comme ``custom_routes``) et n'est jamais filtrée par la
+    politique. Celle-ci ne s'applique qu'aux candidats **automatiques** :
+    homonyme ``X → X-free`` et ``free_model_candidates`` (même famille
+    seulement en mode ``family``, jamais de saut de famille Mimo→DeepSeek).
+
     Défaut (`free_model_spread` faux/absent) : `FREE_MODEL_MAP` historique.
     Spread actif + ≥ 2 candidats : round-robin par requête — 2 requêtes
     consécutives ne touchent pas le même modèle upstream.
@@ -9981,7 +12528,20 @@ def _resolve_free_model(paid_model: str):
     bascule dessus au resolve — toutes les jambes (non-stream + 4 streams)
     en profitent sans changer leur boucle. Fail-soft : repli historique.
     """
+    policy = _free_substitution_policy()
     base = FREE_MODEL_MAP.get(paid_model)
+    if base:
+        _debug(f"  [free] mapping explicite {paid_model!r} → {base!r} (politique {policy!r} non filtrante)")
+    if not base:
+        # Homonyme auto : X → X-free, seulement si ce free existe vraiment.
+        mid = str(paid_model or "").strip().lower()
+        if mid and not mid.endswith("-free") and _known_free_model(f"{mid}-free"):
+            base = f"{mid}-free"
+    if not base:
+        for cand in _free_candidates_for(paid_model):
+            if _free_target_allowed(paid_model, cand):
+                base = cand
+                break
     if not base:
         # [Fix compaction free/paid] Un id DÉJÀ free (``-free`` / pool découvert)
         # est sa propre cible : sans ce repli, ``resolve`` renvoyait None et la
@@ -10200,7 +12760,7 @@ def _trial_dead_stations(free_model: str) -> set:
     try:
         pool = _free_ip_pool
         stations = list(getattr(pool, "_stations", None) or [])
-        if getattr(pool, "socks5_mode", False):
+        if pool is not None and getattr(pool, "socks5_mode", False):
             try:
                 stations += list(pool._socks5_enabled_eps() or [])
             except Exception:
@@ -10210,7 +12770,14 @@ def _trial_dead_stations(free_model: str) -> set:
     dead = set()
     for st in stations:
         try:
-            if st is not None and _free_trial_dead_active(free_model, st):
+            # [audit 2026-10-30] Exclude ANY active (model, IP) cooldown, not
+            # just the long trial-exhausted scope. A 30/120 s rate-limit
+            # cooldown used to be re-selected, wasting the attempt and
+            # re-arming the cooldown.
+            if st is not None and (
+                _free_trial_dead_active(free_model, st)
+                or _free_cooldown_active(free_model, st)
+            ):
                 dead.add(st)
         except Exception:
             continue
@@ -10264,9 +12831,7 @@ def _record_station_quality(
     try:
         from free.quality import get_quality_registry
 
-        get_quality_registry().observe(
-            sid, str(ip or "unknown"), float(duration_ms), status, latency=latency
-        )
+        get_quality_registry().observe(sid, str(ip or "unknown"), float(duration_ms), status, latency=latency)
     except Exception:
         pass
     try:
@@ -10284,6 +12849,51 @@ def _record_station_quality(
             except Exception:
                 pass
             break
+    except Exception:
+        pass
+
+
+def _record_free_completion(
+    station,
+    ip: str,
+    duration_ms: float,
+    output_tokens: int,
+    *,
+    success: bool = True,
+    stop_reason: str | None = None,
+    server_host: str | None = None,
+) -> None:
+    """Enregistre le débit réel (tok/s) d'un flux free terminé.
+
+    Le TTFB seul ne dit pas si une IP génère vite : une IP à 1 tok/s peut
+    avoir un excellent premier octet. Fail-soft total : la qualité ne doit
+    jamais casser le chemin de requête."""
+    try:
+        sid = int(getattr(station, "_station", -1))
+    except Exception:
+        return
+    if sid < 1:
+        return
+    host = server_host or getattr(station, "_current_host", None) or getattr(station, "current_host", None)
+    try:
+        from free.quality import get_quality_registry
+
+        get_quality_registry().observe_completion(
+            sid,
+            str(ip or "unknown"),
+            float(duration_ms or 1.0),
+            int(output_tokens or 0),
+            success=success,
+            stop_reason=stop_reason,
+            server_host=host,
+        )
+    except Exception:
+        pass
+    # Rotation anticipée qualité : après la mesure, jamais avant.
+    try:
+        pool = _free_ip_pool
+        if pool is not None and hasattr(pool, "on_quality_completion"):
+            pool.on_quality_completion(station, str(ip or "unknown"), success=success)
     except Exception:
         pass
 
@@ -10377,15 +12987,13 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
     if not stations:
         return None
     try:
-        base = FREE_MODEL_MAP.get(model_id)
+        base = _resolve_free_model(model_id)
     except Exception:
         base = None
     if not base:
-        if not _is_free_model_route(model_id):
-            return None
-        base = model_id
+        return None
     try:
-        chain = _free_candidate_chain(model_id, base) or [base]
+        chain = _free_candidate_chain(model_id, base)
     except Exception:
         chain = [base]
     waits: list[float] = []
@@ -10393,6 +13001,17 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
         for st in stations:
             if not _free_cooldown_active(m, st):
                 return None
+            # [audit 2026-10-30] A transient cooldown (5xx / "Endpoint is
+            # unavailable") is not a quota exhaustion. The old preflight
+            # reported a fake 429 "quota exhausted" for it.
+            try:
+                _key = _free_cooldown_key(m, st)
+                with _free_cooldown_lock:
+                    _scope = _free_cooldown_scope.get(_key, "")
+                if _scope == "transient":
+                    return None
+            except Exception:
+                pass
             waits.append(_free_cooldown_remaining(m, st))
     if not waits:
         return None
@@ -10410,11 +13029,7 @@ def _free_preflight_response(wait_s: float, *, anthropic: bool):
             msg += f" Retry in {int(wait_s)}s."
     except Exception:
         pass
-    resp = (
-        _anthropic_error(429, msg, "rate_limit_error")
-        if anthropic
-        else _openai_error(429, msg, "rate_limit_error")
-    )
+    resp = _anthropic_error(429, msg, "rate_limit_error") if anthropic else _openai_error(429, msg, "rate_limit_error")
     try:
         if wait_s >= 1:
             resp.headers["Retry-After"] = str(int(wait_s))
@@ -10467,7 +13082,11 @@ def _mark_free_stations_429(
     # NordVPN → stations en erreur → boucle auto-destructrice. ``quota_flag`` est
     # False pour un 429 transitoire → on saute la rotation (cf. FreeIPPool).
     # ``body=None`` (EOF, appelants sans corps) → True (comportement historique).
-    quota_flag = True if body is None else _is_free_quota_failure(429, body)
+    # [audit 2026-10-30] Empty body must behave like None: a real quota 429
+    # without a body was classified transient (`body=""`) and never rotated,
+    # while `body=None` rotated. Same signal -> same decision.
+    _body_empty = body is None or (isinstance(body, str) and not body.strip())
+    quota_flag = True if _body_empty else _is_free_quota_failure(429, body)
     # [trial-dead 2026-10-24] Scope du 429 (core.errors.free_quota_scope) :
     # un `FreeUsageLimitError` (trial per-IP épuisé, MESURÉ en prod, sans
     # reset annoncé) ne reviendra pas dans 120 s — marteler la clé toutes
@@ -10494,9 +13113,7 @@ def _mark_free_stations_429(
         # Surcharge transitoire : cooldown court (30 s) au lieu du quota long —
         # inutile de tenir la station écartée sur un quota qui reviendrait vite.
         if quota_flag:
-            _cd_secs = _free_429_cooldown_seconds(
-                retry_after, body if isinstance(body, str) else None
-            )
+            _cd_secs = _free_429_cooldown_seconds(retry_after, body if isinstance(body, str) else None)
             if _scope == "trial-exhausted" and not (retry_after or "").strip():
                 _td = _trial_dead_cooldown_seconds()
                 if _td > 0:
@@ -10524,7 +13141,9 @@ def _mark_free_stations_429(
                         _new_face = _vv.rotate_installation(_rip) or {}
                         try:
                             _sid = getattr(station, "_station", "?")
-                            _log(f"  [free-identity] {free_model!r} quota ip={_rip} (st{_sid}) → nouvelle installation {(_new_face or {}).get('version')}/{(_new_face or {}).get('client')} gen={(_new_face or {}).get('generation')}")
+                            _log(
+                                f"  [free-identity] {free_model!r} quota ip={_rip} (st{_sid}) → nouvelle installation {(_new_face or {}).get('version')}/{(_new_face or {}).get('client')} gen={(_new_face or {}).get('generation')}"
+                            )
                         except Exception:
                             pass
             except Exception:
@@ -10776,8 +13395,81 @@ async def _free_responses_body_object(resp) -> dict:
     return _collect_responses_sse_object(corps)
 
 
-async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=None, req_id=None,
-                            is_compaction="auto"):
+def _mark_requested_model(model_id: str) -> None:
+    """Pose le modèle demandé et son tier pour les en-têtes de la réponse.
+
+    Premier appel gagnant : un handler pose l'id **client** avant le remap
+    ``ROUTES`` ; les appels suivants (modèle routé, cible free) ne doivent pas
+    écraser ce que le client a réellement demandé.
+    """
+    try:
+        if _current_requested_model.get() is None:
+            _current_requested_model.set(str(model_id))
+        if _current_requested_tier.get() is None:
+            _current_requested_tier.set(_model_tier_for(str(model_id)).get("tier"))
+    except Exception:
+        pass
+
+
+def _mark_actual_free(free_model: str) -> None:
+    """Pose la jambe free pour les en-têtes de la réponse en cours."""
+    try:
+        _current_actual_tier.set("free")
+        _current_actual_model.set(str(free_model or ""))
+        if _current_requested_tier.get() == "paid":
+            _current_fallback.set("paid_to_free")
+    except Exception:
+        pass
+
+
+def _mark_stream_start(model_id: str) -> None:
+    """Pré-annonce la jambe d'un flux avant l'envoi des en-têtes.
+
+    Un ``StreamingResponse`` envoie ``http.response.start`` AVANT d'itérer son
+    générateur : marquer le tier dans le générateur serait trop tard. On pose
+    donc la jambe attendue au retour du handler. Si le flux bascule ensuite,
+    les en-têtes déjà partis ne peuvent plus être réécrits (limite documentée).
+    """
+    try:
+        _mark_requested_model(model_id)
+        free_model = _resolve_free_model(model_id)
+    except Exception:
+        free_model = None
+    if free_model:
+        _mark_actual_free(free_model)
+        return
+    try:
+        _current_actual_tier.set("paid")
+        _current_actual_model.set(str(model_id))
+    except Exception:
+        pass
+
+
+def _mark_actual_stream(use_free: bool, body, resp) -> None:
+    """Pose la jambe réellement servie pour un flux (200 seulement).
+
+    Un flux free en 429/5xx ne doit pas être annoncé ``free`` : le handler va
+    retomber sur le payant, qui posera son propre tier. On ne marque donc que
+    les réponses 200.
+    """
+    try:
+        if int(getattr(resp, "status_code", 0) or 0) != 200:
+            return
+        actual = str((body or {}).get("model") or "") or None
+        _current_actual_model.set(actual)
+        if use_free:
+            _current_actual_tier.set("free")
+            if _current_requested_tier.get() == "paid":
+                _current_fallback.set("paid_to_free")
+        else:
+            _current_actual_tier.set("paid")
+            if _current_free_attempted.get():
+                _current_fallback.set("free_to_paid")
+    except Exception:
+        pass
+
+
+async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=None, req_id=None, is_compaction="auto"):
     """Try the free model equivalent before falling back to paid.
 
     If the model has a free equivalent in FREE_MODEL_MAP, attempt the request
@@ -10811,6 +13503,19 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     non-stream mesuré en réel le 14/09/2026 (A27). Les 14 sites de dépouillement
     utilisent donc ``_`` pour ce créneau.
     """
+    try:
+        _mark_requested_model(model_id)
+    except Exception:
+        pass
+    # [audit 2026-10-30] summary_paid_bypass (opt-in): a detected client
+    # compaction request skips the free leg entirely so strict_free cannot
+    # refuse it; the caller falls back to paid as configured.
+    try:
+        if _summary_paid_bypass_enabled(body):
+            _debug(f"  [compaction] summary_paid_bypass → paid leg for {model_id!r}")
+            return None
+    except Exception:
+        pass
     global _free_ip_pool
 
     # [Compaction summary-lean] Sur trafic compactage détecté uniquement :
@@ -10823,8 +13528,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         _lean_on = True
     if _lean_on:
         try:
-            _is_comp = bool(is_compaction) if isinstance(is_compaction, bool) else bool(
-                _is_compaction_shape(body))
+            _is_comp = bool(is_compaction) if isinstance(is_compaction, bool) else bool(_is_compaction_shape(body))
         except Exception:
             _is_comp = False
         if _is_comp:
@@ -10861,6 +13565,10 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     free_model = _resolve_free_model(model_id)
     if not free_model:
         return None  # No free equivalent, proceed with paid
+    try:
+        _current_free_attempted.set(True)
+    except Exception:
+        pass
 
     # [strict_free 2026-10-24 no-block] Si TOUTE la chaîne (primaire +
     # candidats même endpoint) est trial-morte sur toutes les stations :
@@ -10876,7 +13584,16 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             and list(getattr(_free_ip_pool, "_stations", None) or [])
         )
         if _pool_ok and IP_ROTATION.get("strict_free", False) and _free_proxy_mode() in ("vpn", "socks5"):
-            _all_dead = True
+            # Fail-open si la chaîne est vide : c'est un défaut de résolution,
+            # pas une preuve d'épuisement. L'ancien `_all_dead = True` initial
+            # fabriquait un 429 « toutes stations épuisées » sans aucun appel
+            # upstream (big-pickle, 2026-10-29).
+            if not _chain:
+                _log(
+                    f"  [free] req_id={req_id} chaîne de candidats VIDE pour {free_model!r} "
+                    f"— tentative directe (fail-open, pas de 429 fabriqué)"
+                )
+            _all_dead = bool(_chain)
             for _cm in _chain:
                 try:
                     if not _free_stations_exhausted(_cm):
@@ -10903,7 +13620,9 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                         _fallback_ctx_push(req_id, free_model, 429)
                     except Exception:
                         pass
-                    raise FreeQuotaExhausted(_ra, status=429, body="FreeUsageLimitError: all free candidates trial-dead")
+                    raise FreeQuotaExhausted(
+                        _ra, status=429, body="FreeUsageLimitError: all free candidates trial-dead"
+                    )
     except FreeQuotaExhausted:
         raise
     except Exception:
@@ -10984,7 +13703,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     # client officiel anonyme (Bearer public + IDs ses_/msg_ par IP) —
     # jamais avec la clé payante du client. UNE installation par IP
     # (vault : UA versionnée + ses_/msg_/project isolés — cf. free.identities).
-    # Le label d'identité navigateur reste informatif (observabilité geo).
+    # Le profil reste informatif (porteur TLS + UA officiel de la jambe geo).
     free_profile = _current_free_identity(station)
     try:
         _fi_snap = {}
@@ -10993,15 +13712,22 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             _fi_snap = _vv0.snapshot(free_ip)
     except Exception:
         _fi_snap = {}
-    _current_free_attempt.set({"ip": free_ip, "identity": free_profile.get("impersonate") or "",
-                               "identity_browser": free_profile.get("impersonate") or "",
-                               "wire_version": (_fi_snap or {}).get("version"),
-                               "wire_client": (_fi_snap or {}).get("client"),
-                               "station": station, "instance": _fi_snap})
+    _current_free_attempt.set(
+        {
+            "ip": free_ip,
+            "identity": free_profile.get("impersonate") or "",
+            "wire_version": (_fi_snap or {}).get("version"),
+            "wire_client": (_fi_snap or {}).get("client"),
+            "station": station,
+            "instance": _fi_snap,
+        }
+    )
     try:
         if _fi_snap:
-            _debug(f"  [free-identity] ip={free_ip} wire={_fi_snap.get('version')}/{_fi_snap.get('client')} "
-                   f"browser={free_profile.get('impersonate')} proj={str(_fi_snap.get('project'))[:12]}... ses={str(_fi_snap.get('ses'))[:12]}...")
+            _debug(
+                f"  [free-identity] ip={free_ip} wire={_fi_snap.get('version')}/{_fi_snap.get('client')} "
+                f"carrier={free_profile.get('impersonate')} proj={str(_fi_snap.get('project'))[:12]}... ses={str(_fi_snap.get('ses'))[:12]}..."
+            )
     except Exception:
         pass
     # Session par conversation quand le corps porte un chaînage (parité request.ts),
@@ -11585,6 +14311,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             _c3_bytes = _json_dumps(cdata)
             wrapped.content = _c3_bytes
             wrapped.text = _c3_bytes.decode()
+            _mark_actual_free(free_model)
             return wrapped, resp_headers, free_model, free_ip
         except Exception as e:
             _debug(f"  [free] /responses conversion failed: {e}")
@@ -11608,6 +14335,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             _c3_bytes = _json_dumps(cdata)
             wrapped.content = _c3_bytes
             wrapped.text = _c3_bytes.decode()
+            _mark_actual_free(free_model)
             return wrapped, resp_headers, free_model, free_ip
         except Exception as e:
             _debug(f"  [free] chat→anthropic conversion failed: {e}")
@@ -11684,6 +14412,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     if resp.status_code == 200:
         _debug(f"  [free] {free_model!r} succeeded ({tokens_in}+{tokens_out} tokens)")
         _log(f"  FREE {free_model!r} OK ({tokens_in}+{tokens_out} tokens, saved paid quota)")
+        _mark_actual_free(free_model)
         return resp, resp_headers, free_model, free_ip
 
     # 429 = vrai quota OU surcharge transitoire amont (cf. is_free_quota_failure) →
@@ -11721,21 +14450,29 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         if not _hedge_done:
             # [fix rotation-storm] ``body_429`` distingue un vrai quota
             # (rotation utile) d'une surcharge transitoire (pas de rotation).
-            _mark_free_stations_429(
-                free_model, retry_after, stations=[station], forced_pool=forced_pool, body=body_429
-            )
+            _mark_free_stations_429(free_model, retry_after, stations=[station], forced_pool=forced_pool, body=body_429)
 
         if IP_ROTATION.get("strict_free", False):
-            if _free_exception_fallback_mode() == "direct":
-                return None
-            if _free_stations_exhausted(free_model):
-                # [PLAN_CORRECTION_FAUX_429 A2] vrai 429 → body + retry_after réels
+            # [audit 2026-10-30] En tunnel (vpn/socks5), strict_free ne doit
+            # JAMAIS tomber sur la jambe payante : l'ancien code le faisait
+            # si `free_exception_fallback == direct` (mode non v?rifi?) ou si
+            # une rotation ?tait en vol (_free_stations_exhausted()==False).
+            # Le chemin stream avait d?j? ce garde-fou ; le non-stream non.
+            _sf_mode = _free_proxy_mode()
+            if _sf_mode in ("vpn", "socks5"):
                 try:
                     _full429 = (getattr(resp, "text", "") or "")[:2000]
                 except Exception:
                     _full429 = body_429
                 raise FreeQuotaExhausted(retry_after, status=429, body=_full429)
-
+            if _free_exception_fallback_mode() == "direct":
+                return None
+            if _free_stations_exhausted(free_model):
+                try:
+                    _full429 = (getattr(resp, "text", "") or "")[:2000]
+                except Exception:
+                    _full429 = body_429
+                raise FreeQuotaExhausted(retry_after, status=429, body=_full429)
         return None
 
     # Other errors → cooldown (60 s) so the next request doesn't retry the
@@ -12212,6 +14949,16 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
     Returns (response, final_headers) -- headers may differ after retry.
     Raises UpstreamError on connection/timeout/protocol failures.
     """
+    # [Tier headers] La jambe payante est celle qui part ici ; si une tentative
+    # free a échoué juste avant, le client voit le repli free→paid.
+    try:
+        _current_actual_tier.set("paid")
+        if isinstance(body, dict):
+            _current_actual_model.set(str(body.get("model") or "") or None)
+        if _current_free_attempted.get():
+            _current_fallback.set("free_to_paid")
+    except Exception:
+        pass
     # ── Orphan guard (defense in depth) ──
     # Garde chaînage : vers /responses avec previous_response_id/conversation,
     # l'appariement vit côté serveur — aucun filtrage (pas d'amputation).
@@ -12327,7 +15074,7 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
         )
 
         # Key failover on 429 — does NOT consume a retry attempt
-        if retry_on_429 and resp.status_code == 429 and len(API_KEYS) > 1:
+        if retry_on_429 and resp.status_code == 429:
             failed_key = _key_from_headers(headers, protocol)
             # Fetch fresh quotas and pause key until exact reset time
             await _pause_key_for_quota_reset(failed_key)
@@ -12338,6 +15085,9 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
                 _bump_failover_counter("paid", "quota_429", "alt_key")  # [O3]
                 headers = _get_auth_headers(protocol, entry=alt)
                 continue  # retry immediately without incrementing attempt
+            # Mono-key / all paused: return the real 429 instead of replaying
+            # the same paused key through the generic retry loop.
+            return resp, headers
 
         # Key failover on 529 overloaded — parité officielle : l'officiel file
         # d'attente sur 529, nous on bascule de clé immédiatement (mieux que
@@ -12360,8 +15110,12 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
                 headers = _get_auth_headers(protocol, entry=alt)
                 continue
 
-        # Key failover on 401 — does NOT consume a retry attempt
-        if resp.status_code == 401 and len(API_KEYS) > 1:
+        # Key failover on 401 — does NOT consume a retry attempt.
+        # [2026-10-29] Pause MÊME avec une clé unique : sinon une clé morte
+        # n'était jamais marquée, `_has_usable_paid_key()` restait vrai et
+        # chaque requête rejouait le 401 au lieu de basculer sur la jambe
+        # gratuite. Le nombre de clés ne change pas la validité de la clé.
+        if resp.status_code == 401:
             failed_key = _key_from_headers(headers, protocol)
             # Log the 401 response body to help diagnose dead/revoked keys
             try:
@@ -12370,7 +15124,8 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
                 _err_body = "(unable to read response body)"
             _debug(f"  [auth] 401 response body: {_redact(_err_body, 500)}")
             # 401 = key temporarily unavailable (quota exhausted) → pause 1h
-            _key_pauser.pause_key(failed_key, KEY_PAUSE_401_SEC, "401 Unauthorized (temporary)")
+            if failed_key:
+                _key_pauser.pause_key(failed_key, KEY_PAUSE_401_SEC, "401 Unauthorized (temporary)")
             alt = _find_alternative_key(failed_key)
             if alt:
                 _debug(f"  ⟳ 401 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
@@ -12406,8 +15161,18 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
                 _pause_403 = float(yaml_get("key_pause", "key_pause_403_sec", 1800) or 1800)
             except Exception:
                 _pause_403 = 1800
-            _key_pauser.pause_key(failed_key, _pause_403, "403 Forbidden (region/model not allowed)")
-            alt = _find_alternative_key(failed_key)
+            _model_for_key = str(
+                _current_requested_model.get()
+                or ((body or {}).get("model") if isinstance(body, dict) else "")
+                or ""
+            )
+            _key_pauser.pause_key(
+                failed_key,
+                _pause_403,
+                "403 Forbidden (region/model not allowed)",
+                model=_model_for_key,
+            )
+            alt = _find_alternative_key(failed_key, model=_model_for_key)
             if alt:
                 _debug(f"  ⟳ 403 failover: {failed_key[:8]}… → alias={alt.get('alias', '?')}")
                 _log("  403 on key, retrying with alternative key")
@@ -12436,7 +15201,11 @@ async def _do_request_with_retry(endpoint, body, headers, protocol, retry_on_429
             except Exception:
                 _motif_retry = False
         if (resp.status_code in _RETRYABLE_STATUSES or _motif_retry) and attempt < max_retries - 1:
-            _ra = (resp.headers.get("retry-after") or resp.headers.get("Retry-After") or "").strip() if hasattr(resp, "headers") else ""
+            _ra = (
+                (resp.headers.get("retry-after") or resp.headers.get("Retry-After") or "").strip()
+                if hasattr(resp, "headers")
+                else ""
+            )
             # Parité officielle : honorer la consigne amont jusqu'à max_pause
             # (600s défaut), pas 120s tronqués. Au-delà → backoff local pour
             # ne pas bloquer un worker.
@@ -12462,16 +15231,29 @@ def _update_token_usage(model_id, inp, out, cache, cache_creation=0):
     les snapshots existants sans la clé restent valides).
     """
     try:
+        # [audit 2026-10-30] Upstreams occasionally send nulls/negatives
+        # (cached-only usage, gateway bugs). Clamp before summing so the
+        # dashboard never shows a negative input total.
+        def _nn(value):
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        _inp = _nn(inp)
+        _out = _nn(out)
+        _cache = _nn(cache)
+        _cache_creation = _nn(cache_creation)
         with _token_lock:
             if model_id not in _token_usage:
                 _token_usage[model_id] = {"input": 0, "output": 0, "cache": 0, "cache_write": 0}
             _token_usage[model_id].setdefault("cache_write", 0)
-            _token_usage[model_id]["input"] += inp
-            _token_usage[model_id]["output"] += out
-            _token_usage[model_id]["cache"] += cache
-            _token_usage[model_id]["cache_write"] += cache_creation
+            _token_usage[model_id]["input"] += _inp
+            _token_usage[model_id]["output"] += _out
+            _token_usage[model_id]["cache"] += _cache
+            _token_usage[model_id]["cache_write"] += _cache_creation
         _debug(
-            f"  [tokens] _update_token_usage: model={model_id} +{inp} in +{out} out +{cache} cache +{cache_creation} cache_write | totals: {_token_usage[model_id]}"
+            f"  [tokens] _update_token_usage: model={model_id} +{_inp} in +{_out} out +{_cache} cache +{_cache_creation} cache_write | totals: {_token_usage[model_id]}"
         )
     except Exception as e:
         _debug(f"  ✗ _update_token_usage failed: {type(e).__name__}: {e}")
@@ -12504,6 +15286,10 @@ async def _save_and_log_request(
     success=True,
     error=None,
     response_preview=None,
+    ttfb_ms=None,
+    stop_reason=None,
+    aborted=False,
+    station_override=None,
 ):
     """Log success and save to DB (success=False si tour agent vide suspect)."""
     # [suspect_tiny_output P0] Un tour « énorme input + micro output + aucun
@@ -12572,6 +15358,10 @@ async def _save_and_log_request(
             identity=identity,
             free_status=free_status,
             paid_status=paid_status,
+            ttfb_ms=ttfb_ms,
+            stop_reason=stop_reason,
+            aborted=aborted,
+            station=station_override,
         )
     except Exception as e:
         _debug(f"  ✗ save_request failed: {type(e).__name__}: {e}")
@@ -12639,7 +15429,7 @@ def _make_stream_retry_loop(protocol):
     the caller should `continue` the outer loop.
     """
 
-    async def _handle_429(headers, status_code, attempt, resp_headers=None, resp_text=None):
+    async def _handle_429(headers, status_code, attempt, resp_headers=None, resp_text=None, model=""):
         # B4 idempotence: 400 never retries here (param=name would pause_key uselessly).
         # Credit 400 retry is handled explicitly in the non-stream caller after checking
         # "Insufficient balance" / "Monthly usage limit" in resp.text (see messages() P2).
@@ -12660,23 +15450,38 @@ def _make_stream_retry_loop(protocol):
         # [Lot B2] failover étendu au-delà de attempt==0 : chaque clé en
         # échec est pausée avant la recherche d'alternative, donc chaque
         # failover progresse vers une clé fraîche (P6).
-        if len(API_KEYS) > 1 and status_code in (429, 401, 403):
+        # [2026-10-29] 401 : pause même avec une clé unique. Sinon une clé
+        # morte n'était jamais marquée et le stream rejouait le 401 à chaque
+        # requête au lieu de laisser la jambe gratuite prendre le relais.
+        # [audit 2026-10-30] 429 quota exhausts the key whether or not another
+        # key exists: pause it even in mono-key mode. 403 stays failover-only
+        # (a region/model refusal must not freeze a still-valid key).
+        _pause_or_failover = status_code in (401, 429) or (len(API_KEYS) > 1 and status_code == 403)
+        if _pause_or_failover:
             failed_key = _key_from_headers(headers, protocol)
+            _model_for_key = str(_current_requested_model.get() or model or "")
             if status_code == 429:
                 # Fetch fresh quotas and pause key until exact reset time
                 await _pause_key_for_quota_reset(failed_key)
             elif status_code == 401:
                 # [§14.1.15 v10] aligné sur le non-stream : même code HTTP =
                 # même pause (l'ancien 24h créait une incohérence stream/non).
-                _key_pauser.pause_key(failed_key, KEY_PAUSE_401_SEC, "401 Unauthorized (temporary)")
+                if failed_key:
+                    _key_pauser.pause_key(failed_key, KEY_PAUSE_401_SEC, "401 Unauthorized (temporary)")
             elif status_code == 403:
-                # 403 = region/model blocked for key → pause 30min
-                _key_pauser.pause_key(failed_key, 1800, "403 Forbidden (region/model not allowed)")
-            elif status_code == 400:
-                # Check for credit/balance errors in resp_headers or skip
-                # We need to check the response body - handled in caller
-                pass
-            alt = _find_alternative_key(failed_key)
+                # 403 = region/model blocked for key → pause configurable
+                # (parité avec le non-stream ; l'ancien 1800 s était figé).
+                try:
+                    _pause_403 = float(yaml_get("key_pause", "key_pause_403_sec", 1800) or 1800)
+                except Exception:
+                    _pause_403 = 1800
+                _key_pauser.pause_key(
+                    failed_key,
+                    _pause_403,
+                    "403 Forbidden (region/model not allowed)",
+                    model=_model_for_key,
+                )
+            alt = _find_alternative_key(failed_key, model=_model_for_key)
             if alt:
                 _log(f"  {status_code} on key, retrying with alternative key")
                 # [O3] cause bornée par statut (labels stables) : 429 quota,
@@ -12949,11 +15754,16 @@ async def _free_stream_refuse_bytes(
         # une information perdue. Les motifs de surcharge/quota gardent la
         # priorité (ils viennent d'être calculés ci-dessus).
         if _etype == "api_error":
-            _vocab = "openai" if str(client_protocol or protocol or "").lower() in (
-                "openai",
-                "chat",
-                "responses",
-            ) else "anthropic"
+            _vocab = (
+                "openai"
+                if str(client_protocol or protocol or "").lower()
+                in (
+                    "openai",
+                    "chat",
+                    "responses",
+                )
+                else "anthropic"
+            )
             _etype = _extract_upstream_error_type(_cap, _vocab) or _etype
         _payload = {
             "type": "error",
@@ -13113,9 +15923,7 @@ def _free_fallback_bookkeep(
             f"  [{tag}] req_id={req_id} leg={_leg} free_status={status_code} free_model={free_model!r} {_arrow} host={urllib.parse.urlparse(paid_endpoint).hostname}"
         )
     else:
-        _debug(
-            f"  [{tag}] req_id={req_id} leg={_leg} free_status={status_code} free_model={free_model!r} {_arrow}"
-        )
+        _debug(f"  [{tag}] req_id={req_id} leg={_leg} free_status={status_code} free_model={free_model!r} {_arrow}")
     if refused:
         _log(f"  FREE model {status_code} → refused (strict_free, no paid leg)")
     else:
@@ -13235,7 +16043,25 @@ def _should_retry_empty_stream(has_yielded: bool, stream_out, *, content_yielded
         return False
 
 
-def _stream_cache_delta(usage, current) -> tuple:
+def _stream_content_started(stream_out, seen_tool_indices) -> bool:
+    """Un VRAI contenu (texte, raisonnement, tool call) est-il déjà parti ?
+
+    Distinct de ``_oai_has_yielded``, qui passe à True dès le chunk `role` :
+    une enveloppe seule ne doit pas interdire un retry. Sans cette
+    distinction, un amont qui ouvre le flux puis meurt avant le premier
+    delta faisait émettre « stream interrupted » au client alors qu'un
+    retry était sûr (mesuré 2026-10-30 : tour agentique perdu).
+
+    Fail-safe : en cas de valeur illisible, on considère que du contenu est
+    parti (ne jamais rejouer un flux pour éviter une concaténation).
+    """
+    try:
+        return (stream_out or 0) > 0 or bool(seen_tool_indices)
+    except Exception:
+        return True
+
+
+def _stream_cache_delta(usage, current) -> tuple | None:
     """[F2] Cache réel porté par un `message_delta` → `(nouveau, delta)`.
 
     Pur, jamais de raise. `None` quand le chunk n'apporte rien
@@ -13278,9 +16104,7 @@ def _stream_has_yielded(started, open_blocks, stream_out, line_buf: str = "") ->
     return bool(started or has_blocks or has_out or (isinstance(line_buf, str) and bool(line_buf.strip())))
 
 
-async def _terminate_after_started(
-    open_blocks, stream_out, thinking_idx=None, thinking_sig="", stop_reason="error"
-):
+async def _terminate_after_started(open_blocks, stream_out, thinking_idx=None, thinking_sig="", stop_reason="error"):
     """Graceful SSE termination after a mid-stream failure (avoids concat retry).
 
     [PLAN-raisonnement Phase C.2] si un bloc thinking est encore ouvert,
@@ -13391,6 +16215,34 @@ _SSE_ERR_OPENAI = (
 )
 
 
+def _stream_error_detail(status, payload, *, is_compaction: bool = False) -> tuple[str, str]:
+    """Message/type d'erreur d'un stream non-200, overflow reconnaissable.
+
+    Un 400-overflow rendu en `HTTP 400` nu cachait le motif au client : le
+    client officiel ne pouvait pas le classifier et ne compactait pas. On
+    relaie le texte amont (tronqué) et `invalid_request_error` quand
+    `is_overflow` le reconnaît, ce qui déclenche sa compaction.
+    """
+    try:
+        if isinstance(payload, (bytes, bytearray)):
+            text = bytes(payload).decode("utf-8", errors="replace")
+        else:
+            text = str(payload or "")
+    except Exception:
+        text = ""
+    if not is_compaction:
+        try:
+            markers = get_server_compaction("overflow_markers", None)
+        except Exception:
+            markers = None
+        try:
+            if _is_overflow(status, text, markers):
+                return (text.strip()[:1000] or f"HTTP {status}", "invalid_request_error")
+        except Exception:
+            pass
+    return (f"HTTP {status}", "api_error")
+
+
 async def _sse_coalesce(
     stream,
     max_group_bytes: int = _SSE_COALESCE_MAX_BYTES,
@@ -13482,9 +16334,7 @@ def _deprecated_model_response(model_name: str, protocol: str):
         # refus doit nommer la cible réelle, pas seulement l'alias.
         try:
             name = str(model_name or "").lower().strip()
-            for route in list(_cfg_settings.SORTED_ROUTES) + list(
-                _cfg_settings.SORTED_CUSTOM_ROUTES
-            ):
+            for route in list(_cfg_settings.SORTED_ROUTES) + list(_cfg_settings.SORTED_CUSTOM_ROUTES):
                 if not isinstance(route, dict) or route.get("enabled") is False:
                     continue
                 if not any(str(m).lower() in name for m in route.get("match", [])):
@@ -13498,11 +16348,7 @@ def _deprecated_model_response(model_name: str, protocol: str):
     if target is None:
         return None
     try:
-        active = [
-            mid
-            for mid in sorted(list(MODELS))
-            if not _cfg_live.is_removed(mid)
-        ][:8]
+        active = [mid for mid in sorted(MODELS) if not _cfg_live.is_removed(mid)][:8]
     except Exception:
         active = []
     return _model_deprecated_error(target, protocol, available=active)
@@ -14306,6 +17152,22 @@ async def _finalize_and_close_stream(
     )
 
 
+def _clamp_native_output_limit(body: dict, model_id: str) -> dict:
+    """[audit 2026-10-30] Apply models.<id>.output_limit + 256k absolute cap
+    on NATIVE passthrough bodies (Chat->Chat, Anthropic->Anthropic). The
+    conversion paths already called _set_output_token_limit; a native client
+    could send max_tokens=500000 and bypass both limits."""
+    try:
+        from config.limits import clamp_output_token_limit as _clamp
+
+        for _key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            if _key in body:
+                body[_key] = _clamp(body[_key], model_id)
+    except Exception:
+        pass
+    return body
+
+
 def ensure_min_tokens(body: dict, default: int = None) -> dict:
     if default is None:
         default = yaml_get("thinking", "default_min_tokens", 256)
@@ -14332,7 +17194,7 @@ def ensure_min_tokens(body: dict, default: int = None) -> dict:
     # champs réellement sous le minimum, et on n'abaisse jamais.
     present = {
         k: body[k]
-        for k in ("max_output_tokens", "max_tokens")
+        for k in ("max_output_tokens", "max_tokens", "max_completion_tokens")
         if isinstance(body.get(k), int) and body[k] > 0
     }
     current = min(present.values()) if present else None
@@ -14412,7 +17274,11 @@ async def messages(request: Request):
     _debug(f"  [body] read {len(body_bytes)} bytes in {(time.monotonic() - start_time) * 1000:.0f}ms")
     if len(body_bytes) > MAX_BODY_SIZE:
         _debug(f"  413: body too large ({len(body_bytes)} bytes)")
-        return _anthropic_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})", error_type="invalid_request_error")
+        return _anthropic_error(
+            413,
+            f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})",
+            error_type="invalid_request_error",
+        )
 
     try:
         body = _json_loads(body_bytes)
@@ -14421,6 +17287,7 @@ async def messages(request: Request):
         return _anthropic_error(400, "invalid json", error_type="invalid_request_error")
 
     original_model = body.get("model", "")
+    _mark_requested_model(original_model)
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
     _debug(f"[messages] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
@@ -14456,6 +17323,7 @@ async def messages(request: Request):
         # (le SDK lève NotFoundError typée au lieu d'un 404 brut).
         return _anthropic_error(404, f"Model not found: {original_model!r}", error_type="not_found_error")
     model_id = route["model"]
+    body = _clamp_native_output_limit(body, model_id)
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
     protocol = cfg["protocol"]
@@ -14465,10 +17333,7 @@ async def messages(request: Request):
     if bool(body.get("stream")) and not _is_compaction:
         _pf_wait = _free_preflight_retry_after(model_id)
         if _pf_wait is not None:
-            _log(
-                f"  [free-preflight] messages 429 : aucune station libre "
-                f"(retry {_pf_wait:.0f}s) model={model_id!r}"
-            )
+            _log(f"  [free-preflight] messages 429 : aucune station libre (retry {_pf_wait:.0f}s) model={model_id!r}")
             return _free_preflight_response(_pf_wait, anthropic=True)
 
     # [V8.5] Mauvais protocole : `jev-*` et consorts ne sont pas des modèles de
@@ -14495,6 +17360,26 @@ async def messages(request: Request):
 
     body = dict(body)
     body["model"] = model_id
+
+    # [audit 2026-10-30] Official proactive compaction trigger
+    # (context_limit - buffer), stateless fallback for non-OpenCode clients.
+    try:
+        _pc = await _maybe_proactive_condense(
+            body,
+            body_bytes,
+            model_id=model_id,
+            endpoint=endpoint,
+            protocol=protocol,
+            history_api="anthropic",
+            history_messages=body.get("messages"),
+            request=request,
+            req_id=req_id,
+            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+        )
+        if _pc:
+            body["messages"] = _pc
+    except Exception as _pc_err:
+        _debug(f"  [compaction] proactive messages skipped: {type(_pc_err).__name__}: {_pc_err}")
 
     body = ensure_min_tokens(body)
 
@@ -14555,6 +17440,23 @@ async def messages(request: Request):
             pass
         return _cb_resp
 
+    # ── Gemini native upstream ──────────────────────────────────
+    if protocol == "gemini":
+        return await _handle_messages_gemini(
+            body,
+            model_id=model_id,
+            endpoint=endpoint,
+            original_model=original_model,
+            request=request,
+            req_id=req_id,
+            is_stream=bool(body.get("stream", False)),
+            client_ip=client_ip,
+            thinking_type="none",
+            effort=str(body.get("reasoning_effort") or "none"),
+            tool_names=tool_names,
+            request_body=request_body,
+        )
+
     # ── Anthropic pass-through ──────────────────────────────────
     if protocol == "anthropic":
         # [PLAN-raisonnement Phase D + correctif parité multi-tours] Strip
@@ -14593,7 +17495,9 @@ async def messages(request: Request):
                     req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                     req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
                     req_cache = usage.get("cache_read_input_tokens", 0)
-                    _update_token_usage(_actual_model, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
+                    _update_token_usage(
+                        _actual_model, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage)
+                    )
                     used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
                     await _save_and_log_request(
                         req_id,
@@ -14632,14 +17536,14 @@ async def messages(request: Request):
                     async for chunk in anthropic_stream({}):
                         yield chunk
 
+                _mark_stream_start(model_id)
                 return StreamingResponse(
                     _sse_pump(
-                    anthropic_stream_free_fallback(),
-                    on_error=_note_sse_abort,
-                    error_event=_SSE_ERR_ANTHROPIC,
-
-                    idle_timeout=_SSE_IDLE_TIMEOUT,
-                ),
+                        anthropic_stream_free_fallback(),
+                        on_error=_note_sse_abort,
+                        error_event=_SSE_ERR_ANTHROPIC,
+                        idle_timeout=_SSE_IDLE_TIMEOUT,
+                    ),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                 )
@@ -14663,7 +17567,15 @@ async def messages(request: Request):
             # Check cache
             # [Phase 1 compaction] shape-compaction jamais cachée : un résumé
             # servi rejoué (X-Cache: HIT) boucle côté client.
-            cache_key = None if _is_compaction else _response_cache.make_key(body, body_bytes=body_bytes)
+            cache_key = (
+                None
+                if _is_compaction or _web_nondet_injected.get()
+                else _response_cache.make_key(
+                    body,
+                    body_bytes=body_bytes,
+                    namespace=_response_cache_namespace(request, model_id, endpoint, "response"),
+                )
+            )
             cached = _response_cache.get(cache_key) if cache_key else None
             if cached and cache_key:
                 cached_body, cached_headers = cached
@@ -14681,9 +17593,15 @@ async def messages(request: Request):
                     # Parité stream : lire les 2 formes de cache (Anthropic +
                     # OpenAI-converti), sinon HIT sous-compte le cache_read.
                     try:
+                        # `_extract_cache_tokens` est DÉJÀ importé au niveau
+                        # module (l. 14027) et appelé plus loin dans CETTE
+                        # fonction : un import local sous ce nom nu créerait une
+                        # variable locale non liée dans les autres branches
+                        # (`UnboundLocalError` mesuré en suite). L'alias préserve
+                        # le global ; l'ignore typage couvre le repli `None`.
                         from app.protocol.mapping import _extract_cache_tokens as _hit_cache_fn
                     except Exception:
-                        _hit_cache_fn = None
+                        _hit_cache_fn = None  # type: ignore[assignment]
                     if _hit_cache_fn is not None:
                         try:
                             _hit_cache = _hit_cache_fn(_hit_usage) or 0
@@ -14692,7 +17610,9 @@ async def messages(request: Request):
                     else:
                         _hit_cache = _hit_usage.get("cache_read_input_tokens", 0) or 0
                     if _hit_in or _hit_out:
-                        _update_token_usage(model_id, _hit_in, _hit_out, _hit_cache, _extract_cache_creation_tokens(_hit_usage))
+                        _update_token_usage(
+                            model_id, _hit_in, _hit_out, _hit_cache, _extract_cache_creation_tokens(_hit_usage)
+                        )
                 except Exception:
                     pass
                 return Response(
@@ -14811,7 +17731,7 @@ async def messages(request: Request):
                 # credit-retry (qui reste FIRST) et AVANT le relais d'erreur
                 # intacte. Fail-open total : tout échec → relais intact.
                 # Non-stream uniquement, 1 retry max, jamais systemone/streaming.
-                if resp.status_code == 400 and not is_stream:
+                if resp.status_code == 400 and not is_stream and not _is_compaction:
                     try:
                         _cmp_cfg = get_server_compaction()
                         _cmp_on = bool(_cmp_cfg.get("enabled", False)) if isinstance(_cmp_cfg, dict) else False
@@ -14830,7 +17750,11 @@ async def messages(request: Request):
                                     model_id, _ov, endpoint=endpoint, protocol=protocol, api=None
                                 )
                                 try:
-                                    _s_api = _s_api or ("responses" if "/responses" in str(_s_ep or "") else (_s_proto if _s_proto in ("anthropic", "openai") else "chat"))
+                                    _s_api = _s_api or (
+                                        "responses"
+                                        if "/responses" in str(_s_ep or "")
+                                        else (_s_proto if _s_proto in ("anthropic", "openai") else "chat")
+                                    )
                                 except Exception:
                                     _s_api = "chat"
                                 try:
@@ -14858,8 +17782,21 @@ async def messages(request: Request):
                                         model_id=_s_model,
                                         endpoint=_s_ep,
                                         protocol=_s_proto,
-                                        auth_headers_fn=lambda proto, _f=_s_free, _e=_s_ep: _compaction_summarizer_headers(_f, proto, _e),
-                                        do_request_fn=lambda ep, b, h, pr, _f=_s_free, _s=_s_seed: _compaction_summarizer_request(_f, ep, b, h, pr, seed=_s, forced_pool=getattr(request.state, "_geo_forced_pool", None), req_id=req_id),
+                                        auth_headers_fn=lambda proto, _f=_s_free, _e=_s_ep: (
+                                            _compaction_summarizer_headers(_f, proto, _e)
+                                        ),
+                                        do_request_fn=lambda ep, b, h, pr, _f=_s_free, _s=_s_seed: (
+                                            _compaction_summarizer_request(
+                                                _f,
+                                                ep,
+                                                b,
+                                                h,
+                                                pr,
+                                                seed=_s,
+                                                forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                                                req_id=req_id,
+                                            )
+                                        ),
                                         enabled=True,
                                         summary_max_tokens=_mk,
                                         keep_recent_pairs=_kr,
@@ -14868,6 +17805,16 @@ async def messages(request: Request):
                                         timeout_s=_to,
                                         markers=_mrk,
                                         api=_s_api,
+                                        history_api=(
+                                            "anthropic"
+                                            if str(_s_api or "").lower() == "anthropic"
+                                            else "chat"
+                                        ),
+                                        full_history=not _s_free,
+                                        max_attempts=get_server_compaction("max_attempts", 1),
+                                        keep_tail=get_server_compaction("keep_tail", True),
+                                        system=body.get("system") if isinstance(body, dict) else None,
+                                        tools=body.get("tools") if isinstance(body, dict) else None,
                                     )
                                 except Exception:
                                     _cmp_condensed = None
@@ -14917,17 +17864,43 @@ async def messages(request: Request):
                                             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
                                             req_cache = usage.get("cache_read_input_tokens", 0)
                                             try:
-                                                _update_token_usage(model_id, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
+                                                _update_token_usage(
+                                                    model_id,
+                                                    req_in,
+                                                    req_out,
+                                                    req_cache,
+                                                    _extract_cache_creation_tokens(usage),
+                                                )
                                             except Exception:
                                                 pass
-                                            used = [b["name"] for b in data.get("content", []) if isinstance(b, dict) and b.get("type") == "tool_use"] if isinstance(data, dict) else []
+                                            used = (
+                                                [
+                                                    b["name"]
+                                                    for b in data.get("content", [])
+                                                    if isinstance(b, dict) and b.get("type") == "tool_use"
+                                                ]
+                                                if isinstance(data, dict)
+                                                else []
+                                            )
                                             try:
                                                 await _save_and_log_request(
-                                                    req_id, model_id, original_model, start_time,
-                                                    req_in, req_out, req_cache, protocol, is_stream,
-                                                    thinking_type, effort, client_ip, account_alias,
-                                                    tool_names, tools_used=used,
-                                                    request_body=request_body, response_body=data,
+                                                    req_id,
+                                                    model_id,
+                                                    original_model,
+                                                    start_time,
+                                                    req_in,
+                                                    req_out,
+                                                    req_cache,
+                                                    protocol,
+                                                    is_stream,
+                                                    thinking_type,
+                                                    effort,
+                                                    client_ip,
+                                                    account_alias,
+                                                    tool_names,
+                                                    tools_used=used,
+                                                    request_body=request_body,
+                                                    response_body=data,
                                                 )
                                             except Exception:
                                                 pass
@@ -14940,7 +17913,9 @@ async def messages(request: Request):
                                     # Re-overflow ou non-200 du retry : relais intact (fail-open, 1 tentative).
                                     if _r2.status_code != 200:
                                         try:
-                                            _log(f"  [compaction] condense-retry non-200={_r2.status_code} → relais intact")
+                                            _log(
+                                                f"  [compaction] condense-retry non-200={_r2.status_code} → relais intact"
+                                            )
                                         except Exception:
                                             pass
                                         return Response(
@@ -14974,7 +17949,9 @@ async def messages(request: Request):
                             _r429.headers["Retry-After"] = str(_ra_p)
                         return _r429
                     if resp.status_code == 529:
-                        _r529 = _anthropic_error(529, msg or "Overloaded. Try again later.", error_type="overloaded_error")
+                        _r529 = _anthropic_error(
+                            529, msg or "Overloaded. Try again later.", error_type="overloaded_error"
+                        )
                         if _ra_p:
                             _r529.headers["Retry-After"] = str(_ra_p)
                         return _r529
@@ -15046,6 +18023,7 @@ async def messages(request: Request):
             # We use a local variable instead of reassigning model_id to avoid
             # UnboundLocalError in Python 3.12+ (nonlocal + assignment conflict).
             _track_model = model_id
+            _mark_requested_model(model_id)
             # Try free model for streaming: swap endpoint/model before starting stream
             free_model = _resolve_free_model(model_id)
             # [Parité protocole — défaut mesuré, lot L1/P1] État de la conversion
@@ -15115,6 +18093,10 @@ async def messages(request: Request):
             stream_out = stream_cache = 0
             started = False
             open_blocks = []
+            # [P0.1] Station/IP du dernier flux ouvert : capturés à l'ouverture
+            # (avant une éventuelle rotation) pour mesurer le débit réel.
+            _free_done_station = None
+            _free_done_ip = ""
             # [PLAN-raisonnement Patch A] thinking synthétique : accumulation
             # du contenu thinking passthrough pour pouvoir forger
             # signature_delta côté synthétique (timeout/CancelledError/EOF).
@@ -15178,6 +18160,23 @@ async def messages(request: Request):
                     )
                     async with _stream_ctx as resp:
                         _debug(f"  [stream] connected status={resp.status_code}")
+                        if _using_free:
+                            try:
+                                _free_done_station = _free_attempt_station() or (
+                                    resp._ttfb_ctx[0] if getattr(resp, "_ttfb_ctx", None) else None
+                                )
+                                _free_done_ip = str(
+                                    (_current_free_attempt.get() or {}).get("ip")
+                                    or getattr(resp, "_free_ip", "")
+                                    or ""
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            # La dernière tentative est payante : ne pas attribuer
+                            # son débit à la dernière station free vue.
+                            _free_done_station = None
+                            _free_done_ip = ""
                         if resp.status_code != 200:
                             if _using_free:
                                 # Free endpoint non-200 (429 quota, 5xx...) → cooldown
@@ -15207,9 +18206,7 @@ async def messages(request: Request):
                                         # distingue « l'IP est mauvaise » de
                                         # « le corps n'a pas la forme ».
                                         try:
-                                            _gate_verdict = _free_gate_diagnose(
-                                                headers, body, egress="rejected"
-                                            )
+                                            _gate_verdict = _free_gate_diagnose(headers, body, egress="rejected")
                                             _note_gate_factors(_gate_verdict.failed_factors)
                                             _debug(f"  [gate] facteurs={_gate_verdict.as_log()}")
                                             # [V6.3.2] Mettre la station de côté
@@ -15217,9 +18214,7 @@ async def messages(request: Request):
                                             # Un refus de forme (body/identity)
                                             # échouerait sur les cinq stations :
                                             # on ne consomme pas de rotation pour ça.
-                                            _station_fault = _station_attributable_fault(
-                                                _gate_verdict.failed_factors
-                                            )
+                                            _station_fault = _station_attributable_fault(_gate_verdict.failed_factors)
                                             if _station_fault:
                                                 _fault_station = _free_attempt_station()
                                                 if _fault_station is None:
@@ -15313,7 +18308,7 @@ async def messages(request: Request):
                                         tool_names,
                                         request_body,
                                         "stream",
-                                    client_protocol="anthropic",
+                                        client_protocol="anthropic",
                                     )
                                     if _refuse:
                                         yield _refuse_bytes
@@ -15322,7 +18317,9 @@ async def messages(request: Request):
                                 endpoint = paid_endpoint
                                 _using_free = False
                                 _track_model = model_id
-                                _free_fallback_bookkeep(req_id, free_model, resp.status_code, _track_model, "stream", refused=_refuse)
+                                _free_fallback_bookkeep(
+                                    req_id, free_model, resp.status_code, _track_model, "stream", refused=_refuse
+                                )
                                 if _refuse:
                                     yield await _free_stream_refuse_bytes(
                                         resp,
@@ -15336,7 +18333,7 @@ async def messages(request: Request):
                                         client_ip,
                                         tool_names,
                                         request_body,
-                                    client_protocol="anthropic",
+                                        client_protocol="anthropic",
                                     )
                                     return
                                 continue
@@ -15346,6 +18343,7 @@ async def messages(request: Request):
                                 _attempt,
                                 resp.headers,
                                 (await resp.aread()) if resp.status_code == 403 else None,
+                                model_id,
                             )
                             if should_retry:
                                 _debug("  [stream] 429 retry, key swapped")
@@ -15422,9 +18420,7 @@ async def messages(request: Request):
                             # [Phase 1 compaction] shape-compaction : relayer statut
                             # + body upstream intacts (overflow reconnaissable).
                             if _is_compaction:
-                                err_msg = (
-                                    f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:500]}"
-                                )
+                                err_msg = f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:500]}"
                             elif resp.status_code == 429:
                                 err_msg = "All API keys exhausted (rate limited). Try again later."
                             elif resp.status_code in (401, 403):
@@ -15473,7 +18469,7 @@ async def messages(request: Request):
                                 # statut upstream explicite, free_status lu depuis
                                 # le ctx C1 (peek sans pop).
                                 paid_status=resp.status_code,
-                            client_protocol="anthropic",
+                                client_protocol="anthropic",
                             )
                             return
                         _conv_state = None
@@ -15814,6 +18810,15 @@ async def messages(request: Request):
                         except Exception as e:
                             _debug(f"  ✗ token rollback failed: {type(e).__name__}: {e}")
                     est_input = await _est_task
+                    if _using_free and _free_done_station is not None:
+                        _record_free_completion(
+                            _free_done_station,
+                            _free_done_ip,
+                            _elapsed_ms(start_time),
+                            stream_out or 0,
+                            success=False,
+                            stop_reason="error",
+                        )
                     await _save_request(
                         req_id,
                         _track_model,
@@ -15881,9 +18886,8 @@ async def messages(request: Request):
                         )
                         if _can_fail_with_http_status(False):
                             raise EmptyUpstreamStream(
-                                f"flux amont vide avant tout octet "
-                                f"(modèle={free_model if _using_free else model_id})"
-                            )
+                                f"flux amont vide avant tout octet (modèle={free_model if _using_free else model_id})"
+                            ) from None
                         yield _sse(
                             "error",
                             {
@@ -15925,7 +18929,8 @@ async def messages(request: Request):
             # ligne > line_buffer_max…). La garde `started` seule laissait cet état sortir
             # SANS `content_block_stop`/`message_delta`/`message_stop` : le client Anthropic
             # voyait une 200 se fermer sans terminal.
-            if (started or _bytes_flushed) and not emitted_finish:
+            _stream_truncated = bool((started or _bytes_flushed) and not emitted_finish)
+            if _stream_truncated:
                 # [FIX libellé] Cette ligne annonçait « synthesizing stop » alors que le
                 # code émet ``_terminate_after_started`` → ``stop_reason: "error"``. Un
                 # libellé faux fait croire à un faux vert là où le proxy est honnête, et
@@ -15992,6 +18997,15 @@ async def messages(request: Request):
                     _elapsed_ms(start_time),
                     ip=_free_usage_ip(),
                 )
+            if _using_free and _free_done_station is not None:
+                _record_free_completion(
+                    _free_done_station,
+                    _free_done_ip,
+                    _elapsed_ms(start_time),
+                    stream_out or 0,
+                    success=not _stream_truncated,
+                    stop_reason=("error" if _stream_truncated else stop_reason),
+                )
             if stream_in is not None or stream_out:
                 ak = _alias_for_key(headers.get("x-api-key", ""))
                 await _save_and_log_request(
@@ -16011,6 +19025,12 @@ async def messages(request: Request):
                     tool_names,
                     tools_used=used_tools if used_tools else None,
                     request_body=request_body,
+                    success=not _stream_truncated,
+                    error=("stream_truncated" if _stream_truncated else None),
+                    ttfb_ms=getattr(resp, "_ttfb_ms", None),
+                    stop_reason=stop_reason,
+                    aborted=_stream_truncated,
+                    station_override=getattr(_free_done_station, "_station", None),
                 )
 
         # For streaming: if free model exists, pass empty headers (free models don't need auth)
@@ -16019,20 +19039,33 @@ async def messages(request: Request):
         # bufferisé + 1 refetch station fraîche sur tiny, puis SSE synthétisé
         # (échec quelconque → None → live streaming inchangé).
         _buf = await _buffered_compaction_stream(
-            porte="messages", request=request, req_id=req_id, original_model=original_model,
-            model_id=model_id, endpoint=endpoint, protocol=protocol, headers=a_headers,
-            send_body=body, paid_body=body, client_ip=client_ip, start_time=start_time,
-            is_stream=is_stream, thinking_type=thinking_type, effort=effort,
-            tool_names=tool_names, request_body=request_body, is_compaction=_is_compaction,
+            porte="messages",
+            request=request,
+            req_id=req_id,
+            original_model=original_model,
+            model_id=model_id,
+            endpoint=endpoint,
+            protocol=protocol,
+            headers=a_headers,
+            send_body=body,
+            paid_body=body,
+            client_ip=client_ip,
+            start_time=start_time,
+            is_stream=is_stream,
+            thinking_type=thinking_type,
+            effort=effort,
+            tool_names=tool_names,
+            request_body=request_body,
+            is_compaction=_is_compaction,
         )
         if _buf is not None:
             return _buf
+        _mark_stream_start(model_id)
         return StreamingResponse(
             _sse_pump(
                 anthropic_stream(_stream_headers),
                 on_error=_note_sse_abort,
                 error_event=_SSE_ERR_ANTHROPIC,
-
                 idle_timeout=_SSE_IDLE_TIMEOUT,
             ),
             media_type="text/event-stream",
@@ -16076,88 +19109,107 @@ async def messages(request: Request):
     try:
         headers = _get_auth_headers("openai")
     except AllKeysPausedError as e:
-        # If a free model exists, try it before giving up
-        if _has_free_leg(model_id):
-            try:
-                free_result = await _try_free_model_first(
-                    _oai_body_for_free,
-                    {},
-                    "openai",
-                    model_id,
-                    forced_pool=getattr(request.state, "_geo_forced_pool", None),
-                    req_id=req_id,
-                )
-                if free_result is not None:
-                    resp, _, _actual_model, _actual_ip = free_result
-                    data = _resp_json_or_empty(resp)
-                    usage = data.get("usage", {})
-                    req_in = usage.get("prompt_tokens", 0)
-                    req_out = usage.get("completion_tokens", 0)
-                    cache = _extract_cache_tokens(usage)
-                    _update_token_usage(_actual_model, req_in, req_out, cache, _extract_cache_creation_tokens(usage))
-                    used = _extract_usage_tool_names(data)
-                    await _save_and_log_request(
-                        req_id,
-                        _actual_model,
-                        original_model,
-                        start_time,
-                        req_in,
-                        req_out,
-                        cache,
-                        protocol,
-                        False,
-                        thinking_type,
-                        effort,
-                        client_ip,
-                        "free (no auth)",
-                        tool_names,
-                        tools_used=used,
-                        request_body=request_body,
-                        response_body=data,
-                        free_model_ip=_actual_ip,
+        # [2026-10-29] Streaming : NE PAS passer par le repli free non-stream.
+        # `_try_free_model_first` interroge l'amont sans `stream` et parse du
+        # JSON ; or le client a demandé un flux, donc l'amont répond du SSE →
+        # données vides, 0 token, et un 200 JSON mensonger (mesuré sur
+        # `deepseek-v4.1-flash-free` dès que la clé unique est mise en pause).
+        # On laisse le chemin streaming ci-dessous tenter le free en premier :
+        # il n'a pas besoin d'en-têtes d'authentification.
+        _req_stream = bool(oai_body.get("stream"))
+        if _req_stream and _has_free_leg(model_id):
+            headers = {}
+        else:
+            # If a free model exists, try it before giving up (non-stream only)
+            if _has_free_leg(model_id):
+                try:
+                    free_result = await _try_free_model_first(
+                        _oai_body_for_free,
+                        {},
+                        "openai",
+                        model_id,
+                        forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                        req_id=req_id,
                     )
-                    return Response(
-                        content=_json_dumps_str(
-                            openai_to_anthropic(
-                                data,
-                                original_model,
-                                # [Lot L4 — A8] Restore des noms d'outils raccourcis
-                                # à l'aller. ``get`` (et non ``pop``) : en cas
-                                # d'échec du repli free, le chemin payant qui suit
-                                # a encore besoin de la map.
-                                _oai_body_for_free.get(_TOOL_NAME_MAP_KEY)
-                                if isinstance(_oai_body_for_free, dict)
-                                else None,
+                    if free_result is not None:
+                        resp, _, _actual_model, _actual_ip = free_result
+                        data = _resp_json_or_empty(resp)
+                        usage = data.get("usage", {})
+                        req_in = usage.get("prompt_tokens", 0)
+                        req_out = usage.get("completion_tokens", 0)
+                        cache = _extract_cache_tokens(usage)
+                        _update_token_usage(_actual_model, req_in, req_out, cache, _extract_cache_creation_tokens(usage))
+                        used = _extract_usage_tool_names(data)
+                        await _save_and_log_request(
+                            req_id,
+                            _actual_model,
+                            original_model,
+                            start_time,
+                            req_in,
+                            req_out,
+                            cache,
+                            protocol,
+                            False,
+                            thinking_type,
+                            effort,
+                            client_ip,
+                            "free (no auth)",
+                            tool_names,
+                            tools_used=used,
+                            request_body=request_body,
+                            response_body=data,
+                            free_model_ip=_actual_ip,
+                        )
+                        return Response(
+                            content=_json_dumps_str(
+                                openai_to_anthropic(
+                                    data,
+                                    original_model,
+                                    # [Lot L4 — A8] Restore des noms d'outils raccourcis
+                                    # à l'aller. ``get`` (et non ``pop``) : en cas
+                                    # d'échec du repli free, le chemin payant qui suit
+                                    # a encore besoin de la map.
+                                    _oai_body_for_free.get(_TOOL_NAME_MAP_KEY)
+                                    if isinstance(_oai_body_for_free, dict)
+                                    else None,
+                                ),
+                                ensure_ascii=False,
                             ),
-                            ensure_ascii=False,
-                        ),
-                        media_type="application/json",
-                    )
-            except FreeRefusal as fq_err:
-                return _free_refusal_response(fq_err, "openai")
-            except Exception as fail_err:
-                _debug(f"  [free] free model attempt failed: {fail_err}")
-        retry_after = int(e.retry_after) + 1
-        return Response(
-            content=_json_dumps_str(
-                {
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": f"All API keys exhausted. Retry after {retry_after}s.",
-                    },
-                }
-            ),
-            status_code=503,
-            media_type="application/json",
-            headers={"Retry-After": str(retry_after)},
-        )
+                            media_type="application/json",
+                        )
+                except FreeRefusal as fq_err:
+                    return _free_refusal_response(fq_err, "openai")
+                except Exception as fail_err:
+                    _debug(f"  [free] free model attempt failed: {fail_err}")
+            retry_after = int(e.retry_after) + 1
+            return Response(
+                content=_json_dumps_str(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": f"All API keys exhausted. Retry after {retry_after}s.",
+                        },
+                    }
+                ),
+                status_code=503,
+                media_type="application/json",
+                headers={"Retry-After": str(retry_after)},
+            )
     is_stream = oai_body["stream"]
 
     if not is_stream:
         # Cache check for OpenAI-protocol via /v1/messages (mirrors anthropic branch)
         # [Phase 1 compaction] shape-compaction jamais cachée (idem branche anthropic).
-        cache_key = None if _is_compaction else _response_cache.make_key(body, body_bytes=body_bytes)
+        cache_key = (
+                None
+                if _is_compaction or _web_nondet_injected.get()
+                else _response_cache.make_key(
+                    body,
+                    body_bytes=body_bytes,
+                    namespace=_response_cache_namespace(request, model_id, endpoint, "response"),
+                )
+            )
         cached = _response_cache.get(cache_key) if cache_key else None
         if cached and cache_key:
             cached_body, cached_headers = cached
@@ -16254,7 +19306,9 @@ async def messages(request: Request):
             except UpstreamError as e:
                 return JSONResponse(status_code=e.status_code, content={"error": str(e)})
             _debug(f"  [retry-no-reasoning] response status={resp.status_code}")
-        _condensed_ok = False  # [Phase 2 compaction] retry condensé réussi → skip put cache (jamais de cache des résumés)
+        _condensed_ok = (
+            False  # [Phase 2 compaction] retry condensé réussi → skip put cache (jamais de cache des résumés)
+        )
         if resp.status_code != 200:
             await _log_and_save_error(
                 req_id,
@@ -16311,14 +19365,15 @@ async def messages(request: Request):
                     _sc_on = bool(_sc_cfg.get("enabled", False)) if isinstance(_sc_cfg, dict) else False
                 except Exception:
                     _sc_on = False
-                if _sc_on and not is_stream:
+                if _sc_on and not is_stream and not _is_compaction:
                     try:
                         _sc_hist = oai_body.get("messages") if isinstance(oai_body, dict) else None
                         if "/responses" in (endpoint or "") and isinstance(oai_body, dict):
                             _sc_hist = oai_body.get("input", _sc_hist)
                         _sc_ovr = (
                             str(_sc_cfg.get("summarizer_model_override") or "").strip()
-                            if isinstance(_sc_cfg, dict) else ""
+                            if isinstance(_sc_cfg, dict)
+                            else ""
                         )
                         _sc_model, _sc_ep, _sc_proto, _sc_api, _sc_free, _sc_seed = _compaction_summarizer_plan_full(
                             model_id, _sc_ovr, endpoint=endpoint, protocol="openai", api=None
@@ -16360,8 +19415,19 @@ async def messages(request: Request):
                             model_id=_sc_model,
                             endpoint=_sc_ep,
                             protocol=_sc_proto,
-                            auth_headers_fn=lambda proto, _f=_sc_free, _e=_sc_ep: _compaction_summarizer_headers(_f, proto, _e),
-                            do_request_fn=lambda ep, b, h, pr, _f=_sc_free, _s=_sc_seed: _compaction_summarizer_request(_f, ep, b, h, pr, seed=_s, forced_pool=getattr(request.state, "_geo_forced_pool", None), req_id=req_id),
+                            auth_headers_fn=lambda proto, _f=_sc_free, _e=_sc_ep: _compaction_summarizer_headers(
+                                _f, proto, _e
+                            ),
+                            do_request_fn=lambda ep, b, h, pr, _f=_sc_free, _s=_sc_seed: _compaction_summarizer_request(
+                                _f,
+                                ep,
+                                b,
+                                h,
+                                pr,
+                                seed=_s,
+                                forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                                req_id=req_id,
+                            ),
                             enabled=True,
                             summary_max_tokens=_sc_max,
                             keep_recent_pairs=_sc_keep,
@@ -16370,6 +19436,11 @@ async def messages(request: Request):
                             timeout_s=_sc_to,
                             markers=_sc_markers,
                             api=_sc_api,
+                            history_api="chat",
+                            full_history=not _sc_free,
+                                        max_attempts=get_server_compaction("max_attempts", 1),
+                                        keep_tail=get_server_compaction("keep_tail", True),
+                            tools=oai_body.get("tools") if isinstance(oai_body, dict) else None,
                         )
                     except Exception:
                         _condensed = None
@@ -16403,7 +19474,9 @@ async def messages(request: Request):
                         except Exception:
                             _retry_body = None
                         if isinstance(_retry_body, dict):
-                            _log(f"  [compaction] req_id={req_id} 400-overflow → condense-and-retry once (model={_sc_model!r})")
+                            _log(
+                                f"  [compaction] req_id={req_id} 400-overflow → condense-and-retry once (model={_sc_model!r})"
+                            )
                             try:
                                 try:
                                     _sc_tunnel = bool(getattr(request.state, "_geo_force_tunnel", False))
@@ -16419,12 +19492,16 @@ async def messages(request: Request):
                                     ) as _rpool:
                                         resp = _rpool
                                         try:
-                                            headers = dict(_rpool.headers) if getattr(_rpool, "headers", None) else headers
+                                            headers = (
+                                                dict(_rpool.headers) if getattr(_rpool, "headers", None) else headers
+                                            )
                                         except Exception:
                                             pass
                                         raise _CompactionTunnelDone(resp, headers)
                                 else:
-                                    resp, headers = await _do_request_with_retry(endpoint, _retry_body, headers, "openai")
+                                    resp, headers = await _do_request_with_retry(
+                                        endpoint, _retry_body, headers, "openai"
+                                    )
                             except _CompactionTunnelDone as _td2:
                                 resp, headers = _td2.resp, _td2.headers
                             except UpstreamError as e:
@@ -16463,7 +19540,9 @@ async def messages(request: Request):
                     _pass = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
                     _pass_headers = {"Retry-After": _pass} if _pass else None
                     return Response(
-                        content=anthro_err, status_code=resp.status_code, media_type="application/json",
+                        content=anthro_err,
+                        status_code=resp.status_code,
+                        media_type="application/json",
                         headers=_pass_headers,
                     )
                 # [Étape 2B — B1] 403 DataPolicyError → message explicite
@@ -16592,6 +19671,7 @@ async def messages(request: Request):
         nonlocal endpoint, oai_body, model_id
         # Use local variable to avoid sharing model_id across concurrent requests
         _req_model_id = model_id
+        _mark_requested_model(_req_model_id)
         # Try free model for streaming
         _paid_model_id = _req_model_id  # Save original for fallback
         free_model = _resolve_free_model(_req_model_id)
@@ -16789,7 +19869,7 @@ async def messages(request: Request):
                                     tool_names,
                                     request_body,
                                     "stream-oai",
-                                client_protocol="anthropic",
+                                    client_protocol="anthropic",
                                 )
                                 if _refuse:
                                     yield _refuse_bytes
@@ -16822,7 +19902,7 @@ async def messages(request: Request):
                                     client_ip,
                                     tool_names,
                                     request_body,
-                                client_protocol="anthropic",
+                                    client_protocol="anthropic",
                                 )
                                 return
                             continue
@@ -16832,6 +19912,7 @@ async def messages(request: Request):
                             _attempt,
                             resp.headers,
                             (await resp.aread()) if resp.status_code == 403 else None,
+                            model_id,
                         )
                         if should_retry:
                             if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
@@ -16924,8 +20005,12 @@ async def messages(request: Request):
                         except StopAsyncIteration:
                             break
                         except TimeoutError:
-                            _log(f"  [stream-oai] idle {_oai_idle:.0f}s sans octet amont (tunnel mort ?) → terminaison explicite")
-                            _debug(f"  [stream-oai] idle-timeout mid-stream après {stream_out_tokens} out_tokens last={_last_resp_type!r}")
+                            _log(
+                                f"  [stream-oai] idle {_oai_idle:.0f}s sans octet amont (tunnel mort ?) → terminaison explicite"
+                            )
+                            _debug(
+                                f"  [stream-oai] idle-timeout mid-stream après {stream_out_tokens} out_tokens last={_last_resp_type!r}"
+                            )
                             if _stream_has_yielded(started, open_blocks, stream_out_tokens, ""):
                                 _cb_record_failure(endpoint)
                                 # Le tour est COMPLET mais l'enveloppe finale manque
@@ -16934,7 +20019,9 @@ async def messages(request: Request):
                                 # que l'officiel), pas d'erreur sur un tour fini.
                                 if _last_resp_type in ("response.output_item.done", "response.content_part.done"):
                                     _idle_finish = "tool_calls" if used_tools else "stop"
-                                    _log(f"  [stream-oai] tour complet sans enveloppe → finish {_idle_finish!r} synthétisé")
+                                    _log(
+                                        f"  [stream-oai] tour complet sans enveloppe → finish {_idle_finish!r} synthétisé"
+                                    )
                                     _synth = {
                                         "id": _fast_id("chatcmpl"),
                                         "object": "chat.completion.chunk",
@@ -17264,8 +20351,7 @@ async def messages(request: Request):
                         # terminait la requête SANS seconde chance alors que RIEN
                         # n'avait été émis au client — le retry est donc sûr.
                         _debug(
-                            f"  [stream-oai] empty upstream response (paid leg) "
-                            f"→ retry {_attempt + 2}/{_free_bound}"
+                            f"  [stream-oai] empty upstream response (paid leg) → retry {_attempt + 2}/{_free_bound}"
                         )
                         _log(
                             f"  EMPTY RESPONSE upstream (paid leg, nothing emitted) "
@@ -17313,7 +20399,7 @@ async def messages(request: Request):
                                     request_body=request_body,
                                     free_status=429,
                                     error_label="upstream_free_empty_response",
-                                client_protocol="anthropic",
+                                    client_protocol="anthropic",
                                 )
                                 return
                             yield _sse(
@@ -17365,7 +20451,7 @@ async def messages(request: Request):
                                 request_body=request_body,
                                 free_status=429,
                                 error_label="upstream_free_empty_response",
-                            client_protocol="anthropic",
+                                client_protocol="anthropic",
                             )
                             return
                         continue
@@ -17516,9 +20602,8 @@ async def messages(request: Request):
                     )
                     if _can_fail_with_http_status(False):
                         raise EmptyUpstreamStream(
-                            f"flux amont vide avant tout octet "
-                            f"(modèle={free_model if _using_free else model_id})"
-                        )
+                            f"flux amont vide avant tout octet (modèle={free_model if _using_free else model_id})"
+                        ) from None
                     yield _sse(
                         "error",
                         {
@@ -17645,20 +20730,33 @@ async def messages(request: Request):
     # fetch bufferisé + 1 refetch station fraîche sur tiny, puis SSE
     # Anthropic synthétisé (échec → None → live streaming inchangé).
     _buf_oa = await _buffered_compaction_stream(
-        porte="messages", request=request, req_id=req_id, original_model=original_model,
-        model_id=model_id, endpoint=endpoint, protocol="openai", headers=headers,
-        send_body=oai_body, paid_body=oai_body, client_ip=client_ip, start_time=start_time,
-        is_stream=is_stream, thinking_type=thinking_type, effort=effort,
-        tool_names=tool_names, request_body=request_body, is_compaction=_is_compaction,
+        porte="messages",
+        request=request,
+        req_id=req_id,
+        original_model=original_model,
+        model_id=model_id,
+        endpoint=endpoint,
+        protocol="openai",
+        headers=headers,
+        send_body=oai_body,
+        paid_body=oai_body,
+        client_ip=client_ip,
+        start_time=start_time,
+        is_stream=is_stream,
+        thinking_type=thinking_type,
+        effort=effort,
+        tool_names=tool_names,
+        request_body=request_body,
+        is_compaction=_is_compaction,
     )
     if _buf_oa is not None:
         return _buf_oa
+    _mark_stream_start(model_id)
     return StreamingResponse(
         _sse_pump(
             stream_gen(headers),
             on_error=_note_sse_abort,
             error_event=_SSE_ERR_ANTHROPIC,
-
             idle_timeout=_SSE_IDLE_TIMEOUT,
         ),
         media_type="text/event-stream",
@@ -17682,12 +20780,7 @@ def _canary_verdict(raw: str) -> tuple[bool, str]:
     text = raw or ""
     if "Free model request failed" in text or '"type":"error"' in text or "event: error" in text:
         return False, "trame d'erreur dans le flux"
-    if (
-        '"text_delta"' in text
-        or '"thinking_delta"' in text
-        or '"content_block_delta"' in text
-        or '"delta"' in text
-    ):
+    if '"text_delta"' in text or '"thinking_delta"' in text or '"content_block_delta"' in text or '"delta"' in text:
         return True, ""
     return False, "flux sans contenu"
 
@@ -17705,9 +20798,7 @@ async def _canary_probe_once(probe: str, path: str, model: str, timeout_s: float
     chunks: list[str] = []
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
-            async with client.stream(
-                "POST", f"http://127.0.0.1:{PORT}{path}", json=payload
-            ) as resp:
+            async with client.stream("POST", f"http://127.0.0.1:{PORT}{path}", json=payload) as resp:
                 status_code = resp.status_code
                 async for chunk in resp.aiter_text():
                     chunks.append(chunk)
@@ -17735,9 +20826,7 @@ async def _canary_probe_once(probe: str, path: str, model: str, timeout_s: float
 
 async def _canary_cycle(model_override: str = "") -> dict:
     """Les deux protocoles clients, un modèle de référence, un verdict chacun."""
-    model = str(
-        model_override or yaml_get("canary", "model", "big-pickle") or "big-pickle"
-    )
+    model = str(model_override or yaml_get("canary", "model", "big-pickle") or "big-pickle")
     timeout_s = float(yaml_get("canary", "timeout_s", 90) or 90)
     # [storm-guard 2026-10-24] Si toute la chaîne free du modèle canary est
     # trial-morte sur toutes les stations, les 2 sondes streaming brûleraient
@@ -17753,9 +20842,7 @@ async def _canary_cycle(model_override: str = "") -> dict:
             and getattr(_free_ip_pool, "enabled", False)
             and list(getattr(_free_ip_pool, "_stations", None) or [])
         )
-        if _pool_ok and _chain and all(
-            _free_stations_exhausted(_m) for _m in _chain
-        ):
+        if _pool_ok and _chain and all(_free_stations_exhausted(_m) for _m in _chain):
             from observability import canary as _canary_mod
 
             out = {}
@@ -17763,9 +20850,7 @@ async def _canary_cycle(model_override: str = "") -> dict:
                 ("free.messages", "/v1/messages"),
                 ("free.chat", "/v1/chat/completions"),
             ):
-                _canary_mod.record(
-                    probe, False, latency_ms=0.0, detail="skip trial-dead (no upstream call)"
-                )
+                _canary_mod.record(probe, False, latency_ms=0.0, detail="skip trial-dead (no upstream call)")
                 out[probe] = {
                     "ok": False,
                     "ms": 0.0,
@@ -17857,8 +20942,8 @@ async def _station_quality_probe_loop() -> None:
     if __import__("os").getenv("PYTEST_CURRENT_TEST"):
         return
     try:
-        from free.quality import QualityConfig
         from free.probe import probe_once
+        from free.quality import QualityConfig
 
         while True:
             cfg = QualityConfig.from_yaml()
@@ -17983,13 +21068,30 @@ async def health(detail: str = "lite"):
     _debug("  [health] health check started")
 
     def _health_probe():
-        # [v10 §14.3.16] SELECT 1 sous le MÊME lock que le batch writer :
-        # un check concurrent au commit levait InterfaceError ponctuel.
-        with _db_commit_lock:
-            _conn.execute("SELECT 1")
+        # [2026-10-29] Sonde sur une connexion read-only SÉPARÉE, sans le
+        # `_db_commit_lock` du writer. Avec le lock partagé, un gros commit
+        # (requêtes 90–100 Ko, WAL de plusieurs Go) bloquait `/health` plus de
+        # 30 s : le proxy servait normalement mais les moniteurs le croyaient
+        # mort. SQLite WAL autorise les lecteurs concurrents.
+        _ro = None
+        try:
+            _ro = sqlite3.connect(f"file:{_db_path}?mode=ro", uri=True, timeout=2.0)
+            _ro.execute("SELECT 1").fetchone()
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+        finally:
+            if _ro is not None:
+                try:
+                    _ro.close()
+                except Exception:
+                    pass
 
-    await asyncio.to_thread(_health_probe)
-    _debug("  [health] DB connectivity OK")
+    db_ok, db_error = await asyncio.to_thread(_health_probe)
+    if not db_ok:
+        _debug(f"  [health] DB probe busy/failed: {db_error}")
+    else:
+        _debug("  [health] DB connectivity OK")
 
     usage = (
         {model: {"input": d["input"], "output": d["output"], "cache": d["cache"]} for model, d in _token_usage.items()}
@@ -18042,12 +21144,16 @@ async def health(detail: str = "lite"):
         open_breakers=_open_endpoints,
         pauses=key_pause_status,
     )
+    if not db_ok:
+        status = "degraded"
+        status_reasons.append("db: probe busy")
     _debug(f"  [health] key pauses: {len(key_pause_status)} active, status={status}")
 
     _debug(f"  [health] overall status={status}")
     payload = {
         "status": status,
         "status_reasons": status_reasons,
+        "db": "ok" if db_ok else "busy",
         "usage": usage,
         "upstream": "ok" if upstream_ok else "unreachable",
         "circuit_breakers": cb_status,
@@ -18064,11 +21170,39 @@ async def health(detail: str = "lite"):
             payload["free_payload"] = {
                 "tools": len(_fp.get("tools") or []),
                 "system_chars": len(((_fp.get("system") or {}).get("content")) or ""),
-                "ok": len(_fp.get("tools") or []) >= 10
-                and bool((_fp.get("system") or {}).get("content")),
+                "ok": len(_fp.get("tools") or []) >= 10 and bool((_fp.get("system") or {}).get("content")),
             }
         except Exception as _e:
             payload["free_payload"] = {"ok": False, "error": str(_e)[:200]}
+        # [audit watchdog 2026-10-30] Le heartbeat ne vivait que dans les logs.
+        # Exposé en vue complète : âge du heartbeat, skips de rotation, action
+        # courante et budget de restarts par station.
+        try:
+            import shared_state as _ss_wd
+
+            _wd_rows = []
+            for _m in getattr(_ss_wd, "vpn_managers", None) or []:
+                try:
+                    _st = _m.get_status()
+                    _w = _st.get("watchdog") or {}
+                    _wd_rows.append(
+                        {
+                            "station": int(getattr(_m, "_station", -1)),
+                            "status": _st.get("status"),
+                            "heartbeat_age_s": _w.get("heartbeat_age_s"),
+                            "skipped_ticks": _w.get("skipped_ticks"),
+                            "egress_failures": _w.get("egress_failures"),
+                            "egress_threshold": _w.get("egress_threshold"),
+                            "last_action": _w.get("watchdog_last_action"),
+                            "restarts_1h": _w.get("watchdog_restarts_1h"),
+                            "interval_s": _w.get("interval"),
+                        }
+                    )
+                except Exception:
+                    continue
+            payload["watchdog"] = _wd_rows
+        except Exception:
+            payload["watchdog"] = []
         payload["empty_stream_incidents"] = empty_stream_stats()
         # [V6.3.1] Répartition des échecs free par cause : c'est la mesure qui
         # dira si la politique de reprise dépense ses rotations sur des refus
@@ -18107,9 +21241,7 @@ async def health(detail: str = "lite"):
                     # « breached » en permanence sur du trafic sain.
                     _slo_targets = yaml_get("observability", "slo_targets", None)
                     _slo_by_model = yaml_get("observability", "slo_targets_by_model", None)
-                    payload["slo"] = _slo_evaluate(
-                        _leg_series, targets=_slo_targets, targets_by_model=_slo_by_model
-                    )
+                    payload["slo"] = _slo_evaluate(_leg_series, targets=_slo_targets, targets_by_model=_slo_by_model)
                 except Exception:
                     pass
         except Exception:
@@ -18219,15 +21351,67 @@ async def api_drift():
 
         sections = []
         routes = dict(getattr(_cfg_settings, "MODELS", {}) or {})
-        free_routed_raw = {name for name in routes if _is_free_model_route(name)}
+        # [audit 2026-10-30] Leg truth comes from the server-computed
+        # route_leg/catalog_legs, not from a `-free` suffix heuristic. A
+        # Claude/GPT id without suffix routed on the free leg was classified
+        # paid and reported as a paid orphan (54 false positives live).
+        fmap = dict(getattr(_cfg_settings, "FREE_MODEL_MAP", None) or {})
+
+        def _legs_of(meta) -> set:
+            try:
+                return {str(x).lower() for x in (meta.get("catalog_legs") or ())}
+            except Exception:
+                return set()
+
+        free_routed_raw = {
+            name
+            for name, meta in routes.items()
+            if str((meta or {}).get("route_leg") or "").lower() == "free"
+            or "free" in _legs_of(meta or {})
+            or _is_free_model_route(name)
+        }
+        paid_routed_raw = {
+            name
+            for name, meta in routes.items()
+            if str((meta or {}).get("route_leg") or "").lower() == "paid"
+            or "paid" in _legs_of(meta or {})
+        }
+
+        def _internal_route(name: str) -> bool:
+            try:
+                return bool(_cfg_settings._live_is_internal(name, routes.get(name) or {}))
+            except Exception:
+                return False
+
+        # [audit 2026-10-30] Internal/non-catalogue routes (jev-*) are not
+        # publisher orphans: they are deliberate local endpoints.
+        free_routed_raw = {name for name in free_routed_raw if not _internal_route(name)}
+        paid_routed_raw = {name for name in paid_routed_raw if not _internal_route(name)}
         # [V8.1] Les noms routés ne sont pas les noms *envoyés* : un alias comme
         # `jev-1.13` part en `jev-1.13-free`. Comparer les alias au catalogue
         # fabriquait huit faux orphelins — le genre de bruit qui rend un tableau
         # de bord inutilisable. On compare donc ce qui part réellement.
-        fmap = dict(getattr(_cfg_settings, "FREE_MODEL_MAP", None) or {})
         free_routed = {fmap.get(name, name) for name in free_routed_raw}
-        paid_routed = set(routes) - free_routed_raw
+        paid_routed = {fmap.get(name, name) for name in paid_routed_raw}
         snapshot = getattr(_cfg_settings, "CATALOG_ROUTES", None) or {}
+        # [audit 2026-10-30] CATALOG_ROUTES is a generated cache that can lag
+        # the live /models poll by days. Union it with the live per-leg
+        # catalog so the endpoint stops reporting stale-snapshot ids as
+        # actionable orphans (54 false positives observed live).
+        try:
+            from config import live_models as _lm
+
+            _live_by_leg = _lm.by_leg()
+        except Exception:
+            _live_by_leg = {}
+        # [audit 2026-10-30] live_models keys its legs `opencode`/`opencode-go`
+        # while drift speaks `free`/`paid`: the old `.get(leg)` was always
+        # empty, so the live union never suppressed stale orphans. Union both
+        # live legs (a model offered on EITHER leg is not dead), whatever the
+        # drift leg name.
+        _live_union = set()
+        for _ids in (_live_by_leg or {}).values():
+            _live_union |= set(_ids or ())
         try:
             last = _cfg_settings.CATALOG_ROUTES_FILE.stat().st_mtime
             generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last))
@@ -18237,7 +21421,8 @@ async def api_drift():
             ("free", snapshot.get("opencode") or {}, free_routed),
             ("paid", snapshot.get("opencode-go") or {}, paid_routed),
         ):
-            sections.append(_drift_compute(catalog, routed, leg))
+            _catalog = set(catalog) | _live_union
+            sections.append(_drift_compute(_catalog, routed, leg))
         # [V8.1] Un id absent du snapshot mais **dont le dernier appel a réussi**
         # ne prouve pas qu'il est mort : il prouve que le snapshot a vieilli.
         # On n'annote qu'avec des succès — `jev-1.13-free` a été « observé »
@@ -18320,17 +21505,13 @@ def _free_quota_states(limit: int = 200) -> list:
 
         now_m = time.monotonic()
         with _free_cooldown_lock:
-            items = [
-                (k, t, _free_cooldown_scope.get(k, ""))
-                for k, t in _free_model_cooldowns.items()
-                if t > now_m
-            ]
+            items = [(k, t, _free_cooldown_scope.get(k, "")) for k, t in _free_model_cooldowns.items() if t > now_m]
         out = []
         for key, expiry, scope in items:
             try:
                 model, _, ip = key.partition("|")
                 remain = max(0.0, expiry - now_m)
-                _eta = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=remain)
+                _eta = _dt.datetime.now(_dt.UTC) + _dt.timedelta(seconds=remain)
                 out.append(
                     {
                         "model": model,
@@ -18342,7 +21523,7 @@ def _free_quota_states(limit: int = 200) -> list:
                 )
             except Exception:
                 continue
-        out.sort(key=lambda e: e["retry_in_s"])
+        out.sort(key=lambda e: float(str(e.get("retry_in_s") or 0)))
         return out[: max(1, int(limit))]
     except Exception:
         return []
@@ -18389,10 +21570,104 @@ async def live_models_refresh(request: Request):
     return result
 
 
+def _free_model_inventory() -> tuple[list[dict], dict]:
+    """Inventaire des modèles gratuits : détecté, routé, servi, en cooldown.
+
+    ``detected`` (``FREE_MODELS``) n'est pas ``routed`` : un id découvert mais
+    absent de ``MODELS`` n'est pas servi par le proxy. On expose les deux, plus
+    la provenance du tier et les payants qui retombent dessus (``mapped_from``).
+    """
+    free_models: set = getattr(_cfg_settings, "FREE_MODELS", set()) or set()
+    free_map = getattr(_cfg_settings, "FREE_MODEL_MAP", {}) or {}
+    state = getattr(_cfg_settings, "_FREE_DISCOVERY_STATE", {}) or {}
+    probe = dict((state.get("probe") or {}).get("results") or {})
+    try:
+        from observability.metrics import leg_ok_models as _leg_ok_models
+
+        served = set(_leg_ok_models())
+    except Exception:
+        served = set()
+    cooldown: dict[str, dict] = {}
+    for row in _free_quota_states():
+        mid = str(row.get("model") or "")
+        if mid and mid not in cooldown:
+            cooldown[mid] = row
+
+    ids: list[str] = []
+    for mid in list(MODELS) + sorted(free_models):
+        if mid not in ids:
+            ids.append(mid)
+
+    rows: list[dict] = []
+    candidates = 0
+    for mid in ids:
+        verdict = _model_tier_for(mid)
+        if verdict.get("tier") != "free":
+            if mid in MODELS and (
+                mid in free_models or verdict.get("route_leg") == "free"
+            ):
+                candidates += 1
+            continue
+        effective = str(verdict.get("route_target") or mid)
+        probe_row = probe.get(effective)
+        probe_verdict = probe_row.get("verdict") if isinstance(probe_row, dict) else None
+        if mid in cooldown:
+            status = "cooldown"
+        elif effective in served:
+            status = "served"
+        elif probe_verdict == "alive":
+            status = "probe_alive"
+        elif probe_verdict == "limited":
+            status = "limited"
+        elif probe_verdict == "dead":
+            status = "dead"
+        elif probe_verdict == "not_free":
+            status = "not_free"
+        elif probe_verdict == "not_probeable":
+            status = "systemone"
+        else:
+            status = "unproven"
+        rows.append(
+            {
+                "id": mid,
+                "detected": mid in free_models,
+                "routed": mid in MODELS,
+                "tier": "free",
+                "tier_source": verdict.get("tier_source"),
+                "route_leg": verdict.get("route_leg"),
+                "route_target": verdict.get("route_target"),
+                "free_first": verdict.get("free_first"),
+                "free_target": verdict.get("free_target"),
+                "status": status,
+                "probe": probe_row,
+                "cooldown": cooldown.get(mid),
+                "mapped_from": sorted(key for key, target in free_map.items() if target == mid and key != mid),
+            }
+        )
+
+    counts = {
+        "detected": len(free_models),
+        "listed": len(rows),
+        "candidates": candidates,
+        "routed": sum(1 for row in rows if row["routed"]),
+        "not_routed": sum(1 for row in rows if not row["routed"]),
+        "served": sum(1 for row in rows if row["status"] == "served"),
+        "probe_alive": sum(1 for row in rows if row["status"] == "probe_alive"),
+        "unproven": sum(1 for row in rows if row["status"] == "unproven"),
+        "limited": sum(1 for row in rows if row["status"] == "limited"),
+        "dead": sum(1 for row in rows if row["status"] == "dead"),
+        "not_free": sum(1 for row in rows if row["status"] == "not_free"),
+        "systemone": sum(1 for row in rows if row["status"] == "systemone"),
+        "cooldown": sum(1 for row in rows if row["status"] == "cooldown"),
+    }
+    return rows, counts
+
+
 @app.get("/api/free-models")
 async def free_models():
     """Observability for auto free discovery (GET /api/free-models)."""
     st = _cfg_settings._FREE_DISCOVERY_STATE
+    models, counts = _free_model_inventory()
     return {
         "detected": sorted(_cfg_settings.FREE_MODELS),
         "mapped": dict(_cfg_settings.FREE_MODEL_MAP),
@@ -18404,6 +21679,10 @@ async def free_models():
         "consecutive_failures": int(st.get("consecutive_failures", 0) or 0),
         # [Lot A] sonde active de servabilité — verdicts par id
         "probe": dict(st.get("probe", {}) or {}),
+        # [Tier] inventaire routé : gratuit détecté ≠ gratuit servi
+        "models": models,
+        "counts": counts,
+        "policy": _cfg_settings.get_free_substitution_policy(),
     }
 
 
@@ -18533,8 +21812,7 @@ def _effort_capability(model_id: str) -> dict:
     proposer le cran maximal.
     """
     levels = _model_effort_levels(model_id) or []
-    normalized = {"low" if str(x).strip().lower() == "minimal" else str(x).strip().lower()
-                  for x in levels}
+    normalized = {"low" if str(x).strip().lower() == "minimal" else str(x).strip().lower() for x in levels}
     out: dict[str, Any] = {"supported": bool(normalized)}
     for level in ("low", "medium", "high", "xhigh", "max"):
         out[level] = {"supported": level in normalized}
@@ -18550,7 +21828,8 @@ def _thinking_capability(model_id: str, cfg: dict) -> dict:
     except Exception:
         live = None
     if isinstance(live, dict):
-        types = live.get("types") if isinstance(live.get("types"), dict) else {}
+        _raw_types = live.get("types")
+        types = _raw_types if isinstance(_raw_types, dict) else {}
         return {
             "supported": bool(live.get("supported")),
             "types": {
@@ -18574,14 +21853,21 @@ def _thinking_capability(model_id: str, cfg: dict) -> dict:
 
 
 def _model_capabilities(model_id: str, cfg: dict, entry: dict | None) -> dict:
-    meta = (entry or {}).get("metadata") if isinstance((entry or {}).get("metadata"), dict) else {}
-    modalities = meta.get("modalities") if isinstance(meta.get("modalities"), dict) else {}
+    _entry_meta = (entry or {}).get("metadata")
+    meta = _entry_meta if isinstance(_entry_meta, dict) else {}
+    _raw_modalities = meta.get("modalities")
+    modalities = _raw_modalities if isinstance(_raw_modalities, dict) else {}
     inputs = [str(x).strip().lower() for x in (modalities.get("input") or [])]
+    _proto = str((cfg or {}).get("protocol") or "").lower()
+    _ep = str((cfg or {}).get("endpoint") or "")
+    # Anthropic Messages et Responses natifs savent porter context_management
+    # (le proxy le relaie + ajoute le beta compact) ; Chat/Gemini non.
+    _native_ctx = _proto == "anthropic" or "/responses" in _ep
     cap = {
         "batch": {"supported": False},
         "citations": {"supported": False},
         "code_execution": {"supported": False},
-        "context_management": {"supported": False},
+        "context_management": {"supported": bool(_native_ctx)},
         "effort": _effort_capability(model_id),
         "image_input": {"supported": "image" in inputs},
         "pdf_input": {"supported": "pdf" in inputs},
@@ -18609,10 +21895,119 @@ def _release_epoch(meta: dict, fallback: int) -> int:
     return fallback
 
 
+def _model_tier_for(model_id: str, cfg: dict | None = None, entry: dict | None = None) -> dict:
+    """Verdict Gratuit/Payant, fail-soft : jamais d'échec de ``/v1/models``."""
+    try:
+        # Un alias de route (``glm-5.1`` → ``glm-5.3-flash-free``) est ce que
+        # le handler sert réellement : classer l'alias, pas son endpoint
+        # d'origine. Une seule résolution, comme le chemin de requête.
+        try:
+            _route = _route_for(model_id)
+            _route_target = str(_route.get("model") or "").strip() if isinstance(_route, dict) else ""
+        except Exception:
+            _route_target = ""
+        if _route_target and _route_target != model_id:
+            return _classify_route_alias(
+                model_id,
+                _route_target,
+                cfg=cfg if cfg is not None else get_model_config(model_id),
+                entry=entry if entry is not None else _live_model_entry(model_id),
+                target_cfg=get_model_config(_route_target),
+                target_entry=_live_model_entry(_route_target),
+                free_models=getattr(_cfg_settings, "FREE_MODELS", None),
+                free_model_map=FREE_MODEL_MAP,
+                policy=_cfg_settings.get_free_substitution_policy(),
+            )
+        return _classify_model_tier(
+            model_id,
+            cfg if cfg is not None else get_model_config(model_id),
+            entry if entry is not None else _live_model_entry(model_id),
+            free_models=getattr(_cfg_settings, "FREE_MODELS", None),
+            free_model_map=FREE_MODEL_MAP,
+            policy=_cfg_settings.get_free_substitution_policy(),
+        )
+    except Exception:
+        return {
+            "tier": "unknown",
+            "tier_source": "unknown",
+            "route_leg": "unknown",
+            "catalog_legs": [],
+            "free_first": False,
+            "free_target": None,
+            "free_mapping": None,
+            "free_mapping_active": False,
+            "route_mismatch": False,
+            "catalog_mismatch": False,
+            "route_target": None,
+        }
+
+
+def _probe_result_for(model_id: str, tier: dict | None = None) -> dict | None:
+    """Dernier verdict free-leg connu pour un id (ou sa cible réelle)."""
+    try:
+        state = getattr(_cfg_settings, "_FREE_DISCOVERY_STATE", {}) or {}
+        results = (state.get("probe") or {}).get("results") or {}
+        effective = str((tier or {}).get("route_target") or model_id)
+        row = results.get(effective) or results.get(model_id)
+        return dict(row) if isinstance(row, dict) else None
+    except Exception:
+        return None
+
+
+def _min_positive(*values):
+    """Plus petite valeur entière > 0, ou None."""
+    out = None
+    for value in values:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            out = number if out is None else min(out, number)
+    return out
+
+
+def _effective_model_limits(model_id: str, tier: dict | None, own_limit: dict) -> tuple:
+    """(max_input, max_output) réellement servis par le proxy.
+
+    OpenCode officiel utilise `limit.input || limit.context` et `limit.output`
+    du modèle. Quand le proxy route free-first, la fenêtre effective est le
+    **min** du modèle demandé et de sa cible free : annoncer 1M/128k alors que
+    la jambe free sert 200k/32k fausse la décision de compaction du client.
+    """
+    own_in = own_limit.get("input") or own_limit.get("context")
+    own_out = own_limit.get("output")
+    try:
+        from config.limits import context_limit as _ctx
+        from config.limits import output_limit as _out
+    except Exception:
+        _ctx = _out = None
+    if not own_in and callable(_ctx):
+        own_in = _ctx(model_id)
+    if not own_out and callable(_out):
+        own_out = _out(model_id)
+    target = str((tier or {}).get("free_target") or "").strip()
+    if target and target != model_id and bool((tier or {}).get("free_first")):
+        _entry = _live_model_entry(target) or {}
+        _meta = _entry.get("metadata") if isinstance(_entry.get("metadata"), dict) else {}
+        _limit = _meta.get("limit") if isinstance(_meta.get("limit"), dict) else {}
+        free_in = _limit.get("input") or _limit.get("context")
+        free_out = _limit.get("output")
+        if not free_in and callable(_ctx):
+            free_in = _ctx(target)
+        if not free_out and callable(_out):
+            free_out = _out(target)
+        own_in = _min_positive(own_in, free_in)
+        own_out = _min_positive(own_out, free_out)
+    return own_in, own_out
+
+
 def _model_api_item(model_id: str, lifecycle: str, now: int) -> dict:
     cfg = get_model_config(model_id)
     entry = _live_model_entry(model_id)
-    meta = entry.get("metadata") if isinstance((entry or {}).get("metadata"), dict) else {}
+    tier = _model_tier_for(model_id, cfg, entry)
+    _raw_meta = (entry or {}).get("metadata")
+    meta = _raw_meta if isinstance(_raw_meta, dict) else {}
     endpoint = cfg.get("endpoint", "")
     cb = _circuit_breakers.get(endpoint)
     cb_state = cb.state if cb else "unknown"
@@ -18624,9 +22019,11 @@ def _model_api_item(model_id: str, lifecycle: str, now: int) -> dict:
         if isinstance(release, str) and str(release).strip()
         else datetime.datetime.fromtimestamp(created, datetime.UTC).isoformat()
     )
-    limit = meta.get("limit") if isinstance(meta.get("limit"), dict) else {}
-    max_input = limit.get("context") or limit.get("input")
-    max_tokens = limit.get("output")
+    _raw_limit = meta.get("limit")
+    limit = _raw_limit if isinstance(_raw_limit, dict) else {}
+    # `max_input_tokens` = limite d'ENTRÉE réellement servie ; si la route est
+    # free-first, on expose le min (modèle demandé, cible free).
+    max_input, max_tokens = _effective_model_limits(model_id, tier, limit)
     return {
         "id": model_id,
         "object": "model",
@@ -18640,6 +22037,8 @@ def _model_api_item(model_id: str, lifecycle: str, now: int) -> dict:
         "deprecated_at": None,
         "retires_at": None,
         "line": None,
+        "tier": tier["tier"],
+        "free": tier["tier"] == "free",
         "max_input_tokens": max_input,
         "max_tokens": max_tokens,
         "capabilities": _model_capabilities(model_id, cfg, entry),
@@ -18648,6 +22047,18 @@ def _model_api_item(model_id: str, lifecycle: str, now: int) -> dict:
             "leg": (entry or {}).get("leg"),
             "protocol": cfg.get("protocol"),
             "source": (entry or {}).get("status") or "config",
+            "tier": tier["tier"],
+            "tier_source": tier["tier_source"],
+            "route_leg": tier["route_leg"],
+            "catalog_legs": tier["catalog_legs"],
+            "free_first": tier["free_first"],
+            "free_target": tier["free_target"],
+            "free_mapping": tier["free_mapping"],
+            "free_mapping_active": tier["free_mapping_active"],
+            "route_mismatch": tier["route_mismatch"],
+            "catalog_mismatch": tier["catalog_mismatch"],
+            "route_target": tier["route_target"],
+            "probe": _probe_result_for(model_id, tier),
         },
         "requests": {
             "input": usage.get("input", 0),
@@ -18667,6 +22078,8 @@ async def list_models(
     after_id: str | None = None,
     before_id: str | None = None,
     lifecycle: Annotated[list[str] | None, Query()] = None,
+    tier: str | None = None,
+    free_first: bool | None = None,
 ):
     """Liste les modèles **réellement servis**, avec capacités d'effort.
 
@@ -18704,9 +22117,7 @@ async def list_models(
             available = set(available_map)
             deprecated = set(state.get("deprecated") or ())
             deprecated.update(
-                mid
-                for mid, row in available_map.items()
-                if isinstance(row, dict) and row.get("status") == "deprecated"
+                mid for mid, row in available_map.items() if isinstance(row, dict) and row.get("status") == "deprecated"
             )
             retired = set(state.get("retired") or ())
         except Exception:
@@ -18718,12 +22129,8 @@ async def list_models(
             and not _cfg_live.is_removed(mid)
             and str((available_map.get(mid) or {}).get("status") or "active") != "deprecated"
         ]
-        deprecated_ids = [
-            mid for mid in sorted(set(MODELS) | deprecated) if mid in deprecated
-        ]
-        retired_ids = [
-            mid for mid in sorted(set(MODELS) | retired) if mid in retired and mid not in deprecated
-        ]
+        deprecated_ids = [mid for mid in sorted(set(MODELS) | deprecated) if mid in deprecated]
+        retired_ids = [mid for mid in sorted(set(MODELS) | retired) if mid in retired and mid not in deprecated]
     else:
         active_ids = list(MODELS)
 
@@ -18742,7 +22149,18 @@ async def list_models(
         if mid not in seen:
             seen.add(mid)
             unique.append(mid)
-    items = {mid: _model_api_item(mid, "deprecated" if mid in deprecated_ids else "retired" if mid in retired_ids else "active", now) for mid in unique}
+    items = {
+        mid: _model_api_item(
+            mid, "deprecated" if mid in deprecated_ids else "retired" if mid in retired_ids else "active", now
+        )
+        for mid in unique
+    }
+    wanted_tier = str(tier or "").strip().lower()
+    if wanted_tier in ("free", "paid"):
+        unique = [mid for mid in unique if items[mid].get("tier") == wanted_tier]
+    if free_first is not None:
+        unique = [mid for mid in unique if bool((items[mid].get("proxy") or {}).get("free_first")) == bool(free_first)]
+    counts = _tier_counts([{"tier": items[mid].get("tier"), **(items[mid].get("proxy") or {})} for mid in unique])
     unique.sort(key=lambda mid: (items[mid].get("created") or 0, mid), reverse=True)
 
     total = len(unique)
@@ -18777,6 +22195,7 @@ async def list_models(
         "first_id": data[0]["id"] if data else None,
         "last_id": data[-1]["id"] if data else None,
         "has_more": bool(start > 0 if before_id else end < total),
+        "counts": counts,
         "cache": _response_cache.stats(),
     }
     try:
@@ -18822,6 +22241,7 @@ async def chat_completions(request: Request):
         return _openai_error(400, "invalid json")
 
     original_model = body.get("model", "")
+    _mark_requested_model(original_model)
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
     _debug(f"[chat] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
@@ -18852,7 +22272,7 @@ async def chat_completions(request: Request):
         _dep = _deprecated_model_response(original_model, "openai")
         if _dep is not None:
             return _dep
-        available = sorted(list(MODELS.keys()))
+        available = sorted(MODELS.keys())
         return JSONResponse(
             status_code=404,
             content={
@@ -18861,6 +22281,7 @@ async def chat_completions(request: Request):
             },
         )
     model_id = route["model"]
+    body = _clamp_native_output_limit(body, model_id)
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
     protocol = cfg["protocol"]
@@ -18886,7 +22307,44 @@ async def chat_completions(request: Request):
 
     body = dict(body)
     body["model"] = model_id
+
+    # [audit 2026-10-30] Official proactive compaction trigger.
+    try:
+        _pc = await _maybe_proactive_condense(
+            body,
+            body_bytes,
+            model_id=model_id,
+            endpoint=endpoint,
+            protocol=protocol,
+            history_api="chat",
+            history_messages=body.get("messages"),
+            request=request,
+            req_id=req_id,
+            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+        )
+        if _pc:
+            body["messages"] = _pc
+    except Exception as _pc_err:
+        _debug(f"  [compaction] proactive chat skipped: {type(_pc_err).__name__}: {_pc_err}")
+
     is_stream = body.get("stream", False)
+
+    # [audit 2026-10-30] Native Google Gemini upstream.
+    if protocol == "gemini":
+        return await _handle_chat_gemini(
+            body,
+            model_id=model_id,
+            endpoint=endpoint,
+            original_model=original_model,
+            request=request,
+            req_id=req_id,
+            is_stream=bool(is_stream),
+            client_ip=client_ip,
+            thinking_type="none",
+            effort=str(body.get("reasoning_effort") or "none"),
+            tool_names=tool_names,
+            request_body=request_body,
+        )
 
     # [2026-10-25] Refus de quota AVANT d'ouvrir le flux : un vrai 429 lisible
     # au lieu d'un 200 + data:{"error":…}. No-op dès qu'une station peut servir
@@ -18894,10 +22352,7 @@ async def chat_completions(request: Request):
     if is_stream and not _is_compaction:
         _pf_wait = _free_preflight_retry_after(model_id)
         if _pf_wait is not None:
-            _log(
-                f"  [free-preflight] chat 429 : aucune station libre "
-                f"(retry {_pf_wait:.0f}s) model={model_id!r}"
-            )
+            _log(f"  [free-preflight] chat 429 : aucune station libre (retry {_pf_wait:.0f}s) model={model_id!r}")
             return _free_preflight_response(_pf_wait, anthropic=False)
 
     thinking_raw = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
@@ -18986,97 +22441,100 @@ async def chat_completions(request: Request):
             # 429+Retry-After, jamais le placeholder 503 trompeur.
             # Si des clés valides existent mais sont momentanément pausées,
             # comportement legacy conservé : free-first puis 503 générique.
-            _no_valid_keys = not _has_usable_paid_key()
-            # If a free model exists, try it before giving up
-            if _has_free_leg(model_id):
-                if is_stream:
-                    if _no_valid_keys:
-                        # A3 : pas de clé payante → le placeholder 503 serait
-                        # un mensonge (aucune jambe paid ne peut suivre).
-                        # Le vrai fallback free-direct est servi par
-                        # openai_stream sur cette même requête (motif
-                        # messages-stream l.7852-7865 : free-first réel,
-                        # pas « au prochain attempt »).
-                        _debug(
-                            f"  [chat] req_id={req_id} leg=free-only stream, no usable paid key → free-direct via openai_stream"
+            # [2026-10-29] En streaming, ne JAMAIS rendre le 503 « prochain
+            # essai » : `openai_stream` ci-dessous tente la jambe free avant
+            # l'auth et n'a pas besoin de clé. Sans ça, `/v1/chat/completions`
+            # stream avec une clé morte répondait 503 alors que le même appel
+            # non-stream passait en gratuit (mesuré sur deepseek-free).
+            _free_stream_ok = bool(is_stream and _has_free_leg(model_id))
+            if _free_stream_ok:
+                _debug(
+                    f"  [chat] req_id={req_id} leg=free-only stream, no usable paid key → free-direct via openai_stream"
+                )
+                headers = {}
+            elif _has_free_leg(model_id):
+                # Non-streaming: try free model
+                try:
+                    free_result = await _try_free_model_first(
+                        body,
+                        {},
+                        "openai",
+                        model_id,
+                        forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                        req_id=req_id,
+                    )
+                    if free_result is not None:
+                        resp, _, _actual_model, _actual_ip = free_result
+                        data = (
+                            resp.json()
+                            if resp.headers.get("content-type", "").startswith("application/json")
+                            else {}
                         )
-                    else:
-                        # Streaming with no API key: use free model stream directly (openai_stream defined later, use fallback 503 for now)
-                        return _openai_error(
-                            503, "All API keys paused — free model will be tried by openai_stream on next attempt"
+                        usage = data.get("usage", {})
+                        req_in = usage.get("prompt_tokens", 0)
+                        req_out = usage.get("completion_tokens", 0)
+                        cache = _extract_cache_tokens(usage)
+                        _update_token_usage(
+                            _actual_model, req_in, req_out, cache, _extract_cache_creation_tokens(usage)
                         )
-                else:
-                    # Non-streaming: try free model
-                    try:
-                        free_result = await _try_free_model_first(
-                            body,
-                            {},
-                            "openai",
-                            model_id,
-                            forced_pool=getattr(request.state, "_geo_forced_pool", None),
-                            req_id=req_id,
+                        used = _extract_usage_tool_names(data)
+                        await _save_and_log_request(
+                            req_id,
+                            _actual_model,
+                            original_model,
+                            start_time,
+                            req_in,
+                            req_out,
+                            cache,
+                            protocol,
+                            False,
+                            thinking_type,
+                            effort,
+                            client_ip,
+                            "free (no auth)",
+                            tool_names,
+                            tools_used=used,
+                            request_body=request_body,
+                            response_body=data,
+                            free_model_ip=_actual_ip,
                         )
-                        if free_result is not None:
-                            resp, _, _actual_model, _actual_ip = free_result
-                            data = (
-                                resp.json()
-                                if resp.headers.get("content-type", "").startswith("application/json")
-                                else {}
-                            )
-                            usage = data.get("usage", {})
-                            req_in = usage.get("prompt_tokens", 0)
-                            req_out = usage.get("completion_tokens", 0)
-                            cache = _extract_cache_tokens(usage)
-                            _update_token_usage(_actual_model, req_in, req_out, cache, _extract_cache_creation_tokens(usage))
-                            used = _extract_usage_tool_names(data)
-                            await _save_and_log_request(
-                                req_id,
-                                _actual_model,
-                                original_model,
-                                start_time,
-                                req_in,
-                                req_out,
-                                cache,
-                                protocol,
-                                False,
-                                thinking_type,
-                                effort,
-                                client_ip,
-                                "free (no auth)",
-                                tool_names,
-                                tools_used=used,
-                                request_body=request_body,
-                                response_body=data,
-                                free_model_ip=_actual_ip,
-                            )
-                            return Response(
-                                content=_json_dumps_str(data, ensure_ascii=False),
-                                media_type="application/json",
-                            )
-                    except FreeRefusal as fq_err:
-                        return _free_refusal_response(fq_err, "openai")
-                    except Exception as fail_err:
-                        _debug(f"  [free] free model attempt failed: {fail_err}")
-            retry_after = int(e.retry_after) + 1
-            return Response(
-                content=_json_dumps_str(
-                    {
-                        "error": {
-                            "message": f"All API keys exhausted. Retry after {retry_after}s.",
-                            "type": "api_error",
-                            "code": "503",
+                        return Response(
+                            content=_json_dumps_str(data, ensure_ascii=False),
+                            media_type="application/json",
+                        )
+                except FreeRefusal as fq_err:
+                    return _free_refusal_response(fq_err, "openai")
+                except Exception as fail_err:
+                    _debug(f"  [free] free model attempt failed: {fail_err}")
+            if not _free_stream_ok:
+                retry_after = int(e.retry_after) + 1
+                return Response(
+                    content=_json_dumps_str(
+                        {
+                            "error": {
+                                "message": f"All API keys exhausted. Retry after {retry_after}s.",
+                                "type": "api_error",
+                                "code": "503",
+                            }
                         }
-                    }
-                ),
-                status_code=503,
-                media_type="application/json",
-                headers={"Retry-After": str(retry_after)},
-            )
+                    ),
+                    status_code=503,
+                    media_type="application/json",
+                    headers={"Retry-After": str(retry_after)},
+                )
 
         if not is_stream:
             # Response cache (mirrors the anthropic non-stream handler) [8]
             # [Phase 1 compaction] shape-compaction jamais cachée (idem messages).
-            cache_key = None if _is_compaction else _response_cache.make_key(body, body_bytes=body_bytes)
+            cache_key = (
+                None
+                if _is_compaction or _web_nondet_injected.get()
+                else _response_cache.make_key(
+                    body,
+                    body_bytes=body_bytes,
+                    namespace=_response_cache_namespace(request, model_id, endpoint, "response"),
+                )
+            )
             cached = cache_key and _response_cache.get(cache_key)
             if cached:
                 cached_body, cached_headers = cached
@@ -19186,7 +22644,7 @@ async def chat_completions(request: Request):
                 # credit-retry et AVANT le relais d'erreur. Fail-open total :
                 # enabled=false → passthrough ; condensé None → fall through ;
                 # retry re-overflow/échec → relais intact ; 1 tentative max.
-                if resp.status_code == 400 and not is_stream:
+                if resp.status_code == 400 and not is_stream and not _is_compaction:
                     try:
                         _ch_cfg = get_server_compaction()
                     except Exception:
@@ -19195,7 +22653,7 @@ async def chat_completions(request: Request):
                         _ch_on = bool(_ch_cfg.get("enabled", False)) if isinstance(_ch_cfg, dict) else False
                     except Exception:
                         _ch_on = False
-                    if _ch_on:
+                    if _ch_on and not _is_compaction:
                         try:
                             _ch_hist = body.get("messages") if isinstance(body, dict) else None
                             _ch_condensed = None
@@ -19204,8 +22662,10 @@ async def chat_completions(request: Request):
                                     _ch_ovr = get_server_compaction("summarizer_model_override", None)
                                 except Exception:
                                     _ch_ovr = None
-                                (_ch_model, _ch_ep, _ch_proto, _ch_api, _ch_free, _ch_seed) = _compaction_summarizer_plan_full(
-                                    model_id, _ch_ovr, endpoint=endpoint, protocol="openai", api=None
+                                (_ch_model, _ch_ep, _ch_proto, _ch_api, _ch_free, _ch_seed) = (
+                                    _compaction_summarizer_plan_full(
+                                        model_id, _ch_ovr, endpoint=endpoint, protocol="openai", api=None
+                                    )
                                 )
                                 try:
                                     _ch_api = _ch_api or ("responses" if "/responses" in str(_ch_ep or "") else "chat")
@@ -19247,16 +22707,33 @@ async def chat_completions(request: Request):
                                         model_id=_ch_model,
                                         endpoint=_ch_ep,
                                         protocol=_ch_proto,
-                                        auth_headers_fn=lambda proto, _f=_ch_free, _e=_ch_ep: _compaction_summarizer_headers(_f, proto, _e),
-                                        do_request_fn=lambda ep, b, h, pr, _f=_ch_free, _s=_ch_seed: _compaction_summarizer_request(_f, ep, b, h, pr, seed=_s, forced_pool=getattr(request.state, "_geo_forced_pool", None), req_id=req_id),
+                                        auth_headers_fn=lambda proto, _f=_ch_free, _e=_ch_ep: (
+                                            _compaction_summarizer_headers(_f, proto, _e)
+                                        ),
+                                        do_request_fn=lambda ep, b, h, pr, _f=_ch_free, _s=_ch_seed: (
+                                            _compaction_summarizer_request(
+                                                _f,
+                                                ep,
+                                                b,
+                                                h,
+                                                pr,
+                                                seed=_s,
+                                                forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                                                req_id=req_id,
+                                            )
+                                        ),
                                         enabled=True,
                                         summary_max_tokens=_ch_mk,
                                         keep_recent_pairs=_ch_keep,
-                            keep_tokens=get_server_compaction("keep_tokens", None),
-                            estimate_tokens_fn=_estimate_input_tokens,
+                                        keep_tokens=get_server_compaction("keep_tokens", None),
+                                        estimate_tokens_fn=_estimate_input_tokens,
                                         timeout_s=_ch_to,
                                         markers=_ch_markers,
                                         api=_ch_api,
+                            history_api="chat",
+                            full_history=not _ch_free,
+                            max_attempts=get_server_compaction("max_attempts", 1),
+                            keep_tail=get_server_compaction("keep_tail", True),
                                     )
                                 except Exception:
                                     _ch_condensed = None
@@ -19291,10 +22768,14 @@ async def chat_completions(request: Request):
                                             is_stream=False,
                                             forced_pool=getattr(request.state, "_geo_forced_pool", None),
                                         ) as _ch_r2:
-                                            _ch_h2 = dict(_ch_r2.headers) if getattr(_ch_r2, "headers", None) else headers
+                                            _ch_h2 = (
+                                                dict(_ch_r2.headers) if getattr(_ch_r2, "headers", None) else headers
+                                            )
                                             raise _CompactionTunnelDone(_ch_r2, _ch_h2)
                                     else:
-                                        _ch_r2, _ch_h2 = await _do_request_with_retry(endpoint, _ch_retry, headers, "openai")
+                                        _ch_r2, _ch_h2 = await _do_request_with_retry(
+                                            endpoint, _ch_retry, headers, "openai"
+                                        )
                             except _CompactionTunnelDone as _ch_td:
                                 _ch_r2, _ch_h2 = _ch_td.resp, _ch_td.headers
                             except Exception:
@@ -19303,14 +22784,18 @@ async def chat_completions(request: Request):
                                 if _ch_r2.status_code == 200:
                                     assert isinstance(_ch_retry, dict)
                                     body = _ch_retry
-                                    paid_body = _chat_to_responses_request(_ch_retry) if "/responses" in endpoint else _ch_retry
+                                    paid_body = (
+                                        _chat_to_responses_request(_ch_retry) if "/responses" in endpoint else _ch_retry
+                                    )
                                     if "/responses" in endpoint:
                                         paid_body["stream"] = False
                                     headers = _ch_h2
                                     resp = _ch_r2
                                     account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
                                     _condensed_ok = True
-                                    _log(f"  [compaction] req_id={req_id} 400-overflow → condense-and-retry once (model={_ch_model!r})")
+                                    _log(
+                                        f"  [compaction] req_id={req_id} 400-overflow → condense-and-retry once (model={_ch_model!r})"
+                                    )
                                 # Re-overflow ou non-200 : fall through vers le relais intact (pas de 2e tentative).
                 # Convert 429/401/403 → 503 to avoid Claude Code auth window
                 if resp.status_code in (429, 401, 403):
@@ -19469,6 +22954,7 @@ async def chat_completions(request: Request):
             # We use a local variable instead of reassigning model_id to avoid
             # UnboundLocalError in Python 3.12+ (nonlocal + assignment conflict).
             _track_model = model_id
+            _mark_requested_model(model_id)
             # Try free model for streaming: swap endpoint/model before starting stream
             free_model = _resolve_free_model(model_id)
             if free_model:
@@ -19509,10 +22995,14 @@ async def chat_completions(request: Request):
 
             _est_task = asyncio.create_task(_ensure_est_input())
             stream_out = 0
+            _free_done_station = None
+            _free_done_ip = ""
             _has_yielded = False
             _oai_has_yielded = False
             actual_usage = None
             emitted_finish = False
+            _last_stop_reason = None
+            _real_truncation = False
             _handle_429 = _make_stream_retry_loop("openai")
             _free_forced_pool = getattr(request.state, "_geo_forced_pool", None)
             # [G2] budget centralisé ; le plancher len(API_KEYS) ci-dessous
@@ -19527,6 +23017,10 @@ async def chat_completions(request: Request):
             for _attempt in range(_free_bound):
                 used_tools = []
                 seen_tool_indices = set()  # dedup tool calls by index
+                # [2026-10-30] Le flag suit la réponse courante : une enveloppe
+                # `role` d'une tentative précédente ne doit pas faire croire
+                # qu'un contenu est déjà parti (cf. _stream_content_started).
+                _oai_has_yielded = False
                 try:
                     async with _open_free_stream(
                         endpoint,
@@ -19544,6 +23038,21 @@ async def chat_completions(request: Request):
                         ),
                         forced_pool=_free_forced_pool,
                     ) as resp:
+                        if _using_free:
+                            try:
+                                _free_done_station = _free_attempt_station() or (
+                                    resp._ttfb_ctx[0] if getattr(resp, "_ttfb_ctx", None) else None
+                                )
+                                _free_done_ip = str(
+                                    (_current_free_attempt.get() or {}).get("ip")
+                                    or getattr(resp, "_free_ip", "")
+                                    or ""
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            _free_done_station = None
+                            _free_done_ip = ""
                         if resp.status_code != 200:
                             if _using_free:
                                 # [capture-400-stream] persister le body upstream
@@ -19564,7 +23073,7 @@ async def chat_completions(request: Request):
                                         free_model, resp, _attempt, _free_forced_pool, model_id
                                     )
                                     if _decision == "retry_free":
-                                        if _oai_has_yielded or stream_out > 0:
+                                        if _stream_content_started(stream_out, seen_tool_indices):
                                             _cb_record_failure(endpoint)
                                             _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                                             yield (
@@ -19581,7 +23090,7 @@ async def chat_completions(request: Request):
                                 if _is_retriable_datapolicy(resp) and _attempt + 1 < effective_free_max_attempts(
                                     _free_forced_pool
                                 ):
-                                    if _oai_has_yielded or stream_out > 0:
+                                    if _stream_content_started(stream_out, seen_tool_indices):
                                         _cb_record_failure(endpoint)
                                         _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                                         yield (
@@ -19608,7 +23117,7 @@ async def chat_completions(request: Request):
                                     # C1a : 400/5xx free → retry station fraîche tant que
                                     # le budget free n'est pas épuisé (miroir non-stream).
                                     if _attempt + 1 < effective_free_max_attempts(_free_forced_pool):
-                                        if _oai_has_yielded or stream_out > 0:
+                                        if _stream_content_started(stream_out, seen_tool_indices):
                                             _cb_record_failure(endpoint)
                                             _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                                             yield (
@@ -19644,7 +23153,7 @@ async def chat_completions(request: Request):
                                         tool_names,
                                         request_body,
                                         "chat-stream",
-                                    client_protocol="openai",
+                                        client_protocol="openai",
                                     )
                                     if _refuse:
                                         yield _refuse_bytes
@@ -19666,7 +23175,7 @@ async def chat_completions(request: Request):
                                             client_ip,
                                             tool_names,
                                             request_body,
-                                        client_protocol="openai",
+                                            client_protocol="openai",
                                         )
                                         return
                                     yield (
@@ -19709,7 +23218,7 @@ async def chat_completions(request: Request):
                                         client_ip,
                                         tool_names,
                                         request_body,
-                                    client_protocol="openai",
+                                        client_protocol="openai",
                                     )
                                     return
                                 continue
@@ -19719,9 +23228,10 @@ async def chat_completions(request: Request):
                                 _attempt,
                                 resp.headers,
                                 (await resp.aread()) if resp.status_code == 403 else None,
+                                model_id,
                             )
                             if should_retry:
-                                if _oai_has_yielded or stream_out > 0:
+                                if _stream_content_started(stream_out, seen_tool_indices):
                                     _cb_record_failure(endpoint)
                                     _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                                     yield (
@@ -19740,7 +23250,7 @@ async def chat_completions(request: Request):
                                     f"  [chat-stream] upstream 499, retrying in {wait:.1f}s (attempt {_attempt + 1})"
                                 )
                                 await asyncio.sleep(wait)
-                                if _oai_has_yielded or stream_out > 0:
+                                if _stream_content_started(stream_out, seen_tool_indices):
                                     _cb_record_failure(endpoint)
                                     _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                                     yield (
@@ -19762,7 +23272,7 @@ async def chat_completions(request: Request):
                                 if alt:
                                     _log("  400 credit error on key, retrying with alternative key")
                                     hdrs = _get_auth_headers("openai", entry=alt)
-                                    if _oai_has_yielded or stream_out > 0:
+                                    if _stream_content_started(stream_out, seen_tool_indices):
                                         _cb_record_failure(endpoint)
                                         _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                                         yield (
@@ -19790,10 +23300,9 @@ async def chat_completions(request: Request):
                             # Convert 429/401/403 → 503 to avoid Claude Code auth window
                             # [Phase 1 compaction] shape-compaction : relayer statut
                             # + body upstream intacts (overflow reconnaissable).
+                            err_type = "api_error"
                             if _is_compaction:
-                                err_msg = (
-                                    f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:500]}"
-                                )
+                                err_msg = f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:500]}"
                             elif resp.status_code == 429:
                                 err_msg = "All API keys exhausted (rate limited). Try again later."
                             elif resp.status_code in (401, 403):
@@ -19804,10 +23313,15 @@ async def chat_completions(request: Request):
                                     req_id,
                                 )
                             else:
-                                err_msg = f"HTTP {resp.status_code}"
+                                err_msg, err_type = _stream_error_detail(
+                                    resp.status_code, err, is_compaction=_is_compaction
+                                )
                             yield (
                                 b"data: "
-                                + _json_dumps_str({"error": {"message": err_msg}}, ensure_ascii=False).encode()
+                                + _json_dumps_str(
+                                    {"error": {"message": err_msg, "type": err_type}},
+                                    ensure_ascii=False,
+                                ).encode()
                                 + b"\n\ndata: [DONE]\n\n"
                             )
                             return
@@ -20049,6 +23563,7 @@ async def chat_completions(request: Request):
                                 _fr = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
                                 if _fr is not None:
                                     emitted_finish = True
+                                    _last_stop_reason = str(_fr)
                             if not _chunk_already_yielded:
                                 for _c in _tool_healer.feed(chunk):
                                     _oai_has_yielded = True
@@ -20157,7 +23672,7 @@ async def chat_completions(request: Request):
                                         request_body=request_body,
                                         free_status=429,
                                         error_label="upstream_free_empty_response",
-                                    client_protocol="openai",
+                                        client_protocol="openai",
                                     )
                                     return
                                 yield (
@@ -20211,7 +23726,7 @@ async def chat_completions(request: Request):
                                     request_body=request_body,
                                     free_status=429,
                                     error_label="upstream_free_empty_response",
-                                client_protocol="openai",
+                                    client_protocol="openai",
                                 )
                                 return
                             continue
@@ -20267,9 +23782,7 @@ async def chat_completions(request: Request):
                                             "object": "chat.completion.chunk",
                                             "created": int(time.time()),
                                             "model": original_model,
-                                            "choices": [
-                                                {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
-                                            ],
+                                            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                                         }
                                         yield f"data: {_json_dumps_str(_synth, ensure_ascii=False)}\n\n".encode()
                                         yield _usage_frame()
@@ -20280,8 +23793,11 @@ async def chat_completions(request: Request):
                                     # Parité Anthropic : contenu sans terminal ni usage =
                                     # troncature réelle, pas un succès. On émet une erreur
                                     # explicite au lieu d'un faux `stop` + [DONE].
-                                    _debug("  [oai-stream] truncated without finish_reason/usage → error (no false stop)")
+                                    _debug(
+                                        "  [oai-stream] truncated without finish_reason/usage → error (no false stop)"
+                                    )
                                     _log("  stream truncated without finish_reason/usage → error (no false stop)")
+                                    _real_truncation = True
                                     yield (
                                         b"data: "
                                         + _json_dumps_str(
@@ -20380,6 +23896,11 @@ async def chat_completions(request: Request):
                             yield _usage_frame()
                             yield b"data: [DONE]\n\n"
                             _done_emitted = True
+                        _stream_truncated = _real_truncation or (
+                            not emitted_finish
+                            and not _done_emitted
+                            and (_oai_has_yielded or stream_out > 0)
+                        )
                         # Stream ended — finalize tracking
                         # [B1] résout l'estimation différée avant réconciliation
                         est_input = await _ensure_est_input()
@@ -20406,6 +23927,15 @@ async def chat_completions(request: Request):
                                 _elapsed_ms(start_time),
                                 ip=_free_usage_ip(),
                             )
+                            if _free_done_station is not None:
+                                _record_free_completion(
+                                    _free_done_station,
+                                    _free_done_ip,
+                                    _elapsed_ms(start_time),
+                                    final_out or 0,
+                                    success=not _stream_truncated,
+                                    stop_reason=("error" if _stream_truncated else None),
+                                )
                         await _save_and_log_request(
                             req_id,
                             _track_model,
@@ -20425,6 +23955,12 @@ async def chat_completions(request: Request):
                             tools_used=used_tools if used_tools else None,
                             request_body=request_body,
                             response_preview="".join(_preview_parts) if _preview_parts else None,
+                            success=not _stream_truncated,
+                            error=("stream_truncated" if _stream_truncated else None),
+                            ttfb_ms=getattr(resp, "_ttfb_ms", None),
+                            stop_reason=_last_stop_reason,
+                            aborted=_stream_truncated,
+                            station_override=getattr(_free_done_station, "_station", None),
                         )
                         _cb_record_stream_success(endpoint, final_in, final_out, used_tools)
                 except asyncio.CancelledError:
@@ -20436,7 +23972,7 @@ async def chat_completions(request: Request):
                             f"  ⟳ stream watchdog-cancelled (dead tunnel, station {getattr(st, '_station', '?')}) — failover retry"
                         )
                         _log("  FREE STREAM on confirmed-dead tunnel cancelled → switching station")
-                        if _oai_has_yielded or stream_out > 0:
+                        if _stream_content_started(stream_out, seen_tool_indices):
                             _cb_record_failure(endpoint)
                             _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                             yield (
@@ -20459,7 +23995,7 @@ async def chat_completions(request: Request):
                     _log(
                         f"  FREE STREAM via station {getattr(ftf.station, '_station', '?')} tunnel FAILED ({ftf.cause}) → retry station fraîche"
                     )
-                    if _oai_has_yielded or stream_out > 0:
+                    if _stream_content_started(stream_out, seen_tool_indices):
                         _cb_record_failure(endpoint)
                         _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                         yield (
@@ -20491,7 +24027,7 @@ async def chat_completions(request: Request):
                             _debug("  ⟳ stream retry (network error, same key)")
                             _log("  Retrying stream (network error, same key)")
                             await asyncio.sleep(1.0)
-                            if _oai_has_yielded or stream_out > 0:
+                            if _stream_content_started(stream_out, seen_tool_indices):
                                 _cb_record_failure(endpoint)
                                 _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                                 yield (
@@ -20517,7 +24053,7 @@ async def chat_completions(request: Request):
                             _debug(f"  ⟳ stream retry with alt key: alias={alt.get('alias', '?')}")
                             _log(f"  Retrying stream with alternative key: {alt.get('alias', '?')}")
                             hdrs = _get_auth_headers("openai", entry=alt)
-                        if _oai_has_yielded or stream_out > 0:
+                        if _stream_content_started(stream_out, seen_tool_indices):
                             _cb_record_failure(endpoint)
                             _log(f"  stream_retry_suppressed_after_started attempt={_attempt + 1}")
                             yield (
@@ -20586,20 +24122,33 @@ async def chat_completions(request: Request):
         except Exception:
             _paid_for_buf = body
         _buf_oai = await _buffered_compaction_stream(
-            porte="chat", request=request, req_id=req_id, original_model=original_model,
-            model_id=model_id, endpoint=endpoint, protocol="openai", headers=headers,
-            send_body=body, paid_body=_paid_for_buf, client_ip=client_ip, start_time=start_time,
-            is_stream=is_stream, thinking_type=thinking_type, effort=effort,
-            tool_names=tool_names, request_body=request_body, is_compaction=_is_compaction,
+            porte="chat",
+            request=request,
+            req_id=req_id,
+            original_model=original_model,
+            model_id=model_id,
+            endpoint=endpoint,
+            protocol="openai",
+            headers=headers,
+            send_body=body,
+            paid_body=_paid_for_buf,
+            client_ip=client_ip,
+            start_time=start_time,
+            is_stream=is_stream,
+            thinking_type=thinking_type,
+            effort=effort,
+            tool_names=tool_names,
+            request_body=request_body,
+            is_compaction=_is_compaction,
         )
         if _buf_oai is not None:
             return _buf_oai
+        _mark_stream_start(model_id)
         return StreamingResponse(
             _sse_pump(
                 openai_stream(headers),
                 on_error=_note_sse_abort,
                 error_event=_SSE_ERR_OPENAI,
-
                 idle_timeout=_SSE_IDLE_TIMEOUT,
             ),
             media_type="text/event-stream",
@@ -20641,7 +24190,11 @@ async def chat_completions(request: Request):
     thinking = anthro_body.get("thinking", {})
     thinking_type = thinking.get("type", "none") if isinstance(thinking, dict) else "none"
     effort = (
-        (anthro_body.get("output_config", {}).get("effort") if isinstance(anthro_body.get("output_config"), dict) else None)
+        (
+            anthro_body.get("output_config", {}).get("effort")
+            if isinstance(anthro_body.get("output_config"), dict)
+            else None
+        )
         or anthro_body.get("effort")
         or (thinking.get("effort") if isinstance(thinking, dict) else None)
         or "none"
@@ -20672,7 +24225,9 @@ async def chat_completions(request: Request):
                         req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                         req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
                         req_cache = usage.get("cache_read_input_tokens", 0)
-                        _update_token_usage(_actual_model, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
+                        _update_token_usage(
+                            _actual_model, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage)
+                        )
                         used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
                         await _save_and_log_request(
                             req_id,
@@ -20848,6 +24403,7 @@ async def chat_completions(request: Request):
         # le ``except Exception`` du handler → le client recevait un
         # ``text/event-stream`` de 0 octet, sans erreur ni log exploitable.
         nonlocal endpoint, model_id, anthro_body
+        _mark_requested_model(model_id)
         # [A26/P4] Déclaré AVANT la bascule free : sinon Python en ferait une
         # variable locale non initialisée quand le modèle n'a pas d'équivalent
         # free — exactement la classe du bug A24 documenté juste au-dessus.
@@ -20889,6 +24445,9 @@ async def chat_completions(request: Request):
         tool_data = {}
         open_blocks = set()
         stream_out = 0
+        _free_done_station = None
+        _free_done_ip = ""
+        _last_stop_reason = None
         total_input = 0
         cache_read = 0
         cache_write = 0
@@ -20945,6 +24504,21 @@ async def chat_completions(request: Request):
                     )
                 )
                 async with _stream_ctx as resp:
+                    if _using_free:
+                        try:
+                            _free_done_station = _free_attempt_station() or (
+                                resp._ttfb_ctx[0] if getattr(resp, "_ttfb_ctx", None) else None
+                            )
+                            _free_done_ip = str(
+                                (_current_free_attempt.get() or {}).get("ip")
+                                or getattr(resp, "_free_ip", "")
+                                or ""
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        _free_done_station = None
+                        _free_done_ip = ""
                     if resp.status_code != 200:
                         if _using_free:
                             # [capture-400-stream] persister le body upstream
@@ -21029,7 +24603,7 @@ async def chat_completions(request: Request):
                                     tool_names,
                                     request_body,
                                     "anthro-to-oai-stream",
-                                client_protocol="openai",
+                                    client_protocol="openai",
                                 )
                                 if _refuse:
                                     yield _refuse_bytes
@@ -21042,7 +24616,12 @@ async def chat_completions(request: Request):
                             # ne plus convertir le flux entrant.
                             _free_chat_stream = False
                             _free_fallback_bookkeep(
-                                req_id, free_model, resp.status_code, _track_model, "anthro-to-oai-stream", refused=_refuse
+                                req_id,
+                                free_model,
+                                resp.status_code,
+                                _track_model,
+                                "anthro-to-oai-stream",
+                                refused=_refuse,
                             )
                             if _refuse:
                                 yield await _free_stream_refuse_bytes(
@@ -21057,7 +24636,7 @@ async def chat_completions(request: Request):
                                     client_ip,
                                     tool_names,
                                     request_body,
-                                client_protocol="openai",
+                                    client_protocol="openai",
                                 )
                                 return
                             continue
@@ -21067,6 +24646,7 @@ async def chat_completions(request: Request):
                             _attempt,
                             resp.headers,
                             (await resp.aread()) if resp.status_code == 403 else None,
+                            model_id,
                         )
                         if should_retry:
                             if _stream_has_yielded(started, open_blocks, stream_out, _line_buf):
@@ -21132,6 +24712,7 @@ async def chat_completions(request: Request):
                         # Convert 429/401/403 → 503 to avoid Claude Code auth window
                         # [Phase 1 compaction] shape-compaction : relayer statut
                         # + body upstream intacts (overflow reconnaissable).
+                        err_type = "api_error"
                         if _is_compaction:
                             err_msg = f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:500]}"
                         elif resp.status_code == 429:
@@ -21146,10 +24727,15 @@ async def chat_completions(request: Request):
                                 req_id,
                             )  # [Étape 2B — B1] DataPolicyError → URL opt-in
                         else:
-                            err_msg = f"HTTP {resp.status_code}"
+                            err_msg, err_type = _stream_error_detail(
+                                resp.status_code, err, is_compaction=_is_compaction
+                            )
                         yield (
                             b"data: "
-                            + _json_dumps_str({"error": {"message": err_msg}}, ensure_ascii=False).encode()
+                            + _json_dumps_str(
+                                {"error": {"message": err_msg, "type": err_type}},
+                                ensure_ascii=False,
+                            ).encode()
                             + b"\n\ndata: [DONE]\n\n"
                         )
                         return
@@ -21287,6 +24873,8 @@ async def chat_completions(request: Request):
                                 if _md_cache is not None:
                                     cache_read = _md_cache[0]
                                 sr = d.get("stop_reason", "")
+                                if sr:
+                                    _last_stop_reason = str(sr)
                                 if sr == "end_turn":
                                     finish = "stop"
                                 elif sr == "max_tokens":
@@ -21313,6 +24901,15 @@ async def chat_completions(request: Request):
                                         _elapsed_ms(start_time),
                                         ip=_free_usage_ip(),
                                     )
+                                    if _free_done_station is not None:
+                                        _record_free_completion(
+                                            _free_done_station,
+                                            _free_done_ip,
+                                            _elapsed_ms(start_time),
+                                            stream_out or 0,
+                                            success=True,
+                                            stop_reason=None,
+                                        )
                                 used_tools = [v["name"] for v in tool_data.values() if v.get("name")]
                                 await _save_and_log_request(
                                     req_id,
@@ -21331,6 +24928,9 @@ async def chat_completions(request: Request):
                                     tool_names,
                                     tools_used=used_tools if used_tools else None,
                                     request_body=request_body,
+                                    ttfb_ms=getattr(resp, "_ttfb_ms", None),
+                                    stop_reason=_last_stop_reason,
+                                    aborted=False,
                                 )
                                 # Send final usage chunk for OpenAI streaming client
                                 total = total_input + stream_out
@@ -21491,10 +25091,7 @@ async def chat_completions(request: Request):
                 except Exception as _tail_exc:
                     # [FIX swallow] Un reste de buffer illisible était avalé (`pass`) :
                     # le flux se terminait ensuite sur un faux `finish_reason: "stop"`.
-                    _debug(
-                        "  ✗ [_anthro_to_oai] tail unparsable: "
-                        f"{type(_tail_exc).__name__}: {_tail_exc}"
-                    )
+                    _debug(f"  ✗ [_anthro_to_oai] tail unparsable: {type(_tail_exc).__name__}: {_tail_exc}")
             if not emitted_finish:
                 # [FIX faux vert] Ni ``message_stop`` ni ``message_delta`` porteur d'un
                 # ``stop_reason`` n'ont été vus : le flux Anthropic amont a été COUPÉ (son
@@ -21514,12 +25111,12 @@ async def chat_completions(request: Request):
                 )
                 emitted_finish = True
 
+    _mark_stream_start(model_id)
     return StreamingResponse(
         _sse_pump(
             _anthro_to_oai_stream(a_headers),
             on_error=_note_sse_abort,
             error_event=_SSE_ERR_OPENAI,
-
             idle_timeout=_SSE_IDLE_TIMEOUT,
         ),
         media_type="text/event-stream",
@@ -21570,12 +25167,14 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
     station = None
     free_ip = ""
     tried: set = set()
+
     # [Lot 1 FIX f] Sentinelle egress direct : pid=None + current_ip="" pour
     # que _free_cooldown_key rende "{model}|direct" de façon déterministe
     # (jamais de station tunnel stale sur le chemin direct pool-indispo).
     class _DirectEgress:
         pid = None
         current_ip = ""
+
     _direct_station = _DirectEgress()
     _last_tunnel_exc: Exception | None = None
     resp = None
@@ -21617,9 +25216,7 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                         f"stagger={getattr(pool, '_free_parallel_hedge_delay_ms', '?')}ms"
                     )
                     try:
-                        resp, winner = await _hedged_fetch(
-                            _hedge_cands, body, headers, endpoint, forced_pool
-                        )
+                        resp, winner = await _hedged_fetch(_hedge_cands, body, headers, endpoint, forced_pool)
                         # [G1] filet 429 = TOUTES les stations hedged ont 429 →
                         # bad-mark chacune (le handling partagé ci-dessous reste
                         # idempotent sur la gagnante-filet).
@@ -21706,11 +25303,7 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                                     else pool._best_station(forced_pool)
                                 )
                             except TypeError:
-                                attempt = (
-                                    pool._best_station_excluding_many(tried)
-                                    if tried
-                                    else pool._best_station()
-                                )
+                                attempt = pool._best_station_excluding_many(tried) if tried else pool._best_station()
                     else:
                         try:
                             attempt = (
@@ -21719,11 +25312,7 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                                 else pool._best_station(forced_pool)
                             )
                         except TypeError:
-                            attempt = (
-                                pool._best_station_excluding_many(tried)
-                                if tried
-                                else pool._best_station()
-                            )
+                            attempt = pool._best_station_excluding_many(tried) if tried else pool._best_station()
                 if attempt is not None:
                     tried.add(attempt)
             else:
@@ -21788,8 +25377,15 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                 except Exception:
                     _ok_in, _ok_out = 0, 0
                 _log_free_model_usage(
-                    paid_model, free_model, "free (no auth)", "free (no auth)",
-                    200, _ok_in, _ok_out, _free_elapsed, ip=free_ip,
+                    paid_model,
+                    free_model,
+                    "free (no auth)",
+                    "free (no auth)",
+                    200,
+                    _ok_in,
+                    _ok_out,
+                    _free_elapsed,
+                    ip=free_ip,
                 )
                 break
             if _code == 429:
@@ -21797,16 +25393,21 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                 # cooldown+rotation via le helper partagé (rotation seulement si
                 # vrai quota), puis station FRAÎCHE tant que le budget dure.
                 _log_free_model_usage(
-                    paid_model, free_model, "free (no auth)", "free (no auth)",
-                    429, 0, 0, _free_elapsed, ip=free_ip,
+                    paid_model,
+                    free_model,
+                    "free (no auth)",
+                    "free (no auth)",
+                    429,
+                    0,
+                    0,
+                    _free_elapsed,
+                    ip=free_ip,
                 )
                 try:
                     _b429 = (getattr(resp, "text", "") or "")[:2000]
                 except Exception:
                     _b429 = ""
-                _mark_free_stations_429(
-                    free_model, _ra, stations=[attempt], forced_pool=forced_pool, body=_b429
-                )
+                _mark_free_stations_429(free_model, _ra, stations=[attempt], forced_pool=forced_pool, body=_b429)
                 _log(
                     f"  FREE {free_model!r} RATE LIMITED (429) on station {getattr(attempt, '_station', '?')} → "
                     f"retry station fraîche (essai {_free_used + 1}/{free_max})"
@@ -21828,8 +25429,15 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                 except Exception:
                     _b5 = ""
                 _log_free_model_usage(
-                    paid_model, free_model, "free (no auth)", "free (no auth)",
-                    _code, 0, 0, _free_elapsed, ip=free_ip,
+                    paid_model,
+                    free_model,
+                    "free (no auth)",
+                    "free (no auth)",
+                    _code,
+                    0,
+                    0,
+                    _free_elapsed,
+                    ip=free_ip,
                 )
                 _log(
                     f"  FREE {free_model!r} upstream {_code} on station {getattr(attempt, '_station', '?')} → "
@@ -21874,8 +25482,15 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                 except Exception:
                     _ok_in, _ok_out = 0, 0
                 _log_free_model_usage(
-                    paid_model, free_model, "free (no auth)", "free (no auth)",
-                    200, _ok_in, _ok_out, int((time.monotonic() - t0) * 1000), ip=free_ip,
+                    paid_model,
+                    free_model,
+                    "free (no auth)",
+                    "free (no auth)",
+                    200,
+                    _ok_in,
+                    _ok_out,
+                    int((time.monotonic() - t0) * 1000),
+                    ip=free_ip,
                 )
             return resp
         # Que des tunnels morts (les 429, eux, sont relayés ci-dessus) :
@@ -21907,8 +25522,9 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
 
                 _eng = _get_eng()
                 setattr(_ss_lat_dead, "latency_engine", _eng)  # noqa: B010 — attribut dynamique, mypy l'interdit en accès direct
-            if isinstance(station, object) and getattr(station, "_station", None) is not None:
-                _eng.record_request(int(getattr(station, "_station")), str(free_ip or "direct"), float(_dead_ms), free_model, 502)  # noqa: B009
+            _st_lat = getattr(station, "_station", None) if isinstance(station, object) else None
+            if _st_lat is not None:
+                _eng.record_request(int(_st_lat), str(free_ip or "direct"), float(_dead_ms), free_model, 502)
                 _record_station_quality(station, str(free_ip or "direct"), float(_dead_ms), 502)
         except Exception as _e_lat:
             _debug(f"  [systemone-free] latency engine skip: {_e_lat}")
@@ -21934,9 +25550,7 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
     # UpstreamError 502 « empty SSE collection ». POST httpx non-stream nu.
     for _dt in range(2):  # essai + UN retry borné après Retry-After
         try:
-            resp = await _ensure_http_client().post(
-                endpoint, content=_serialize_json_body(body), headers=wire_headers
-            )
+            resp = await _ensure_http_client().post(endpoint, content=_serialize_json_body(body), headers=wire_headers)
         except httpx.RequestError as e:
             raise UpstreamError(f"free {free_model} direct failed: {type(e).__name__}: {e}", status_code=502) from e
         except Exception as e:
@@ -21953,8 +25567,15 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                 except Exception:
                     _d_in, _d_out = 0, 0
                 _log_free_model_usage(
-                    paid_model, free_model, "free (no auth)", "free (no auth)",
-                    200, _d_in, _d_out, int((time.monotonic() - t0) * 1000), ip="direct",
+                    paid_model,
+                    free_model,
+                    "free (no auth)",
+                    "free (no auth)",
+                    200,
+                    _d_in,
+                    _d_out,
+                    int((time.monotonic() - t0) * 1000),
+                    ip="direct",
                 )
             return resp
         try:
@@ -21962,8 +25583,15 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
         except Exception:
             _ra = ""
         _log_free_model_usage(
-            paid_model, free_model, "free (no auth)", "free (no auth)",
-            429, 0, 0, int((time.monotonic() - t0) * 1000), ip="direct",
+            paid_model,
+            free_model,
+            "free (no auth)",
+            "free (no auth)",
+            429,
+            0,
+            0,
+            int((time.monotonic() - t0) * 1000),
+            ip="direct",
         )
         # [Lot 1 FIX f] Clé direct déterministe : jamais la station tunnel
         # stale ni la ContextVar du chemin pool. stations=[] = compteur seul
@@ -22068,6 +25696,7 @@ async def systemone(request: Request):
         return _openai_error(400, "body must be a JSON object")
 
     original_model = body.get("model", "")
+    _mark_requested_model(original_model)
     request_body = body
     _debug(f"[systemone] req_id={req_id} model={original_model!r} ip={client_ip}")
     route = _route_for(original_model)
@@ -22150,7 +25779,9 @@ async def systemone(request: Request):
         headers = {"Authorization": f"Bearer {entry.get('api_key', API_KEY)}", "Content-Type": "application/json"}
         account_alias = _alias_for_key(entry.get("api_key", ""))
 
-    _log(f"→ {original_model!r} → {model_id} | systemone | free={is_free} | free_first={free_first_model!r} | ip={client_ip}")
+    _log(
+        f"→ {original_model!r} → {model_id} | systemone | free={is_free} | free_first={free_first_model!r} | ip={client_ip}"
+    )
 
     free_status_before_paid = None
     if free_first_model:
@@ -22165,9 +25796,9 @@ async def systemone(request: Request):
         except UpstreamError as e:
             free_resp, free_err = None, e
         try:
-            free_status_before_paid = int(
-                getattr(free_resp, "status_code", 0) or (free_err.status_code if free_err else 0)
-            ) or 0
+            free_status_before_paid = (
+                int(getattr(free_resp, "status_code", 0) or (free_err.status_code if free_err else 0)) or 0
+            )
         except Exception:
             free_status_before_paid = 0
         if free_resp is not None and free_status_before_paid == 200:
@@ -22175,21 +25806,47 @@ async def systemone(request: Request):
                 data = _json_loads(free_resp.content)
             except Exception:
                 await _log_and_save_error(
-                    req_id, free_first_model, original_model, start_time, 502,
+                    req_id,
+                    free_first_model,
+                    original_model,
+                    start_time,
+                    502,
                     "Upstream returned non-JSON response",
-                    "openai", False, "none", "none", client_ip, "", [],
-                    request_body=request_body, response_body={"error": "non-JSON upstream"},
-                    free_status=200, paid_status=None,
+                    "openai",
+                    False,
+                    "none",
+                    "none",
+                    client_ip,
+                    "",
+                    [],
+                    request_body=request_body,
+                    response_body={"error": "non-JSON upstream"},
+                    free_status=200,
+                    paid_status=None,
                 )
                 return _openai_error(502, "Upstream returned non-JSON response")
             usage = data.get("usage", {}) if isinstance(data, dict) else {}
             req_in = int(usage.get("input_tokens", 0) or 0)
             req_out = int(usage.get("output_tokens", 0) or 0)
             await _save_and_log_request(
-                req_id, free_first_model, original_model, start_time, req_in, req_out, 0,
-                "openai", False, "none", "none", client_ip, "", [],
-                request_body=request_body, response_body=data,
-                free_status=200, paid_status=None,
+                req_id,
+                free_first_model,
+                original_model,
+                start_time,
+                req_in,
+                req_out,
+                0,
+                "openai",
+                False,
+                "none",
+                "none",
+                client_ip,
+                "",
+                [],
+                request_body=request_body,
+                response_body=data,
+                free_status=200,
+                paid_status=None,
             )
             _update_token_usage(free_first_model, req_in, req_out, 0)
             return JSONResponse(status_code=200, content=data)
@@ -22213,7 +25870,11 @@ async def systemone(request: Request):
                         err_content = {"error": f"upstream status {free_status_before_paid}"}
                 _ra_headers = {}
                 try:
-                    _ra_raw = ((free_resp.headers.get("retry-after", "") or "").strip()) if getattr(free_resp, "headers", None) else ""
+                    _ra_raw = (
+                        ((free_resp.headers.get("retry-after", "") or "").strip())
+                        if getattr(free_resp, "headers", None)
+                        else ""
+                    )
                 except Exception:
                     _ra_raw = ""
                 if _ra_raw:
@@ -22231,24 +25892,47 @@ async def systemone(request: Request):
                     if _ra_ok:
                         _ra_headers = {"Retry-After": _ra_raw}
                 await _log_and_save_error(
-                    req_id, free_first_model, original_model, start_time,
+                    req_id,
+                    free_first_model,
+                    original_model,
+                    start_time,
                     free_status_before_paid or 502,
                     (getattr(free_resp, "text", "") or "")[:2000],
-                    "openai", False, "none", "none", client_ip, "", [],
+                    "openai",
+                    False,
+                    "none",
+                    "none",
+                    client_ip,
+                    "",
+                    [],
                     request_body=request_body,
                     response_body=err_content if isinstance(err_content, dict) else {"error": str(err_content)[:2000]},
-                    free_status=free_status_before_paid or 502, paid_status=None,
+                    free_status=free_status_before_paid or 502,
+                    paid_status=None,
                 )
                 return JSONResponse(
-                    status_code=free_status_before_paid or 502, content=err_content,
+                    status_code=free_status_before_paid or 502,
+                    content=err_content,
                     headers=_ra_headers or None,
                 )
             await _log_and_save_error(
-                req_id, free_first_model, original_model, start_time,
-                (free_err.status_code if free_err else 502), str(free_err or "free leg failed"),
-                "openai", False, "none", "none", client_ip, "", [],
-                request_body=request_body, response_body={"error": str(free_err or "free leg failed")[:2000]},
-                free_status=(free_err.status_code if free_err else 502), paid_status=None,
+                req_id,
+                free_first_model,
+                original_model,
+                start_time,
+                (free_err.status_code if free_err else 502),
+                str(free_err or "free leg failed"),
+                "openai",
+                False,
+                "none",
+                "none",
+                client_ip,
+                "",
+                [],
+                request_body=request_body,
+                response_body={"error": str(free_err or "free leg failed")[:2000]},
+                free_status=(free_err.status_code if free_err else 502),
+                paid_status=None,
             )
             return JSONResponse(
                 status_code=(free_err.status_code if free_err else 502),
@@ -22277,16 +25961,31 @@ async def systemone(request: Request):
             # jamais de direct quand vpn/socks5 est configuré). forced_pool=None
             # (pas de géo sur systemone) + req_id (ctx fallback persistance).
             resp = await _systemone_free_via_pool(
-                endpoint, body, headers if isinstance(headers, dict) else dict(free_headers),
-                forced_pool=None, req_id=req_id,
+                endpoint,
+                body,
+                headers if isinstance(headers, dict) else dict(free_headers),
+                forced_pool=None,
+                req_id=req_id,
             )
         else:
             resp, headers = await _do_request_with_retry(endpoint, body, headers, "openai")
     except UpstreamError as e:
         await _log_and_save_error(
-            req_id, model_id, original_model, start_time, e.status_code, str(e),
-            "openai", False, "none", "none", client_ip, account_alias, [],
-            request_body=request_body, response_body={"error": str(e)[:2000]},
+            req_id,
+            model_id,
+            original_model,
+            start_time,
+            e.status_code,
+            str(e),
+            "openai",
+            False,
+            "none",
+            "none",
+            client_ip,
+            account_alias,
+            [],
+            request_body=request_body,
+            response_body={"error": str(e)[:2000]},
             free_status=e.status_code if is_free else free_status_before_paid,
             paid_status=None if is_free else e.status_code,
         )
@@ -22300,9 +25999,21 @@ async def systemone(request: Request):
         except Exception:
             err_text = f"upstream status {resp.status_code}"
         await _log_and_save_error(
-            req_id, model_id, original_model, start_time, resp.status_code, err_text,
-            "openai", False, "none", "none", client_ip, account_alias, [],
-            request_body=request_body, response_body={"error": err_text[:2000]},
+            req_id,
+            model_id,
+            original_model,
+            start_time,
+            resp.status_code,
+            err_text,
+            "openai",
+            False,
+            "none",
+            "none",
+            client_ip,
+            account_alias,
+            [],
+            request_body=request_body,
+            response_body={"error": err_text[:2000]},
             free_status=resp.status_code if is_free else free_status_before_paid,
             paid_status=None if is_free else resp.status_code,
         )
@@ -22340,9 +26051,21 @@ async def systemone(request: Request):
         data = _json_loads(resp.content)
     except Exception:
         await _log_and_save_error(
-            req_id, model_id, original_model, start_time, 502, "Upstream returned non-JSON response",
-            "openai", False, "none", "none", client_ip, account_alias, [],
-            request_body=request_body, response_body={"error": "non-JSON upstream"},
+            req_id,
+            model_id,
+            original_model,
+            start_time,
+            502,
+            "Upstream returned non-JSON response",
+            "openai",
+            False,
+            "none",
+            "none",
+            client_ip,
+            account_alias,
+            [],
+            request_body=request_body,
+            response_body={"error": "non-JSON upstream"},
             free_status=502 if is_free else free_status_before_paid,
             paid_status=None if is_free else 502,
         )
@@ -22352,14 +26075,128 @@ async def systemone(request: Request):
     req_in = int(usage.get("input_tokens", 0) or 0)
     req_out = int(usage.get("output_tokens", 0) or 0)
     await _save_and_log_request(
-        req_id, model_id, original_model, start_time, req_in, req_out, 0,
-        "openai", False, "none", "none", client_ip, account_alias, [],
-        request_body=request_body, response_body=data,
+        req_id,
+        model_id,
+        original_model,
+        start_time,
+        req_in,
+        req_out,
+        0,
+        "openai",
+        False,
+        "none",
+        "none",
+        client_ip,
+        account_alias,
+        [],
+        request_body=request_body,
+        response_body=data,
         free_status=200 if is_free else free_status_before_paid,
         paid_status=None if is_free else 200,
     )
     _update_token_usage(model_id, req_in, req_out, 0)
     return JSONResponse(status_code=200, content=data)
+
+
+@app.post("/v1/responses/compact")
+async def responses_compact(request: Request):
+    """Stateless passthrough to a Responses-native provider's /compact endpoint.
+
+    [audit 2026-10-30] Official clients call this endpoint for provider-native
+    compaction. The proxy cannot fabricate the opaque item, but it can relay
+    the request to the model's real ``/responses/compact`` URL and return the
+    provider response unchanged (including its 4xx/5xx).
+    """
+    req_id = _fast_id("cmp")
+    start_time = time.monotonic()
+    client_ip = _get_client_ip(request)
+    body_bytes = await request.body()
+    if len(body_bytes) > MAX_BODY_SIZE:
+        return _openai_error(413, f"Request body too large ({len(body_bytes)} bytes, max {MAX_BODY_SIZE})")
+    try:
+        body = _json_loads(body_bytes)
+    except Exception:
+        return _openai_error(400, "invalid json")
+    if not isinstance(body, dict):
+        return _openai_error(400, "invalid body")
+    original_model = str(body.get("model") or "")
+    if not bool(get_server_compaction("native_passthrough", True)):
+        return _openai_error(400, "Native Responses compaction is disabled (server_compaction.native_passthrough=false)")
+    route = _route_for(original_model)
+    if route is None:
+        return _openai_error(404, f"Model not found: {original_model!r}")
+    model_id = route["model"]
+    cfg = get_model_config(model_id)
+    endpoint = str(cfg.get("endpoint") or "")
+    protocol = str(cfg.get("protocol") or "")
+    if protocol != "openai" or "/responses" not in endpoint:
+        return _openai_error(
+            400,
+            f"Model {original_model!r} does not support native Responses compaction",
+        )
+    compact_endpoint = endpoint.rstrip("/")
+    if compact_endpoint.endswith("/responses"):
+        compact_endpoint += "/compact"
+    else:
+        compact_endpoint += "/responses/compact"
+    body = dict(body)
+    body["model"] = model_id
+    body.pop("stream", None)
+    try:
+        headers = _get_auth_headers("openai")
+    except AllKeysPausedError:
+        return _openai_error(503, "All API keys exhausted. Check your billing.")
+    except Exception as exc:
+        return _openai_error(503, f"No usable API key: {type(exc).__name__}")
+    _log(f"  [compaction] native passthrough ? {compact_endpoint} model={model_id!r} req_id={req_id}")
+    try:
+        resp, _ = await _do_request_with_retry(compact_endpoint, body, headers, "openai")
+    except UpstreamError as exc:
+        return _openai_error(getattr(exc, "status_code", 502) or 502, str(exc))
+    except Exception as exc:
+        return _openai_error(502, f"Native compaction failed: {type(exc).__name__}: {exc}")
+    if resp.status_code != 200:
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/json"),
+        )
+    data = _resp_json_or_empty(resp)
+    _debug(
+        f"  [compaction] native done model={model_id!r} "
+        f"duration_ms={(time.monotonic() - start_time) * 1000:.0f} ip={client_ip}"
+    )
+    return JSONResponse(status_code=200, content=data)
+
+
+def _responses_chain_refusal(body, endpoint) -> str:
+    """Refus explicite d'un chaînage serveur impossible sur une cible stateless.
+
+    `previous_response_id`, `conversation` et `item_reference` demandent au
+    serveur de résoudre l'historique. Le proxy ne le stocke pas : les ignorer
+    produisait une réponse plausible SANS contexte. Les cibles Responses
+    natives les relaient telles quelles ; Chat/Anthropic/Gemini doivent
+    recevoir l'historique complet et sont refusées sinon.
+    """
+    try:
+        if "/responses" in str(endpoint or ""):
+            return ""
+        if not isinstance(body, dict):
+            return ""
+        chained = bool(body.get("previous_response_id") or body.get("conversation"))
+        item_ref = any(
+            isinstance(item, dict) and item.get("type") == "item_reference"
+            for item in (body.get("input") or [])
+        )
+        if chained or item_ref:
+            return (
+                "previous_response_id/conversation/item_reference are not "
+                "supported on a stateless target: the proxy cannot resolve "
+                "server-side history. Send the full input history instead."
+            )
+    except Exception:
+        return ""
+    return ""
 
 
 @app.post("/v1/responses")
@@ -22387,6 +26224,7 @@ async def responses(request: Request):
     body = ensure_min_tokens(body)
 
     original_model = body.get("model", "")
+    _mark_requested_model(original_model)
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
     # [Phase 1 compaction] Détection shape stricte sur le body ORIGINAL
@@ -22402,13 +26240,15 @@ async def responses(request: Request):
             _native = bool(_is_native_compaction(body))
         except Exception:
             _native = False
-        _log(f"  [compaction] req_id={req_id} model={original_model!r} body={len(body_bytes)}B (responses) native={int(_native)}")
+        _log(
+            f"  [compaction] req_id={req_id} model={original_model!r} body={len(body_bytes)}B (responses) native={int(_native)}"
+        )
     route = _route_for(original_model)
     if route is None:
         _dep = _deprecated_model_response(original_model, "openai")
         if _dep is not None:
             return _dep
-        available = sorted(list(MODELS.keys()))
+        available = sorted(MODELS.keys())
         return JSONResponse(
             status_code=404,
             content={
@@ -22417,10 +26257,55 @@ async def responses(request: Request):
             },
         )
     model_id = route["model"]
+    body = _clamp_native_output_limit(body, model_id)
     cfg = get_model_config(model_id)
     endpoint = cfg["endpoint"]
     protocol = cfg["protocol"]
     is_stream = body.get("stream", False)
+
+    # [audit 2026-10-30] Un chaînage serveur (previous_response_id/
+    # conversation/item_reference) ne peut pas être résolu par un proxy
+    # stateless. Refus explicite AVANT toute conversion : sinon le modèle
+    # répond sans contexte. Les cibles Responses natives relaient.
+    _chain_refusal = _responses_chain_refusal(body, endpoint)
+    if _chain_refusal:
+        return _openai_error(400, _chain_refusal)
+
+    # [audit 2026-10-30] Official proactive compaction trigger.
+    try:
+        _pc = await _maybe_proactive_condense(
+            body,
+            body_bytes,
+            model_id=model_id,
+            endpoint=endpoint,
+            protocol=protocol,
+            history_api="responses",
+            history_messages=body.get("input"),
+            request=request,
+            req_id=req_id,
+            forced_pool=getattr(request.state, "_geo_forced_pool", None),
+        )
+        if _pc:
+            body["input"] = _pc
+    except Exception as _pc_err:
+        _debug(f"  [compaction] proactive responses skipped: {type(_pc_err).__name__}: {_pc_err}")
+
+    # [audit 2026-10-30] Native Google Gemini upstream.
+    if protocol == "gemini":
+        return await _handle_responses_gemini(
+            body,
+            model_id=model_id,
+            endpoint=endpoint,
+            original_model=original_model,
+            request=request,
+            req_id=req_id,
+            is_stream=bool(is_stream),
+            client_ip=client_ip,
+            thinking_type="none",
+            effort=str(body.get("reasoning_effort") or "none"),
+            tool_names=tool_names,
+            request_body=request_body,
+        )
 
     _log(f"→ {original_model!r} → {model_id} | {protocol} | responses | stream={is_stream} | ip={client_ip}")
 
@@ -22428,10 +26313,7 @@ async def responses(request: Request):
     if is_stream and not _is_compaction:
         _pf_wait = _free_preflight_retry_after(model_id)
         if _pf_wait is not None:
-            _log(
-                f"  [free-preflight] responses 429 : aucune station libre "
-                f"(retry {_pf_wait:.0f}s) model={model_id!r}"
-            )
+            _log(f"  [free-preflight] responses 429 : aucune station libre (retry {_pf_wait:.0f}s) model={model_id!r}")
             return _free_preflight_response(_pf_wait, anthropic=False)
 
     # [Compaction garde opt-in] voir handler messages (warn log / deny 413).
@@ -22512,7 +26394,11 @@ async def responses(request: Request):
     thinking = anthro_body.get("thinking", {})
     thinking_type = thinking.get("type", "none") if isinstance(thinking, dict) else "none"
     effort = (
-        (anthro_body.get("output_config", {}).get("effort") if isinstance(anthro_body.get("output_config"), dict) else None)
+        (
+            anthro_body.get("output_config", {}).get("effort")
+            if isinstance(anthro_body.get("output_config"), dict)
+            else None
+        )
         or anthro_body.get("effort")
         or (thinking.get("effort") if isinstance(thinking, dict) else None)
         or "none"
@@ -22559,7 +26445,9 @@ async def responses(request: Request):
                             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                             req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
                             req_cache = usage.get("cache_read_input_tokens", 0)
-                            _update_token_usage(_actual_model, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage))
+                            _update_token_usage(
+                                _actual_model, req_in, req_out, req_cache, _extract_cache_creation_tokens(usage)
+                            )
                             used = [b["name"] for b in data.get("content", []) if b.get("type") == "tool_use"]
                             await _save_and_log_request(
                                 req_id,
@@ -22621,7 +26509,15 @@ async def responses(request: Request):
         if not is_stream:
             # Response cache (mirrors the anthropic/chat handlers)
             # [Phase 1 compaction] shape-compaction jamais cachée (idem messages/chat).
-            cache_key = None if _is_compaction else _response_cache.make_key(body, body_bytes=body_bytes)
+            cache_key = (
+                None
+                if _is_compaction or _web_nondet_injected.get()
+                else _response_cache.make_key(
+                    body,
+                    body_bytes=body_bytes,
+                    namespace=_response_cache_namespace(request, model_id, endpoint, "response"),
+                )
+            )
             cached = cache_key and _response_cache.get(cache_key)
             if cached:
                 cached_body, cached_headers = cached
@@ -22954,6 +26850,17 @@ async def responses(request: Request):
             # ne fabrique jamais de chaînage (pas d'état conversation).
             _relay_responses_optional_fields(oai_body, body)
             _ensure_encrypted_content_include(oai_body)
+        else:
+            # [audit 2026-10-30] P6 → Chat loses Responses-only hints because
+            # the intermediate Anthropic body cannot carry them. Relay the
+            # Chat-valid ones from the original client body.
+            for _k in ("prompt_cache_key", "service_tier", "user"):
+                _v = body.get(_k) if isinstance(body, dict) else None
+                if isinstance(_v, str) and _v and _k not in oai_body:
+                    oai_body[_k] = _v
+            _md = body.get("metadata") if isinstance(body, dict) else None
+            if isinstance(_md, dict) and _md and "metadata" not in oai_body:
+                oai_body["metadata"] = _md
         # [TROU 3 — A8] Map de restauration des noms d'outils construite à l'aller
         # par ``_chat_to_responses_request`` (noms >64 raccourcis, clé privée
         # ``_tool_name_map``). Elle est EXTRAITE ici, avant les deux jambes
@@ -23016,9 +26923,7 @@ async def responses(request: Request):
                     # On respecte donc le mode demandé, comme les autres chemins.
                     if oai_body.get("stream"):
                         return Response(
-                            content=responses_stream_sse(
-                                responses_stream_events(oai_resp, original_model)
-                            ),
+                            content=responses_stream_sse(responses_stream_events(oai_resp, original_model)),
                             media_type="text/event-stream",
                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                         )
@@ -23050,7 +26955,15 @@ async def responses(request: Request):
     if not is_stream:
         # Response cache (mirrors the anthropic/chat handlers)
         # [Phase 1 compaction] shape-compaction : jamais mise en cache.
-        cache_key = None if _is_compaction else _response_cache.make_key(body, body_bytes=body_bytes)
+        cache_key = (
+                None
+                if _is_compaction or _web_nondet_injected.get()
+                else _response_cache.make_key(
+                    body,
+                    body_bytes=body_bytes,
+                    namespace=_response_cache_namespace(request, model_id, endpoint, "response"),
+                )
+            )
         cached = cache_key and _response_cache.get(cache_key)
         if cached:
             cached_body, cached_headers = cached
@@ -23097,7 +27010,7 @@ async def responses(request: Request):
         # passthrough ; condensé None → fall through ; retry re-overflow →
         # relais intact ; 1 tentative max. Forme selon l'endpoint : ``input``
         # (``/responses``) ou ``messages`` (chat), retry tunnel-aware.
-        if resp.status_code == 400 and not is_stream:
+        if resp.status_code == 400 and not is_stream and not _is_compaction:
             try:
                 _r6_cfg = get_server_compaction()
             except Exception:
@@ -23106,9 +27019,13 @@ async def responses(request: Request):
                 _r6_on = bool(_r6_cfg.get("enabled", False)) if isinstance(_r6_cfg, dict) else False
             except Exception:
                 _r6_on = False
-            if _r6_on:
+            if _r6_on and not _is_compaction:
                 try:
-                    _r6_use_input = "/responses" in (endpoint or "") and isinstance(oai_body, dict) and isinstance(oai_body.get("input"), list)
+                    _r6_use_input = (
+                        "/responses" in (endpoint or "")
+                        and isinstance(oai_body, dict)
+                        and isinstance(oai_body.get("input"), list)
+                    )
                     if _r6_use_input:
                         _r6_hist = oai_body.get("input")
                         _r6_api = "responses"
@@ -23160,16 +27077,39 @@ async def responses(request: Request):
                                 model_id=_r6_model,
                                 endpoint=_r6_ep,
                                 protocol=_r6_proto,
-                                auth_headers_fn=lambda proto, _f=_r6_free, _e=_r6_ep: _compaction_summarizer_headers(_f, proto, _e),
-                                do_request_fn=lambda ep, b, h, pr, _f=_r6_free, _s=_r6_seed: _compaction_summarizer_request(_f, ep, b, h, pr, seed=_s, forced_pool=getattr(request.state, "_geo_forced_pool", None), req_id=req_id),
+                                auth_headers_fn=lambda proto, _f=_r6_free, _e=_r6_ep: _compaction_summarizer_headers(
+                                    _f, proto, _e
+                                ),
+                                do_request_fn=lambda ep, b, h, pr, _f=_r6_free, _s=_r6_seed: (
+                                    _compaction_summarizer_request(
+                                        _f,
+                                        ep,
+                                        b,
+                                        h,
+                                        pr,
+                                        seed=_s,
+                                        forced_pool=getattr(request.state, "_geo_forced_pool", None),
+                                        req_id=req_id,
+                                    )
+                                ),
                                 enabled=True,
                                 summary_max_tokens=_r6_mk,
                                 keep_recent_pairs=_r6_keep,
-                            keep_tokens=get_server_compaction("keep_tokens", None),
-                            estimate_tokens_fn=_estimate_input_tokens,
+                                keep_tokens=get_server_compaction("keep_tokens", None),
+                                estimate_tokens_fn=_estimate_input_tokens,
                                 timeout_s=_r6_to,
                                 markers=_r6_markers,
                                 api=_r6_api,
+                                history_api="responses" if _r6_use_input else "chat",
+                                full_history=not _r6_free,
+                                max_attempts=get_server_compaction("max_attempts", 1),
+                                keep_tail=get_server_compaction("keep_tail", True),
+                                tools=oai_body.get("tools") if isinstance(oai_body, dict) else None,
+                                instructions=(
+                                    oai_body.get("instructions")
+                                    if isinstance(oai_body, dict)
+                                    else None
+                                ),
                             )
                         except Exception:
                             _r6_condensed = None
@@ -23216,7 +27156,9 @@ async def responses(request: Request):
                             resp = _r6_r2
                             account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
                             _r6_condensed_ok = True
-                            _log(f"  [compaction] req_id={req_id} 400-overflow → condense-and-retry once (model={_r6_model!r})")
+                            _log(
+                                f"  [compaction] req_id={req_id} 400-overflow → condense-and-retry once (model={_r6_model!r})"
+                            )
                         # Re-overflow ou non-200 : fall through vers le relais intact (pas de 2e tentative).
         account_alias = _alias_for_key(_key_from_headers(headers, "openai"))
         if resp.status_code != 200:
@@ -23258,7 +27200,9 @@ async def responses(request: Request):
                     _pass = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
                     _pass_headers = {"Retry-After": _pass} if _pass else None
                     return Response(
-                        content=oai_err, status_code=resp.status_code, media_type="application/json",
+                        content=oai_err,
+                        status_code=resp.status_code,
+                        media_type="application/json",
                         headers=_pass_headers,
                     )
                 return _openai_error(
@@ -23352,6 +27296,7 @@ async def responses(request: Request):
     # ── Streaming (OpenAI backend) — collect stream, emit Responses SSE ──
     # Try free model first if available
     _geo_tunnel = getattr(request.state, "_geo_force_tunnel", False)
+    _stream_paid_model = model_id
     try:
         free_result = await _try_free_model_first(
             oai_body,
@@ -23429,6 +27374,81 @@ async def responses(request: Request):
                     )
                 collected_chunks = []
                 collected_reasoning_chunks = []
+                # [audit 2026-10-30] Responses-native upstream: relay the SSE
+                # bytes as they arrive instead of collecting the whole answer.
+                # Only when no free model substitution changed the protocol
+                # (a Chat free leg must still be converted).
+                if (
+                    is_stream
+                    and "/responses" in (endpoint or "")
+                    and model_id == _stream_paid_model
+                    and bool(get_server_compaction("native_passthrough", True))
+                ):
+                    _native_usage: dict = {}
+
+                    async def _native_relay():
+                        _buf = b""
+                        try:
+                            async for _chunk in resp.aiter_bytes():
+                                yield _chunk
+                                try:
+                                    _buf += _chunk
+                                    while b"\n" in _buf:
+                                        _line, _buf = _buf.split(b"\n", 1)
+                                        if not _line.startswith(b"data:"):
+                                            continue
+                                        _raw_evt = _line[5:].strip()
+                                        if not _raw_evt:
+                                            continue
+                                        try:
+                                            _evt = json.loads(_raw_evt)
+                                        except Exception:
+                                            continue
+                                        if isinstance(_evt, dict) and _evt.get("type") == "response.completed":
+                                            _u = (_evt.get("response") or {}).get("usage")
+                                            if isinstance(_u, dict):
+                                                _native_usage.update(_u)
+                                except Exception:
+                                    pass
+                        finally:
+                            try:
+                                if _native_usage:
+                                    _in = int(_native_usage.get("input_tokens") or 0)
+                                    _out = int(_native_usage.get("output_tokens") or 0)
+                                    _det = _native_usage.get("input_tokens_details")
+                                    _cache = int((_det or {}).get("cached_tokens") or 0) if isinstance(_det, dict) else 0
+                                    _update_token_usage(model_id, _in, _out, _cache)
+                                    await _save_and_log_request(
+                                        req_id,
+                                        model_id,
+                                        original_model,
+                                        start_time,
+                                        _in,
+                                        _out,
+                                        _cache,
+                                        protocol,
+                                        True,
+                                        thinking_type,
+                                        effort,
+                                        client_ip,
+                                        account_alias,
+                                        tool_names,
+                                        request_body=request_body,
+                                        response_body={"usage": _native_usage},
+                                    )
+                            except Exception:
+                                pass
+
+                    return StreamingResponse(
+                        _native_relay(),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
+
                 # [fix tool_calls] Meme defaut latent que sur le chemin free : les
                 # deltas de tool_calls et le vrai finish_reason etaient IGNORES
                 # (seuls ``content``/``reasoning_content`` etaient collectes, et
@@ -23520,8 +27540,7 @@ async def responses(request: Request):
                             # [fix tool_calls free] vrai finish_reason de l'amont,
                             # "tool_calls" compris — un "stop" code en dur faisait
                             # croire au client que le tour etait termine.
-                            "finish_reason": _finish_reason
-                            or ("tool_calls" if _msg_out.get("tool_calls") else "stop"),
+                            "finish_reason": _finish_reason or ("tool_calls" if _msg_out.get("tool_calls") else "stop"),
                         }
                     ],
                     "usage": final_usage or {"prompt_tokens": 0, "completion_tokens": 0},
@@ -23591,6 +27610,258 @@ async def responses(request: Request):
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
+
+    # [audit 2026-10-30] Chat?Responses true streaming: emit Responses
+    # events as Chat deltas arrive (text/reasoning live, tool calls at
+    # completion). Invalid/empty streams terminate with response.failed
+    # instead of a silent [DONE]. A wrapper without aiter_lines must still
+    # produce the structured 500 (falsifiability).
+    if not callable(getattr(resp, "aiter_lines", None)):
+        return _openai_error(500, "Upstream stream has no SSE interface")
+    from app.protocol.mapping import ResponsesStreamEmitter as _RSE
+
+    async def _chat_stream_to_responses():
+        _em = _RSE(original_model)
+        _t0 = int(time.time())
+
+        def _ev(event: dict) -> bytes:
+            return (f"data: {_json_dumps_str(event, ensure_ascii=False)}\n\n").encode()
+
+        yield _ev(_em.created(_t0))
+        yield _ev(_em.in_progress())
+        _out: list = []
+        _text: list[str] = []
+        _text_id = None
+        _text_idx = None
+        _reasoning: list[str] = []
+        _reason_id = None
+        _reason_idx = None
+        _reason_open = False
+        _tools: dict[int, dict] = {}
+        _finish = ""
+        _usage: dict = {}
+        _state = ResponsesSseState()
+        _failed_msg = ""
+        try:
+            async for _line in resp.aiter_lines():
+                if not _line.startswith("data:"):
+                    continue
+                _raw = _line[5:].strip()
+                if not _raw or _raw == "[DONE]":
+                    continue
+                try:
+                    _chunk = _json_loads(_raw)
+                except Exception:
+                    continue
+                if not isinstance(_chunk, dict):
+                    continue
+                if isinstance(_chunk.get("error"), dict):
+                    _failed_msg = str(_chunk["error"].get("message") or "upstream stream error")
+                    break
+                _u = _chunk.get("usage")
+                if isinstance(_u, dict):
+                    _usage = _u
+                _choices = _chunk.get("choices")
+                if not isinstance(_choices, list) or not _choices:
+                    _conv = _responses_sse_to_chat_deltas(_raw, parsed=_chunk, state=_state)
+                    if _conv is None:
+                        continue
+                    _chunk = _conv
+                    _choices = _chunk.get("choices") or []
+                if not _choices or not isinstance(_choices[0], dict):
+                    continue
+                _choice = _choices[0]
+                if _choice.get("finish_reason"):
+                    _finish = str(_choice["finish_reason"])
+                _delta = _choice.get("delta") if isinstance(_choice.get("delta"), dict) else {}
+                _rc = _delta.get("reasoning_content") or _delta.get("reasoning")
+                if isinstance(_rc, str) and _rc:
+                    if not _text_id:
+                        if not _reason_open:
+                            _reason_id = _fast_id("rs")
+                            _reason_idx = len(_out)
+                            yield _ev(
+                                _em.output_item_added(
+                                    {
+                                        "id": _reason_id,
+                                        "type": "reasoning",
+                                        "summary": [{"type": "summary_text", "text": ""}],
+                                    },
+                                    _reason_idx,
+                                )
+                            )
+                            _reason_open = True
+                        _reasoning.append(_rc)
+                        yield _ev(_em.reasoning_summary_delta(_rc, _reason_id, _reason_idx))
+                _c = _delta.get("content")
+                if isinstance(_c, str) and _c:
+                    if _reason_open and _reason_id:
+                        _full_reason = "".join(_reasoning)
+                        yield _ev(
+                            _em.output_item_done(
+                                {
+                                    "id": _reason_id,
+                                    "type": "reasoning",
+                                    "summary": [{"type": "summary_text", "text": _full_reason}],
+                                },
+                                _reason_idx,
+                            )
+                        )
+                        _out.append(
+                            {
+                                "id": _reason_id,
+                                "type": "reasoning",
+                                "summary": [{"type": "summary_text", "text": _full_reason}],
+                            }
+                        )
+                        _reason_open = False
+                    if not _text_id:
+                        _text_id = _fast_id("msg")
+                        _text_idx = len(_out)
+                        yield _ev(
+                            _em.output_item_added(
+                                {
+                                    "id": _text_id,
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "", "annotations": []}],
+                                },
+                                _text_idx,
+                            )
+                        )
+                        yield _ev(_em.content_part_added(_text_id, _text_idx, 0))
+                    _text.append(_c)
+                    yield _ev(_em.text_delta(_c, _text_id, _text_idx, 0))
+                for _tc in _delta.get("tool_calls") or []:
+                    if not isinstance(_tc, dict):
+                        continue
+                    _ix = _tc.get("index")
+                    _ix = _ix if isinstance(_ix, int) else len(_tools)
+                    _acc = _tools.setdefault(
+                        _ix,
+                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    if _tc.get("id"):
+                        _acc["id"] = _tc["id"]
+                    _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
+                    if _fn.get("name"):
+                        _acc["function"]["name"] += str(_fn["name"])
+                    if _fn.get("arguments"):
+                        _acc["function"]["arguments"] += str(_fn["arguments"])
+            if _failed_msg:
+                yield _ev(_em.failed(message=_failed_msg))
+            else:
+                if _reason_open and _reason_id:
+                    _full_reason = "".join(_reasoning)
+                    _ritem = {
+                        "id": _reason_id,
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": _full_reason}],
+                    }
+                    yield _ev(_em.output_item_done(_ritem, _reason_idx))
+                    _out.append(_ritem)
+                if _text_id:
+                    _full_text = "".join(_text)
+                    _mitem = {
+                        "id": _text_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": _full_text, "annotations": []}],
+                    }
+                    yield _ev(_em.text_done(_full_text, _text_id, _text_idx, 0))
+                    yield _ev(_em.content_part_done(_text_id, _full_text, _text_idx, 0))
+                    yield _ev(_em.output_item_done(_mitem, _text_idx))
+                    _out.append(_mitem)
+                for _ix in sorted(_tools):
+                    _acc = _tools[_ix]
+                    _fn = _acc.get("function") or {}
+                    _name = restore_tool_name(_fn.get("name", ""), _out_tool_map)
+                    if not _name:
+                        continue
+                    _call_id = _acc.get("id") or _fast_id("call")
+                    _args = str(_fn.get("arguments") or "{}")
+                    _oix = len(_out)
+                    _item = {
+                        "id": _call_id,
+                        "type": "function_call",
+                        "call_id": _call_id,
+                        "name": _name,
+                        "arguments": "",
+                    }
+                    yield _ev(_em.output_item_added(_item, _oix))
+                    if _args:
+                        yield _ev(_em.function_call_arguments_delta(_args, _call_id, _oix))
+                    yield _ev(_em.function_call_arguments_done(_args, _call_id, _oix))
+                    _full_item = {**_item, "arguments": _args}
+                    yield _ev(_em.output_item_done(_full_item, _oix))
+                    _out.append(_full_item)
+                if not _out and not _failed_msg:
+                    yield _ev(_em.failed(message="upstream stream produced no output"))
+                else:
+                    _cached = _extract_cache_tokens(_usage) if _usage else 0
+                    _in_t = int(_usage.get("prompt_tokens") or 0) if _usage else 0
+                    _out_t = int(_usage.get("completion_tokens") or 0) if _usage else 0
+                    _status = "incomplete" if _finish in ("length", "content_filter") else "completed"
+                    _final = {
+                        "id": _em.response_id,
+                        "object": "response",
+                        "created_at": _t0,
+                        "status": _status,
+                        "model": original_model,
+                        "output": _out,
+                        "usage": {
+                            "input_tokens": _in_t,
+                            "input_tokens_details": {"cached_tokens": _cached},
+                            "output_tokens": _out_t,
+                            "output_tokens_details": {"reasoning_tokens": 0},
+                            "total_tokens": _in_t + _out_t,
+                        },
+                    }
+                    if _status == "incomplete":
+                        _final["incomplete_details"] = {
+                            "reason": "content_filter" if _finish == "content_filter" else "max_output_tokens"
+                        }
+                        yield _ev(_em.incomplete(_final))
+                    else:
+                        yield _ev(_em.completed(_final))
+                    try:
+                        _update_token_usage(model_id, _in_t, _out_t, _cached)
+                        await _save_and_log_request(
+                            req_id,
+                            model_id,
+                            original_model,
+                            start_time,
+                            _in_t,
+                            _out_t,
+                            _cached,
+                            protocol,
+                            True,
+                            thinking_type,
+                            effort,
+                            client_ip,
+                            account_alias,
+                            tool_names,
+                            request_body=request_body,
+                            response_body={"usage": _usage or {}, "streamed": True},
+                        )
+                    except Exception:
+                        pass
+        except Exception as _stream_exc:
+            try:
+                yield _ev(_em.failed(message=f"stream error: {type(_stream_exc).__name__}"))
+            except Exception:
+                pass
+        yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(
+        _chat_stream_to_responses(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
     # Collect streaming response and convert to Responses API format
     collected_chunks = []

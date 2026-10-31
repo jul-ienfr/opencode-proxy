@@ -66,14 +66,8 @@ def test_declared_mapping_is_what_the_runtime_carries():
     with open(_cfg_settings.CONFIG_PATH, encoding="utf-8") as f:
         on_disk = (yaml.safe_load(f) or {}).get("custom_routes") or {}
     assert _cfg_settings.CUSTOM_ROUTES == on_disk
-    runtime_set = {
-        (tuple(r.get("match") or []), r.get("model"))
-        for r in _cfg_settings.SORTED_CUSTOM_ROUTES
-    }
-    disk_set = {
-        (tuple(r.get("match") or []), r.get("model"))
-        for r in on_disk.values()
-    }
+    runtime_set = {(tuple(r.get("match") or []), r.get("model")) for r in _cfg_settings.SORTED_CUSTOM_ROUTES}
+    disk_set = {(tuple(r.get("match") or []), r.get("model")) for r in on_disk.values()}
     assert runtime_set == disk_set
 
 
@@ -85,9 +79,7 @@ def test_every_declared_route_is_followed_literally():
             f"cible {target!r} absente de models: — la route est déclarée mais non servable"
         )
         for _id in r.get("match") or []:
-            assert _resolve(_id)["model"] == target, (
-                f"{_id!r} ne suit pas sa route déclarée ({target!r})"
-            )
+            assert _resolve(_id)["model"] == target, f"{_id!r} ne suit pas sa route déclarée ({target!r})"
 
 
 def test_custom_redirect_never_transits_a_second_hop():
@@ -104,8 +96,7 @@ def test_custom_redirect_never_transits_a_second_hop():
             continue  # pas de cas de chaîne déclaré pour cette cible
         for _id in r.get("match") or []:
             assert _resolve(_id)["model"] == target, (
-                f"{_id!r} a transité un second hop vers {m2t[target]!r} "
-                f"au lieu de s'arrêter sur {target!r}"
+                f"{_id!r} a transité un second hop vers {m2t[target]!r} au lieu de s'arrêter sur {target!r}"
             )
 
 
@@ -138,9 +129,7 @@ def test_free_first_leg_still_holds_for_mapped_paid_ids():
         for paid, free in _cfg_settings.FREE_MODEL_MAP.items()
         if paid in _match_to_target() and free in _cfg_settings.MODELS
     ]
-    assert covered, (
-        "aucun couple map couvert + servable : la map a-t-elle été vidée ?"
-    )
+    assert covered, "aucun couple map couvert + servable : la map a-t-elle été vidée ?"
     for paid, free in covered:
         assert free in _cfg_settings.MODELS, (paid, free)
         cfg = _cfg_settings.get_model_config(free)

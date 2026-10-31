@@ -27,8 +27,6 @@ couperait un flux qui livrait du contenu. C'est documente dans le code.
 
 import inspect
 
-import pytest
-
 import opencode as oc
 
 
@@ -45,9 +43,7 @@ def test_can_fail_only_when_nothing_was_sent():
     assert oc._can_fail_with_http_status(False) is True, (
         "aucun octet emis -> en-tetes pas partis -> le statut est encore libre"
     )
-    assert oc._can_fail_with_http_status(True) is False, (
-        "des octets sont partis -> on ne coupe jamais un flux commence"
-    )
+    assert oc._can_fail_with_http_status(True) is False, "des octets sont partis -> on ne coupe jamais un flux commence"
 
 
 def test_raised_exception_subclasses_runtime_error():

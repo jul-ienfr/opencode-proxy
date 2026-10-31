@@ -81,7 +81,9 @@ async def summarizer_request(
         raise exc
 
 
-async def normalize_free_responses(resp, endpoint, body, *, json_loads_fn=None, responses_to_chat_fn=None, response_cls=None):
+async def normalize_free_responses(
+    resp, endpoint, body, *, json_loads_fn=None, responses_to_chat_fn=None, response_cls=None
+):
     """Ramène une réponse free ``/responses`` en forme ``choices`` lisible.
 
     ``/responses`` rend ``output[]`` (blocs ``output_text``) que l'extracteur

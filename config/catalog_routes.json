@@ -5,809 +5,1507 @@
    "beam-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "big-pickle": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 200000,
+     "output": 32000
+    }
    },
    "cat-jam-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "claude-3-5-haiku": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 200000,
+     "output": 8192
+    }
    },
    "claude-fable-5": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "claude-fable-5-1": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "claude-haiku-4-5": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 200000,
+     "output": 64000
+    }
    },
    "claude-haiku-5-5": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "claude-opus-4-1": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 200000,
+     "output": 32000
+    }
    },
    "claude-opus-4-5": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 200000,
+     "output": 64000
+    }
    },
    "claude-opus-4-6": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "claude-opus-4-7": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "claude-opus-4-8": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "claude-opus-5": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "claude-opus-5-5": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "claude-sonnet-4": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 64000
+    }
    },
    "claude-sonnet-4-5": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 64000
+    }
    },
    "claude-sonnet-4-6": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 64000
+    }
    },
    "claude-sonnet-5": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "claude-sonnet-5-5": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "deepseek-v4-flash": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 384000
+    }
    },
    "deepseek-v4-flash-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 200000,
+     "output": 128000
+    }
    },
    "deepseek-v4-flash-vision-exp": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 384000
+    }
    },
    "deepseek-v4-pro": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 384000
+    }
    },
    "deepseek-v4.1-flash": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 384000
+    }
    },
    "deepseek-v4.1-flash-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 200000,
+     "output": 32000
+    }
    },
    "exo-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "fledge-alpha-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
+   },
+   "flint-40b-free": {
+    "family": "chat",
+    "protocol": "openai",
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 65536
+    }
    },
    "gemini-3-flash": {
     "family": "gemini",
-    "protocol": null,
-    "base_url": "https://opencode.ai/inference/google/v1beta"
+    "protocol": "gemini",
+    "base_url": "https://opencode.ai/inference/google/v1beta",
+    "limit": {
+     "context": 1048576,
+     "output": 65536
+    }
    },
    "gemini-3-pro": {
     "family": "gemini",
-    "protocol": null,
-    "base_url": "https://opencode.ai/inference/google/v1beta"
+    "protocol": "gemini",
+    "base_url": "https://opencode.ai/inference/google/v1beta",
+    "limit": {
+     "context": 1048576,
+     "output": 65536
+    }
    },
    "gemini-3.1-pro": {
     "family": "gemini",
-    "protocol": null,
-    "base_url": "https://opencode.ai/inference/google/v1beta"
+    "protocol": "gemini",
+    "base_url": "https://opencode.ai/inference/google/v1beta",
+    "limit": {
+     "context": 1048576,
+     "output": 65536
+    }
    },
    "gemini-3.5-flash": {
     "family": "gemini",
-    "protocol": null,
-    "base_url": "https://opencode.ai/inference/google/v1beta"
+    "protocol": "gemini",
+    "base_url": "https://opencode.ai/inference/google/v1beta",
+    "limit": {
+     "context": 1048576,
+     "output": 65536
+    }
    },
    "gemini-3.5-flash-lite": {
     "family": "gemini",
-    "protocol": null,
-    "base_url": "https://opencode.ai/inference/google/v1beta"
+    "protocol": "gemini",
+    "base_url": "https://opencode.ai/inference/google/v1beta",
+    "limit": {
+     "context": 1048576,
+     "output": 65536
+    }
    },
    "gemini-3.6-flash": {
     "family": "gemini",
-    "protocol": null,
-    "base_url": "https://opencode.ai/inference/google/v1beta"
+    "protocol": "gemini",
+    "base_url": "https://opencode.ai/inference/google/v1beta",
+    "limit": {
+     "context": 1048576,
+     "output": 65536
+    }
    },
    "gemini-3.7-flash": {
     "family": "gemini",
-    "protocol": null,
-    "base_url": "https://opencode.ai/inference/google/v1beta"
+    "protocol": "gemini",
+    "base_url": "https://opencode.ai/inference/google/v1beta",
+    "limit": {
+     "context": 1048576,
+     "output": 65536
+    }
    },
    "gemini-3.8-flash": {
     "family": "gemini",
-    "protocol": null,
-    "base_url": "https://opencode.ai/inference/google/v1beta"
+    "protocol": "gemini",
+    "base_url": "https://opencode.ai/inference/google/v1beta",
+    "limit": {
+     "context": 1048576,
+     "output": 65536
+    }
    },
    "gemini-4-argon": {
     "family": "gemini",
-    "protocol": null,
-    "base_url": "https://opencode.ai/inference/google/v1beta"
+    "protocol": "gemini",
+    "base_url": "https://opencode.ai/inference/google/v1beta",
+    "limit": {
+     "context": 1048576,
+     "output": 65536
+    }
    },
    "glm-4.6": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "glm-4.7": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "glm-4.7-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "glm-5": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "glm-5-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "glm-5.1": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "glm-5.2": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "glm-5.3": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "glm-5.3-flash": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "glm-5.3-flash-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 200000,
+     "output": 32000
+    }
    },
    "gpt-5": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5-codex": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5-nano": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5.1": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5.1-codex": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5.1-codex-max": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5.1-codex-mini": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5.2": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5.2-codex": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5.3-codex": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5.3-codex-spark": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 128000,
+     "output": 128000
+    }
    },
    "gpt-5.4": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "gpt-5.4-mini": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5.4-nano": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 400000,
+     "output": 128000
+    }
    },
    "gpt-5.4-pro": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "gpt-5.5": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "gpt-5.5-pro": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "gpt-5.6-luna": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "gpt-5.6-sol": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "gpt-5.6-terra": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "gpt-6-astra": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "gpt-6-luna": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "gpt-6-sol": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "gpt-6.1-sol": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "grok-4.5": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 500000,
+     "output": 500000
+    }
    },
    "grok-4.6": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 500000,
+     "output": 500000
+    }
    },
    "grok-4.7": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 500000,
+     "output": 500000
+    }
    },
    "grok-build-0.1": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 256000,
+     "output": 256000
+    }
    },
    "grok-code": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 256000,
+     "output": 256000
+    }
    },
    "hy3-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 190000,
+     "output": 64000
+    }
    },
    "hy3-preview-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 256000,
+     "output": 64000
+    }
    },
    "kimi-k2": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 262144
+    }
    },
    "kimi-k2-thinking": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 262144
+    }
    },
    "kimi-k2.5": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 65536
+    }
    },
    "kimi-k2.5-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 262144
+    }
    },
    "kimi-k2.6": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 65536
+    }
    },
    "kimi-k2.7-code": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 262144
+    }
    },
    "kimi-k3": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "laguna-s-2.1-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 256000,
+     "output": 32000
+    }
    },
    "ling-2.6-flash-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262100,
+     "output": 32800
+    }
    },
    "ling-3.0-flash-fin-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 32768
+    }
    },
    "ling-3.0-flash-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 32768
+    }
    },
    "ling-3.0-tiny-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 32768
+    }
    },
    "ling-3.1-flash-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 32768
+    }
    },
    "ll-alpha-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 65536
+    }
    },
    "longcat-2.0-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "longcat-2.5-preview-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "mimo-v2-flash-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 65536
+    }
    },
    "mimo-v2-omni-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 64000
+    }
    },
    "mimo-v2-pro-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 64000
+    }
    },
    "mimo-v2.5-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 200000,
+     "output": 32000
+    }
    },
    "mimo-v2.6-flash-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 200000,
+     "output": 32000
+    }
    },
    "minimax-m2.1": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "minimax-m2.1-free": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "minimax-m2.5": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "minimax-m2.5-free": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "minimax-m2.7": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "minimax-m3": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 512000,
+     "output": 128000
+    }
    },
    "minimax-m3-free": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 200000,
+     "output": 32000
+    }
    },
    "minimax-m3.1-flash-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 512000
+    }
    },
    "mistral-large-4": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 524288,
+     "output": 262144
+    }
    },
    "muse-spark-1.2": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "muse-spark-1.2-contributor-free": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "muse-spark-1.3": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "muse-spark-1.3-contributor-free": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
+   },
+   "muse-wonder-1.0": {
+    "family": "responses",
+    "protocol": "openai",
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "nemotron-3-super-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 204800,
+     "output": 128000
+    }
    },
    "nemotron-3-ultra-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "nemotron-3.5-lightning-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 262144
+    }
    },
    "nemotron-3.5-super-vl-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "north-mini-code-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 256000,
+     "output": 64000
+    }
    },
    "qwen3-coder": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 65536
+    }
    },
    "qwen3.5-plus": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 262144,
+     "output": 65536
+    }
    },
    "qwen3.6-plus": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 262144,
+     "output": 65536
+    }
    },
    "qwen3.6-plus-free": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 262144,
+     "output": 65536
+    }
    },
    "qwen3.8-flash": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "qwen3.8-max": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 131072
+    }
    },
    "ring-2.6-1t-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 262000,
+     "output": 66000
+    }
    },
    "space-bunny-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 524288
+    }
    },
    "step-5-preview-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 65536
+    }
    },
    "trinity-large-preview-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 131072,
+     "output": 131072
+    }
    },
    "x-preview-f-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/openai/v1"
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    }
   },
   "opencode-go": {
    "beam-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "cat-jam-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "claude-haiku-5-5": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/go/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/go/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "deepseek-v4-pro": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 384000
+    }
    },
    "deepseek-v4.1-flash": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 384000
+    }
+   },
+   "gemini-4-argon": {
+    "family": "gemini",
+    "protocol": "gemini",
+    "base_url": "https://opencode.ai/inference/go/google/v1beta",
+    "limit": {
+     "context": 1048576,
+     "output": 65536
+    }
    },
    "gemini-4-argon-contributor": {
     "family": "gemini",
-    "protocol": null,
-    "base_url": "https://opencode.ai/inference/go/google/v1beta"
+    "protocol": "gemini",
+    "base_url": "https://opencode.ai/inference/go/google/v1beta",
+    "limit": {
+     "context": 1048576,
+     "output": 65536
+    }
    },
    "glm-5.2": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "glm-5.3": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "glm-5.3-flash": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "gpt-5.6-luna": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "gpt-6-luna": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1050000,
+     "output": 128000
+    }
    },
    "grok-4.7": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 500000,
+     "output": 500000
+    }
    },
    "hy3": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 256000,
+     "output": 128000
+    }
    },
    "hy4-preview": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1024000,
+     "output": 64000
+    }
+   },
+   "iceman-contributor-free": {
+    "family": "chat",
+    "protocol": "openai",
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 131072
+    }
    },
    "kimi-k2.7-code": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 262144,
+     "output": 262144
+    }
    },
    "kimi-k3": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
+   },
+   "kimi-k3.1-pro": {
+    "family": "chat",
+    "protocol": "openai",
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "longcat-2.0": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "longcat-2.5-preview-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "mimo-v2.5": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 128000
+    }
    },
    "mimo-v2.5-pro": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 128000
+    }
    },
    "mimo-v2.6-flash": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "mimo-v2.6-pro": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "minimax-m2.7": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/go/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/go/anthropic/v1",
+    "limit": {
+     "context": 204800,
+     "output": 131072
+    }
    },
    "minimax-m3": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/go/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/go/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
+   },
+   "minimax-m3.1-flash": {
+    "family": "chat",
+    "protocol": "openai",
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 512000
+    }
    },
    "minimax-m3.1-flash-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 512000
+    }
    },
    "muse-spark-1.2-contributor": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "muse-spark-1.3-contributor": {
     "family": "responses",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 131072
+    }
    },
    "qwen3.7-plus": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/go/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/go/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 65536
+    }
    },
    "qwen3.8-flash": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/go/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/go/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "qwen3.8-max": {
     "family": "messages",
     "protocol": "anthropic",
-    "base_url": "https://opencode.ai/inference/go/anthropic/v1"
+    "base_url": "https://opencode.ai/inference/go/anthropic/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 131072
+    }
    },
    "space-bunny": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1048576,
+     "output": 524288
+    }
    },
    "step-5-preview": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 65536
+    }
    },
    "step-5-preview-free": {
     "family": "chat",
     "protocol": "openai",
-    "base_url": "https://opencode.ai/inference/go/openai/v1"
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "limit": {
+     "context": 1000000,
+     "output": 65536
+    }
    }
   }
  }

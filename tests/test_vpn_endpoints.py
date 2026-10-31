@@ -520,9 +520,7 @@ def test_upload_config_writes_custom_dir_and_persists(ctx, monkeypatch, tmp_path
 
     assert resp == {"ok": True, "path": "vpn_configs/custom/nordvigre.ovpn"}
     assert persisted == [{"custom_ovpn_file": "vpn_configs/custom/nordvigre.ovpn"}]
-    assert opened and opened[0].path.replace("\\", "/").endswith(
-        "vpn_configs/custom/nordvigre.ovpn"
-    )
+    assert opened and opened[0].path.replace("\\", "/").endswith("vpn_configs/custom/nordvigre.ovpn")
     assert bytes(opened[0].data) == body
     assert makedirs_calls, "custom dir ensured before write"
 
@@ -569,9 +567,7 @@ def test_diagnostic_bundle(ctx, monkeypatch):
     fast, s1, s2, pool, cfg, persisted = ctx
     s1.status = "connected"
     s1.current_ip = "7.7.7.7"
-    monkeypatch.setattr(
-        api, "_docker_diag", lambda: {"available": True, "running": True, "version": "v1.2"}
-    )
+    monkeypatch.setattr(api, "_docker_diag", lambda: {"available": True, "running": True, "version": "v1.2"})
     monkeypatch.setattr(api, "_docker_compose_config", lambda: ["=== compose: OK"])
     monkeypatch.setattr(api.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
     monkeypatch.setattr(api.os.path, "exists", lambda p: False)

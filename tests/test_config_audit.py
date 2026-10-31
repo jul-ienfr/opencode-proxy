@@ -23,17 +23,13 @@ import json
 import pathlib
 import sys
 
-import pytest
-
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-_SPEC = importlib.util.spec_from_file_location(
-    "config_audit", ROOT / "scripts" / "config_audit.py"
-)
-audit = importlib.util.module_from_spec(_SPEC)
+_SPEC = importlib.util.spec_from_file_location("config_audit", ROOT / "scripts" / "config_audit.py")
 assert _SPEC and _SPEC.loader
+audit = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(audit)
 
 
@@ -96,9 +92,7 @@ class TestTheAuditDetectsAFreshDeadKey:
         faux = tmp_path / "config.yaml"
         faux.write_text(yaml.safe_dump(config, allow_unicode=True), encoding="utf-8")
         baseline = tmp_path / "baseline.json"
-        baseline.write_text(
-            json.dumps({"dead": ["server.prot"], "missing": []}), encoding="utf-8"
-        )
+        baseline.write_text(json.dumps({"dead": ["server.prot"], "missing": []}), encoding="utf-8")
 
         monkeypatch.setattr(audit, "CONFIG", faux)
         monkeypatch.setattr(audit, "BASELINE", baseline)
@@ -132,16 +126,12 @@ class TestDashboardRequireTokenIsNowHonoured:
 
     def test_env_false_wins_over_yaml(self, monkeypatch):
         monkeypatch.setenv("DASHBOARD_REQUIRE_TOKEN", "0")
-        monkeypatch.setattr(
-            self._api().config_settings, "yaml_get", lambda *a, **k: True, raising=False
-        )
+        monkeypatch.setattr(self._api().config_settings, "yaml_get", lambda *a, **k: True, raising=False)
         assert self._api()._require_token_from_config() is False
 
     def test_yaml_applies_when_env_is_unset(self, monkeypatch):
         monkeypatch.delenv("DASHBOARD_REQUIRE_TOKEN", raising=False)
-        monkeypatch.setattr(
-            self._api().config_settings, "yaml_get", lambda *a, **k: True, raising=False
-        )
+        monkeypatch.setattr(self._api().config_settings, "yaml_get", lambda *a, **k: True, raising=False)
         assert self._api()._require_token_from_config() is True
 
     def test_a_broken_yaml_never_crashes_the_dashboard(self, monkeypatch):

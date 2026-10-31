@@ -453,11 +453,7 @@ def test_route_responses_replays_free_text_into_sse(monkeypatch):
     status, _ctype, raw = _post_responses(monkeypatch, resp)
 
     assert status == 200
-    frames = [
-        json.loads(ln[6:])
-        for ln in raw.splitlines()
-        if ln.startswith("data: ") and ln[6:].strip() != "[DONE]"
-    ]
+    frames = [json.loads(ln[6:]) for ln in raw.splitlines() if ln.startswith("data: ") and ln[6:].strip() != "[DONE]"]
     assert frames and frames[0]["type"] == "response.created"
     text = "".join(e.get("delta", "") for e in frames if e["type"] == "response.output_text.delta")
     assert text == "Bonjour tout le monde"
@@ -483,11 +479,7 @@ def test_route_responses_wire_json_shim_also_works(monkeypatch):
 
 def _text_from_responses_sse(raw):
     """Texte agrégé des events Responses rendus à un client stream."""
-    frames = [
-        json.loads(ln[6:])
-        for ln in raw.splitlines()
-        if ln.startswith("data: ") and ln[6:].strip() != "[DONE]"
-    ]
+    frames = [json.loads(ln[6:]) for ln in raw.splitlines() if ln.startswith("data: ") and ln[6:].strip() != "[DONE]"]
     return "".join(e.get("delta", "") for e in frames if e.get("type") == "response.output_text.delta")
 
 
@@ -518,9 +510,7 @@ def test_route_responses_chat_json_body_yields_non_empty_text(monkeypatch):
 def test_route_responses_wire_json_shim_yields_non_empty_text(monkeypatch):
     """Chemin 5402 : ``_WireJsonResponse`` doit aussi porter le texte."""
     payload = {
-        "choices": [
-            {"message": {"role": "assistant", "content": "Bonjour"}, "finish_reason": "stop"}
-        ],
+        "choices": [{"message": {"role": "assistant", "content": "Bonjour"}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
     }
     resp = oc._CurlCffiResponse(oc._WireJsonResponse(payload))
@@ -575,16 +565,10 @@ _CHAT_TOOL = {
 
 
 def _frames_of(raw):
-    return [
-        json.loads(ln[6:])
-        for ln in raw.splitlines()
-        if ln.startswith("data: ") and ln[6:].strip() != "[DONE]"
-    ]
+    return [json.loads(ln[6:]) for ln in raw.splitlines() if ln.startswith("data: ") and ln[6:].strip() != "[DONE]"]
 
 
-@pytest.mark.parametrize(
-    "obj", [_RESPONSES_TOOL, _CHAT_TOOL], ids=["responses-function_call", "chat-tool_calls"]
-)
+@pytest.mark.parametrize("obj", [_RESPONSES_TOOL, _CHAT_TOOL], ids=["responses-function_call", "chat-tool_calls"])
 def test_route_responses_tool_call_survives_replay(monkeypatch, obj):
     """Un tour d'outil de la jambe free doit ressortir AVEC son outil.
 
@@ -606,11 +590,7 @@ def test_route_responses_tool_call_survives_replay(monkeypatch, obj):
     ]
     assert added, f"tool_call PERDU — types: {[f.get('type') for f in frames]}"
     assert added[0]["item"].get("name") == "bash"
-    args = "".join(
-        f.get("delta", "")
-        for f in frames
-        if f.get("type") == "response.function_call_arguments.delta"
-    )
+    args = "".join(f.get("delta", "") for f in frames if f.get("type") == "response.function_call_arguments.delta")
     assert args == '{"command":"ls"}', f"arguments perdus: {args!r}"
 
 
@@ -646,49 +626,50 @@ async def test_synth_drops_nameless_tool_call():
 # l'outil n'est jamais execute. C'est la regression verrouillee ici.
 
 
-_SSE_TOOL_NO_FINISH = b"".join(
-    b"data: " + json.dumps(f).encode() + b"\n\n"
-    for f in (
-        {
-            "id": "gen-1",
-            "object": "chat.completion.chunk",
-            "choices": [
-                {"index": 0, "delta": {"content": "Je lance ls."}, "finish_reason": None}
-            ],
-        },
-        {
-            "id": "gen-1",
-            "object": "chat.completion.chunk",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": "call_abc",
-                                "type": "function",
-                                "function": {"name": "bash", "arguments": ""},
-                            }
-                        ]
-                    },
-                    "finish_reason": None,
-                }
-            ],
-        },
-        {
-            "id": "gen-1",
-            "object": "chat.completion.chunk",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"command":"ls"}'}}]},
-                    "finish_reason": None,
-                }
-            ],
-        },
+_SSE_TOOL_NO_FINISH = (
+    b"".join(
+        b"data: " + json.dumps(f).encode() + b"\n\n"
+        for f in (
+            {
+                "id": "gen-1",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"content": "Je lance ls."}, "finish_reason": None}],
+            },
+            {
+                "id": "gen-1",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_abc",
+                                    "type": "function",
+                                    "function": {"name": "bash", "arguments": ""},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "gen-1",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"command":"ls"}'}}]},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+        )
     )
-) + b"data: [DONE]\n\n"
+    + b"data: [DONE]\n\n"
+)
 
 
 def _replay_frames(raw):
@@ -1007,4 +988,4 @@ def test_route_responses_still_500s_without_sse_interface(monkeypatch):
     assert err["type"] == "invalid_request_error"
     assert err["code"] == "500"
     assert isinstance(err["message"], str) and err["message"]
-    assert "Traceback" not in raw and "File \"" not in raw, "traceback exposé au client"
+    assert "Traceback" not in raw and 'File "' not in raw, "traceback exposé au client"

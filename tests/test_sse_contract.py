@@ -88,7 +88,7 @@ class _Ctx:
 class _Pool:
     enabled = True
     active_station = None
-    _stations = []
+    _stations: list = []
 
     def _best_station(self):
         return None
@@ -200,7 +200,9 @@ async def test_message_delta_carries_the_stop_reason(upstream):
 
     deltas = [json.loads(data) for name, data in _events(response.text) if name == "message_delta"]
     assert deltas, "aucun message_delta"
-    assert deltas[0].get("delta", {}).get("stop_reason") in {"end_turn", "stop_sequence", "max_tokens", "tool_use"}, deltas[0]
+    assert deltas[0].get("delta", {}).get("stop_reason") in {"end_turn", "stop_sequence", "max_tokens", "tool_use"}, (
+        deltas[0]
+    )
 
 
 @pytest.mark.asyncio
@@ -210,7 +212,7 @@ async def test_no_event_after_message_stop(upstream):
         response = await client.post("/v1/messages", json=_anthropic_body())
 
     names = [name for name, _ in _events(response.text)]
-    tail = names[names.index("message_stop") + 1:]
+    tail = names[names.index("message_stop") + 1 :]
     assert tail == [], f"evenements apres message_stop : {tail}"
 
 
@@ -221,13 +223,15 @@ async def test_reasoning_is_exposed_as_a_thinking_block(upstream):
     Un client qui recoit du raisonnement melange au texte l'affiche a
     l'utilisateur comme une reponse : c'est pire que de le perdre.
     """
-    upstream([
-        _chunk({"role": "assistant", "content": ""}),
-        _chunk({"reasoning_content": "je reflechis"}),
-        _chunk({"content": "Bonjour"}),
-        _chunk({}, finish="stop"),
-        b"data: [DONE]\n\n",
-    ])
+    upstream(
+        [
+            _chunk({"role": "assistant", "content": ""}),
+            _chunk({"reasoning_content": "je reflechis"}),
+            _chunk({"content": "Bonjour"}),
+            _chunk({}, finish="stop"),
+            b"data: [DONE]\n\n",
+        ]
+    )
     async with _client() as client:
         response = await client.post("/v1/messages", json=_anthropic_body())
 
@@ -252,14 +256,21 @@ async def test_reasoning_is_exposed_as_a_thinking_block(upstream):
 @pytest.mark.asyncio
 async def test_tool_call_becomes_a_tool_use_block(upstream):
     """Un appel d'outil doit produire un bloc `tool_use`, pas du texte."""
-    upstream([
-        _chunk({"role": "assistant", "content": ""}),
-        _chunk({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
-                                "function": {"name": "read", "arguments": ""}}]}),
-        _chunk({"tool_calls": [{"index": 0, "function": {"arguments": "{\"path\":\"a.txt\"}"}}]}),
-        _chunk({}, finish="tool_calls"),
-        b"data: [DONE]\n\n",
-    ])
+    upstream(
+        [
+            _chunk({"role": "assistant", "content": ""}),
+            _chunk(
+                {
+                    "tool_calls": [
+                        {"index": 0, "id": "call_1", "type": "function", "function": {"name": "read", "arguments": ""}}
+                    ]
+                }
+            ),
+            _chunk({"tool_calls": [{"index": 0, "function": {"arguments": '{"path":"a.txt"}'}}]}),
+            _chunk({}, finish="tool_calls"),
+            b"data: [DONE]\n\n",
+        ]
+    )
     async with _client() as client:
         response = await client.post("/v1/messages", json=_anthropic_body())
 

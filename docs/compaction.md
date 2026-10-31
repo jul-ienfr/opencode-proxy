@@ -14,13 +14,43 @@ stations/VPN/hedge/geo/identités, `Bearer public`, jamais de clé payante).
 Conversation payante → résumé payant (mêmes clés, même endpoint `go`, même
 tunnel geo si `require_vpn`). Jamais de bascule silencieuse. Échec = fail-open.
 
+### 1 bis. Alignement sur le client officiel (2026-10-30)
+
+Le client officiel V2 (`packages/core/src/session/compaction.ts`, version 2.2.2)
+a été relu depuis le binaire installé et comparé au proxy :
+
+| Point | Client officiel | Proxy (après alignement) |
+|---|---|---|
+| Déclencheur | `auto:true`, seuil `context_limit − max(16k, 10 %)` (16k seulement si fenêtre ≥ 32k) ; récupération unique sur overflow | `auto:true` : trigger proactif sur `context_limit − buffer` quand la fenêtre est connue (catalogue, `limit.input` prioritaire), **et** sur `free.max_wire_bytes` (900 Ko, aligné sur la fenêtre free 200k tokens) pour un modèle free-mappé non officiel dont la copie serait tronquée, + récupération sur overflow |
+| Budget récent | `compaction.keep.tokens` = **15 000** | `keep_tokens: 15000` par défaut ; `keep_recent_pairs` reste le repli legacy. Sur la jambe free, le budget est **recalculé** depuis l'ossature (system+outils) pour que checkpoint + queue tiennent sous `free.max_wire_bytes` |
+| Requête résumeur | conversation réelle (system/tools/messages) + prompt ajouté en user → réutilise le cache de prompt | conversation réelle + prompt quand la forme d'API correspond et que la jambe est payante ; transcript texte sinon (free gate) |
+| Repli « trop long » | renvoie l'historique aplati en texte, niveaux 0→4 | transcript texte initial, puis repli si la requête pleine est rejetée 400/413/422 |
+| Checkpoint | `<conversation-checkpoint>` + ligne d'explication + `<summary>` + `<recent-context>` sérialisé (tool outputs coupés à 1 250 chars) | **identique** (`truncate.py`) |
+| Queue gardée | messages récents sérialisés dans `<recent-context>` ; seuls les nouveaux messages suivent | queue sérialisée dans le checkpoint ; la dernière paire user (requête en cours) reste verbatim pour pouvoir y répondre |
+| Corrective | même requête + `NUDGE` une fois | même requête + `NUDGE` quand l'historique complet est utilisé ; texte + « Previous attempt » sinon |
+| Gabarit / validation | `## Objective…`, `filled()` = une rubrique exacte | **identique** |
+| Compaction native | item provider opaque (OpenAI Responses), fenêtre de remplacement | `/v1/responses/compact` relayé au provider ; streaming Responses-natif relayé octet par octet ; le proxy ne forge jamais d'item chiffré |
+| Trigger proactif | `context_limit − max(16k, 10 %)` (16k si fenêtre ≥ 32k), checkpoint persisté côté client | `context_limit − buffer` (fenêtres du catalogue, `limit.input` prioritaire) + checkpoint caché par session (`x-opencode-session-id`/`x-session-id`) ; sur free, seuil `free.max_wire_bytes` ; sans en-tête de session, réactif seulement |
+| Compaction manuelle | endpoint serveur `/compact`, événements de session | non modélisée : le proxy est sans état de session |
+
+**Divergences justifiées** : le proxy ne stocke pas l'historique de session
+(le client renvoie l'historique complet à chaque tour) et la jambe free exige
+un corps de porte strict (10 outils officiels, system borné) : le résumeur free
+reste sur transcript texte. Le déclencheur proactif est reproduit côté serveur
+avec les fenêtres du catalogue + un checkpoint caché par en-tête de session ;
+sur la jambe free, le seuil réel est la copie finale (`free.max_wire_bytes`,
+900 Ko, aligné sur la fenêtre free 200k tokens / seuil 180k ; mesure gate
+900 Ko / 24 outils / 28 messages). La récupération réactive
+(« overflow → une compaction puis un retry ») reste le filet de sécurité.
+
+
 ## 2. Entrées client (3 portes)
 
 | Porte | Shapes détectées (`is_compaction_shape`, `is_native_compaction`) |
 |---|---|
-| `POST /v1/messages` | officielle (messages 100% user, sans tools/system, ≥ `min_chars_implicit`), marqueur `<conversation-checkpoint>` / `context compaction` (tous rôles, sans borne, sans tools), natif Anthropic (`context_management.edits[].type~compact`, `{"compaction":{"type":"summarize"}}`, bloc `{"type":"compaction"}` rejoué) |
+| `POST /v1/messages` | officielle (messages 100% user, sans tools/system, ≥ `min_chars_implicit`), marqueur `<conversation-checkpoint>` / `context compaction` (tous rôles, sans borne, sans tools), **prompt V2 ajouté à la conversation réelle** (« You MUST summarize the conversation above… », « Update the existing checkpoint… », NUDGE), natif Anthropic (`context_management.edits[].type~compact`, `{"compaction":{"type":"summarize"}}`, bloc `{"type":"compaction"}` rejoué) |
 | `POST /v1/chat/completions` | user-only, marqueur Hermes `[CONTEXT COMPACTION – REFERENCE ONLY]` + `tools=[]` + `model=deepseek-v4-flash`, pas de natif server-side en Chat |
-| `POST /v1/responses` | `input` user-only, natif OpenAI (`context_management.compact_threshold`, item `compaction`/`compaction_trigger` opaque, `POST /responses/compact` standalone, chaînage `previous_response_id` ou input-array, `store=false` ZDR) |
+| `POST /v1/responses` | `input` user-only, natif OpenAI (`context_management` **tableau** `[{type:"compaction",compact_threshold}]` du client V2 ou forme dict historique, item `compaction`/`compaction_trigger` opaque, `POST /responses/compact` standalone, chaînage `previous_response_id` ou input-array, `store=false` ZDR) |
 
 Tout compactage détecté → exclusion response-cache (`cache_key=None`), relais
 intact des 429/401/403 (jamais de 503), log `[compaction] … native=0/1`.
@@ -29,7 +59,7 @@ intact des 429/401/403 (jamais de 503), log `[compaction] … native=0/1`.
 
 | Destination | Aller | Retour |
 |---|---|---|
-| Anthropic (`protocol:anthropic`, `go/messages`) | passthrough verbatim + `strip_synthetic_thinking` seul ; forward `context_management`, beta `compact-*`, blocs `compaction` ; `pause_after_compaction` → `stop_reason=compaction` | passthrough ; bloc `compaction` en 1 seul delta ; `usage.iterations=[compaction,message]` relayé |
+| Anthropic (`protocol:anthropic`, `go/messages`) | passthrough verbatim + `strip_synthetic_thinking` seul ; forward `context_management`, beta `compact-*` (ajouté par le proxy si le client l'a omis), blocs `compaction` ; `pause_after_compaction` → `stop_reason=compaction` | passthrough ; bloc `compaction` en 1 seul delta ; `usage.iterations=[compaction,message]` relayé |
 | OpenAI Chat (`protocol:openai`, `go/chat` ou `free/chat`) | entrée Anthropic → `anthropic_to_openai` + `sanitize_tool_names` (64) + `_free_wire_body` côté free ; entrée Chat → remap `model` + `ensure_min_tokens` + effort recalculé plafond free ; résumeur : `build_summarizer_body` (`messages`, `stream:false`, cap 32000, sans tools/system/thinking) | client Anthropic → `openai_to_anthropic` + restore noms ; client Chat → `choices` verbatim ; 400 → `is_overflow` |
 | Responses (`api:responses`, `go/responses` ou `free/responses`) | Chat → `_chat_to_responses_request`, Anthropic → `_anthropic_to_responses_request`, natif → `_sanitize_native_responses_request` ; forward `compact_threshold`, `conversation`, `previous_response_id`, `prompt_cache_key` ; résumeur : `build_summarizer_responses_body` (`input`, `store:false`) | `openai_chat_to_responses` / `_responses_to_anthropic_response` / `_responses_to_chat_response` + `name_map` ; item `compaction` opaque relayé tel quel, sortie `/responses/compact` = fenêtre canonique (ne jamais élaguer) |
 
@@ -54,18 +84,25 @@ non-stream uniquement, 1 tentative, retry tunnel-aware (`_open_via_pool` si
 forme du retry selon l'endpoint (`messages` vs `input` + checkpoint adapté).
 `native_passthrough:true` (défaut) = natifs relayés verbatim, jamais résumés
 côté client. `summary_paid_bypass:false` (défaut OFF) = résumé client détecté
-ne contourne pas `strict_free` (correctif Hermes opt-in).
+ne contourne pas `strict_free` ; à `true`, le résumé détecté saute la jambe free
+et part directement en payant (correctif Hermes opt-in). `keep_tail:false`
+laisse seulement la question user en cours verbatim après le checkpoint ; le
+reste de la queue est sérialisé dans `<recent-context>`.
 
 ## 5. Config
 
 ```yaml
 server_compaction:
-  enabled: false            # condense-and-retry serveur (défaut OFF = passthrough)
+  enabled: true             # récupération overflow (aligné officiel auto:true) ;
+                            # false = passthrough inchangé
+  auto: true                # trigger proactif officiel (context_limit - buffer)
+  buffer: 0                 # 0 = officiel max(16k, 10 % de la fenêtre)
   summary_max_tokens: 2048  # capé à 32000 (SUMMARY_OUTPUT_MAX officiel)
-  keep_recent_pairs: 4      # paires complètes gardées verbatim (frontières outil)
+  keep_tokens: 15000        # officiel compaction.keep.tokens (queue verbatim)
+  keep_recent_pairs: 4      # repli legacy quand keep_tokens est null/0
   summarizer_model_override: null  # souverain quand posé
   timeout_s: 60
-  max_attempts: 1           # jamais de récursion
+  max_attempts: 1           # tentatives résumeur (borné 1..5), jamais de récursion
   min_chars_implicit: 1000  # borne anti-faux-positif shapes implicites
   overflow_markers: null    # null = défauts (prompt too long, context_length_exceeded…)
   class_policy: auto        # auto|free_only|paid_only
@@ -78,8 +115,6 @@ server_compaction:
                             # compactage détecté (l'amont digère mal les Mo)
   summary_lean_max_chars: 2000
   summary_clamp_max_tokens: 32000  # sortie résumés plafonnée (SUMMARY_OUTPUT_MAX officiel)
-  keep_tokens: null         # budget tokens queue (officiel keep.tokens) ; null = paires
-  keep_recent_pairs: 4      # ... utilisées quand keep_tokens est null
   huge_warn_tokens: 0       # 0 = off ; warn log au-delà (opt-in)
   huge_deny_tokens: 0       # 0 = off ; 413 actionnable au-delà (opt-in)
 ```
@@ -117,6 +152,7 @@ totale (tâche de fond, pas d'interactivité).
 - `router.py` : `detect_compaction` → `(is_compaction,is_native,kind)`, `plan_for_conversation` (pur, DI).
 - `transport.py` : `summarizer_headers/request`, `normalize_free_responses`, `should_use_tunnel` (DI).
 - `streaming.py` : `should_buffer_compaction`, `is_tiny_result`, `completion_text`, `chat/anthropic_sse_from_completion` (pur).
-- `shapes.py` : `is_compaction_shape` (officielle+marqueur+natif), `is_native_compaction`.
+- `shapes.py` : `is_compaction_shape` (officielle+marqueur+natif ; la shape
+  implicite user-only exige un vocabulaire de résumé/compaction), `is_native_compaction`.
 - `summarizer.py` : `build_summarizer_body/_anthropic_body/_responses_body/_for_api`, `run_summarizer(...,api)`, `_extract_text` (chat+anthropic+responses, item compaction ignoré).
 - `react.py` : `maybe_condense(...,api)` ; `truncate.py` : coupe aux frontières de paires + `build_checkpoint_input` / `build_condensed_input` (fenêtre Responses).

@@ -22,7 +22,6 @@ jamais un faux data URI ni une suppression silencieuse. C'est le contrat à
 verrouiller — pas un défaut à corriger.
 """
 
-
 import protocol_mapping as pm
 
 PDF_B64 = "JVBERi0xLjQKJcOkw7zDtsOfCg=="
@@ -74,9 +73,7 @@ def test_p2_document_base64_defaults_media_type_to_pdf():
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "document", "source": {"type": "base64", "data": PDF_B64}}
-                    ],
+                    "content": [{"type": "document", "source": {"type": "base64", "data": PDF_B64}}],
                 }
             ],
         },
@@ -204,9 +201,7 @@ def test_p2_document_url_becomes_honest_placeholder():
         "deepseek-v4-flash",
     )
     content = out["messages"][0]["content"]
-    text = content if isinstance(content, str) else " ".join(
-        p.get("text", "") for p in content if isinstance(p, dict)
-    )
+    text = content if isinstance(content, str) else " ".join(p.get("text", "") for p in content if isinstance(p, dict))
     assert "https://ex.com/doc.pdf" in text, "l'URL du document a été perdue sans trace"
     assert "[document" in text, "le placeholder honnête n'a pas été émis"
 
@@ -221,18 +216,14 @@ def test_p2_document_unknown_source_is_never_dropped_silently():
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "document", "source": {"type": "exotique", "data": "xx"}}
-                    ],
+                    "content": [{"type": "document", "source": {"type": "exotique", "data": "xx"}}],
                 }
             ],
         },
         "deepseek-v4-flash",
     )
     content = out["messages"][0]["content"]
-    text = content if isinstance(content, str) else " ".join(
-        p.get("text", "") for p in content if isinstance(p, dict)
-    )
+    text = content if isinstance(content, str) else " ".join(p.get("text", "") for p in content if isinstance(p, dict))
     assert "document" in text, "document non géré disparu sans aucune trace"
 
 
@@ -276,18 +267,12 @@ def test_p4_file_id_becomes_document_file_id():
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "file", "file": {"file_id": "file_xyz789"}}
-                    ],
+                    "content": [{"type": "file", "file": {"file_id": "file_xyz789"}}],
                 }
             ],
         }
     )
-    docs = [
-        b
-        for b in out["messages"][0]["content"]
-        if isinstance(b, dict) and b.get("type") == "document"
-    ]
+    docs = [b for b in out["messages"][0]["content"] if isinstance(b, dict) and b.get("type") == "document"]
     assert docs[0]["source"] == {"type": "file", "file_id": "file_xyz789"}
 
 
@@ -301,9 +286,7 @@ def test_p4_file_url_becomes_placeholder():
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "file", "file": {"file_data": "https://ex.com/a.pdf"}}
-                    ],
+                    "content": [{"type": "file", "file": {"file_data": "https://ex.com/a.pdf"}}],
                 }
             ],
         }
@@ -340,14 +323,8 @@ def test_document_base64_roundtrip_is_faithful():
         },
         "deepseek-v4-flash",
     )
-    back = pm.openai_to_anthropic_request(
-        {"model": "test", "max_tokens": 1024, "messages": via_chat["messages"]}
-    )
-    docs = [
-        b
-        for b in back["messages"][0]["content"]
-        if isinstance(b, dict) and b.get("type") == "document"
-    ]
+    back = pm.openai_to_anthropic_request({"model": "test", "max_tokens": 1024, "messages": via_chat["messages"]})
+    docs = [b for b in back["messages"][0]["content"] if isinstance(b, dict) and b.get("type") == "document"]
     assert docs, "le document a disparu lors de l'aller-retour"
     assert docs[0]["source"]["data"] == PDF_B64, "les octets du document ont été altérés"
     assert docs[0]["source"]["media_type"] == "application/pdf"
@@ -362,22 +339,14 @@ def test_document_file_id_roundtrip_is_faithful():
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "document", "source": {"type": "file", "file_id": "file_rt1"}}
-                    ],
+                    "content": [{"type": "document", "source": {"type": "file", "file_id": "file_rt1"}}],
                 }
             ],
         },
         "deepseek-v4-flash",
     )
-    back = pm.openai_to_anthropic_request(
-        {"model": "test", "max_tokens": 1024, "messages": via_chat["messages"]}
-    )
-    docs = [
-        b
-        for b in back["messages"][0]["content"]
-        if isinstance(b, dict) and b.get("type") == "document"
-    ]
+    back = pm.openai_to_anthropic_request({"model": "test", "max_tokens": 1024, "messages": via_chat["messages"]})
+    docs = [b for b in back["messages"][0]["content"] if isinstance(b, dict) and b.get("type") == "document"]
     assert docs[0]["source"]["file_id"] == "file_rt1"
 
 
@@ -410,9 +379,7 @@ def test_responses_input_file_url_becomes_document_url():
     docs = [b for b in blocks if isinstance(b, dict) and b.get("type") == "document"]
     assert docs, "input_file par URL n'a pas produit de document"
     src = docs[0]["source"]
-    assert src.get("type") == "url" and src.get("url") == "https://ex.com/rapport.pdf", (
-        f"source inattendue : {src}"
-    )
+    assert src.get("type") == "url" and src.get("url") == "https://ex.com/rapport.pdf", f"source inattendue : {src}"
 
 
 def test_responses_input_file_data_becomes_document_base64():
@@ -424,18 +391,12 @@ def test_responses_input_file_data_becomes_document_base64():
             "input": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "input_file", "file_data": DATA_URI, "filename": "r.pdf"}
-                    ],
+                    "content": [{"type": "input_file", "file_data": DATA_URI, "filename": "r.pdf"}],
                 }
             ],
         }
     )
-    docs = [
-        b
-        for b in out["messages"][0]["content"]
-        if isinstance(b, dict) and b.get("type") == "document"
-    ]
+    docs = [b for b in out["messages"][0]["content"] if isinstance(b, dict) and b.get("type") == "document"]
     assert docs[0]["source"]["type"] == "base64"
     assert docs[0]["source"]["data"] == PDF_B64
 
@@ -450,18 +411,12 @@ def test_responses_no_invented_mime_type_on_url_file():
             "input": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "input_file", "file_url": "https://ex.com/x.pdf"}
-                    ],
+                    "content": [{"type": "input_file", "file_url": "https://ex.com/x.pdf"}],
                 }
             ],
         }
     )
-    docs = [
-        b
-        for b in out["messages"][0]["content"]
-        if isinstance(b, dict) and b.get("type") == "document"
-    ]
+    docs = [b for b in out["messages"][0]["content"] if isinstance(b, dict) and b.get("type") == "document"]
     assert "mime_type" not in docs[0]["source"]
 
 
@@ -553,9 +508,7 @@ def test_all_document_directions_keep_a_trace_of_input():
                     "messages": [
                         {
                             "role": "user",
-                            "content": [
-                                {"type": "file", "file": {"file_data": DATA_URI}}
-                            ],
+                            "content": [{"type": "file", "file": {"file_data": DATA_URI}}],
                         }
                     ],
                 }

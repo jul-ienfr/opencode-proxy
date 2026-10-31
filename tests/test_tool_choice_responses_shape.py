@@ -17,6 +17,7 @@ client recevait un résumé vide et la tâche se figeait.
 Ces tests verrouillent la normalisation et, surtout, l'absence de régression sur
 les formes nommées (qui relèvent de ``_remap_responses_tool_choice``).
 """
+
 import json
 
 import pytest
@@ -53,9 +54,7 @@ def test_object_forms_are_normalized_to_auto(incoming):
 def test_the_exact_client_form_is_fixed():
     """Le cas réel : ``{"type":"auto"}`` — celui du client et du compactage."""
     out = pm._chat_to_responses_request(_chat({"type": "auto"}))
-    assert out["tool_choice"] == "auto", (
-        "l'upstream /responses refuse {'type':'auto'} : un tour vide s'ensuit"
-    )
+    assert out["tool_choice"] == "auto", "l'upstream /responses refuse {'type':'auto'} : un tour vide s'ensuit"
 
 
 @pytest.mark.parametrize("incoming", ["auto", "none", "required"])

@@ -22,6 +22,7 @@ Usage :
     --repeat N      rejouer N fois (mesure de stabilite)
     --dry-run       reconstruire et verifier, sans envoyer
 """
+
 from __future__ import annotations
 
 import argparse
@@ -41,7 +42,7 @@ STATION_PORTS = {i: 1080 + (i - 1) for i in range(1, 7)}
 
 
 def log(msg: str) -> None:
-    ts = dt.datetime.now(dt.timezone.utc).strftime("%H:%M:%S")
+    ts = dt.datetime.now(dt.UTC).strftime("%H:%M:%S")
     print(f"[{ts}Z] {msg}", flush=True)
 
 
@@ -109,7 +110,7 @@ def list_records() -> None:
 # ---------------------------------------------------------------- reconstruction
 
 
-def rebuild(rec: dict) -> tuple[str, dict, bytes, str, str]:
+def rebuild(rec: dict) -> tuple[str | None, dict, bytes, str | None, str]:
     """Rend (endpoint, headers, body_bytes, impersonate, ip) exactement comme capture."""
     req = rec.get("request") or {}
     endpoint = req.get("url") or rec.get("endpoint")
@@ -161,22 +162,14 @@ async def send_once(oc, rec: dict, ip: str, station: int) -> dict:
     pool = slot = None
     t0 = 0.0
     try:
-        pool, slot = await oc._get_pooled_curl_session(
-            f"socks5://127.0.0.1:{port}", imp, fp, egress_ip=ip
-        )
+        pool, slot = await oc._get_pooled_curl_session(f"socks5://127.0.0.1:{port}", imp, fp, egress_ip=ip)
         t0 = __import__("time").monotonic()
-        resp = await slot.sess.post(
-            endpoint, content=body_bytes, headers=headers, timeout=(10, 60), stream=True
-        )
+        resp = await slot.sess.post(endpoint, content=body_bytes, headers=headers, timeout=(10, 60), stream=True)
         elapsed = round((__import__("time").monotonic() - t0) * 1000)
         chunks = []
         try:
             async for ln in resp.aiter_lines():
-                chunks.append(
-                    ln.decode("utf-8", "replace")
-                    if isinstance(ln, (bytes, bytearray))
-                    else str(ln)
-                )
+                chunks.append(ln.decode("utf-8", "replace") if isinstance(ln, (bytes, bytearray)) else str(ln))
                 if sum(len(c) for c in chunks) > 4000:
                     break
         finally:
@@ -231,7 +224,7 @@ async def replay(record: str, index: int, any_egress: bool, repeat: int, dry_run
     endpoint, headers, body_bytes, imp, ip = rebuild(rec)
     log(f"rejoue : {rec.get('ts_utc')} {rec.get('model')} ip={ip} body={len(body_bytes)} o")
     log(f"en-tetes reconstruits : {len(headers)} (ordre preserve), TLS impersonate={imp!r}")
-    log(f"prochaine etape : verification IP -> station")
+    log("prochaine etape : verification IP -> station")
 
     target = await station_for_ip(oc, ip)
     if target is None:
@@ -266,7 +259,7 @@ async def replay(record: str, index: int, any_egress: bool, repeat: int, dry_run
         for line in diff(rec, new):
             log("  " + line)
         payload = {
-            "replayed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "replayed_at": dt.datetime.now(dt.UTC).isoformat(),
             "source": os.path.abspath(record),
             "index": index,
             "exact_egress": egress == ip,
@@ -274,7 +267,7 @@ async def replay(record: str, index: int, any_egress: bool, repeat: int, dry_run
             "response": new,
             "diff": diff(rec, new),
         }
-        ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        ts = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
         path = os.path.join(REPLAY_DIR, f"replay_{ts}_{i + 1}.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2, default=str)

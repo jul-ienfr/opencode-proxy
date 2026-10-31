@@ -121,7 +121,7 @@ class RequestDeadlineMiddleware:
 
         try:
             await asyncio.wait_for(self.app(scope, receive, send_wrapper), timeout=budget)
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             await self._abort(send, state, path, budget)
 
     async def _abort(self, send, state, path, budget) -> None:
@@ -150,8 +150,12 @@ class RequestDeadlineMiddleware:
         if b"event-stream" in state["content_type"]:
             frame = (
                 b"event: error\ndata: "
-                + json.dumps({"type": "error", "error": {"type": "timeout_error",
-                              "message": f"time budget {budget:.0f}s exceeded"}}).encode()
+                + json.dumps(
+                    {
+                        "type": "error",
+                        "error": {"type": "timeout_error", "message": f"time budget {budget:.0f}s exceeded"},
+                    }
+                ).encode()
                 + b"\n\n"
             )
             try:

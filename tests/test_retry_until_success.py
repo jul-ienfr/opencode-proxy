@@ -101,11 +101,7 @@ def _starts(sent):
 
 
 def _bodies(sent):
-    return b"".join(
-        m.get("body") or b""
-        for m in sent
-        if m.get("type") == "http.response.body"
-    )
+    return b"".join(m.get("body") or b"" for m in sent if m.get("type") == "http.response.body")
 
 
 def test_429_then_stream_success_is_transparent():
@@ -119,7 +115,9 @@ def test_429_then_stream_success_is_transparent():
 
 
 def test_empty_200_then_stream_success_is_retried():
-    app = _seq([[_start(200, SSE), _body(b"")], _sse(b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n', more=False)])
+    app = _seq(
+        [[_start(200, SSE), _body(b"")], _sse(b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n', more=False)]
+    )
     sent = _run(_cfg(), app)
     assert _starts(sent)[0]["status"] == 200
     assert b"ok" in _bodies(sent)

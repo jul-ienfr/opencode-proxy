@@ -86,8 +86,7 @@ def test_the_unavailable_set_is_documented_not_guessed():
     unav = data["unavailable"]
     assert data.get("verified_at"), "la mesure doit etre datee"
     assert len(unav["missing_api_key"]) + len(unav["model_unavailable"]) >= 50, (
-        "le fichier doit garder la trace des ids refuses : c'est la preuve que "
-        "l'exposition n'a pas ete faite a moitie"
+        "le fichier doit garder la trace des ids refuses : c'est la preuve que l'exposition n'a pas ete faite a moitie"
     )
     assert "big-pickle" not in (
         unav["missing_api_key"] + unav["model_unavailable"] + unav["inconclusive_at_first_pass"]
@@ -120,8 +119,7 @@ def test_known_unavailable_models_are_not_exposed(model_id):
 
 def test_verified_model_is_classified_as_free_by_the_pipeline():
     assert "big-pickle" in cs.FREE_MODELS, (
-        "un modèle vérifié en direct doit rejoindre FREE_MODELS, sinon le "
-        "pipeline le traite en payant"
+        "un modèle vérifié en direct doit rejoindre FREE_MODELS, sinon le pipeline le traite en payant"
     )
 
 

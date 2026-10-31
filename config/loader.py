@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 
 logger = logging.getLogger("config.settings")
 
@@ -92,7 +93,9 @@ def resolved_station_count(cfg: dict) -> int:
 # amont (3×429/60s → gel 180s). load-balance (least-loaded) par défaut :
 # le compteur strict change de station à chaque requête et réveille tout
 # le pool pour rien.
-_FREE_PARALLEL_DEFAULTS = {
+# Table hétérogène assumée (bool / str / int) : `dict[str, Any]` évite que la
+# jointure des types ne dégénère en `object` et n'interdise les fallbacks.
+_FREE_PARALLEL_DEFAULTS: dict[str, Any] = {
     "enabled": False,
     "routing": "round-robin",
     "mode": "load-balance",

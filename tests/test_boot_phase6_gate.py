@@ -242,7 +242,7 @@ def test_free_model_detection():
 
 
 def test_free_model_detection_uses_the_map(monkeypatch):
-    monkeypatch.setitem(oc.FREE_MODEL_MAP, "muse-spark-1.3-contributor", "muse-spark-free")
+    monkeypatch.setitem(oc.FREE_MODEL_MAP, "muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free")
     assert oc._is_free_model_route("muse-spark-1.3-contributor") is True
 
 

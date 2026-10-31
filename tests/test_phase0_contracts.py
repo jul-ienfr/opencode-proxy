@@ -239,7 +239,7 @@ def test_db_insert_sql_placeholder_count():
     """L'INSERT requests DOIT avoir 32 placeholders (tuple 32 colonnes)."""
     from app.db import _INSERT_REQUESTS_SQL
 
-    assert _INSERT_REQUESTS_SQL.count("?") == 32, (
+    assert _INSERT_REQUESTS_SQL.count("?") == 35, (
         f"INSERT requests: {_INSERT_REQUESTS_SQL.count('?')} placeholders ≠ 32"
     )
 

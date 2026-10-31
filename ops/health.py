@@ -71,13 +71,9 @@ class HealthPolicy:
             _secondary_hold = 0.0
             _degraded_hold = 0.0
         return cls(
-            effective_stack_filter=bool(
-                health.get("effective_stack_filter", True)
-            ),
+            effective_stack_filter=bool(health.get("effective_stack_filter", True)),
             flap_hysteresis_s=_hyst,
-            flap_min_observations=max(
-                1, min(10, _int("flap_min_observations", 2))
-            ),
+            flap_min_observations=max(1, min(10, _int("flap_min_observations", 2))),
             churn_scan_max_min=max(2, min(60, _int("churn_scan_max_min", 10))),
             log_scan_tail=max(100, min(20000, _int("log_scan_tail", 2000))),
             secondary_path_hold_s=_secondary_hold,
@@ -174,11 +170,7 @@ class StatusDebouncer:
             "stable": self.stable,
             "candidate": self.candidate,
             "candidate_hits": self.candidate_hits,
-            "candidate_age_s": (
-                round(max(0.0, float(now) - self.candidate_since), 1)
-                if self.candidate
-                else 0.0
-            ),
+            "candidate_age_s": (round(max(0.0, float(now) - self.candidate_since), 1) if self.candidate else 0.0),
             "flap_count_1h": self.flap_count(now),
             "total_transitions": self.total_transitions,
             "hysteresis_s": self.policy.flap_hysteresis_s,

@@ -47,6 +47,7 @@ def _identities_dir() -> str:
         pass
     return os.path.join(ROOT, "logs", "identities")
 
+
 # Versions client MESURÉES à 200 sur la gateway (ne jamais inventer une
 # version : le gate a déjà rejeté 1.19.0 et v2/prod — cf. opencode.py).
 KNOWN_CLIENT_VERSIONS = ("1.18.31", "1.19.3")
@@ -184,7 +185,9 @@ class IpIdentity:
         "_file",
     )
 
-    def __init__(self, ip: str, base_project: str = "", forced_client: str = "", forced_version: str = "", generation: int = 0):
+    def __init__(
+        self, ip: str, base_project: str = "", forced_client: str = "", forced_version: str = "", generation: int = 0
+    ):
         self.ip = ip or "direct"
         try:
             self.generation = int(generation or 0)
@@ -267,8 +270,14 @@ class IpIdentity:
             tmp = self._file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"ip": self.ip, "version": self.version, "client": self.client,
-                     "project": self.project, "ses": self.ses_global, "ts": self.ses_ts},
+                    {
+                        "ip": self.ip,
+                        "version": self.version,
+                        "client": self.client,
+                        "project": self.project,
+                        "ses": self.ses_global,
+                        "ts": self.ses_ts,
+                    },
                     f,
                 )
             os.replace(tmp, self._file)
@@ -345,9 +354,14 @@ class IpIdentity:
         ]
 
     def snapshot(self) -> dict:
-        return {"ip": self.ip, "version": self.version, "client": self.client,
-                "project": self.project, "ses": self.ses_global,
-                "generation": self.generation}
+        return {
+            "ip": self.ip,
+            "version": self.version,
+            "client": self.client,
+            "project": self.project,
+            "ses": self.ses_global,
+            "generation": self.generation,
+        }
 
 
 class IdentityVault:
@@ -379,16 +393,20 @@ class IdentityVault:
             if forced_client and forced_client not in KNOWN_CLIENT_NAMES:
                 try:
                     import logging as _lg
+
                     _lg.getLogger("free.identities").warning(
-                        "[identities] forced_client %r ignoré (attendu %s)", forced_client, KNOWN_CLIENT_NAMES)
+                        "[identities] forced_client %r ignoré (attendu %s)", forced_client, KNOWN_CLIENT_NAMES
+                    )
                 except Exception:
                     pass
                 forced_client = ""
             if forced_version and forced_version not in KNOWN_CLIENT_VERSIONS:
                 try:
                     import logging as _lg
+
                     _lg.getLogger("free.identities").warning(
-                        "[identities] forced_version %r ignorée (attendu %s)", forced_version, KNOWN_CLIENT_VERSIONS)
+                        "[identities] forced_version %r ignorée (attendu %s)", forced_version, KNOWN_CLIENT_VERSIONS
+                    )
                 except Exception:
                     pass
                 forced_version = ""
@@ -480,8 +498,7 @@ class IdentityVault:
                     remembered = 0
                 gen = max(base_gen, remembered) + 1
                 self._gen[key] = gen
-                ident = IpIdentity(key, self._base_project, self._forced_client, self._forced_version,
-                                   generation=gen)
+                ident = IpIdentity(key, self._base_project, self._forced_client, self._forced_version, generation=gen)
                 self._ids[key] = ident
             try:
                 return ident.snapshot()

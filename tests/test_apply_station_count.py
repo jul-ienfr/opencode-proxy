@@ -17,7 +17,6 @@ Offline: ``vpn_manager.VPNManager`` is monkeypatched by a stub whose
 exercised for real. Nothing touches the live system.
 """
 
-
 import pytest
 from test_vpn_freshness import _cfg
 from test_vpn_stack_nstation import _env_map, _Rec, _seed_env
@@ -104,9 +103,7 @@ async def test_upscale_3_syncs_env_stack_before_any_start(tmp_path, monkeypatch)
     the existing STATION1/2 keys and the other .env entries are preserved,
     no compose recreate happens (stack already effective)."""
     (tmp_path / "wireguard.env").write_text("PRIVATE_KEY=x\n", encoding="utf-8")
-    _seed_env(
-        tmp_path, VPN_TYPE_STATION1="wireguard", VPN_TYPE_STATION2="wireguard", SOME_SECRET="abc123"
-    )
+    _seed_env(tmp_path, VPN_TYPE_STATION1="wireguard", VPN_TYPE_STATION2="wireguard", SOME_SECRET="abc123")
     compose = tmp_path / "docker-compose.yml"
     monkeypatch.setenv("VPN_DOCKER_COMPOSE_FILE", str(compose))
 
@@ -128,9 +125,7 @@ async def test_upscale_3_syncs_env_stack_before_any_start(tmp_path, monkeypatch)
 
     env = _env_map(tmp_path / ".env")
     for s in (1, 2, 3):
-        assert env[f"VPN_TYPE_STATION{s}"] == "wireguard", (
-            f"station {s} must join the running stack"
-        )
+        assert env[f"VPN_TYPE_STATION{s}"] == "wireguard", f"station {s} must join the running stack"
     assert env["SOME_SECRET"] == "abc123", "non-station keys preserved"
 
     assert m1.cmds == [] and m2.cmds == [], "no compose recreate on a no-op stack sync"
@@ -178,3 +173,24 @@ async def test_downscale_3_to_2_stops_container_no_stack_call(tmp_path, monkeypa
     assert "max_free_attempts" in persisted[0]
     assert shared_state.vpn_managers == stubs[:2]
     assert shared_state.vpn_manager_2 is stubs[1]
+
+@pytest.mark.asyncio
+async def test_idempotent_count_persists_stale_mirror(tmp_path, monkeypatch):
+    """[audit 2026-10-30] Runtime count == requested count must still persist
+    ``station_count``. The historical short-circuit returned before writing
+    config.yaml, so a stale mirror (runtime 6 / yaml 4) stayed stale and the
+    next reboot silently dropped stations."""
+    m1, m2, pool, watcher = _canvas(tmp_path, monkeypatch)
+    m1._status = "connected"
+    m2._status = "connected"
+    persisted = []
+
+    async def _fake_persist(u):
+        persisted.append(dict(u))
+
+    monkeypatch.setattr(api, "_persist_vpn_config", _fake_persist)
+
+    await opencode._apply_station_count(2)
+
+    assert persisted and persisted[0].get("station_count") == 2
+    assert [m._station for m in shared_state.vpn_managers] == [1, 2]

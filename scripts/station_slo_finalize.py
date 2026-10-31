@@ -37,7 +37,7 @@ def main() -> int:
     args = ap.parse_args()
     until = _parse_iso(args.until)
     while True:
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         remaining = (until - now).total_seconds()
         if remaining <= 0:
             break
@@ -48,7 +48,7 @@ def main() -> int:
     if not out.is_absolute():
         out = ROOT / out
     out.parent.mkdir(parents=True, exist_ok=True)
-    generated = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    generated = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     header = (
         "# Rapport SLO final — fenêtre 24 h\n\n"
         f"- Généré : `{generated}`\n"

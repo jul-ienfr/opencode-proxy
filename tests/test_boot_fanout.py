@@ -70,9 +70,7 @@ async def _run_fanout_sequence(managers, stagger_s):
             await asyncio.sleep(oc._boot_stagger_s())
 
     async def _boot_fanout():
-        results = await asyncio.gather(
-            *(_start_one(m) for m in managers if m.enabled), return_exceptions=True
-        )
+        results = await asyncio.gather(*(_start_one(m) for m in managers if m.enabled), return_exceptions=True)
         for _r in results:
             assert not isinstance(_r, Exception)
         n_expected = len(managers)

@@ -36,9 +36,7 @@ def static_app(tmp_path):
 def test_gzip_accept_serves_precompressed_bytes(static_app):
     fast, tmp_path = static_app
     with TestClient(fast) as client:
-        r = client.get(
-            "/static/app.js", headers={"accept-encoding": "gzip, deflate"}
-        )
+        r = client.get("/static/app.js", headers={"accept-encoding": "gzip, deflate"})
     assert r.status_code == 200
     assert r.headers["content-encoding"] == "gzip"
     assert r.headers["vary"] == "Accept-Encoding"
@@ -73,9 +71,7 @@ def test_non_static_paths_untouched(static_app):
         r = client.get("/", headers={"accept-encoding": "identity"})
     assert r.status_code == 200
     assert b"dash" in r.content
-    assert "cache-control" not in r.headers, (
-        "Cache-Control réservé aux assets /static/*"
-    )
+    assert "cache-control" not in r.headers, "Cache-Control réservé aux assets /static/*"
 
 
 def test_precompressed_payload_is_smaller_and_valid(static_app, monkeypatch):

@@ -150,9 +150,7 @@ class TestTheProbeVerdict:
 
     def test_an_error_frame_is_never_a_success(self):
         """Le cas `jev` exact : HTTP 200, flux ouvert, modèle refusé."""
-        ok, raison = self.verdict(
-            'event: error\ndata: {"error":{"message":"Free model request failed: refusee"}}'
-        )
+        ok, raison = self.verdict('event: error\ndata: {"error":{"message":"Free model request failed: refusee"}}')
         assert ok is False
         assert "erreur" in raison
 

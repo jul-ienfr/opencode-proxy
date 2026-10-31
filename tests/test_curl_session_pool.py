@@ -47,8 +47,9 @@ class _FakeCurlSession:
 
 @pytest.mark.asyncio
 async def test_non_stream_requests_overlap(monkeypatch):
-    """6 emprunts concurrents, M=3, post 0.12 s : le mur total prouve le
-    parallélisme (≈2 vagues ≈0.25 s) au lieu de 6×0.12=0.72 s sérialisé."""
+    """6 emprunts concurrents, M = taille configurée du pool, post 0.12 s :
+    le mur total prouve le parallélisme (≈2 vagues ≈0.25 s) au lieu de
+    6×0.12=0.72 s sérialisé."""
     log: list = []
     created: list = []
 
@@ -74,7 +75,7 @@ async def test_non_stream_requests_overlap(monkeypatch):
     await asyncio.gather(*(_one() for _ in range(6)))
     elapsed = time.monotonic() - t0
 
-    assert len(created) <= 3, "M sessions max pour une même clé"
+    assert len(created) <= oc._curl_pool_size(), "M sessions max pour une même clé"
     assert elapsed < 0.55, f"sérialisation détectée ({elapsed:.2f}s ≥ 6×0.12)"
     # zéro partage intra-session : chaque session n'a jamais >1 requête
     assert all(s.max_inflight == 1 for s in created)
@@ -129,9 +130,7 @@ async def test_eviction_removes_only_faulty_session(monkeypatch):
         return seq.pop(0)
 
     monkeypatch.setattr("curl_cffi.requests.AsyncSession", _factory)
-    monkeypatch.setattr(
-        oc, "_curl_proxy_url", lambda p: p
-    )  # neutralise la résolution proxy
+    monkeypatch.setattr(oc, "_curl_proxy_url", lambda p: p)  # neutralise la résolution proxy
 
     pool, slot = await oc._get_pooled_curl_session("socks5://e:1080", "chrome131")
     assert slot.sess is bad
@@ -301,15 +300,10 @@ async def test_do_free_request_parallel_via_helper(monkeypatch):
     monkeypatch.setattr(oc, "_free_ip_pool", None)
 
     t0 = time.monotonic()
-    results = await asyncio.gather(
-        *(
-            oc._do_free_request_curl_cffi({}, {}, "socks5://p:1080", None)
-            for _ in range(4)
-        )
-    )
+    results = await asyncio.gather(*(oc._do_free_request_curl_cffi({}, {}, "socks5://p:1080", None) for _ in range(4)))
     elapsed = time.monotonic() - t0
 
     assert all(r.status_code == 200 for r in results)
-    assert len(created) <= 3
+    assert len(created) <= oc._curl_pool_size()
     assert elapsed < 0.32, f"head-of-line blocking encore présent ({elapsed:.2f}s)"
     assert all(s.max_inflight == 1 for s in created), "session partagée détectée"

@@ -55,6 +55,9 @@ def _auth_cooldown_remaining() -> float:
         return max(0.0, _AUTH_GLOBAL_COOLDOWN_UNTIL - now)
 
 
+
+
+
 def _auth_connect_done() -> None:
     global _AUTH_IN_FLIGHT
     with _AUTH_THROTTLE_LOCK:

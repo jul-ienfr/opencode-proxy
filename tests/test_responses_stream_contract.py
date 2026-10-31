@@ -226,9 +226,7 @@ def test_sequence_numbers_are_strictly_increasing_from_zero():
 def test_each_output_item_is_opened_and_closed():
     """``output_item.added`` et ``output_item.done`` s'apparient par index."""
     resp = _text_response()
-    resp["output"].append(
-        {"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "f", "arguments": "{}"}
-    )
+    resp["output"].append({"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "f", "arguments": "{}"})
     events = responses_stream_events(resp, "test-model")
     added = [e["output_index"] for e in events if e["type"] == "response.output_item.added"]
     done = [e["output_index"] for e in events if e["type"] == "response.output_item.done"]
@@ -261,9 +259,7 @@ def test_reasoning_encrypted_content_completes_only_at_item_done():
     )
     events = responses_stream_events(resp, "test-model")
     done_items = [
-        e["item"]
-        for e in events
-        if e["type"] == "response.output_item.done" and e["item"].get("type") == "reasoning"
+        e["item"] for e in events if e["type"] == "response.output_item.done" and e["item"].get("type") == "reasoning"
     ]
     assert done_items, "aucun output_item.done pour le raisonnement"
     assert done_items[0].get("encrypted_content") == "blob_complet"
@@ -315,9 +311,7 @@ def test_malformed_output_items_do_not_raise():
 def test_missing_usage_does_not_raise():
     resp = {"id": "r", "object": "response", "status": "completed", "model": "m", "output": []}
     events = responses_stream_events(resp, "m")
-    assert events[-1]["response"].get("usage") is None or isinstance(
-        events[-1]["response"].get("usage"), dict
-    )
+    assert events[-1]["response"].get("usage") is None or isinstance(events[-1]["response"].get("usage"), dict)
 
 
 # ─────────────────────── sérialisation SSE ───────────────────────
@@ -572,9 +566,7 @@ def test_stream_is_coherent_for_every_shape(name, output):
     types = [e["type"] for e in events]
 
     assert types[-1] == "response.completed", f"{name}: dernier = {types[-1]}"
-    assert [e["sequence_number"] for e in events] == list(range(len(events))), (
-        f"{name}: sequence_number non contigus"
-    )
+    assert [e["sequence_number"] for e in events] == list(range(len(events))), f"{name}: sequence_number non contigus"
     added = [e["output_index"] for e in events if e["type"] == "response.output_item.added"]
     done = [e["output_index"] for e in events if e["type"] == "response.output_item.done"]
     assert added == done, f"{name}: items déséquilibrés added={added} done={done}"
@@ -627,9 +619,7 @@ def test_mixed_shapes_use_the_right_event_family_per_item():
     assert "response.content_part.added" in types_for(1)
 
     assert "response.function_call_arguments.delta" in types_for(2)
-    assert "response.output_text.delta" not in types_for(2), (
-        "un appel d'outil ne diffuse pas de texte"
-    )
+    assert "response.output_text.delta" not in types_for(2), "un appel d'outil ne diffuse pas de texte"
 
 
 def test_function_call_arguments_delta_omits_name_and_content_index():
@@ -650,9 +640,7 @@ def test_function_call_arguments_delta_omits_name_and_content_index():
             }
         ],
     }
-    deltas = [
-        e for e in responses_stream_events(resp, "m") if e["type"] == "response.function_call_arguments.delta"
-    ]
+    deltas = [e for e in responses_stream_events(resp, "m") if e["type"] == "response.function_call_arguments.delta"]
     assert deltas, "aucun delta d'arguments émis"
     for e in deltas:
         assert "name" not in e
@@ -671,14 +659,10 @@ def test_no_bare_terminal_site_remains_in_the_handler():
     import re
     from pathlib import Path
 
-    src = Path(__file__).resolve().parent.parent.joinpath("opencode.py").read_text(
-        encoding="utf-8", errors="replace"
-    )
+    src = Path(__file__).resolve().parent.parent.joinpath("opencode.py").read_text(encoding="utf-8", errors="replace")
     # Motif d'origine : un payload `response.completed` fabriqué à la main pour
     # le wire SSE (et non la séquence construite par l'émetteur).
-    bare = re.findall(
-        r'\{\s*"type":\s*"response\.completed"\s*,\s*"response":\s*oai_resp\s*\}', src
-    )
+    bare = re.findall(r'\{\s*"type":\s*"response\.completed"\s*,\s*"response":\s*oai_resp\s*\}', src)
     assert not bare, (
         f"{len(bare)} site(s) ré-émettent un `response.completed` brut : "
         f"le faux streaming (A11/A21) est revenu. Utiliser "
@@ -701,9 +685,7 @@ def test_handler_uses_the_emitter_for_every_streaming_return():
     """
     from pathlib import Path
 
-    src = Path(__file__).resolve().parent.parent.joinpath("opencode.py").read_text(
-        encoding="utf-8", errors="replace"
-    )
+    src = Path(__file__).resolve().parent.parent.joinpath("opencode.py").read_text(encoding="utf-8", errors="replace")
     sse_sites = src.count("responses_stream_sse(")
     emitter_calls = src.count("responses_stream_events(")
     assert sse_sites > 0, "aucun site SSE : le streaming Responses a disparu"

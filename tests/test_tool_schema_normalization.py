@@ -13,6 +13,7 @@ _R = pm._resolve_schema_profile
 
 # ── anyOf / oneOf null ──────────────────────────────────────────
 
+
 class TestStripAnyOfNull:
     def test_anyof_string_null_hoist_preserve_sibling(self):
         schema = {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "foo"}
@@ -50,6 +51,7 @@ class TestStripAnyOfNull:
 
 # ── type array null ─────────────────────────────────────────────
 
+
 class TestTypeArrayNull:
     def test_type_array_string_null(self):
         assert _N({"type": ["string", "null"]}, "muse-spark-1.2-contributor") == {"type": "string"}
@@ -65,6 +67,7 @@ class TestTypeArrayNull:
 
 # ── nullable ────────────────────────────────────────────────────
 
+
 class TestNullable:
     def test_nullable_true_stripped(self):
         out = _N({"type": "string", "nullable": True}, "muse-spark-1.2-contributor")
@@ -77,6 +80,7 @@ class TestNullable:
 
 
 # ── $ref ────────────────────────────────────────────────────────
+
 
 class TestResolveRef:
     def test_ref_defs_inline(self):
@@ -114,6 +118,7 @@ class TestResolveRef:
 
 # ── additionalProperties ────────────────────────────────────────
 
+
 class TestStripAdditionalProperties:
     def test_additional_true_stripped(self):
         schema = {"type": "object", "properties": {"x": {"type": "string"}}, "additionalProperties": True}
@@ -142,12 +147,20 @@ class TestStripAdditionalProperties:
         assert "patternProperties" not in out
 
     def test_if_then_else_stripped(self):
-        schema = {"type": "object", "if": {"properties": {"a": {"type": "string"}}}, "then": {"required": ["a"]}, "else": {"required": []}}
+        schema = {
+            "type": "object",
+            "if": {"properties": {"a": {"type": "string"}}},
+            "then": {"required": ["a"]},
+            "else": {"required": []},
+        }
         out = _N(schema, "muse-spark-1.2-contributor")
         assert "if" not in out and "then" not in out and "else" not in out
 
     def test_nested_additional_true_stripped(self):
-        schema = {"type": "object", "properties": {"cfg": {"type": "object", "properties": {}, "additionalProperties": True}}}
+        schema = {
+            "type": "object",
+            "properties": {"cfg": {"type": "object", "properties": {}, "additionalProperties": True}},
+        }
         out = _N(schema, "muse-spark-1.2-contributor")
         assert "additionalProperties" not in out["properties"]["cfg"]
 
@@ -158,6 +171,7 @@ class TestStripAdditionalProperties:
 
 
 # ── description ─────────────────────────────────────────────────
+
 
 class TestDescriptionTruncation:
     def test_over_1024_truncated_strict(self):
@@ -186,6 +200,7 @@ class TestDescriptionTruncation:
 
 
 # ── nesting ─────────────────────────────────────────────────────
+
 
 class TestNestingDepth:
     def _deep(self, n):
@@ -220,6 +235,7 @@ class TestNestingDepth:
 
 # ── format ──────────────────────────────────────────────────────
 
+
 class TestFormat:
     def test_uri_stripped_strict(self):
         out = _N({"type": "string", "format": "uri"}, "muse-spark-1.2-contributor")
@@ -240,6 +256,7 @@ class TestFormat:
 
 # ── enum ────────────────────────────────────────────────────────
 
+
 class TestEnumEmpty:
     def test_enum_empty_dropped(self):
         out = _N({"type": "string", "enum": []}, "muse-spark-1.2-contributor")
@@ -251,6 +268,7 @@ class TestEnumEmpty:
 
 
 # ── profiles ────────────────────────────────────────────────────
+
 
 class TestModelProfiles:
     def test_muse_spark_strict(self):
@@ -280,9 +298,14 @@ class TestModelProfiles:
 
 # ── copy-on-write ───────────────────────────────────────────────
 
+
 class TestCopyOnWrite:
     def test_input_not_mutated(self):
-        schema = {"type": "object", "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}}, "additionalProperties": True}
+        schema = {
+            "type": "object",
+            "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+            "additionalProperties": True,
+        }
         orig = copy.deepcopy(schema)
         _N(schema, "muse-spark-1.2-contributor")
         assert schema == orig
@@ -299,6 +322,7 @@ class TestCopyOnWrite:
 # (le validateur de la jambe Responses rejette les lookarounds en 400
 # invalid_request_error). La transpile BMP-exacte via
 # _rewrite_unicode_properties ne sert plus qu'aux profils permissifs.
+
 
 class TestUnsafePatternStrip:
     OFFENDING = r"^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}\"\\./[\]]{1,200}$"
@@ -415,6 +439,7 @@ class TestUnsafePatternStrip:
 
 # ── idempotence ─────────────────────────────────────────────────
 
+
 class TestIdempotence:
     def test_idempotent(self):
         schema = {
@@ -435,12 +460,21 @@ class TestIdempotence:
 
 # ── e2e ─────────────────────────────────────────────────────────
 
+
 class TestEndToEndConversion:
     def test_anthropic_to_openai_anyof_null(self):
         body = {
             "model": "muse-spark-1.2-contributor",
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"name": "t", "input_schema": {"type": "object", "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}}}}],
+            "tools": [
+                {
+                    "name": "t",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+                    },
+                }
+            ],
         }
         r = pm.anthropic_to_openai(body, "muse-spark-1.2-contributor")
         p = json.dumps(r["tools"][0]["function"]["parameters"])
@@ -450,7 +484,9 @@ class TestEndToEndConversion:
         body = {
             "model": "muse-spark-1.2-contributor",
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"name": "t", "input_schema": {"type": "object", "properties": {"q": {"type": ["string", "null"]}}}}],
+            "tools": [
+                {"name": "t", "input_schema": {"type": "object", "properties": {"q": {"type": ["string", "null"]}}}}
+            ],
         }
         r = pm.anthropic_to_openai(body, "muse-spark-1.2-contributor")
         p = json.dumps(r["tools"][0]["function"]["parameters"])
@@ -460,7 +496,15 @@ class TestEndToEndConversion:
         body = {
             "model": "muse-spark-1.2-contributor",
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "t", "parameters": {"type": "object", "properties": {"q": {"type": ["string", "null"]}}}}}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "t",
+                        "parameters": {"type": "object", "properties": {"q": {"type": ["string", "null"]}}},
+                    },
+                }
+            ],
         }
         r = pm.anthropic_to_openai(body, "muse-spark-1.2-contributor")
         p = json.dumps(r["tools"][0]["function"]["parameters"])
@@ -470,7 +514,18 @@ class TestEndToEndConversion:
         oai = {
             "model": "muse-spark-1.2-contributor",
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "t", "parameters": {"type": "object", "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}}}}}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "t",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+                        },
+                    },
+                }
+            ],
         }
         r = pm.openai_to_anthropic_request(oai)
         p = json.dumps(r["tools"][0]["input_schema"])
@@ -480,7 +535,15 @@ class TestEndToEndConversion:
         oai = {
             "model": "muse-spark-1.2-contributor",
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "t", "parameters": {"type": "object", "properties": {"q": {"type": ["string", "null"]}}}}}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "t",
+                        "parameters": {"type": "object", "properties": {"q": {"type": ["string", "null"]}}},
+                    },
+                }
+            ],
         }
         r = pm.openai_to_anthropic_request(oai)
         p = json.dumps(r["tools"][0]["input_schema"])
@@ -490,7 +553,13 @@ class TestEndToEndConversion:
         body = {
             "model": "muse-spark-1.2-contributor",
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
-            "tools": [{"type": "function", "name": "t", "parameters": {"type": "object", "properties": {"q": {"type": ["string", "null"]}}}}],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "t",
+                    "parameters": {"type": "object", "properties": {"q": {"type": ["string", "null"]}}},
+                }
+            ],
         }
         r = pm.openai_responses_to_anthropic(body)
         p = json.dumps(r["tools"][0]["input_schema"])
@@ -500,7 +569,18 @@ class TestEndToEndConversion:
         chat = {
             "model": "muse-spark-1.2-contributor",
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "t", "parameters": {"type": "object", "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}}}}}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "t",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+                        },
+                    },
+                }
+            ],
         }
         r = pm._chat_to_responses_request(chat)
         p = json.dumps(r["tools"][0]["parameters"])
@@ -510,7 +590,16 @@ class TestEndToEndConversion:
         body = {
             "model": "muse-spark-1.2-contributor",
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"name": "t", "input_schema": {"type": "object", "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}}, "required": ["q"]}}],
+            "tools": [
+                {
+                    "name": "t",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+                        "required": ["q"],
+                    },
+                }
+            ],
         }
         r = pm.anthropic_to_openai(body, "muse-spark-1.2-contributor")
         assert r["tools"][0]["function"]["parameters"]["required"] == ["q"]
@@ -519,7 +608,16 @@ class TestEndToEndConversion:
         body = {
             "model": "muse-spark-1.2-contributor",
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"name": "t", "input_schema": {"type": "object", "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}}, "required": []}}],
+            "tools": [
+                {
+                    "name": "t",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"q": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+                        "required": [],
+                    },
+                }
+            ],
         }
         r = pm.anthropic_to_openai(body, "muse-spark-1.2-contributor")
         assert "additionalProperties" not in json.dumps(r["tools"][0]["function"]["parameters"]) or True
@@ -529,7 +627,16 @@ class TestEndToEndConversion:
         body = {
             "model": "muse-spark-1.2-contributor",
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"name": "t", "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}, "additionalProperties": True}}],
+            "tools": [
+                {
+                    "name": "t",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"x": {"type": "string"}},
+                        "additionalProperties": True,
+                    },
+                }
+            ],
         }
         r = pm.anthropic_to_openai(body, "muse-spark-1.2-contributor")
         # Parité 1.19.0 : True strippé, jamais forcé false.

@@ -61,6 +61,8 @@ def main() -> int:
     if not key:
         print("déjà migré : aucune control_api_key dans config.yaml")
         return 0
+    # la paire (key, line) est toujours les deux nulles ou les deux fournies
+    assert line is not None
     cred = _credentials_key()
     if cred and cred != key:
         print("REFUS : config.yaml et credentials.env divergent — corriger d'abord")

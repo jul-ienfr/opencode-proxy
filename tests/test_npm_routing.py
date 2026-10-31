@@ -61,7 +61,7 @@ _LEGS = {
 
 def _tiers(npm: str | None, *model_ids: str) -> dict:
     """Une entrée de provider TIERS. ``npm=None`` = provider qui n'en déclare pas."""
-    entry = {"models": {model_id: {} for model_id in model_ids}}
+    entry: dict = {"models": {model_id: {} for model_id in model_ids}}
     if npm is not None:
         entry["npm"] = npm
     return entry
@@ -206,9 +206,7 @@ def test_parti_servi_ou_refus_jamais_les_deux():
         *mc.INTERNAL_IDS,
     }
     for model_id in candidats:
-        assert (mc.refusal_reason(model_id, catalog) is None) == mc.is_servable(
-            model_id, catalog
-        ), model_id
+        assert (mc.refusal_reason(model_id, catalog) is None) == mc.is_servable(model_id, catalog), model_id
     servis = {m for m in candidats if mc.is_servable(m, catalog)}
     assert servis == {"m-paye", "m-anonyme", *mc.INTERNAL_IDS}
 
@@ -238,15 +236,11 @@ def test_refus_nomme_lid_les_hotes_et_le_npm_de_chacun():
     reason = mc.refusal_reason("m-tier", catalog)
     assert reason is not None
     assert reason.startswith(
-        'model "m-tier" is not provided by this proxy: '
-        "no opencode provider serves it, it is hosted upstream by "
+        'model "m-tier" is not provided by this proxy: no opencode provider serves it, it is hosted upstream by '
     )
     assert "connu (npm @ai-sdk/anthropic, api messages)" in reason
     assert "gemini (npm @ai-sdk/google, api gemini)" in reason
-    assert (
-        "hors_table (npm @aihubmix/ai-sdk-provider, outside the known table: "
-        "no endpoint can be derived)"
-    ) in reason
+    assert ("hors_table (npm @aihubmix/ai-sdk-provider, outside the known table: no endpoint can be derived)") in reason
 
 
 def test_refus_nomme_un_hote_sans_npm():
@@ -281,10 +275,7 @@ def test_id_inconnu_de_tout_le_catalogue():
     """Aucun hôte : le message le dit, plutôt que de pointer une liste vide."""
     catalog = _cat(**_LEGS)
     reason = mc.refusal_reason("pas-un-modele-xyz", catalog)
-    assert reason == (
-        'model "pas-un-modele-xyz" is not provided by this proxy: '
-        "unknown to the opencode catalog."
-    )
+    assert reason == ('model "pas-un-modele-xyz" is not provided by this proxy: unknown to the opencode catalog.')
 
 
 def test_hotes_excluent_nos_deux_jambes():
@@ -306,7 +297,11 @@ def test_hotes_tries_independamment_de_lordre_du_json():
     refus (et un test) dépendrait de l'ordre dans lequel l'éditeur a sérialisé.
     """
     modèles_ordonnés = ("m",)
-    ordre_a = _cat(zulu=_tiers("@ai-sdk/anthropic", *modèles_ordonnés), alpha=_tiers(None, *modèles_ordonnés), mike=_tiers("@ai-sdk/google", *modèles_ordonnés))
+    ordre_a = _cat(
+        zulu=_tiers("@ai-sdk/anthropic", *modèles_ordonnés),
+        alpha=_tiers(None, *modèles_ordonnés),
+        mike=_tiers("@ai-sdk/google", *modèles_ordonnés),
+    )
     ordre_b = _cat(mike=ordre_a["mike"], zulu=ordre_a["zulu"], alpha=ordre_a["alpha"])
     assert mc.hosts_of("m", ordre_a) == ("alpha", "mike", "zulu")
     assert mc.hosts_of("m", ordre_b) == ("alpha", "mike", "zulu")

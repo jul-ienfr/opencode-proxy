@@ -42,17 +42,13 @@ def test_store_false_is_relayed():
 
     Sans relais, la réponse est conservée ≥30 j malgré la consigne du client.
     """
-    req = _chat_to_responses_request(
-        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "store": False}
-    )
+    req = _chat_to_responses_request({"model": "m", "messages": [{"role": "user", "content": "hi"}], "store": False})
     assert req.get("store") is False
 
 
 def test_store_true_is_relayed():
     """L'autre valeur explicite est relayée aussi (pas seulement le refus)."""
-    req = _chat_to_responses_request(
-        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "store": True}
-    )
+    req = _chat_to_responses_request({"model": "m", "messages": [{"role": "user", "content": "hi"}], "store": True})
     assert req.get("store") is True
 
 
@@ -69,9 +65,7 @@ def test_store_absent_is_not_invented():
 @pytest.mark.parametrize("bad", ["yes", 1, 0, [], {}, "false"])
 def test_invalid_store_is_dropped_not_forwarded(bad):
     """Une valeur non booléenne serait rejetée par l'upstream (400 évitable)."""
-    req = _chat_to_responses_request(
-        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "store": bad}
-    )
+    req = _chat_to_responses_request({"model": "m", "messages": [{"role": "user", "content": "hi"}], "store": bad})
     assert "store" not in req, f"{bad!r} propagé tel quel"
 
 
@@ -96,9 +90,7 @@ def test_truncation_absent_is_not_invented():
 @pytest.mark.parametrize("bad", ["banana", "", "AUTO", True, 1, None, ["auto"]])
 def test_invalid_truncation_is_dropped(bad):
     """Seules les deux valeurs du schéma passent ; le reste est écarté."""
-    req = _chat_to_responses_request(
-        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "truncation": bad}
-    )
+    req = _chat_to_responses_request({"model": "m", "messages": [{"role": "user", "content": "hi"}], "truncation": bad})
     assert "truncation" not in req, f"{bad!r} propagé tel quel"
 
 
@@ -161,9 +153,7 @@ def test_stream_options_include_usage_is_set_on_upstream_calls():
     import re
     from pathlib import Path
 
-    src = Path(__file__).resolve().parent.parent.joinpath("opencode.py").read_text(
-        encoding="utf-8", errors="replace"
-    )
+    src = Path(__file__).resolve().parent.parent.joinpath("opencode.py").read_text(encoding="utf-8", errors="replace")
     occurrences = len(re.findall(r'"stream_options"\]\s*=\s*\{"include_usage":\s*True\}', src))
     assert occurrences >= 2, (
         f"include_usage présent {occurrences} fois (<2) : le chunk d'usage final "
@@ -325,9 +315,7 @@ def test_native_passthrough_strips_item_ids():
 
 def test_converted_history_carries_no_item_ids():
     """Voie convertie : aucun `id` fabriqué ne fuit vers l'upstream."""
-    req = _chat_to_responses_request(
-        _chat([{"role": "user", "content": "hi"}], stream=False)
-    )
+    req = _chat_to_responses_request(_chat([{"role": "user", "content": "hi"}], stream=False))
     assert '"id"' not in str(req["input"])
 
 
@@ -413,9 +401,7 @@ def test_encrypted_content_include_not_added_by_default():
     """store absent/vrai → rien (pas de surcoût upstream)."""
     req = _chat_to_responses_request(_chat([{"role": "user", "content": "hi"}], reasoning_effort="high"))
     assert "include" not in req
-    req2 = _chat_to_responses_request(
-        _chat([{"role": "user", "content": "hi"}], store=True, reasoning_effort="high")
-    )
+    req2 = _chat_to_responses_request(_chat([{"role": "user", "content": "hi"}], store=True, reasoning_effort="high"))
     assert "include" not in req2
 
 
@@ -430,9 +416,7 @@ def test_encrypted_content_include_merged_with_existing():
 
 def test_reasoning_dict_without_summary_gets_detailed():
     """SDK : summary défaut 'detailed' quand un effort est posé sans summary."""
-    req = _chat_to_responses_request(
-        _chat([{"role": "user", "content": "hi"}], reasoning={"effort": "high"})
-    )
+    req = _chat_to_responses_request(_chat([{"role": "user", "content": "hi"}], reasoning={"effort": "high"}))
     assert req["reasoning"] == {"effort": "high", "summary": "detailed"}
 
 
@@ -449,6 +433,48 @@ def test_anthropic_path_relays_optional_fields():
     )
     assert req.get("previous_response_id") == "resp_1"
     assert req.get("service_tier") == "auto"
+
+
+def test_chain_refused_on_non_responses_target():
+    """Un chaînage serveur ne peut pas être résolu par un proxy stateless."""
+    from opencode import _responses_chain_refusal
+
+    body = {"previous_response_id": "resp_1", "input": []}
+    assert _responses_chain_refusal(body, "https://up/v1/chat/completions")
+    assert _responses_chain_refusal(body, "https://up/v1/messages")
+    assert _responses_chain_refusal(body, "https://up/v1beta/models/x:generateContent")
+    conv = {"conversation": "conv_1", "input": []}
+    assert _responses_chain_refusal(conv, "https://up/v1/chat/completions")
+    ref = {"input": [{"type": "item_reference", "id": "ref_1"}]}
+    assert _responses_chain_refusal(ref, "https://up/v1/chat/completions")
+    # Cible Responses native : relais autorisé.
+    assert _responses_chain_refusal(body, "https://up/v1/responses") == ""
+    # Pas de chaînage : autorisé partout.
+    assert _responses_chain_refusal({"input": []}, "https://up/v1/chat/completions") == ""
+
+
+@pytest.mark.asyncio
+async def test_chain_refused_endpoint_chat_target(monkeypatch):
+    """La garde est câblée avant la conversion/proactive compaction."""
+    import httpx
+
+    import opencode as oc
+
+    monkeypatch.setattr(oc, "_route_for", lambda model: {"model": "m"})
+    monkeypatch.setattr(
+        oc,
+        "get_model_config",
+        lambda model: {"endpoint": "https://up/v1/chat/completions", "protocol": "openai"},
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=oc.app), base_url="http://proxy.test", timeout=30.0
+    ) as client:
+        r = await client.post(
+            "/v1/responses",
+            json={"model": "client-alias", "previous_response_id": "resp_1", "input": []},
+        )
+    assert r.status_code == 400
+    assert "stateless" in r.text
 
 
 # ─────────────────────── Chaînage : garde orphelin ───────────────────────
@@ -630,13 +656,39 @@ def test_optional_chat_fields_absent_not_invented():
 # ─────────────────────── Clé de cache : hors chaînage ───────────────────────
 
 
-def test_cache_key_ignores_chaining_fields():
-    """F6 : previous_response_id / prompt_cache_key uniques ne doivent pas
-    annuler le cache réponse (requêtes identiques → même clé)."""
+def test_cache_key_ignores_only_prompt_cache_key():
+    """[audit 2026-10-30] ``prompt_cache_key`` est un hint de routage et peut
+    être exclu. ``previous_response_id``/``conversation`` désignent un
+    historique serveur : les exclure servait la réponse d'une autre
+    conversation. Ils doivent changer la clé."""
     from server.cache import ResponseCache
 
     c = ResponseCache()
     base = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     k1 = c.make_key(dict(base))
-    k2 = c.make_key({**base, "previous_response_id": "resp_1", "prompt_cache_key": "ses_abc"})
-    assert k1 is not None and k1 == k2
+    k_hint = c.make_key({**base, "prompt_cache_key": "ses_abc"})
+    k_prev = c.make_key({**base, "previous_response_id": "resp_1"})
+    k_conv = c.make_key({**base, "conversation": "conv_1"})
+    assert k1 is not None
+    assert k_hint == k1
+    assert k_prev != k1
+    assert k_conv != k1
+
+
+def test_cache_key_namespace_separates_protocols_and_tenants():
+    from server.cache import ResponseCache
+
+    c = ResponseCache()
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    a = c.make_key(body, namespace="/v1/messages|m|ep|tenant-a")
+    b = c.make_key(body, namespace="/v1/chat/completions|m|ep|tenant-a")
+    c2 = c.make_key(body, namespace="/v1/messages|m|ep|tenant-b")
+    assert a and b and c2
+    assert len({a, b, c2}) == 3
+
+
+def test_native_responses_compact_route_registered():
+    from opencode import app
+
+    paths = {getattr(route, "path", "") for route in app.routes}
+    assert "/v1/responses/compact" in paths

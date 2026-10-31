@@ -55,9 +55,10 @@ Suivi d'implémentation du plan d'audit. Détails code : voir commentaires
    `logs/free_pool.json` (quotas/ip_stats, débouncé 60s + force sur
    rotation), `logs/vpn_state*.json` + `.bak`, `logs/identities/*.json`.
 
-9. ** Geo vs free ** : même egress, deux faces assumées (navigateur curated
-   sur jambe geo, Bun vault sur jambe free — protocoles différents).
-   Dashboard expose les deux (`wire_identity` + `current_identity`).
+9. ** Geo vs free ** : même egress, UNE seule face assumée depuis le
+   2026-10-25 (client OpenCode officiel : Bun TLS + UA v2/UA vault selon la
+   jambe ; les anciens profils navigateur `sec-ch-ua`/`Accept-Language` ne
+   sont plus émis). Dashboard expose `wire_identity` + `current_identity`.
 
 ## Reste ouvert
 

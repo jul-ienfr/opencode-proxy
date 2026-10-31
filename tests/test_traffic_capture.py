@@ -39,6 +39,7 @@ def test_middleware_default_capture_singleton():
     assert mw._capture is tc_module.capture
     assert mw._capture.enabled is tc_module.capture.enabled
 
+
 # ── helpers ───────────────────────────────────────────────────────
 
 

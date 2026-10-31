@@ -47,11 +47,27 @@ def build(catalog: dict) -> dict:
             base = model_api(catalog, provider, model_id)
             if not family or not base:
                 continue
-            routes[model_id] = {
+            route = {
                 "family": family,
                 "protocol": FAMILY_TO_PROTOCOL.get(family),
                 "base_url": base,
             }
+            # [audit 2026-10-30] Context/output limits are needed for the
+            # official auto-compaction trigger (context_limit - buffer).
+            info = models.get(model_id) if isinstance(models, dict) else {}
+            limit = info.get("limit") if isinstance(info, dict) else None
+            if isinstance(limit, dict):
+                clean = {}
+                for key in ("context", "output"):
+                    try:
+                        value = int(limit.get(key) or 0)
+                    except (TypeError, ValueError):
+                        value = 0
+                    if value > 0:
+                        clean[key] = value
+                if clean:
+                    route["limit"] = clean
+            routes[model_id] = route
         out[provider] = dict(sorted(routes.items()))
     return {"generated_from": CATALOG_URL, "providers": out}
 

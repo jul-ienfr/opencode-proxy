@@ -7,7 +7,7 @@ Hermetic matrix (no network, json dispatch stubs only):
     /responses (max_output_tokens), jev-* → non sondable (SystemOne).
   * free_probe_verdict — alive 2xx, dead 404/410 + marqueurs body,
     not_free 401/402, limited 429, unknown 5xx/403/400-sans-marqueur/None.
-  * probe_recheck_plan — unknown périmés seulement.
+  * probe_recheck_plan — unknown ET limited périmés.
   * probe_free_models — budget max_ids respecté (les f/jev non sondables
     consomment un slot sans dispatch), transport error → unknown.
   * settings hook — gate DI : promotion filtrée (ghost non appliqué), gate
@@ -26,7 +26,7 @@ import config.discovery as _disc
 import config.settings as _st
 
 _ROOT = Path(__file__).resolve().parents[1]
-API_BASE_FREE = "https://opencode.ai/inference/v1/chat/completions"
+API_BASE_FREE = "https://opencode.ai/inference/openai/v1/chat/completions"
 
 
 # ── probe_cfg — parse + clamps ──────────────────────────────────────
@@ -38,6 +38,7 @@ def test_probe_cfg_defaults_desactivé():
     assert cfg["timeout"] == 8.0
     assert cfg["concurrency"] == 3
     assert cfg["max_ids"] == 10
+    assert cfg["limited_recheck_s"] == 3600.0
     assert cfg["dead_status"] == {404, 410}
     assert cfg["not_free_status"] == {401, 402}
     assert "not found" in cfg["dead_markers"]
@@ -47,12 +48,13 @@ def test_probe_cfg_clamps_hors_bornes_et_valeurs_invalides():
     cfg = _disc.probe_cfg(
         {
             "enabled": True,
-            "timeout": 1,          # clamp bas → 2
-            "concurrency": 99,     # clamp haut → 10
-            "max_ids": 0,          # clamp bas → 1
-            "dead_ttl_s": 2,       # clamp bas → 60
-            "recheck_interval_s": 10 ** 9,  # clamp haut → 86400
-            "skip_recent_ok_s": 10 ** 9,    # clamp haut → 86400
+            "timeout": 1,  # clamp bas → 2
+            "concurrency": 99,  # clamp haut → 10
+            "max_ids": 0,  # clamp bas → 1
+            "dead_ttl_s": 2,  # clamp bas → 60
+            "recheck_interval_s": 10**9,  # clamp haut → 86400
+            "limited_recheck_s": 10**9,  # clamp haut → 86400
+            "skip_recent_ok_s": 10**9,  # clamp haut → 86400
             "dead_status": "bad",  # non-list → défaut
             "not_free_status": [401],
             "dead_markers": ["gone forever", 42, "  "],  # non-str filtrés
@@ -64,6 +66,7 @@ def test_probe_cfg_clamps_hors_bornes_et_valeurs_invalides():
     assert cfg["max_ids"] == 1
     assert cfg["dead_ttl_s"] == 60.0
     assert cfg["recheck_interval_s"] == 86400.0
+    assert cfg["limited_recheck_s"] == 86400.0
     assert cfg["skip_recent_ok_s"] == 86400.0
     assert cfg["dead_status"] == {404, 410}
     assert cfg["not_free_status"] == {401}
@@ -84,7 +87,7 @@ def test_shaping_chat_free_id():
 
 def test_shaping_muse_responses():
     url, body = _disc.free_probe_shaping("muse-spark-1.4-free", API_BASE_FREE)
-    assert url == "https://opencode.ai/inference/v1/responses"
+    assert url == "https://opencode.ai/inference/openai/v1/responses"
     assert body["input"] == "ping"
     assert body["max_output_tokens"] == 64
 
@@ -125,7 +128,7 @@ def test_verdict_matrix(status, body, expected):
 # ── recheck plan ────────────────────────────────────────────────────
 
 
-def test_recheck_plan_unknown_perimes_seulement():
+def test_recheck_plan_unknown_et_limited_perimes():
     cfg = _disc.probe_cfg({"enabled": True})
     now = 1000.0
     results = {
@@ -133,8 +136,11 @@ def test_recheck_plan_unknown_perimes_seulement():
         "b-free": {"verdict": "unknown", "checked_epoch": now},
         "c-free": {"verdict": "dead", "checked_epoch": now - 200000},  # gate exclut via dead_ttl
         "d-free": {"verdict": "alive", "checked_epoch": now - 200000},  # frais, pas de recheck
+        "e-free": {"verdict": "limited", "checked_epoch": now - 2 * cfg["limited_recheck_s"]},
+        "f-free": {"verdict": "limited", "checked_epoch": now},
+        "g-free": {"verdict": "limited", "checked_epoch": now - (cfg["limited_recheck_s"] - 1)},
     }
-    assert _disc.probe_recheck_plan(results, cfg, now) == ["a-free"]
+    assert _disc.probe_recheck_plan(results, cfg, now) == ["a-free", "e-free"]
     assert _disc.probe_recheck_plan({}, cfg, now) == []
 
 
@@ -162,6 +168,66 @@ def test_probe_free_models_budget_et_verdicts():
     assert rows["jev-5-free"]["verdict"] == "not_probeable"
     assert rows["bb-free"]["verdict"] == "alive"
     assert "cc-free" not in rows  # hors budget — pas de verdict cette passe
+
+
+def test_probe_all_429_is_unknown_global_and_retried_shortly():
+    cfg = _disc.probe_cfg({"enabled": True, "concurrency": 1, "max_ids": 10})
+    rows = _disc.probe_free_models(
+        ["aa-free", "bb-free"],
+        api_base_free=API_BASE_FREE,
+        headers_fn=None,
+        dispatch_fn=lambda *_a: (429, ""),
+        cfg=cfg,
+    )
+
+    assert {r["verdict"] for r in rows.values()} == {"unknown"}
+    assert all("global" in r["reason"] for r in rows.values())
+    assert all(r["not_before_epoch"] > time.time() for r in rows.values())
+    # Re-test court, pas 30 min : le plan doit le voir après transient_429_retry_s.
+    assert _disc.probe_recheck_plan(rows, cfg, time.time()) == []
+    assert set(_disc.probe_recheck_plan(rows, cfg, time.time() + cfg["transient_429_retry_s"] + 1)) == {
+        "aa-free",
+        "bb-free",
+    }
+
+
+def test_probe_all_429_with_healthy_control_stays_limited():
+    cfg = _disc.probe_cfg({"enabled": True, "concurrency": 1, "max_ids": 10})
+
+    def dispatch(_url, _headers, payload):
+        mid = json.loads(payload)["model"]
+        return (200 if mid == "control-free" else 429), ""
+
+    rows = _disc.probe_free_models(
+        ["aa-free", "bb-free"],
+        api_base_free=API_BASE_FREE,
+        headers_fn=None,
+        dispatch_fn=dispatch,
+        cfg=cfg,
+        control_id="control-free",
+    )
+
+    assert {r["verdict"] for r in rows.values()} == {"limited"}
+    assert "control-free" not in rows
+
+
+def test_probe_mixed_429_keeps_limited():
+    cfg = _disc.probe_cfg({"enabled": True, "concurrency": 1, "max_ids": 10})
+
+    def dispatch(_url, _headers, payload):
+        mid = json.loads(payload)["model"]
+        return {"aa-free": 200, "bb-free": 429}[mid], ""
+
+    rows = _disc.probe_free_models(
+        ["aa-free", "bb-free"],
+        api_base_free=API_BASE_FREE,
+        headers_fn=None,
+        dispatch_fn=dispatch,
+        cfg=cfg,
+    )
+
+    assert rows["aa-free"]["verdict"] == "alive"
+    assert rows["bb-free"]["verdict"] == "limited"
 
 
 def test_probe_free_models_erreur_transport_inconnu():
@@ -196,9 +262,7 @@ def _probe_doc(probe: dict | None):
 def _isolated_st(monkeypatch, doc):
     monkeypatch.setattr(_st, "_yaml_data", dict(doc))
     monkeypatch.setattr(_st, "MODELS", dict(doc.get("models") or {}))
-    monkeypatch.setattr(
-        _st, "FREE_MODEL_MAP", dict(doc.get("free_model_map") or {})
-    )
+    monkeypatch.setattr(_st, "FREE_MODEL_MAP", dict(doc.get("free_model_map") or {}))
     monkeypatch.setattr(_st, "FREE_MODELS", set())
     monkeypatch.setattr(_st, "FREE_MODEL_POOL", [])
     monkeypatch.setattr(_st, "FREE_DISCOVERY_ENABLED", True)
@@ -252,6 +316,46 @@ def test_hook_gate_filtre_avant_apply(monkeypatch):
     assert gate.calls[0][0] == {"alive-free", "ghost-free"}
     assert gate.calls[0][2] == API_BASE_FREE
     assert _st._FREE_DISCOVERY_STATE["probe"] == {"run_at": "t1"}
+
+
+def test_hook_gate_persiste_les_verdicts(monkeypatch):
+    _isolated_st(monkeypatch, _probe_doc({"enabled": True}))
+    _fake_fetch(monkeypatch, ["alive-free"])
+    state = {"results": {"alive-free": {"verdict": "alive", "status": 200}}}
+    monkeypatch.setattr(_st, "_FREE_PROBE_GATE", _FakeGate(accepted={"alive-free"}, state=state))
+    persisted = []
+    monkeypatch.setattr(
+        _st,
+        "record_probed_free_models",
+        lambda results: persisted.append(dict(results)) or 1,
+    )
+
+    _st._ensure_free_models_sync()
+
+    assert persisted == [state["results"]]
+
+
+def test_hook_fetch_vide_fait_tourner_la_gate_pour_la_maintenance(monkeypatch):
+    _isolated_st(monkeypatch, _probe_doc({"enabled": True}))
+    _fake_fetch(monkeypatch, [])
+    _st.FREE_MODELS.update({"known-free"})
+    gate = _FakeGate(
+        accepted={"known-free"},
+        state={"results": {"known-free": {"verdict": "alive"}}},
+    )
+    monkeypatch.setattr(_st, "_FREE_PROBE_GATE", gate)
+    persisted = []
+    monkeypatch.setattr(
+        _st,
+        "record_probed_free_models",
+        lambda results: persisted.append(dict(results)) or 1,
+    )
+
+    assert _st._ensure_free_models_sync() == 0
+    assert gate.calls and gate.calls[0][0] == set()
+    assert gate.calls[0][1] == {"known-free"}
+    assert persisted == [{"known-free": {"verdict": "alive"}}]
+    assert "known-free" in _st.FREE_MODELS  # l'apply vide n'a pas purgé
 
 
 def test_hook_sans_gate_comportement_historique(monkeypatch):
@@ -387,20 +491,16 @@ def test_gate_promue_alive_limited_et_fige_dead(monkeypatch):
     assert state["summary"].get("alive", 0) == 2
     assert state["summary"].get("limited", 0) == 1
     # face officielle transmise à la sonde (chat + responses selon id)
-    chat_seen = next(
-        s for s in seen_holder["seen"] if s["mid"] == "good-free"
-    )
+    chat_seen = next(s for s in seen_holder["seen"] if s["mid"] == "good-free")
     assert chat_seen["headers"]["Authorization"] == "Bearer public"
     assert "provider-utils/4.0.23" in chat_seen["headers"]["User-Agent"]
-    resp_seen = next(
-        s for s in seen_holder["seen"] if s["mid"] == "muse-spark-1.4-free"
-    )
+    resp_seen = next(s for s in seen_holder["seen"] if s["mid"] == "muse-spark-1.4-free")
     assert "4.0.40" in resp_seen["headers"]["User-Agent"]
     assert "responses" in resp_seen["url"]
     # ── cycle suivant : le dead est gelé (pas re-sondé), les vivants connus ──
     state_writer = _probe_state_write(oc)
     state_writer(acc, state)
-    seen_h2 = _fake_dispatch(monkeypatch, oc, mapping)
+    _fake_dispatch(monkeypatch, oc, mapping)  # installe le dispatch (côté effet)
     acc2, state2 = oc._free_probe_gate(announced, acc, API_BASE_FREE)
     assert "bad404-free" not in acc2
     assert acc2 >= {"good-free", "angry-free", "muse-spark-1.4-free"}
@@ -418,11 +518,50 @@ def test_gate_recheck_unknown_perime(monkeypatch):
     assert [s["mid"] for s in seen_holder["seen"]] == ["stale-free"]
 
 
+def test_gate_recheck_limited_perime_mais_pas_le_frais(monkeypatch):
+    oc = _gate_env(monkeypatch)
+    now = time.time()
+    oc._cfg_settings._FREE_DISCOVERY_STATE["probe"] = {
+        "results": {
+            "old-limited-free": {"verdict": "limited", "checked_epoch": now - 10000.0},
+            "new-limited-free": {"verdict": "limited", "checked_epoch": now},
+        }
+    }
+    seen_holder = _fake_dispatch(monkeypatch, oc, {"old-limited-free": 200})
+    known = {"old-limited-free", "new-limited-free"}
+    acc, state = oc._free_probe_gate(known, known, API_BASE_FREE)
+    assert acc == known
+    assert [s["mid"] for s in seen_holder["seen"]] == ["old-limited-free"]
+    assert state["results"]["old-limited-free"]["verdict"] == "alive"
+    assert state["results"]["new-limited-free"]["verdict"] == "limited"
+
+
+def test_gate_sonde_les_connus_sans_verdict(monkeypatch):
+    oc = _gate_env(monkeypatch)
+    seen_holder = _fake_dispatch(monkeypatch, oc, {"never-probed-free": 200})
+    acc, state = oc._free_probe_gate(set(), {"never-probed-free"}, API_BASE_FREE)
+    assert acc == {"never-probed-free"}
+    assert [s["mid"] for s in seen_holder["seen"]] == ["never-probed-free"]
+    assert state["results"]["never-probed-free"]["verdict"] == "alive"
+    assert state["candidates_unproven"] == ["never-probed-free"]
+
+
+def test_gate_maintenance_prioritaire_sur_les_nouveaux(monkeypatch):
+    oc = _gate_env(monkeypatch, probe_over={"max_ids": 2})
+    seen_holder = _fake_dispatch(
+        monkeypatch,
+        oc,
+        {"known-a-free": 200, "known-b-free": 200, "new-c-free": 200},
+    )
+    acc, state = oc._free_probe_gate({"new-c-free"}, {"known-a-free", "known-b-free"}, API_BASE_FREE)
+    assert {s["mid"] for s in seen_holder["seen"]} == {"known-a-free", "known-b-free"}
+    assert set(state["probed"]) == {"known-a-free", "known-b-free"}
+    assert "new-c-free" not in state["probed"]
+
+
 def test_gate_skip_usage_recent_traffic_source(monkeypatch):
     oc = _gate_env(monkeypatch)
-    monkeypatch.setattr(
-        oc, "_free_probe_recently_ok", lambda ids, seconds: {"usage-free"}
-    )
+    monkeypatch.setattr(oc, "_free_probe_recently_ok", lambda ids, seconds: {"usage-free"})
     seen_holder = _fake_dispatch(monkeypatch, oc, {})
     acc, state = oc._free_probe_gate({"usage-free"}, set(), API_BASE_FREE)
     assert acc == {"usage-free"}  # trafic réel = signal vivant
@@ -434,10 +573,8 @@ def test_gate_skip_usage_recent_traffic_source(monkeypatch):
 def test_gate_budget_max_ids(monkeypatch):
     oc = _gate_env(monkeypatch, probe_over={"max_ids": 2})
     mapping = {"aa-free": 200, "bb-free": 200, "cc-free": 200}
-    seen_holder = _fake_dispatch(monkeypatch, oc, mapping)
-    acc, state = oc._free_probe_gate(
-        {"aa-free", "bb-free", "cc-free"}, set(), API_BASE_FREE
-    )
+    _fake_dispatch(monkeypatch, oc, mapping)  # installe le dispatch (côté effet)
+    acc, state = oc._free_probe_gate({"aa-free", "bb-free", "cc-free"}, set(), API_BASE_FREE)
     assert acc == {"aa-free", "bb-free"}  # cc hors budget → pas promu ce cycle
     assert state["probed"] and set(state["probed"]) == {"aa-free", "bb-free"}
 

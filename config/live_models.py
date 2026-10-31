@@ -138,9 +138,7 @@ def load_persisted(
         if events:
             _STATE["events"] = [e for e in events if isinstance(e, dict)][-MAX_EVENTS:]
         if available_ids is not None:
-            _STATE["available_ids"] = {
-                str(x).strip().lower() for x in available_ids if str(x).strip()
-            }
+            _STATE["available_ids"] = {str(x).strip().lower() for x in available_ids if str(x).strip()}
             _STATE["initialized"] = True
         try:
             _STATE["revision"] = max(int(revision or 0), _STATE["revision"])
@@ -269,12 +267,9 @@ def _thinking_capability(entry: dict) -> dict | None:
     reasoning = entry.get("reasoning")
     if options is None and reasoning is None:
         return None
-    has_toggle = any(
-        isinstance(o, dict) and str(o.get("type") or "").lower() == "toggle" for o in (options or [])
-    )
+    has_toggle = any(isinstance(o, dict) and str(o.get("type") or "").lower() == "toggle" for o in (options or []))
     has_budget = any(
-        isinstance(o, dict) and str(o.get("type") or "").lower() == "budget_tokens"
-        for o in (options or [])
+        isinstance(o, dict) and str(o.get("type") or "").lower() == "budget_tokens" for o in (options or [])
     )
     has_effort = bool(effort_levels_from_options(options))
     supported = bool(reasoning) if reasoning is not None else bool(options)
@@ -290,8 +285,10 @@ def _thinking_capability(entry: dict) -> dict | None:
 
 
 def _metadata(entry: dict, model_id: str, family: str | None, base_url: str | None) -> dict:
-    limit = entry.get("limit") if isinstance(entry.get("limit"), dict) else {}
-    modalities = entry.get("modalities") if isinstance(entry.get("modalities"), dict) else {}
+    _raw_limit = entry.get("limit")
+    limit = _raw_limit if isinstance(_raw_limit, dict) else {}
+    _raw_modalities = entry.get("modalities")
+    modalities = _raw_modalities if isinstance(_raw_modalities, dict) else {}
     return {
         "id": model_id,
         "name": entry.get("name") or model_id,
@@ -430,7 +427,8 @@ def build_snapshot(
 
     for model_id in sorted(current_models):
         low = model_id.strip().lower()
-        cfg = current_models.get(model_id) if isinstance(current_models.get(model_id), dict) else {}
+        _raw_cfg = current_models.get(model_id)
+        cfg = _raw_cfg if isinstance(_raw_cfg, dict) else {}
         if is_internal(model_id, cfg):
             kept_internal.append(model_id)
             continue
@@ -493,10 +491,7 @@ def build_snapshot(
     # marque le relevé partiel et on ne supprime rien.
     guarded = False
     if not partial and removed_ids:
-        counted = [
-            m for m in current_models
-            if not is_internal(m, current_models.get(m) or {})
-        ]
+        counted = [m for m in current_models if not is_internal(m, current_models.get(m) or {})]
         if len(counted) >= 10 and len(removed_ids) / max(1, len(counted)) > 0.5:
             guarded = True
             partial = True
@@ -570,13 +565,23 @@ def build_route(
     """
     leg = str(entry.get("leg") or PAID_LEG)
     is_free = leg == FREE_LEG
-    meta = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+    _raw_meta = entry.get("metadata")
+    meta = _raw_meta if isinstance(_raw_meta, dict) else {}
     family = str(meta.get("family_api") or "").strip().lower()
     if not family:
         low = str(model_id or "").lower()
         family = "responses" if ("muse" in low or "spark" in low) else "chat"
     if family == "gemini":
-        return None
+        # [audit 2026-10-30] Native Google dialect, served by app.protocol.gemini.
+        base = str(meta.get("base_url") or "").strip().rstrip("/")
+        if not base:
+            return None
+        return {
+            "endpoint": base,
+            "protocol": "gemini",
+            "api": "gemini",
+            "source": "live_catalog",
+        }
     if family == "messages":
         base = str(meta.get("base_url") or "").strip().rstrip("/")
         if base:
@@ -624,6 +629,7 @@ def apply_snapshot(
     removed: list[str] = []
     added: list[str] = []
     migrated: list[str] = []
+    free_candidates: list[str] = []
 
     for model_id in snapshot.get("removed_ids") or []:
         cfg = models.get(model_id)
@@ -650,8 +656,12 @@ def apply_snapshot(
             continue
         models[model_id] = route
         added.append(model_id)
-        if isinstance(free_models, set) and entry.get("leg") == FREE_LEG:
-            free_models.add(model_id)
+        if (
+            isinstance(free_models, set)
+            and entry.get("leg") == FREE_LEG
+            and model_id not in free_models
+        ):
+            free_candidates.append(model_id)
 
     for model_id in snapshot.get("migrated_ids") or []:
         entry = available.get(model_id)
@@ -660,28 +670,42 @@ def apply_snapshot(
         route = route_fn(model_id, entry)
         if not route:
             continue
-        old = models.get(model_id) if isinstance(models.get(model_id), dict) else {}
-        if (
-            old.get("endpoint") == route.get("endpoint")
-            and old.get("protocol") == route.get("protocol")
-        ):
+        _raw_old = models.get(model_id)
+        old = _raw_old if isinstance(_raw_old, dict) else {}
+        if old.get("endpoint") == route.get("endpoint") and old.get("protocol") == route.get("protocol"):
             continue
         merged = {**old, **route}
         models[model_id] = merged
         migrated.append(model_id)
-        if isinstance(free_models, set) and entry.get("leg") == FREE_LEG:
-            free_models.add(model_id)
+        if (
+            isinstance(free_models, set)
+            and entry.get("leg") == FREE_LEG
+            and model_id not in free_models
+            and model_id not in free_candidates
+        ):
+            free_candidates.append(model_id)
 
-    # Les modèles de la jambe anonyme sont free par construction, même sans
-    # suffixe historiquement reconnu (`big-pickle`, `beam-free`…).
+    # Le suffixe ``-free`` est une preuve explicite : reconnu immédiatement.
+    # La sonde peut confirmer un nouveau suffixe, mais ne le démote jamais.
+    if isinstance(free_models, set):
+        for model_id in models:
+            if str(model_id).lower().endswith("-free") and model_id not in free_models:
+                free_models.add(model_id)
+
+    # Un modèle de la jambe anonyme n'entre dans FREE_MODELS qu'après une
+    # sonde free-leg réussie (voir _FREE_PROBE_NEW côté hôte). Ici on ne fait
+    # que recenser les candidats : la liste est rejouée à chaque relevé, et
+    # l'hôte ignore ceux déjà testés (alive/limited/not_free/dead).
     if isinstance(free_models, set):
         for model_id, entry in available.items():
             if (
                 isinstance(entry, dict)
                 and entry.get("leg") == FREE_LEG
                 and model_id in models
+                and model_id not in free_models
+                and model_id not in free_candidates
             ):
-                free_models.add(model_id)
+                free_candidates.append(model_id)
 
     if isinstance(free_model_pool, list) and isinstance(free_models, set):
         free_model_pool[:] = sorted(free_models)
@@ -702,7 +726,12 @@ def apply_snapshot(
             )
         except Exception:
             pass
-    return {"added": added, "removed": removed, "migrated": migrated}
+    return {
+        "added": added,
+        "removed": removed,
+        "migrated": migrated,
+        "free_candidates": free_candidates,
+    }
 
 
 def commit_snapshot(
@@ -736,11 +765,7 @@ def commit_snapshot(
                 for x in (set(deprecated) | set(apply_result.get("removed") or ()))
                 if str(x).strip()
             }
-            notified = sorted(
-                model
-                for model in candidates
-                if model not in announced
-            )
+            notified = sorted(model for model in candidates if model not in announced)
             announced.update(notified)
             _STATE["announced"] = announced
 
@@ -748,9 +773,7 @@ def commit_snapshot(
         # démarrage précédent (les ajouts/retraits réels sont comparés à
         # l'inventaire persisté, pas à l'état mémoire vide).
         current_live = (
-            set(available) & {str(x).strip().lower() for x in model_ids}
-            if model_ids is not None
-            else set(available)
+            set(available) & {str(x).strip().lower() for x in model_ids} if model_ids is not None else set(available)
         )
         new_live = current_live - previous_live
         gone_live = previous_live - current_live
@@ -786,10 +809,7 @@ def commit_snapshot(
                 "available_ids": current_live,
                 "served": current_live,
                 "initialized": True,
-                "by_leg": {
-                    leg: set((snapshot.get("by_leg") or {}).get(leg) or ())
-                    for leg in LEGS
-                },
+                "by_leg": {leg: set((snapshot.get("by_leg") or {}).get(leg) or ()) for leg in LEGS},
                 "added": list(apply_result.get("added") or ()),
                 "removed": list(apply_result.get("removed") or ()),
                 "migrated": list(apply_result.get("migrated") or ()),
@@ -870,9 +890,7 @@ def record_deprecation_notices(
             for client in list(clients or ())[:MAX_CLIENTS_PER_MODEL]:
                 if not isinstance(client, dict):
                     continue
-                keys = _client_keys(
-                    client.get("client_ip") or "", client.get("account_alias") or ""
-                )
+                keys = _client_keys(client.get("client_ip") or "", client.get("account_alias") or "")
                 if not keys:
                     continue
                 notice = {
@@ -887,9 +905,7 @@ def record_deprecation_notices(
                         continue
                     seen_keys.add(key)
                     bucket = notices.setdefault(key, [])
-                    if any(
-                        isinstance(n, dict) and n.get("model") == model for n in bucket
-                    ):
+                    if any(isinstance(n, dict) and n.get("model") == model for n in bucket):
                         continue
                     # Le MÊME objet est référencé par `ip:` et `acct:` : le
                     # résumé dashboard peut le compter une seule fois.
@@ -907,11 +923,7 @@ def _prune_notices_locked(now: float) -> None:
     notices = _STATE.get("notices") or {}
     empty: list[str] = []
     for key, bucket in notices.items():
-        kept = [
-            n
-            for n in (bucket or ())
-            if isinstance(n, dict) and float(n.get("expires_at") or 0) > now
-        ]
+        kept = [n for n in (bucket or ()) if isinstance(n, dict) and float(n.get("expires_at") or 0) > now]
         if kept:
             notices[key] = kept
         else:
@@ -957,8 +969,7 @@ def notices_summary() -> list[dict]:
                 seen.add(token)
                 counts[model] = counts.get(model, 0) + 1
     return [
-        {"model": model, "clients": count, "message": notice_message(model)}
-        for model, count in sorted(counts.items())
+        {"model": model, "clients": count, "message": notice_message(model)} for model, count in sorted(counts.items())
     ]
 
 

@@ -176,7 +176,9 @@ def _parse_error_payload(payload: Any) -> tuple[str, str, str]:
     low_msg = msg.lower()
     if low_type in _NON_RETRYABLE_TYPES:
         return "pass", etype or "invalid_request_error", msg or "non-retryable error"
-    if any(marker in low_msg for marker in ("context length", "context too long", "too many tokens", "maximum context")):
+    if any(
+        marker in low_msg for marker in ("context length", "context too long", "too many tokens", "maximum context")
+    ):
         return "pass", etype or "invalid_request_error", msg
     if low_type in _RETRYABLE_TYPES:
         return "retry", etype or "api_error", msg
@@ -604,7 +606,9 @@ class RetryUntilSuccessMiddleware:
             message = f"upstream unavailable after retries ({reason})"
         if outer_committed:
             try:
-                await send({"type": "http.response.body", "body": _sse_error(path, message, error_type), "more_body": False})
+                await send(
+                    {"type": "http.response.body", "body": _sse_error(path, message, error_type), "more_body": False}
+                )
             except Exception:
                 pass
             return
@@ -827,9 +831,7 @@ class RetryUntilSuccessMiddleware:
                     )
                 )
                 current_app = app_task
-                done, _pending = await asyncio.wait(
-                    {app_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED
-                )
+                done, _pending = await asyncio.wait({app_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED)
                 if disconnect_task in done and disconnected.is_set():
                     app_task.cancel()
                     try:

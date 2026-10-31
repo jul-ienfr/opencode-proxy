@@ -106,7 +106,8 @@ def shim_tools(body: dict | None) -> list[str]:
         if not isinstance(tool, dict):
             continue
         # Deux formes admises : {"type":"function","function":{...}} et {"name":...}
-        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        _raw_fn = tool.get("function")
+        fn = _raw_fn if isinstance(_raw_fn, dict) else tool
         name = fn.get("name")
         if not isinstance(name, str) or not name:
             continue

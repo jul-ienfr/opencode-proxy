@@ -54,18 +54,14 @@ def test_every_client_form_is_understood(fields, expected_level, expected_source
 
 def test_output_config_effort_has_priority_over_legacy():
     """La forme ACTUELLE documentée prime sur la forme historique."""
-    level, source, _ = extract_requested_level(
-        {"output_config": {"effort": "max"}, "effort": "low"}
-    )
+    level, source, _ = extract_requested_level({"output_config": {"effort": "max"}, "effort": "low"})
     assert level == "max"
     assert source == "output_config.effort"
 
 
 def test_output_config_effort_has_priority_over_reasoning_effort():
     """Un corps portant les deux (client mixte) suit le champ documenté."""
-    level, _, _ = extract_requested_level(
-        {"output_config": {"effort": "medium"}, "reasoning_effort": "low"}
-    )
+    level, _, _ = extract_requested_level({"output_config": {"effort": "medium"}, "reasoning_effort": "low"})
     assert level == "medium"
 
 
@@ -224,26 +220,24 @@ def test_p2_and_p4_agree_on_the_same_request(level, model):
     reference = resolve_effort({"effort": level}, model)
     assert reference.level is not None
 
-    from_p2 = pm.anthropic_to_openai(
-        {"model": model, "max_tokens": 4096, "messages": [], "effort": level}, model
-    ).get("reasoning_effort")
-    from_p4 = pm.openai_to_anthropic_request(
-        {"model": model, "max_tokens": 4096, "messages": [], "reasoning_effort": level}
-    ).get("output_config", {}).get("effort")
+    from_p2 = pm.anthropic_to_openai({"model": model, "max_tokens": 4096, "messages": [], "effort": level}, model).get(
+        "reasoning_effort"
+    )
+    from_p4 = (
+        pm.openai_to_anthropic_request({"model": model, "max_tokens": 4096, "messages": [], "reasoning_effort": level})
+        .get("output_config", {})
+        .get("effort")
+    )
 
     assert from_p2 == reference.level, "P2 diverge de la politique"
-    assert from_p4 == ("low" if reference.level == "minimal" else reference.level), (
-        "P4 diverge de la politique"
-    )
+    assert from_p4 == ("low" if reference.level == "minimal" else reference.level), "P4 diverge de la politique"
 
 
 @pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max", "minimal"])
 def test_p6_agrees_with_policy(level):
     """A3/A15 : P6 applique la même politique, et n'émet jamais
     `reasoning_effort` (nom OpenAI) vers un amont Anthropic."""
-    out = pm.openai_responses_to_anthropic(
-        {"model": UNCAPPED, "input": [], "reasoning": {"effort": level}}
-    )
+    out = pm.openai_responses_to_anthropic({"model": UNCAPPED, "input": [], "reasoning": {"effort": level}})
     assert "reasoning_effort" not in out
     expected = "low" if level == "minimal" else level
     assert out.get("output_config", {}).get("effort") == expected

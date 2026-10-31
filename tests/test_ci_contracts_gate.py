@@ -21,11 +21,9 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-_SPEC = importlib.util.spec_from_file_location(
-    "ci_contracts", ROOT / "scripts" / "ci_contracts.py"
-)
-ci = importlib.util.module_from_spec(_SPEC)
+_SPEC = importlib.util.spec_from_file_location("ci_contracts", ROOT / "scripts" / "ci_contracts.py")
 assert _SPEC and _SPEC.loader
+ci = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(ci)
 
 
@@ -33,8 +31,7 @@ class TestEveryDeclaredContractExists:
     @pytest.mark.parametrize("nom", sorted({n for noms in ci.CONTRATS.values() for n in noms}))
     def test_declared_file_exists(self, nom):
         assert (ROOT / "tests" / nom).exists(), (
-            f"{nom} est déclaré dans le gate CI mais n'existe pas : "
-            "le gate passerait au vert sans l'exécuter"
+            f"{nom} est déclaré dans le gate CI mais n'existe pas : le gate passerait au vert sans l'exécuter"
         )
 
     def test_the_gate_is_not_empty(self):

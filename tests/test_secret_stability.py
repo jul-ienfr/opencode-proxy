@@ -20,7 +20,7 @@ def _read_key(path):
     return ir.get("control_api_key")
 
 
-def test_save_yaml_config_preserves_control_api_key(tmp_path, monkeypatch):
+def test_save_yaml_config_never_persists_control_api_key(tmp_path, monkeypatch):
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
         yaml.dump({"ip_rotation": {"control_api_key": "KEY-SHOULD-SURVIVE"}}, sort_keys=False),
@@ -34,7 +34,8 @@ def test_save_yaml_config_preserves_control_api_key(tmp_path, monkeypatch):
     )
     st.save_yaml_config()
     st.save_yaml_config()  # idempotent
-    assert _read_key(str(cfg)) == "KEY-SHOULD-SURVIVE"
+    assert _read_key(str(cfg)) is None, "le secret ne doit JAMAIS retourner dans le YAML"
+    assert st._yaml_data["ip_rotation"]["control_api_key"] == "KEY-SHOULD-SURVIVE"
     assert os.path.exists(str(cfg) + ".tmp") is False, "atomic replace left no .tmp behind"
 
 

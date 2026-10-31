@@ -14,8 +14,6 @@ Ces tests figent la parité côté conversion (le stream a déjà ses tests dans
 ``test_chat_sse_to_anthropic.py``).
 """
 
-import pytest
-
 from app.protocol.mapping import (
     openai_chat_to_responses,
     openai_to_anthropic,
@@ -60,8 +58,7 @@ def test_responses_non_stream_expose_un_item_reasoning():
 
 
 def test_sans_raisonnement_aucun_bloc_vide():
-    chat = {"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
-            "usage": {}}
+    chat = {"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}], "usage": {}}
     anthro = openai_to_anthropic(chat, "m")
     assert [b["type"] for b in anthro["content"]] == ["text"]
     resp = openai_chat_to_responses(chat, "m")

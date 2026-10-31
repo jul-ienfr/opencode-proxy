@@ -20,8 +20,6 @@ cassera la jambe free. Un commentaire ne survit pas a six mois ; un test rouge,
 si.
 """
 
-import pytest
-
 import opencode as oc
 
 

@@ -176,9 +176,7 @@ def _fake_upstream_payload(monkeypatch, ids):
     monkeypatch.setattr(
         discovery.subprocess,
         "run",
-        lambda *a, **k: types.SimpleNamespace(
-            returncode=0, stdout=_json.dumps(payload), stderr=""
-        ),
+        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=_json.dumps(payload), stderr=""),
     )
     return discovery
 
@@ -243,9 +241,7 @@ def _isolated(tmp_path, monkeypatch, purged_in_yaml=True):
             _PURGED: {"protocol": "openai"},
         },
         "free_model_map": {"mimo-v2.5": "mimo-v2.5-free"},
-        "free_discovery": (
-            {"purged_ids": [_PURGED]} if purged_in_yaml else {"purged_ids": []}
-        ),
+        "free_discovery": ({"purged_ids": [_PURGED]} if purged_in_yaml else {"purged_ids": []}),
     }
     # `_isolated_settings` mute le singleton `config.settings` PARTAGÉ et ne
     # snapshot pas PURGED_IDS : on le fait ici, sinon les tombeaux réels de
@@ -254,9 +250,7 @@ def _isolated(tmp_path, monkeypatch, purged_in_yaml=True):
     real_purged = set(st.PURGED_IDS)
     st2, *old = _isolated_settings(tmp_path, monkeypatch, yaml_data)
     st2.PURGED_IDS.clear()
-    st2.PURGED_IDS.update(
-        x for x in (yaml_data["free_discovery"].get("purged_ids") or []) if x
-    )
+    st2.PURGED_IDS.update(x for x in (yaml_data["free_discovery"].get("purged_ids") or []) if x)
     return st2, old, real_purged
 
 

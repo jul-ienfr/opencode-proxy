@@ -24,8 +24,6 @@ from __future__ import annotations
 import pathlib
 import re
 
-import pytest
-
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 #: Dossiers scannés — le code produit, pas les tests ni la recherche.
@@ -47,7 +45,7 @@ ALLOWED: dict[str, tuple[int, str]] = {
         "endpoint `systemone` (pas de variante dans le résolveur) + "
         "`Origin`/`Referer`, partie du facteur identity mesuré",
     ),
-    "discovery.py": (3, "construction d'URL du catalogue + lien de documentation"),
+    "discovery.py": (1, "construction d'URL du catalogue + lien de documentation"),
     "settings.py": (5, "défauts du résolveur (`yaml_get` prioritaire)"),
 }
 
@@ -89,8 +87,7 @@ class TestRatchet:
             if len(entries) > limite:
                 exces[name] = entries[limite:]
         assert not exces, (
-            "URL d'amont en dur en plus du quota : passer par le résolveur "
-            f"(`config/settings.py`) — {exces}"
+            f"URL d'amont en dur en plus du quota : passer par le résolveur (`config/settings.py`) — {exces}"
         )
 
     def test_no_allowlist_entry_is_stale(self):
@@ -101,9 +98,7 @@ class TestRatchet:
             for name, (limite, _raison) in ALLOWED.items()
             if len(trouves.get(name, [])) < limite
         }
-        assert not obsoletes, (
-            f"quotas à resserrer (moins d'occurrences que déclaré) : {obsoletes}"
-        )
+        assert not obsoletes, f"quotas à resserrer (moins d'occurrences que déclaré) : {obsoletes}"
 
     def test_every_quota_carries_a_reason(self):
         for name, (limite, raison) in ALLOWED.items():
@@ -118,8 +113,7 @@ class TestRatchet:
         """
         source = (ROOT / "opencode.py").read_text(encoding="utf-8", errors="replace")
         assert '"https://opencode.ai"' in source, (
-            "la valeur exacte de l'en-tête d'origine a disparu — re-mesurer le "
-            "facteur identity avant de la remplacer"
+            "la valeur exacte de l'en-tête d'origine a disparu — re-mesurer le facteur identity avant de la remplacer"
         )
 
 

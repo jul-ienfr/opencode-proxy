@@ -73,9 +73,7 @@ async def test_read_only_connection_is_readonly(wal_db, tmp_path):
             assert ro is not None, "connexion RO indisponible"
             n = ro.execute("SELECT COUNT(*) AS n FROM requests").fetchone()["n"]
             try:
-                ro.execute(
-                    "INSERT INTO requests(id, timestamp, model) VALUES ('x', 't', 'm')"
-                )
+                ro.execute("INSERT INTO requests(id, timestamp, model) VALUES ('x', 't', 'm')")
                 wrote = True
             except sqlite3.Error:
                 wrote = False
@@ -112,9 +110,7 @@ async def test_inserts_not_blocked_by_slow_dashboard_read(wal_db, tmp_path):
         await asyncio.sleep(0.05)  # la lecture est maintenant en vol
 
         def do_insert():
-            conn.execute(
-                "INSERT INTO requests(id, timestamp, model) VALUES ('i1', '2026-08-26T00:00:00Z', 'glm')"
-            )
+            conn.execute("INSERT INTO requests(id, timestamp, model) VALUES ('i1', '2026-08-26T00:00:00Z', 'glm')")
             conn.commit()
 
         t0 = time.monotonic()

@@ -63,7 +63,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--api", default="http://127.0.0.1:4000")
     ap.add_argument("--out", default="logs/station_snapshot.json")
-    ap.add_argument("--containers", default="opencode-vpn,opencode-vpn-2,opencode-vpn-3,opencode-vpn-4,opencode-vpn-5,opencode-vpn-6")
+    ap.add_argument(
+        "--containers",
+        default="opencode-vpn,opencode-vpn-2,opencode-vpn-3,opencode-vpn-4,opencode-vpn-5,opencode-vpn-6",
+    )
     args = ap.parse_args()
 
     containers = [c.strip() for c in args.containers.split(",") if c.strip()]

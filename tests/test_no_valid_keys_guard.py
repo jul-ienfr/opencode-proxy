@@ -84,18 +84,30 @@ def _wire_free(monkeypatch, free_curl):
 
 
 def _json_resp(status, usage=None, text=""):
-    return _FakeResp(status, headers={"content-type": "application/json"},
-                     usage=usage or {"prompt_tokens": 3, "completion_tokens": 5},
-                     text=text)
+    return _FakeResp(
+        status,
+        headers={"content-type": "application/json"},
+        usage=usage or {"prompt_tokens": 3, "completion_tokens": 5},
+        text=text,
+    )
 
 
 # ── A2 : strict_free × échec free → FreeQuotaExhausted, jamais None+paid ──
+
 
 @pytest.mark.asyncio
 async def test_a2_strict_no_keys_429_exhausted_refuses(no_valid_keys, free_cfg, monkeypatch):
     """A2/429 : strict_free + no-valid-keys + 429 → refuse (Retry-After propagé)."""
     oc.IP_ROTATION["strict_free"] = True
-    curl = _FakeFreeCurl([_json_resp(429, text="quota hit", ), _json_resp(429, text="quota hit")])
+    curl = _FakeFreeCurl(
+        [
+            _json_resp(
+                429,
+                text="quota hit",
+            ),
+            _json_resp(429, text="quota hit"),
+        ]
+    )
     curl_resp_headers = {"retry-after": "77", "content-type": "application/json"}
     curl.responses = [
         _FakeResp(429, headers=dict(curl_resp_headers), text="quota hit"),
@@ -123,9 +135,7 @@ async def test_a2_strict_no_keys_non429_refuses(no_valid_keys, free_cfg, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_a2_nonstrict_no_keys_non429_returns_none_but_paid_guard_blocks(
-    no_valid_keys, free_cfg, monkeypatch
-):
+async def test_a2_nonstrict_no_keys_non429_returns_none_but_paid_guard_blocks(no_valid_keys, free_cfg, monkeypatch):
     """A2/non-strict : échec free → None (contrat historique), MAIS la garde
     A1 (_has_usable_paid_key()==False) doit bloquer la jambe paid en aval.
 
@@ -184,6 +194,7 @@ async def test_a2_nonstrict_with_valid_key_still_falls_back(free_vpn_env, free_c
 
 # ── A1 : vérité _has_usable_paid_key ──────────────────────────────────────
 
+
 def test_a1_truth_table(no_valid_keys, monkeypatch):
     """A1/vérité : vide → False ; disabled → False ; pausée → False ;
     valide → True ; .env seul → True."""
@@ -212,6 +223,7 @@ def test_a1_truth_table(no_valid_keys, monkeypatch):
 
 # ── A1 : garde handler paid-skipped (non-stream l.10712) ─────────────────
 
+
 @pytest.mark.asyncio
 async def test_a1_paid_skipped_guard_closed(no_valid_keys, free_cfg, monkeypatch):
     """A1/handler : free None + no-valid-keys → le handler ne doit pas appeler
@@ -219,15 +231,16 @@ async def test_a1_paid_skipped_guard_closed(no_valid_keys, free_cfg, monkeypatch
     doublé lève _PaidTouched si touché ; on assert la garde AVANT l'appel."""
     curl = _FakeFreeCurl([_FakeResp(500, headers={"content-type": "application/json"}, text="x")])
     _wire_free(monkeypatch, curl)
-    free_result = await oc._try_free_model_first(
-        _free_body(), {}, "openai", PAID_MODEL, req_id="req-a1-skip")
+    free_result = await oc._try_free_model_first(_free_body(), {}, "openai", PAID_MODEL, req_id="req-a1-skip")
     assert free_result is None
     # Garde l.10712 : fermée → le handler répond paid-skipped SANS appeler paid.
     assert oc._has_usable_paid_key() is False
     paid_called = []
+
     async def _record_paid(*a, **k):
         paid_called.append((a, k))
         raise _PaidTouched("paid touché")
+
     monkeypatch.setattr(oc, "_do_request_with_retry", _record_paid)
     if not oc._has_usable_paid_key():
         resp = oc._openai_error(
@@ -244,6 +257,7 @@ async def test_a1_paid_skipped_guard_closed(no_valid_keys, free_cfg, monkeypatch
 
 # ── A3 : AllKeysPaused stream/non-stream parité ───────────────────────────
 
+
 def test_a3_allkeys_paused_distinction(no_valid_keys):
     """A3 : AllKeysPaused + no-valid-keys → free-direct (stream, note l.10604)
     ou free-first (non-stream, l.10612) — jamais le placeholder 503 « next
@@ -257,14 +271,18 @@ def test_a3_allkeys_paused_distinction(no_valid_keys):
 
 # ── A.0 : invariant payant sur chaque essai ───────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_a0_no_paid_artifacts_on_free_attempts(no_valid_keys, free_cfg, monkeypatch):
     """A.0 : headers + body de CHAQUE essai free sans artefact payant."""
     from test_free_multi_attempt import assert_no_paid_artifacts
-    curl = _FakeFreeCurl([
-        _FakeResp(429, headers={"content-type": "application/json"}, text="q"),
-        _json_resp(200),
-    ])
+
+    curl = _FakeFreeCurl(
+        [
+            _FakeResp(429, headers={"content-type": "application/json"}, text="q"),
+            _json_resp(200),
+        ]
+    )
     pool = _wire_free(monkeypatch, curl)
     out = await oc._try_free_model_first(_free_body(), {}, "openai", PAID_MODEL, req_id="req-a0")
     assert out is not None  # retry B → OK

@@ -98,9 +98,7 @@ def test_cache_control_sur_outil_est_transporte_sans_inventer_le_champ_openai():
     outils = converti.get("tools") or []
     assert outils, "l'outil doit survivre a la conversion"
     outil = outils[0]
-    assert outil.get("cache_control") == {"type": "ephemeral"}, (
-        f"breakpoint d'outil perdu silencieusement : {outil}"
-    )
+    assert outil.get("cache_control") == {"type": "ephemeral"}, f"breakpoint d'outil perdu silencieusement : {outil}"
     assert "prompt_cache_breakpoint" not in outil, (
         "prompt_cache_breakpoint emis sur une definition d'outil : placement contraire a B3 "
         "(risque de 400 chez un amont strict) — voir mapping.py:621"

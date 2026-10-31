@@ -65,9 +65,7 @@ async def free_pool_request(
         try:
             resp, resp_headers, _actual_model, _actual_ip = result
         except Exception as e:
-            raise upstream_error_cls(
-                f"free summarizer pool bad result: {e}", status_code=502, original=e
-            ) from e
+            raise upstream_error_cls(f"free summarizer pool bad result: {e}", status_code=502, original=e) from e
         return resp, resp_headers
     except Exception as e:
         if isinstance(e, upstream_error_cls):

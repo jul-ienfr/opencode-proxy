@@ -56,18 +56,14 @@ class _DockerStub:
         if kind == "ps":
             if self.ps_fails:
                 return subprocess.CompletedProcess(args, 1, stdout="", stderr="daemon down")
-            return subprocess.CompletedProcess(
-                args, 0, stdout="\n".join(self.fleet) + "\n", stderr=""
-            )
+            return subprocess.CompletedProcess(args, 0, stdout="\n".join(self.fleet) + "\n", stderr="")
         if kind == "inspect":
             if self.inspect == "rc":
                 return subprocess.CompletedProcess(args, 1, stdout="", stderr="not found")
             name = args[1]
             vpn_type = self.fleet.get(name)
             if vpn_type is None:
-                return subprocess.CompletedProcess(
-                    args, 1, stdout="", stderr=f"No such object: {name}"
-                )
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr=f"No such object: {name}")
             if self.inspect == "bad-json":
                 payload = "not json"
             else:
@@ -92,9 +88,7 @@ def _managers(tmp_path, n, stack="wireguard"):
     à côté du compose — on force ce chemin vers le tmp du test pour ne
     JAMAIS consulter le vrai `.env` du projet (sinon les résultats dépendent
     de la flotte live de la machine)."""
-    managers = [
-        FakeVPNManager(_cfg(tmp_path), station=s, tmp_path=tmp_path) for s in range(1, n + 1)
-    ]
+    managers = [FakeVPNManager(_cfg(tmp_path), station=s, tmp_path=tmp_path) for s in range(1, n + 1)]
     for m in managers:
         m._stack_effective = stack
         m._compose_file_path = lambda: str(tmp_path / "docker-compose.yml")
@@ -109,9 +103,7 @@ async def test_orphan_retired_station_removed(tmp_path):
     """A station retired by a downscale that crashed before its `docker
     rm -f`: the name is gone from the registry but still exists in docker →
     removed at boot, before any start()."""
-    stub = _DockerStub(
-        {"opencode-vpn": "wireguard", "opencode-vpn-2": "wireguard", "opencode-vpn-3": "wireguard"}
-    )
+    stub = _DockerStub({"opencode-vpn": "wireguard", "opencode-vpn-2": "wireguard", "opencode-vpn-3": "wireguard"})
     managers = _managers(tmp_path, 2)  # registry: station 1-2 only
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
@@ -163,13 +155,9 @@ async def test_expected_on_wrong_stack_removed(tmp_path):
     Le .env suit la mémoire ici (STATION2=openvpn… non — volontairement
     COHÉRENT avec l'ancienne attente : les deux stations disent wireguard,
     donc conteneur s2 = mémoire ∧ fichier contre lui → rm)."""
-    stub = _DockerStub(
-        {"opencode-vpn": "wireguard", "opencode-vpn-2": "openvpn"}
-    )  # stale-boot station 2
+    stub = _DockerStub({"opencode-vpn": "wireguard", "opencode-vpn-2": "openvpn"})  # stale-boot station 2
     managers = _managers(tmp_path, 2, stack="wireguard")
-    (tmp_path / ".env").write_text(
-        "VPN_TYPE_STATION1=wireguard\nVPN_TYPE_STATION2=wireguard\n", encoding="utf-8"
-    )
+    (tmp_path / ".env").write_text("VPN_TYPE_STATION1=wireguard\nVPN_TYPE_STATION2=wireguard\n", encoding="utf-8")
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
 
@@ -225,9 +213,7 @@ async def test_env_and_memory_agree_still_removes(tmp_path):
     tourne openvpn (vrai stale-stack, cas 19/08) → rm maintenu."""
     stub = _DockerStub({"opencode-vpn-2": "openvpn"})
     managers = _managers(tmp_path, 2, stack="wireguard")
-    (tmp_path / ".env").write_text(
-        "VPN_TYPE_STATION1=wireguard\nVPN_TYPE_STATION2=wireguard\n", encoding="utf-8"
-    )
+    (tmp_path / ".env").write_text("VPN_TYPE_STATION1=wireguard\nVPN_TYPE_STATION2=wireguard\n", encoding="utf-8")
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
 
@@ -251,9 +237,7 @@ async def test_mixed_fleet_removes_both_kinds(tmp_path):
     )  # orphan
     managers = _managers(tmp_path, 2, stack="wireguard")
     managers[1]._stack_effective = "openvpn"  # station 2 effective = OV
-    (tmp_path / ".env").write_text(
-        "VPN_TYPE_STATION1=wireguard\nVPN_TYPE_STATION2=openvpn\n", encoding="utf-8"
-    )
+    (tmp_path / ".env").write_text("VPN_TYPE_STATION1=wireguard\nVPN_TYPE_STATION2=openvpn\n", encoding="utf-8")
 
     removed = await vm.reconcile_orphan_containers(managers, stub.run)
 
@@ -324,9 +308,7 @@ async def test_rm_no_such_container_is_success(tmp_path):
                 return subprocess.CompletedProcess(args, 0, stdout="opencode-vpn-9\n", stderr="")
             if args[0] == "rm":
                 self.removed.append(args[2])
-                return subprocess.CompletedProcess(
-                    args, 1, stdout="", stderr="Not Found: No such container: x"
-                )
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="Not Found: No such container: x")
             return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
 
     stub = _Gone()

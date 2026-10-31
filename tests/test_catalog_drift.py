@@ -16,8 +16,6 @@ from __future__ import annotations
 import pathlib
 import sys
 
-import pytest
-
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -89,10 +87,12 @@ class TestAnnotate:
 
 class TestSummarise:
     def test_it_aggregates_orphans_across_legs(self):
-        payload = drift.summarise([
-            drift.compute(["a"], ["x"], "free"),
-            drift.compute(["b"], ["y"], "paid"),
-        ])
+        payload = drift.summarise(
+            [
+                drift.compute(["a"], ["x"], "free"),
+                drift.compute(["b"], ["y"], "paid"),
+            ]
+        )
         assert payload["orphan_count"] == 2
         assert payload["orphans"] == ["free::x", "paid::y"]
 

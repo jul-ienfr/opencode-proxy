@@ -39,8 +39,23 @@ import opencode as oc  # noqa: E402
 
 # --- MESURE DU VRAI BINAIRE (sonde AQ, 3 executions stables) --------------
 MESURE_CIPHERS = [
-    4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392,
-    49161, 49171, 49162, 49172, 156, 157, 47, 53,
+    4865,
+    4866,
+    4867,
+    49195,
+    49199,
+    49196,
+    49200,
+    52393,
+    52392,
+    49161,
+    49171,
+    49162,
+    49172,
+    156,
+    157,
+    47,
+    53,
 ]
 MESURE_EXTS = [0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43]
 MESURE_CURVES = [29, 23, 24]
@@ -65,18 +80,12 @@ class TestJa3ConformeAuBinaire:
     def test_ciphers_identiques_au_binaire(self):
         """Les 17 ciphers, dans l'ordre mesuré sur opencode.exe."""
         got = [int(x) for x in _champs()[1].split("-")]
-        assert got == MESURE_CIPHERS, (
-            f"ciphers divergents du binaire.\n  mesure : {MESURE_CIPHERS}\n"
-            f"  code   : {got}"
-        )
+        assert got == MESURE_CIPHERS, f"ciphers divergents du binaire.\n  mesure : {MESURE_CIPHERS}\n  code   : {got}"
 
     def test_extensions_identiques_au_binaire(self):
         """Les 13 extensions du binaire, dans l'ordre, SANS 65037."""
         got = [int(x) for x in _champs()[2].split("-")]
-        assert got == MESURE_EXTS, (
-            f"extensions divergentes du binaire.\n  mesure : {MESURE_EXTS}\n"
-            f"  code   : {got}"
-        )
+        assert got == MESURE_EXTS, f"extensions divergentes du binaire.\n  mesure : {MESURE_EXTS}\n  code   : {got}"
 
     def test_65037_alps_absent(self):
         """65037 (ALPS/ECH) : le client ne l'envoie PAS.

@@ -325,7 +325,11 @@ class SharedRotationState:
         if changed:
             self._saved_at = _now_utc()
             self._persist()
-            logger.info("[shared-rotation] pruned ghost stations >%d (%d events removed)", max_station, before - len(self._ip_events))
+            logger.info(
+                "[shared-rotation] pruned ghost stations >%d (%d events removed)",
+                max_station,
+                before - len(self._ip_events),
+            )
 
     def set_window(self, cfg: dict) -> None:
         """Re-read recent_ip_window/recent_ip_max_age on config change
@@ -487,9 +491,7 @@ class EngineConfig:
     hard_cooldown_sec: float = 1800.0
     ewma_alpha: float = 0.3
     window: int = 20
-    per_model: dict[str, float] = field(
-        default_factory=lambda: {"default": 8000.0}
-    )
+    per_model: dict[str, float] = field(default_factory=lambda: {"default": 8000.0})
     floor_ms: float = 3000.0
     global_degraded_threshold: float = 0.5
     global_degraded_cooldown_sec: float = 300.0
@@ -511,9 +513,7 @@ class EngineConfig:
         c.ewma_threshold_ms = float(g("ewma_threshold_ms", c.ewma_threshold_ms))
         c.p95_threshold_ms = float(g("p95_threshold_ms", c.p95_threshold_ms))
         c.consecutive_slow = int(g("consecutive_slow", c.consecutive_slow))
-        c.min_requests_before_eval = int(
-            g("min_requests_before_eval", c.min_requests_before_eval)
-        )
+        c.min_requests_before_eval = int(g("min_requests_before_eval", c.min_requests_before_eval))
         c.soft_cooldown_sec = float(g("soft_cooldown_sec", c.soft_cooldown_sec))
         c.hard_cooldown_sec = float(g("hard_cooldown_sec", c.hard_cooldown_sec))
         c.ewma_alpha = float(g("ewma_alpha", c.ewma_alpha))
@@ -522,15 +522,9 @@ class EngineConfig:
         if isinstance(pm_raw, dict) and pm_raw:
             c.per_model = {str(k): float(v) for k, v in pm_raw.items()}
         c.floor_ms = float(g("floor_ms", c.floor_ms))
-        c.global_degraded_threshold = float(
-            g("global_degraded_threshold", c.global_degraded_threshold)
-        )
-        c.global_degraded_cooldown_sec = float(
-            g("global_degraded_cooldown_sec", c.global_degraded_cooldown_sec)
-        )
-        c.max_soft_rotates_per_hour = int(
-            g("max_soft_rotates_per_hour", c.max_soft_rotates_per_hour)
-        )
+        c.global_degraded_threshold = float(g("global_degraded_threshold", c.global_degraded_threshold))
+        c.global_degraded_cooldown_sec = float(g("global_degraded_cooldown_sec", c.global_degraded_cooldown_sec))
+        c.max_soft_rotates_per_hour = int(g("max_soft_rotates_per_hour", c.max_soft_rotates_per_hour))
         sm = str(g("stream_metric", c.stream_metric)).lower()
         c.stream_metric = sm if sm in ("ttfb", "total") else "ttfb"
         c.prewarm_after_rotate = bool(g("prewarm_after_rotate", True))
@@ -553,6 +547,7 @@ class LatencyRotationEngine:
         self.cfg = EngineConfig()
         # [audit-2026-10-24] OrderedDict = vraie LRU (move_to_end + popitem).
         from collections import OrderedDict as _OD
+
         self._trackers: dict[tuple[int, str], IpLatencyTracker] = _OD()  # type: ignore[assignment]
         # (sid, ip) -> (kind, until_monotonic)
         self._cooldowns: dict[tuple[int, str], tuple[str, float]] = {}
@@ -573,6 +568,7 @@ class LatencyRotationEngine:
         # burst rotations post-restart). Sauf sous pytest (isolation tests).
         try:
             import os as _os
+
             if not _os.getenv("PYTEST_CURRENT_TEST"):
                 self._load_engine_state()
         except Exception:
@@ -698,6 +694,7 @@ class LatencyRotationEngine:
     def _engine_state_file(self) -> str:
         try:
             import os as _os
+
             return _os.path.join(ROOT, "logs", "latency_engine.json")
         except Exception:
             return "logs/latency_engine.json"
@@ -708,6 +705,7 @@ class LatencyRotationEngine:
         # Sauf sous pytest (isolation).
         try:
             import os as _os
+
             if _os.getenv("PYTEST_CURRENT_TEST"):
                 return
             now = self._now()
@@ -722,6 +720,7 @@ class LatencyRotationEngine:
         try:
             import json as _js
             import os as _os
+
             now = self._now()
             cds = []
             for (sid, ip), (kind, until) in list(self._cooldowns.items()):
@@ -748,13 +747,14 @@ class LatencyRotationEngine:
         try:
             import json as _js
             import os as _os
+
             fp = self._engine_state_file()
             if not _os.path.exists(fp):
                 return
             with open(fp, encoding="utf-8") as f:
                 data = _js.load(f) or {}
             now = self._now()
-            for e in (data.get("cooldowns") or []):
+            for e in data.get("cooldowns") or []:
                 try:
                     sid = int(e.get("sid"))
                     ip = str(e.get("ip"))

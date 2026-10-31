@@ -35,7 +35,7 @@ from app.protocol.mapping import _local_signature
 
 # Cible Anthropic sans équivalent free : la jambe payante est exercée sans swap.
 PAID_ANTHRO = "minimax-m3"
-EP_ANTHRO = "https://opencode.ai/zen/go/v1/messages"
+EP_ANTHRO = "https://opencode.ai/inference/go/anthropic/v1/messages"
 
 REASONING = "raisonnement synthetique du proxy"
 FORGED_SIGNATURE = _local_signature(REASONING)
@@ -220,9 +220,7 @@ def _signed_thinking_blocks(body: dict) -> list[dict]:
 
 def _p6_body(*, avec_orphelin: bool) -> dict:
     """Requête P6 (client Responses)."""
-    entree: list[dict] = [
-        {"role": "user", "content": [{"type": "input_text", "text": "question"}]}
-    ]
+    entree: list[dict] = [{"role": "user", "content": [{"type": "input_text", "text": "question"}]}]
     if avec_orphelin:
         entree.append(
             {

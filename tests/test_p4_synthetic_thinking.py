@@ -32,7 +32,7 @@ from app.protocol.mapping import _local_signature
 # Modèle client à cible Anthropic sans équivalent dans ``FREE_MODEL_MAP``
 # (``minimax-m3``) : la jambe payante est exercée sans dépendre du swap free.
 PAID_ANTHRO = "minimax-m3"
-EP_ANTHRO = "https://opencode.ai/zen/go/v1/messages"
+EP_ANTHRO = "https://opencode.ai/inference/go/anthropic/v1/messages"
 
 # Raisonnement synthétique : texte + signature locale, exactement ce que le proxy
 # fabrique à partir de ``reasoning_content`` (cf. mapping.py ``_local_signature``).

@@ -240,13 +240,14 @@ def test_pc5_spread_round_robin(monkeypatch):
     oc._free_model_rr.clear()
     try:
         monkeypatch.setitem(oc.IP_ROTATION, "free_model_spread", True)
+        monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "family")
         monkeypatch.setitem(
             oc.IP_ROTATION,
             "free_model_candidates",
             {
                 "muse-spark-1.3-contributor": [
                     "muse-spark-1.3-contributor-free",
-                    "mimo-v2.5-free",
+                    "muse-spark-1.4-contributor-free",
                 ]
             },
         )
@@ -260,7 +261,7 @@ def test_pc5_spread_round_robin(monkeypatch):
         assert r1 != r2  # 2 requêtes consécutives ≠ même modèle
         assert {r1, r2} == {
             "muse-spark-1.3-contributor-free",
-            "mimo-v2.5-free",
+            "muse-spark-1.4-contributor-free",
         }
     finally:
         oc._free_model_rr.clear()
@@ -502,7 +503,13 @@ def test_pc14_analyze_statuses(tmp_path, monkeypatch):
 def test_pc14_display_knobs_take_effect(monkeypatch):
     from dashboard import display as disp
 
-    saved = (disp.LOG_VISIBLE, disp._DEBUG_FLUSH_INTERVAL, disp._DEBUG_MAX_SIZE, disp._DEBUG_ROTATE_KEEP, disp.log_lines)
+    saved = (
+        disp.LOG_VISIBLE,
+        disp._DEBUG_FLUSH_INTERVAL,
+        disp._DEBUG_MAX_SIZE,
+        disp._DEBUG_ROTATE_KEEP,
+        disp.log_lines,
+    )
     try:
         monkeypatch.setattr(
             disp._cfg_settings,
@@ -523,7 +530,9 @@ def test_pc14_display_knobs_take_effect(monkeypatch):
         assert disp.LOG_VISIBLE == 50 and disp.log_lines.maxlen == 300
         assert disp._DEBUG_ROTATE_KEEP == 2
     finally:
-        disp.LOG_VISIBLE, disp._DEBUG_FLUSH_INTERVAL, disp._DEBUG_MAX_SIZE, disp._DEBUG_ROTATE_KEEP, disp.log_lines = saved
+        disp.LOG_VISIBLE, disp._DEBUG_FLUSH_INTERVAL, disp._DEBUG_MAX_SIZE, disp._DEBUG_ROTATE_KEEP, disp.log_lines = (
+            saved
+        )
 
 
 def test_pc14_quota_interval_knob(monkeypatch):
@@ -799,9 +808,7 @@ async def test_socks_probe_second_pass_on_timeouts(tmp_path, monkeypatch):
     historiques + 2 URLs, la repasse serait plafonnée au temps restant
     (2 s) — pas un bug, juste l'enveloppe qui protège /api/vpn-status.
     """
-    mgr = FakeVPNManager(
-        _pc_cfg(tmp_path, ip_probe_budget=20.0), tmp_path=tmp_path
-    )
+    mgr = FakeVPNManager(_pc_cfg(tmp_path, ip_probe_budget=20.0), tmp_path=tmp_path)
     mgr._ip_check_urls = ["http://a.invalid", "http://b.invalid"]
     calls = {"n": 0, "budgets": []}
 
@@ -994,3 +1001,27 @@ def test_pc9_bad_mark_wins_over_grace():
     per["rotation_started_at"] = time.monotonic()
     assert pool._station_usable(sts[0], exclude_approaching=False) is False
     assert pool._non_routable_reason(sts[0]).startswith("bad_until")
+
+
+# ── [audit 2026-10-30] statut connected ≠ tunnel utilisable ────────
+
+
+def test_connected_station_with_dead_egress_is_not_routable():
+    """Le watchdog peut remettre ``connected`` avec l'egress mort : exclure."""
+    st = _Station(1, status="connected", current_ip="9.9.9.9")
+    st._egress_state = "tunnel_down"
+    pool = _pc_pool(st)
+    assert pool._station_usable(st, exclude_approaching=False) is False
+    assert pool._non_routable_reason(st) == "egress=tunnel_down"
+
+
+def test_pc9_grace_still_serves_while_egress_tunnel_down():
+    """Rotation douce : l'ancienne IP reste servie malgré tunnel_down récent."""
+    st = _Station(1, status="connecting", current_ip="9.9.9.9")
+    st._egress_state = "tunnel_down"
+    pool = _pc_pool(st)
+    per = pool._per_station(st)
+    per["last_confirmed_ip"] = "9.9.9.9"
+    per["rotation_started_at"] = time.monotonic()
+    assert pool._station_usable(st, exclude_approaching=False) is True
+    assert pool._non_routable_reason(st) is None

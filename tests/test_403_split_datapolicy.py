@@ -40,12 +40,11 @@ DP_BODY = (
 
 
 def _resp(code, text):
-    return types.SimpleNamespace(
-        status_code=code, text=text, headers={}, content=text.encode()
-    )
+    return types.SimpleNamespace(status_code=code, text=text, headers={}, content=text.encode())
 
 
 # ── B1 : garde → message explicite (URL + alias), jamais texte région ──
+
 
 def test_b1_datapolicy_guard_returns_explicit_message_with_url_and_alias():
     msg = oc._check_datapolicy_guard(_resp(403, DP_BODY), "test-acct")
@@ -74,6 +73,7 @@ def test_b1_optin_url_extraction_and_case_insensitivity():
 
 # ── B2 : jamais retriable (garde pré-forward, pas retry aveugle) ──
 
+
 @pytest.mark.parametrize(
     "code,text",
     [
@@ -94,14 +94,13 @@ def test_b2_datapolicy_never_retriable(code, text):
 
 # ── C1 : corrélation free→paid par req_id (préfixe conditionnel) ──
 
+
 def test_c1_correlated_prefix_only_with_fallback_ctx():
     oc._fallback_ctx_push("req-b-corr", "muse-spark-1.3-contributor-free", 400)
     out = oc._correlated_403_message("UPSTREAM-MSG", "req-b-corr")
     # [FIX classement harness] le statut est rendu en mots (voir
     # test_messages_client_sans_code_401_403) : plus de « 400 » chiffré dans le texte.
-    assert out.startswith(
-        "free muse-spark-1.3-contributor-free → requête refusée par l'amont"
-    )
+    assert out.startswith("free muse-spark-1.3-contributor-free → requête refusée par l'amont")
     assert "paid fallback → " in out
     assert out.endswith("UPSTREAM-MSG")
 
@@ -112,6 +111,7 @@ def test_c1_no_ctx_message_unchanged_paid_direct():
 
 
 # ── B1 bout-à-bout : split complet garde → message ──
+
 
 def test_b1_end_to_end_split_datapolicy_vs_region():
     dp = oc._check_datapolicy_guard(_resp(403, DP_BODY), "acct-1") or oc._auth_window_message(403)

@@ -56,11 +56,7 @@ def test_streaming_sse_format():
     from protocol_mapping import _json_dumps
 
     payload = {"type": "message", "delta": {"text": "hello"}}
-    raw = (
-        _json_dumps(payload).decode()
-        if isinstance(_json_dumps(payload), bytes)
-        else _json_dumps(payload)
-    )
+    raw = _json_dumps(payload).decode() if isinstance(_json_dumps(payload), bytes) else _json_dumps(payload)
     sse = f"data: {raw}\n\n"
     assert sse.startswith("data: ")
     assert sse.endswith("\n\n")

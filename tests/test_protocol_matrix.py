@@ -109,9 +109,7 @@ def test_axis_effort_p2_reads_every_input_form(case):
 
 def test_axis_effort_p2_model_cap_enforced():
     """P2 : le plafond du modèle s'applique (A2 — glm-5 plafonne à high)."""
-    out = pm.anthropic_to_openai(
-        {**ANTHRO_BODY, "output_config": {"effort": "max"}}, "glm-5-air"
-    )
+    out = pm.anthropic_to_openai({**ANTHRO_BODY, "output_config": {"effort": "max"}}, "glm-5-air")
     assert out["reasoning_effort"] == "high"
 
 
@@ -122,17 +120,13 @@ def test_axis_effort_p2_model_cap_enforced():
 def test_axis_effort_p4_no_level_is_lost(requested, expected):
     """P4 : aucun niveau ne doit être écrasé (A2 — l'ancien dict n'avait que
     3 entrées et repliait tout le reste sur 16000)."""
-    out = pm.openai_to_anthropic_request(
-        {**CHAT_BODY, "model": "deepseek-v4-flash", "reasoning_effort": requested}
-    )
+    out = pm.openai_to_anthropic_request({**CHAT_BODY, "model": "deepseek-v4-flash", "reasoning_effort": requested})
     assert out.get("output_config", {}).get("effort") == expected
 
 
 def test_axis_effort_p4_minimal_is_recognized():
     """A2 : `minimal` est une valeur OpenAI légitime, pas à supprimer."""
-    out = pm.openai_to_anthropic_request(
-        {**CHAT_BODY, "model": "deepseek-v4-flash", "reasoning_effort": "minimal"}
-    )
+    out = pm.openai_to_anthropic_request({**CHAT_BODY, "model": "deepseek-v4-flash", "reasoning_effort": "minimal"})
     assert out.get("output_config", {}).get("effort") == "low"
 
 
@@ -141,8 +135,7 @@ def test_axis_effort_p6_reaches_anthropic():
     req = {**RESPONSES_BODY, "reasoning": {"effort": "medium"}}
     out = pm.openai_responses_to_anthropic(req)
     assert "reasoning_effort" not in out, (
-        "P6 : `reasoning_effort` est un nom de champ OPENAI — il ne doit jamais "
-        "partir vers un amont Anthropic (A15)."
+        "P6 : `reasoning_effort` est un nom de champ OPENAI — il ne doit jamais partir vers un amont Anthropic (A15)."
     )
     assert out.get("output_config", {}).get("effort") == "medium", (
         "P6 : l'effort est perdu vers l'amont Anthropic (A3)."
@@ -153,9 +146,7 @@ def test_axis_effort_no_path_emits_deprecated_thinking_enabled():
     """A14/A23 : aucun chemin ne doit plus émettre `thinking.enabled` +
     `budget_tokens` (forme rejetée sur Claude 4.7+, et budget > max_tokens)."""
     outs = {
-        "P4": pm.openai_to_anthropic_request(
-            {**CHAT_BODY, "reasoning_effort": "high", "max_tokens": 512}
-        ),
+        "P4": pm.openai_to_anthropic_request({**CHAT_BODY, "reasoning_effort": "high", "max_tokens": 512}),
         "P6": pm.openai_responses_to_anthropic(
             {**RESPONSES_BODY, "reasoning": {"effort": "high"}, "max_output_tokens": 512}
         ),
@@ -199,9 +190,7 @@ def test_axis_budget_to_level_p2(budget, expected):
 def test_axis_budget_never_exceeds_max_tokens_p4():
     """A23 : l'invariant Anthropic `max_tokens > budget_tokens` est
     structurellement respecté — on n'émet plus aucun budget (L16)."""
-    out = pm.openai_to_anthropic_request(
-        {**CHAT_BODY, "reasoning_effort": "high", "max_tokens": 512}
-    )
+    out = pm.openai_to_anthropic_request({**CHAT_BODY, "reasoning_effort": "high", "max_tokens": 512})
     budget = out.get("thinking", {}).get("budget_tokens")
     assert budget is None or budget < out["max_tokens"], (
         f"P4 : budget_tokens={budget} >= max_tokens={out.get('max_tokens')} → 400 (A23)."
@@ -226,10 +215,7 @@ def test_axis_min_tokens_floor_p3_is_wired():
         pytest.skip("opencode non importé dans ce contexte de test (import lourd)")
     src = inspect.getsource(sys.modules["opencode"].chat_completions)
     # On ignore les commentaires : ils citent le nom sans appeler la fonction.
-    calls = [
-        line for line in src.splitlines()
-        if "ensure_min_tokens" in line and not line.lstrip().startswith("#")
-    ]
+    calls = [line for line in src.splitlines() if "ensure_min_tokens" in line and not line.lstrip().startswith("#")]
     assert calls, "P3 n'appelle toujours pas ensure_min_tokens (A4 non corrigée)."
     assert any("ensure_min_tokens(body)" in line for line in calls), (
         "l'appel doit porter sur le corps de la requête : ensure_min_tokens(body)"
@@ -341,9 +327,7 @@ def test_axis_tools_choice_dict_to_dict():
 
 def test_axis_tools_choice_any_becomes_required():
     """P4 : `any` (Anthropic) → `required` (OpenAI), pas `auto`."""
-    out = pm.anthropic_to_openai(
-        {**ANTHRO_BODY_FULL, "tool_choice": {"type": "any"}}, "deepseek-v4-flash"
-    )
+    out = pm.anthropic_to_openai({**ANTHRO_BODY_FULL, "tool_choice": {"type": "any"}}, "deepseek-v4-flash")
     assert out["tool_choice"] == "required"
 
 
@@ -381,9 +365,7 @@ def test_axis_document_url_p2_becomes_file():
     }
     out = pm.anthropic_to_openai(body, "deepseek-v4-flash")
     dumped = str(out)
-    assert "example.com/a.pdf" in dumped, (
-        "l'URL du document est perdue : ni `file` ni repli texte (A9)."
-    )
+    assert "example.com/a.pdf" in dumped, "l'URL du document est perdue : ni `file` ni repli texte (A9)."
 
 
 def test_axis_document_url_responses_p6():
@@ -405,9 +387,7 @@ def test_axis_document_url_responses_p6():
 
 # ────────────────────────── Axe 9 : images ──────────────────────────
 
-_B64_PNG = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
-)
+_B64_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
 
 def test_axis_image_p2_becomes_image_url():
@@ -440,9 +420,7 @@ def test_axis_image_in_tool_result_p2():
             {"role": "user", "content": "prends une capture"},
             {
                 "role": "assistant",
-                "content": [
-                    {"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}
-                ],
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}],
             },
             {
                 "role": "user",
@@ -499,13 +477,14 @@ def test_axis_token_estimate_ignores_media_size():
             "source": {"type": "base64", "media_type": "image/png", "data": _B64_PNG * 500},
         }
     ]
+
     def body(content):
         return {"model": "t", "max_tokens": 128, "messages": [{"role": "user", "content": content}]}
+
     n_small = estimate_input_tokens(body(small))
     n_huge = estimate_input_tokens(body(huge))
     assert n_huge > n_small, (
-        "l'estimation ignore toujours la taille des médias : une grande image "
-        "doit coûter plus qu'une petite (A10)"
+        "l'estimation ignore toujours la taille des médias : une grande image doit coûter plus qu'une petite (A10)"
     )
 
 
@@ -530,9 +509,7 @@ def test_axis_orphan_responses_input_dropped():
         {"type": "function_call_output", "call_id": "call_inexistant", "output": "x"},
     ]
     out = pm._drop_orphan_responses_input(inp)
-    assert not any(i.get("type") == "function_call_output" for i in out), (
-        "orphelin Responses non retiré (A8)."
-    )
+    assert not any(i.get("type") == "function_call_output" for i in out), "orphelin Responses non retiré (A8)."
 
 
 # ─────────────── Axe 12 : ordre des blocs en réponse ───────────────
@@ -627,9 +604,7 @@ def test_axis_responses_stream_is_incremental():
     if "opencode" not in sys.modules:
         pytest.skip("opencode non importé dans ce contexte de test (import lourd)")
     src = inspect.getsource(sys.modules["opencode"])
-    assert "responses_stream_events(" in src, (
-        "A11 régressé : le handler ne construit plus de séquence incrémentale."
-    )
+    assert "responses_stream_events(" in src, "A11 régressé : le handler ne construit plus de séquence incrémentale."
 
 
 def test_axis_chat_stream_conversion_produces_deltas():
@@ -638,9 +613,7 @@ def test_axis_chat_stream_conversion_produces_deltas():
     Format d'entrée = JSON nu (sans préfixe `data: `) : c'est ce que documente
     le golden `sse_deltas`.
     """
-    out = pm._responses_sse_to_chat_deltas(
-        '{"type":"response.output_text.delta","delta":"Bonjour"}'
-    )
+    out = pm._responses_sse_to_chat_deltas('{"type":"response.output_text.delta","delta":"Bonjour"}')
     assert out, "aucun delta produit pour un fragment Responses."
     assert out["choices"][0]["delta"]["content"] == "Bonjour"
 
@@ -649,8 +622,7 @@ def test_axis_responses_reasoning_delta_becomes_reasoning_content():
     """P4 stream : le résumé de raisonnement Responses alimente
     `reasoning_content` (transport du raisonnement vers un client Chat)."""
     out = pm._responses_sse_to_chat_deltas(
-        '{"type":"response.content_part.delta",'
-        '"delta":{"type":"reasoning_summary_text","text":"hm"}}'
+        '{"type":"response.content_part.delta","delta":{"type":"reasoning_summary_text","text":"hm"}}'
     )
     assert out["choices"][0]["delta"]["reasoning_content"] == "hm"
 

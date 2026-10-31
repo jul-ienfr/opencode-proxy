@@ -45,9 +45,9 @@
       }
     ],
     "usage": {
-      "prompt_tokens": 11,
+      "prompt_tokens": 14,
       "completion_tokens": 7,
-      "total_tokens": 18,
+      "total_tokens": 21,
       "prompt_tokens_details": {
         "cached_tokens": 3
       }

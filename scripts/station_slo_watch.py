@@ -53,7 +53,7 @@ def _metric_value(line: str) -> float:
 
 def _parse_metrics(text: str) -> dict:
     """Extrait les compteurs utiles, sans dépendance Prometheus."""
-    out = {
+    out: dict = {
         "rotations": {},
         "fallback": {},
         "free_status": {},

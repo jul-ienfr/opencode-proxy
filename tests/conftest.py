@@ -122,6 +122,74 @@ def _reset_curl_pool():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_key_pauser_file(tmp_path, monkeypatch):
+    """Le fichier de pauses des clés appartient au proxy **live**.
+
+    Sans isolation, un test qui pause une clé écrit dans
+    ``logs/paused_keys.yaml`` : le prochain démarrage du proxy recharge une
+    pause de test (incident mesuré le 2026-10-29 : `/health` affichait
+    ``key paused: … (test)`` et les vraies pauses 401 avaient disparu).
+    On ne patche que si ``opencode`` est déjà importé, pour ne pas casser les
+    tests qui vérifient justement la paresse de l'import.
+    """
+    import sys
+
+    module = sys.modules.get("opencode")
+    if module is not None:
+        try:
+            monkeypatch.setattr(
+                module._KeyPauser,
+                "_PAUSED_FILE",
+                str(tmp_path / "paused_keys.yaml"),
+            )
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _freeze_config_hot_reload():
+    """[audit 2026-10-30] A leftover config.yaml mtime made a later test
+    trigger maybe_reload_custom_routes() mid-test; the reload replaced
+    IP_ROTATION and reset strict_free=True, causing order-dependent
+    failures (test_hedge_all_429_marks_all_stations). Pin the mtimes at
+    setup; hot-reload tests explicitly re-arm them.
+    """
+    try:
+        import time as _time
+
+        import config.settings as _cs
+
+        _cs._config_yaml_mtime = _cs._get_mtime(_cs.CONFIG_PATH)
+        _cs._custom_routes_mtime = _cs._get_mtime(_cs.CUSTOM_ROUTES_PATH)
+        _cs._custom_routes_last_check = _time.time()
+    except Exception:
+        pass
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pool_state_file(tmp_path, monkeypatch):
+    """[audit 2026-10-30] ``logs/free_pool.json`` appartient au proxy live.
+
+    Les tests qui appellent ``save_pool_state()`` (bad-mark, quota, rotation)
+    ?crivaient des sids/IP de test dans l'?tat du pool r?el. On redirige le
+    chemin vers tmp_path pour toute la dur?e de la suite.
+    """
+    try:
+        import free.pool as _fp
+
+        monkeypatch.setattr(
+            _fp.FreeIPPool,
+            "_pool_state_file",
+            lambda self: str(tmp_path / "free_pool.json"),
+        )
+    except Exception:
+        pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_global_429():
     """[FIX EOF nu] Coupe-circuit 429 global remis à neuf entre tests.
 

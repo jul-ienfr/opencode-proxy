@@ -30,12 +30,19 @@ importer ce module au top (règle anti-cycles ``config/*``).
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 
 logger = logging.getLogger("config.settings")
 
 #: Nom de la clé sous ``models.<id>`` (lisible en live, datée à la main).
 LIMIT_KEY = "output_limit"
+#: Surcharge locale de la fenêtre de contexte (sinon catalogue).
+CONTEXT_KEY = "context_limit"
+
+#: Cache du catalogue de routes (mtime, {model: context_limit}).
+_CATALOG_LIMITS_CACHE: tuple[float, dict] | None = None
 
 #: Parité officielle v2 (`model-request.ts:49-57`) : fallback quand le
 #: catalogue ne donne rien, cap absolu, plancher du calcul de place.
@@ -133,6 +140,59 @@ def clamp_output_token_limit(limit, model):
     return value
 
 
+def _catalog_context_limits() -> dict:
+    """``{model_id: context_limit}`` depuis ``catalog_routes.json`` (cache mtime)."""
+    global _CATALOG_LIMITS_CACHE
+    path = Path(__file__).with_name("catalog_routes.json")
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    if _CATALOG_LIMITS_CACHE is not None and _CATALOG_LIMITS_CACHE[0] == mtime:
+        return _CATALOG_LIMITS_CACHE[1]
+    out: dict[str, int] = {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for leg in (data.get("providers") or {}).values():
+            for model_id, route in (leg or {}).items():
+                limit = route.get("limit") if isinstance(route, dict) else None
+                if not isinstance(limit, dict):
+                    continue
+                try:
+                    # Parité `calculateCeiling` : `limit.input || limit.context`.
+                    ctx = int(limit.get("input") or limit.get("context") or 0)
+                except (TypeError, ValueError):
+                    ctx = 0
+                if ctx > 0 and model_id not in out:
+                    out[str(model_id)] = ctx
+    except Exception:
+        out = {}
+    _CATALOG_LIMITS_CACHE = (mtime, out)
+    return out
+
+
+def context_limit(model) -> int | None:
+    """Fenêtre de contexte (tokens) du modèle, ou ``None`` si inconnue.
+
+    Priorité : ``models.<id>.context_limit`` (config locale) puis catalogue
+    ``catalog_routes.json``. Sert au déclencheur proactif officiel
+    ``context_limit - buffer``.
+    """
+    name = str(model or "").strip()
+    if not name:
+        return None
+    table = _models_table()
+    entry = table.get(name)
+    if entry is None and name.lower() != name:
+        entry = table.get(name.lower())
+    if isinstance(entry, dict):
+        value = _coerce_limit(entry.get(CONTEXT_KEY))
+        if value is not None:
+            return value
+    catalog = _catalog_context_limits()
+    return catalog.get(name) or catalog.get(name.lower())
+
+
 def output_limit_with_fallback(model) -> int:
     """Limite modèle v2 : `min(catalogue.output ou 32k fallback, 256k cap)`."""
     cap = output_limit(model)
@@ -140,4 +200,14 @@ def output_limit_with_fallback(model) -> int:
     return base if base <= OUTPUT_TOKEN_MAX else OUTPUT_TOKEN_MAX
 
 
-__all__ = ["LIMIT_KEY", "OUTPUT_TOKEN_FALLBACK", "OUTPUT_TOKEN_MAX", "OUTPUT_TOKEN_MIN", "clamp_output_token_limit", "output_limit", "output_limit_with_fallback"]
+__all__ = [
+    "CONTEXT_KEY",
+    "LIMIT_KEY",
+    "OUTPUT_TOKEN_FALLBACK",
+    "OUTPUT_TOKEN_MAX",
+    "OUTPUT_TOKEN_MIN",
+    "clamp_output_token_limit",
+    "context_limit",
+    "output_limit",
+    "output_limit_with_fallback",
+]

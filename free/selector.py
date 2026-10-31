@@ -12,6 +12,7 @@ passe les stations déjà filtrées par `_station_usable`.
 from __future__ import annotations
 
 import random
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -64,22 +65,45 @@ class StationSelector:
 
         sid = int(getattr(station, "_station", -1))
         ip = str(getattr(station, "current_ip", "") or "unknown")
-        used, limit, load, _ = self._stats(station)
+        used, limit, load, inflight = self._stats(station)
         item = self.quality.get(sid, ip)
-        return item.score(
+        base = item.score(
             self.cfg,
             quota_used=used,
             quota_limit=limit or 1,
             server_load=load,
             now=float(now if now is not None else _time.monotonic()),
         )
+        try:
+            n = int(inflight or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            # [P1] Une station déjà chargée cède la place avant saturation de
+            # ses sessions ; à 0 in-flight le score reste inchangé.
+            base = max(
+                0.0,
+                base - min(float(self.cfg.inflight_penalty_max), float(self.cfg.inflight_penalty) * n),
+            )
+        return base
+
+    def _item(self, station: Any):
+        sid = int(getattr(station, "_station", -1))
+        ip = str(getattr(station, "current_ip", "") or "unknown")
+        return self.quality.get(sid, ip)
 
     def _has_observation(self, station: Any) -> bool:
         try:
-            sid = int(getattr(station, "_station", -1))
-            ip = str(getattr(station, "current_ip", "") or "unknown")
-            item = self.quality.get(sid, ip)
+            item = self._item(station)
             return item.count > 0 or bool(item.last_probe_at)
+        except Exception:
+            return False
+
+    def _is_cold(self, station: Any, now: float) -> bool:
+        """Station jamais mesurée en fin de flux (tok/s inconnu)."""
+        try:
+            item = self._item(station)
+            return item.tps_n == 0 and not item.is_slow_lane(now)
         except Exception:
             return False
 
@@ -118,9 +142,15 @@ class StationSelector:
             return ranked[0]
         # Exploration bornée : évite de coller à une station dont le score
         # est momentanément biaisé (probe froide, endpoint local).
+        # [P1 29/10] Si des stations n'ont AUCUN échantillon tok/s, les tirer
+        # au hasard parmi elles (pas seulement ranked[1]) : sinon elles
+        # restent froides à vie et le fallback est inconnu.
         try:
             if len(ranked) > 1 and (self._rng() * 100.0) < self.cfg.exploration_pct:
-                return ranked[1]
+                _now = time.monotonic()
+                _cold = [st for st in ranked[1:] if self._is_cold(st, _now)]
+                _pool = _cold or ranked[1:]
+                return _pool[min(len(_pool) - 1, int(self._rng() * len(_pool)))]
         except Exception:
             pass
         # Si les deux meilleurs sont dans le bruit, choisir la moins chargée
@@ -130,11 +160,13 @@ class StationSelector:
                 s0 = self.score(ranked[0])
                 s1 = self.score(ranked[1])
                 if abs(s0 - s1) < 0.03:
+
                     def _used(st):
                         try:
                             return int(getattr(st, "_requests_this_ip", 0) or 0)
                         except Exception:
                             return 0
+
                     return min((ranked[0], ranked[1]), key=_used)
             except Exception:
                 pass

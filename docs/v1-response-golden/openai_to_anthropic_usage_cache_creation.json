@@ -45,6 +45,6 @@
       "cache_read_input_tokens": 40
     }
   },
-  "_note": "axe usage cache creation (A6) : prompt_tokens_details → cache_read 40 / cache_creation 60 ; input Anthropic = 100 − 40 − 60 = 0 (le client additionne les trois)",
+  "_note": "axe usage cache creation (A6) : prompt_tokens_details → cache_read 40 / cache_creation 60",
   "_generated_by": "scripts/gen_golden_fixtures.py (plan v10 §11.5)"
 }

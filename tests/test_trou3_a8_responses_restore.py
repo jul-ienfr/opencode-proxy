@@ -257,8 +257,7 @@ def test_p5_upstream_short_name_is_restored_to_client(client, recorder):
     assert status == 200
     got = _client_tool_name_from_responses(text)
     assert got == LONG_NAME, (
-        f"P5 : le client reçoit {got!r} au lieu de {LONG_NAME!r} — "
-        "outil jamais envoyé par le client, donc non routable"
+        f"P5 : le client reçoit {got!r} au lieu de {LONG_NAME!r} — outil jamais envoyé par le client, donc non routable"
     )
 
 

@@ -62,6 +62,7 @@ def _get_encoding() -> Any:
             _encoding = None
     return _encoding
 
+
 # ── orjson fast-path (5-10x vs stdlib json on large bodies) ──
 # (import fail-fast en tête de fichier — cf. note Lot 1 ci-dessus)
 
@@ -405,7 +406,8 @@ def _clamp_max_output_tokens(value: int, model_id: str) -> int:
     return value
 
 
-def _set_output_token_limit(    target: dict,
+def _set_output_token_limit(
+    target: dict,
     source: dict,
     model: str,
     default: int | None = 32000,
@@ -480,10 +482,7 @@ def _set_output_token_limit(    target: dict,
         target["max_tokens"] = limit
     elif _wants_max_completion_tokens(model):
         target["max_completion_tokens"] = limit
-        _debug(
-            f"  [convert] {model}: max_tokens→max_completion_tokens={limit} "
-            f"(modèle de raisonnement, B2)"
-        )
+        _debug(f"  [convert] {model}: max_tokens→max_completion_tokens={limit} (modèle de raisonnement, B2)")
     else:
         target["max_tokens"] = limit
     return limit
@@ -548,9 +547,13 @@ def _extract_text(content) -> str:
                 elif i.get("type") == "thinking":
                     parts.append(i.get("thinking", ""))
                 elif i.get("type") == "image":
-                    parts.append(f"[image:{i.get('source', {}).get('type', 'unknown')}]")
+                    _src = i.get("source")
+                    _stype = _src.get("type", "unknown") if isinstance(_src, dict) else "unknown"
+                    parts.append(f"[image:{_stype}]")
                 elif i.get("type") == "document":
-                    parts.append(f"[document:{i.get('source', {}).get('type', 'unknown')}]")
+                    _src_d = i.get("source")
+                    _stype_d = _src_d.get("type", "unknown") if isinstance(_src_d, dict) else "unknown"
+                    parts.append(f"[document:{_stype_d}]")
                 elif i.get("type") == "input_audio":
                     _af = (
                         (i.get("input_audio") or {}).get("format", "unknown")
@@ -811,6 +814,7 @@ def _enforce_cache_breakpoint_limit(result: dict) -> dict:
             slots.append(t)
 
     excess = total - ANTHROPIC_MAX_CACHE_BREAKPOINTS
+
     # C2 : un breakpoint client `ttl: 1h` (cache long, coûteux à réchauffer)
     # survit à un breakpoint auto 5 min — on sacrifie d'abord les breakpoints
     # sans TTL explicite, à ancienneté égale.
@@ -921,11 +925,16 @@ def _restructure_for_cache(oai_body: dict, model_id: str) -> dict:
     dynamic_part = sys_content[split_point:].strip()
 
     # Rebuild: static system message with cache_control + dynamic as user message
+    # [audit 2026-10-30] Preserve the client's cache_control (notably ttl:1h)
+    # instead of replacing it with a fresh default ephemeral breakpoint.
+    _sys_cc = messages[sys_idx].get("cache_control")
+    _static_cc = dict(_sys_cc) if isinstance(_sys_cc, dict) else {"type": "ephemeral"}
+    _static_cc.setdefault("type", "ephemeral")
     new_messages = [
         {
             "role": "system",
             "content": static_part,
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": _static_cc,
         }
     ]
 
@@ -1636,7 +1645,11 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                     _ubt = "?"
                 _debug(f"  [convert] server/block type={_ubt!r} sans équivalent Chat → placeholder texte")
                 try:
-                    _ph = _json_dumps_str(block, ensure_ascii=False)[:2000] if isinstance(block, dict) else str(block)[:2000]
+                    _ph = (
+                        _json_dumps_str(block, ensure_ascii=False)[:2000]
+                        if isinstance(block, dict)
+                        else str(block)[:2000]
+                    )
                 except Exception:
                     _ph = str(_ubt)
                 text_parts.append(f"[{_ubt}: {_ph}]")
@@ -1810,9 +1823,7 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
                     )
                 else:
                     # type without name, e.g., {"type":"web_search_2025_03_05"} -> keep
-                    oai_tools.append(
-                        _carry_cc({"type": t_type, "name": t.get("name", "web_search")}, t)
-                    )
+                    oai_tools.append(_carry_cc({"type": t_type, "name": t.get("name", "web_search")}, t))
                 continue
             if "name" in t:
                 # Anthropic format: {"name": "...", "description": "...", "input_schema": {...}}
@@ -1850,9 +1861,7 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
             else:
                 # Unknown format: B4 fix - don't produce {"name":""}; check if web_* type without name
                 if isinstance(t_type, str) and t_type.startswith("web_"):
-                    oai_tools.append(
-                        _carry_cc({"type": t_type, "name": t.get("name", "web_search")}, t)
-                    )
+                    oai_tools.append(_carry_cc({"type": t_type, "name": t.get("name", "web_search")}, t))
                 elif t.get("name"):
                     params = _normalize_tool_schema(t.get("input_schema", t.get("parameters", {})) or {}, model)
                     oai_tools.append(
@@ -1986,14 +1995,24 @@ def anthropic_to_openai(body: dict, model: str, raw: bytes | None = None) -> dic
     # le retry-once des items ``reasoning`` de ``/responses``.
     # Le raisonnement est un ENRICHISSEMENT, jamais un bloquant : on dégrade
     # (perte de la mémoire du raisonnement) plutôt que d'échouer.
-    _final = _restructure_for_cache(_close_cache(oai), model)
+    # [audit 2026-10-30] _restructure_for_cache adds a system breakpoint
+    # AFTER _close_cache enforced the 4-breakpoint cap. Re-enforce after.
+    _final = _enforce_cache_breakpoint_limit(_restructure_for_cache(_close_cache(oai), model))
     # Parité officielle : jamais de drop silencieux des champs top-level sans
     # équivalent Chat. Un seul `_debug` groupé (pas de bruit par requête OK).
     try:
-        _ignored = [k for k in (
-            "top_k", "container", "mcp_servers", "context_management",
-            "inference_geo", "diagnostics",
-        ) if k in body]
+        _ignored = [
+            k
+            for k in (
+                "top_k",
+                "container",
+                "mcp_servers",
+                "context_management",
+                "inference_geo",
+                "diagnostics",
+            )
+            if k in body
+        ]
         _oc = body.get("output_config") if isinstance(body.get("output_config"), dict) else None
         if isinstance(_oc, dict) and any(k in _oc for k in ("format", "task_budget")):
             _ignored.append("output_config.format/task_budget")
@@ -2020,6 +2039,10 @@ _orig_anthropic_to_openai = anthropic_to_openai
 # gelerait le contenu à 512 entrées — plus aucun nouveau body mis en cache).
 _anthropic_cache: OrderedDict = OrderedDict()
 _anthropic_cache_max = 512
+# [audit 2026-10-30] Bound by BYTES too: 512 entries x 10 MB bodies (images/
+# documents base64) could retain ~5 GB. 64 MB cap keeps the RSS bounded.
+_anthropic_cache_bytes = 0
+_anthropic_cache_max_bytes = 64 * 1024 * 1024
 
 # [plan Lot 0] compteurs hit-rate exposition /metrics (fail-soft, zéro lock :
 # incréments GIL-atomiques suffisent pour de l'observabilité).
@@ -2032,7 +2055,14 @@ def conversion_cache_stats() -> dict:
     hit = _conversion_hits
     miss = _conversion_misses
     total = hit + miss
-    return {"hit": hit, "miss": miss, "hit_rate": (hit / total) if total else 0.0}
+    return {
+        "hit": hit,
+        "miss": miss,
+        "hit_rate": (hit / total) if total else 0.0,
+        "size": len(_anthropic_cache),
+        "bytes": _anthropic_cache_bytes,
+        "max_bytes": _anthropic_cache_max_bytes,
+    }
 
 
 def _conversion_epoch() -> int:
@@ -2206,6 +2236,14 @@ def strip_synthetic_thinking(body: dict) -> int:
                 continue
             kept.append(block)
         msg["content"] = kept
+    # [audit 2026-10-30] Removing a synthetic thinking block can leave an
+    # assistant message with content:[] (reasoning-only turn). Anthropic
+    # rejects empty content in 400, so re-filter the emptied messages.
+    if stripped:
+        try:
+            body["messages"] = filter_empty_anthropic_messages(body.get("messages") or [])
+        except Exception:
+            pass
     return stripped
 
 
@@ -2280,13 +2318,21 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
     """Convert OpenAI Chat Completions request → Anthropic Messages format."""
     system_text = ""
     pending_tool_results = []
+    emitted_tool_ids: set[str] = set()
     anthro_messages = []
 
     for msg in oai_body.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
         role = msg.get("role", "")
 
         if role == "system":
-            system_text = _extract_text(msg.get("content", ""))
+            # [audit 2026-10-30] OpenAI allows several system/developer
+            # messages. The previous code overwrote ``system_text`` and kept
+            # only the last one; preserve order instead.
+            _sys_text = _extract_text(msg.get("content", ""))
+            if _sys_text:
+                system_text = f"{system_text}\n\n{_sys_text}" if system_text else _sys_text
             continue
 
         if role == "developer":
@@ -2368,7 +2414,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                                     "source": {"type": "base64", "media_type": _o_fm, "data": _o_fd},
                                 }
                                 if _o_fname:
-                                    _o_doc["name"] = _o_fname
+                                    _o_doc["title"] = _o_fname
                                 _o_tr_blocks.append(_o_doc)
                             elif _o_ffid:
                                 _o_tr_blocks.append(
@@ -2383,7 +2429,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                                         "type": "document",
                                         "source": {"type": "url", "url": _o_fdata},
                                     }
-                                    _o_doc2["name"] = _o_fname
+                                    _o_doc2["title"] = _o_fname
                                     _o_tr_blocks.append(_o_doc2)
                                 else:
                                     _debug(f"  [convert] DROP tool file URL non-PDF {_o_fdata!r} → placeholder")
@@ -2398,10 +2444,23 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                 _o_tr_content: str | list = _o_tr_blocks[0]["text"]
             else:
                 _o_tr_content = _o_tr_blocks or _extract_text(_o_tool_content)
+            # [audit 2026-10-30] Symmetric ID scrubbing + orphan guard.
+            # ``tool_use`` ids are scrubbed/anonymised by _tool_id_or_stable;
+            # the result must carry the SAME id. A result whose call was
+            # skipped (empty tool name) or never emitted is dropped instead
+            # of becoming an Anthropic 400.
+            _tid_raw = msg.get("tool_call_id", "")
+            _tid = scrub_claude_tool_id(_tid_raw) if isinstance(_tid_raw, str) and _tid_raw.strip() else ""
+            if not _tid:
+                _debug(f"  [convert] SKIP tool_result without tool_call_id ({role})")
+                continue
+            if _tid not in emitted_tool_ids:
+                _debug(f"  [convert] SKIP orphan tool_result id={_tid!r} (no emitted tool_use)")
+                continue
             pending_tool_results.append(
                 {
                     "type": "tool_result",
-                    "tool_use_id": msg.get("tool_call_id", ""),
+                    "tool_use_id": _tid,
                     "content": _o_tr_content,
                 }
             )
@@ -2412,9 +2471,17 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
 
         blocks = []
 
-        # Prepend pending tool_results to the next user message
-        if role == "user" and pending_tool_results:
-            blocks.extend(pending_tool_results)
+        # [audit 2026-10-30] Anthropic requires every tool_use to be followed
+        # IMMEDIATELY by a user message carrying its tool_result. A Chat
+        # history is assistant(tool_calls) → tool → assistant(final): the old
+        # code only flushed on the next ``user`` message, so the final
+        # assistant was emitted before the tool_result and upstream returned
+        # 400. Flush as a user turn before ANY non-tool message.
+        if pending_tool_results:
+            if role == "user":
+                blocks.extend(pending_tool_results)
+            else:
+                anthro_messages.append({"role": "user", "content": list(pending_tool_results)})
             pending_tool_results = []
 
         # Convert content
@@ -2516,10 +2583,12 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                 inp = _json_loads(fn.get("arguments", "{}"))
             except Exception:
                 inp = {}
+            _tool_id = _tool_id_or_stable(tc.get("id"), "toolu_", len(blocks))
+            emitted_tool_ids.add(_tool_id)
             blocks.append(
                 {
                     "type": "tool_use",
-                    "id": _tool_id_or_stable(tc.get("id"), "toolu_", len(blocks)),
+                    "id": _tool_id,
                     "name": _tname,
                     "input": inp,
                 }
@@ -2572,21 +2641,25 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
     # [Lot L14 — A17] Lit `max_tokens` ET `max_completion_tokens` : la forme
     # moderne était ignorée, la limite du client remplacée par le défaut 16384.
     # Destination Anthropic → toujours `max_tokens`.
-    _set_output_token_limit(
-        result, oai_body, oai_body.get("model", ""), target_protocol="anthropic"
-    )
+    _set_output_token_limit(result, oai_body, oai_body.get("model", ""), target_protocol="anthropic")
 
     if system_text:
         result["system"] = system_text
 
-    # Map simple params
-    for key, anthro_key in [
-        ("temperature", "temperature"),
-        ("top_p", "top_p"),
-        ("stop", "stop_sequences"),
-    ]:
-        if key in oai_body:
-            result[anthro_key] = oai_body[key]
+    # Map simple params. [audit 2026-10-30] Anthropic validates these more
+    # strictly than Chat: ``stop`` is an array (a Chat string must be wrapped),
+    # temperature/top_p are 0..1. Forwarding a valid Chat value verbatim
+    # produced a 400 on every Anthropic target.
+    if "temperature" in oai_body and isinstance(oai_body["temperature"], (int, float)):
+        result["temperature"] = max(0.0, min(1.0, float(oai_body["temperature"])))
+    if "top_p" in oai_body and isinstance(oai_body["top_p"], (int, float)):
+        result["top_p"] = max(0.0, min(1.0, float(oai_body["top_p"])))
+    if "stop" in oai_body:
+        _stop = oai_body["stop"]
+        if isinstance(_stop, str):
+            result["stop_sequences"] = [_stop]
+        elif isinstance(_stop, list):
+            result["stop_sequences"] = [s for s in _stop if isinstance(s, str)]
 
     # Parité SDK : metadata/service_tier valides côté Anthropic, user → user_id.
     _relay_anthropic_optional_fields(result, oai_body)
@@ -2668,6 +2741,10 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
                 result["tool_choice"] = {"type": "auto"}
         else:
             result["tool_choice"] = {"type": "auto"}
+        # [audit 2026-10-30] Chat/Responses `parallel_tool_calls:false` maps
+        # to Anthropic's disable_parallel_tool_use on the tool_choice object.
+        if oai_body.get("parallel_tool_calls") is False and isinstance(result.get("tool_choice"), dict):
+            result["tool_choice"]["disable_parallel_tool_use"] = True
 
     # [Lot H4 / Lot L2] Sens inverse de _effort_to_reasoning : un client OpenAI
     # qui envoie reasoning_effort doit obtenir une config thinking Anthropic
@@ -2687,9 +2764,7 @@ def openai_to_anthropic_request(oai_body: dict) -> dict:
     # output_config.effort, qui ne porte aucun budget.
     _decision = _resolve_effort(oai_body, result.get("model", ""))
     if _decision.wants and _decision.level:
-        _apply_anthropic_effort(
-            result, _decision.level, result.get("model", ""), source=_decision.source
-        )
+        _apply_anthropic_effort(result, _decision.level, result.get("model", ""), source=_decision.source)
 
     return result
 
@@ -2712,9 +2787,7 @@ def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
         elif t == "tool_use":
             tool_calls.append(
                 {
-                    "id": _tool_id_or_stable(
-                        block.get("id"), "call_", block.get("name", ""), len(tool_calls)
-                    ),
+                    "id": _tool_id_or_stable(block.get("id"), "call_", block.get("name", ""), len(tool_calls)),
                     "type": "function",
                     "function": {
                         "name": block.get("name", ""),
@@ -2729,19 +2802,28 @@ def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
         finish = "length"
     elif sr == "tool_use":
         finish = "tool_calls"
+    elif sr in ("refusal", "content_filter"):
+        # [audit 2026-10-30] A safety refusal is not a normal stop.
+        finish = "content_filter"
     else:
         finish = "stop"
 
-    # Usage mapping
-    usage = anthro.get("usage", {})
-    prompt_tokens = usage.get("input_tokens", 0)
-    completion_tokens = usage.get("output_tokens", 0)
+    # Usage mapping. [audit 2026-10-30] Anthropic reports NON-cached input;
+    # OpenAI Chat reports an INCLUSIVE prompt total. The old code copied the
+    # non-cached value, so a 97 + 87 552-cache response became prompt_tokens
+    # = 97 (cached_tokens > prompt_tokens) and clients under-estimated their
+    # context by ~900x, defeating auto-compaction.
+    usage = anthro.get("usage", {}) if isinstance(anthro.get("usage"), dict) else {}
+    _non_cached = _usage_int(usage.get("input_tokens"))
+    cache_read = _usage_int(usage.get("cache_read_input_tokens"))
+    cache_creation = _usage_int(usage.get("cache_creation_input_tokens"))
+    prompt_tokens = _non_cached + cache_read + cache_creation
+    completion_tokens = _usage_int(usage.get("output_tokens"))
     oai_usage = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
     }
-    cache_read = usage.get("cache_read_input_tokens", 0)
     if cache_read:
         oai_usage["prompt_tokens_details"] = {"cached_tokens": cache_read}
 
@@ -2773,7 +2855,7 @@ def anthropic_to_openai_response(anthro: dict, model: str) -> dict:
 
 def _responses_part_to_anthropic(part: dict) -> dict | None:
     """Convertit une part Responses input_image/input_file → bloc Anthropic
-    natif (image/document + name). Factorise la logique de
+    natif (image/document + title). Factorise la logique de
     openai_responses_to_anthropic (boucle principale + function_call_output
     liste). None si inconvertible. Défensif : jamais d'exception."""
     if not isinstance(part, dict):
@@ -2838,7 +2920,7 @@ def _responses_part_to_anthropic(part: dict) -> dict | None:
                     "source": {"type": "base64", "media_type": _r_fm, "data": _r_fd},
                 }
                 if _r_fname:
-                    _r_doc["name"] = _r_fname
+                    _r_doc["title"] = _r_fname
                 return _r_doc
             return None
         elif _r_fdata:
@@ -2851,17 +2933,23 @@ def _responses_part_to_anthropic(part: dict) -> dict | None:
                 },
             }
             if _r_fname:
-                _r_doc2["name"] = _r_fname
+                _r_doc2["title"] = _r_fname
             return _r_doc2
         elif _r_ffid:
             return {"type": "document", "source": {"type": "file", "file_id": _r_ffid}}
         elif _r_furl:
+            # [audit 2026-10-30] Anthropic only guarantees URL documents for
+            # PDF; sending a .txt/.docx URL is a 400. Mirror P4: placeholder.
+            _furl_path = str(_r_furl).split("?", 1)[0].lower()
+            if not _furl_path.endswith(".pdf"):
+                _debug(f"  [convert] DROP document URL non-PDF {_r_furl!r} → placeholder")
+                return {"type": "text", "text": f"[document:url:{_r_furl}]"}
             _r_doc3: dict = {
                 "type": "document",
                 "source": {"type": "url", "url": _r_furl},
             }
             if _r_fname:
-                _r_doc3["name"] = _r_fname
+                _r_doc3["title"] = _r_fname
             return _r_doc3
         return None
     return None
@@ -2886,11 +2974,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
         _raw_input = []
     _norm_input: list = []
     for _it in _raw_input:
-        if (
-            isinstance(_it, dict)
-            and _it.get("role")
-            and isinstance(_it.get("content"), str)
-        ):
+        if isinstance(_it, dict) and _it.get("role") and isinstance(_it.get("content"), str):
             _txt = _it["content"]
             _it = {
                 **_it,
@@ -2898,9 +2982,24 @@ def openai_responses_to_anthropic(body: dict) -> dict:
             }
         _norm_input.append(_it)
 
+    # [audit 2026-10-30] ``instructions`` is the canonical Responses
+    # system prompt (OpenAI SDK / Codex). It was never read, so the whole
+    # system prompt vanished when the target was Anthropic.
     system_text = ""
+    _instructions = body.get("instructions")
+    if isinstance(_instructions, str) and _instructions.strip():
+        system_text = _instructions
     pending_tool_results: list = []
     anthro_messages: list = []
+
+    # Pre-scan tool call ids so a function_call_output can be matched even
+    # if the client emitted it before the call item (defensive ordering).
+    _declared_tool_ids: set[str] = set()
+    for _it in _norm_input:
+        if isinstance(_it, dict) and _it.get("type") == "function_call":
+            _raw_id = _it.get("call_id") or _it.get("id")
+            if isinstance(_raw_id, str) and _raw_id.strip():
+                _declared_tool_ids.add(scrub_claude_tool_id(_raw_id))
 
     for item in _norm_input:
         if not isinstance(item, dict):
@@ -2909,8 +3008,10 @@ def openai_responses_to_anthropic(body: dict) -> dict:
 
         if role in ("system", "developer"):
             for block in item.get("content") or []:
-                if isinstance(block, dict) and block.get("type") == "input_text":
-                    system_text += block.get("text", "")
+                if isinstance(block, dict) and block.get("type") in ("input_text", "text", "output_text"):
+                    _sys_part = block.get("text", "")
+                    if _sys_part:
+                        system_text = f"{system_text}\n\n{_sys_part}" if system_text else _sys_part
             continue
 
         if item.get("type") == "function_call_output":
@@ -2942,10 +3043,22 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                     else:
                         _fco_blocks.append({"type": "text", "text": _fp.get("text", str(_fp))})
                 _fco_out = _fco_blocks or ""
+            _fco_raw_id = item.get("call_id") or item.get("id")
+            _fco_tid = (
+                scrub_claude_tool_id(_fco_raw_id)
+                if isinstance(_fco_raw_id, str) and _fco_raw_id.strip()
+                else ""
+            )
+            if not _fco_tid:
+                _debug("  [convert] SKIP function_call_output without call_id")
+                continue
+            if _fco_tid not in _declared_tool_ids:
+                _debug(f"  [convert] SKIP orphan function_call_output id={_fco_tid!r}")
+                continue
             pending_tool_results.append(
                 {
                     "type": "tool_result",
-                    "tool_use_id": item.get("call_id", item.get("id", "")),
+                    "tool_use_id": _fco_tid,
                     "content": _fco_out,
                 }
             )
@@ -2953,23 +3066,29 @@ def openai_responses_to_anthropic(body: dict) -> dict:
 
         # Convert previous-turn function_call items to assistant tool_use blocks
         if item.get("type") == "function_call":
+            _fc_name = item.get("name", "")
+            if not isinstance(_fc_name, str) or not _fc_name.strip():
+                _debug(f"  [convert] SKIP function_call with empty name id={item.get('call_id', '?')}")
+                continue
             try:
                 inp = _json_loads(item.get("arguments", "{}"))
             except Exception:
                 inp = {}
+            _fc_raw_id = item.get("call_id") or item.get("id")
+            _fc_tid = _tool_id_or_stable(
+                _fc_raw_id,
+                "toolu_",
+                _fc_name,
+                len(anthro_messages),
+            )
             anthro_messages.append(
                 {
                     "role": "assistant",
                     "content": [
                         {
                             "type": "tool_use",
-                            "id": _tool_id_or_stable(
-                                item.get("call_id") or item.get("id"),
-                                "toolu_",
-                                item.get("name", ""),
-                                len(anthro_messages),
-                            ),
-                            "name": item.get("name", ""),
+                            "id": _fc_tid,
+                            "name": _fc_name,
                             "input": inp,
                         }
                     ],
@@ -2981,16 +3100,29 @@ def openai_responses_to_anthropic(body: dict) -> dict:
             continue
 
         blocks = []
-        if role == "user" and pending_tool_results:
-            blocks.extend(pending_tool_results)
+        # [audit 2026-10-30] Same immediate tool_result rule as P4: an
+        # assistant final answer must not precede the tool result.
+        if pending_tool_results:
+            if role == "user":
+                blocks.extend(pending_tool_results)
+            else:
+                anthro_messages.append({"role": "user", "content": list(pending_tool_results)})
             pending_tool_results = []
 
         for block in item.get("content") or []:
             if not isinstance(block, dict):
                 continue
             btype = block.get("type", "")
-            if btype in ("input_text", "text"):
+            if btype in ("input_text", "text", "output_text"):
+                # [audit 2026-10-30] Responses assistant history uses
+                # ``output_text``. It fell through every branch and was
+                # replaced by an empty text block, erasing every previous
+                # assistant answer from the model's context.
                 blocks.append({"type": "text", "text": block.get("text", "")})
+            elif btype == "refusal":
+                _refusal = block.get("refusal", "")
+                if isinstance(_refusal, str) and _refusal:
+                    blocks.append({"type": "text", "text": _refusal})
             elif btype in ("input_image", "input_file"):
                 # Schéma Responses : input_image = image_url (data URI ou
                 # https) ou file_id ; input_file = file_data (data URI) +
@@ -3007,12 +3139,19 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 # [PLAN-raisonnement Phase D.3] pas de thinking forgé vers
                 # l'upstream Anthropic (signature cryptographique exigée) —
                 # le summary est omis de l'historique.
-                _summary = block.get("summary") or []
-                _has_text = any(isinstance(s, dict) and s.get("text") for s in _summary)
-                if _has_text:
-                    _debug(
-                        "  [convert] DROP reasoning summary historique → upstream Anthropic (pas de signature forgée)"
-                    )
+                _enc = block.get("encrypted_content")
+                if isinstance(_enc, str) and _enc:
+                    # [audit 2026-10-30] Authentic encrypted reasoning is
+                    # replayable as redacted_thinking; dropping it lost the
+                    # reasoning across a protocol switch.
+                    blocks.append({"type": "redacted_thinking", "data": _enc})
+                else:
+                    _summary = block.get("summary") or []
+                    _has_text = any(isinstance(s, dict) and s.get("text") for s in _summary)
+                    if _has_text:
+                        _debug(
+                            "  [convert] DROP reasoning summary historique → upstream Anthropic (pas de signature forgée)"
+                        )
 
         if not blocks:
             blocks.append({"type": "text", "text": ""})
@@ -3034,9 +3173,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
     # Responses (cf. `_relay_responses_storage_fields` appelé là-bas).
     # [Lot L14 — A17] Même lecture unifiée des formes de limite ; destination
     # Anthropic → toujours `max_tokens`.
-    _set_output_token_limit(
-        result, body, body.get("model", ""), target_protocol="anthropic"
-    )
+    _set_output_token_limit(result, body, body.get("model", ""), target_protocol="anthropic")
     if system_text:
         result["system"] = system_text
     if "temperature" in body:
@@ -3077,6 +3214,9 @@ def openai_responses_to_anthropic(body: dict) -> dict:
                 result["tool_choice"] = {"type": "auto"}
         else:
             result["tool_choice"] = {"type": "auto"}
+        # [audit 2026-10-30] Same mapping as P4.
+        if body.get("parallel_tool_calls") is False and isinstance(result.get("tool_choice"), dict):
+            result["tool_choice"]["disable_parallel_tool_use"] = True
 
     # Convert Anthropic thinking/effort -> model-specific reasoning parameter.
     # [Lot L2] SOURCE UNIQUE, comme P2 et P4. ``resolve_effort`` couvre
@@ -3094,9 +3234,7 @@ def openai_responses_to_anthropic(body: dict) -> dict:
     # ignorerait au mieux, rejetterait au pire.
     _decision = _resolve_effort(body, result.get("model", ""))
     if _decision.wants and _decision.level:
-        _apply_anthropic_effort(
-            result, _decision.level, result.get("model", ""), source=_decision.source
-        )
+        _apply_anthropic_effort(result, _decision.level, result.get("model", ""), source=_decision.source)
     # Parité SDK : metadata/service_tier valides côté Anthropic, user → user_id.
     _relay_anthropic_optional_fields(result, body)
 
@@ -3107,6 +3245,7 @@ def anthropic_to_openai_responses(anthro: dict, model: str, name_map: dict | Non
     """Convert Anthropic Messages response → OpenAI Responses API format."""
     content_blocks = anthro.get("content", [])
     output_items: list[dict[str, Any]] = []
+    reasoning_items: list[dict[str, Any]] = []
     text_content: list = []
     function_calls: list = []
 
@@ -3124,33 +3263,27 @@ def anthropic_to_openai_responses(anthro: dict, model: str, name_map: dict | Non
             # réellement quelque chose à résumer.
             _thinking_text = block.get("thinking") or ""
             if _thinking_text.strip():
-                output_items.insert(
-                    0,
+                reasoning_items.append(
                     {
                         "type": "reasoning",
                         "summary": [{"type": "summary_text", "text": _thinking_text}],
-                    },
+                    }
                 )
             else:
-                _debug(
-                    "  [convert] thinking display=omitted (texte vide) → "
-                    "pas d'item reasoning vide émis"
-                )
+                _debug("  [convert] thinking display=omitted (texte vide) → pas d'item reasoning vide émis")
         elif btype == "redacted_thinking":
             # Raisonnement chiffré authentique : préservé rejouable
             # (encrypted_content) au lieu d'être droppé en silence.
             _data = block.get("data", "")
             if isinstance(_data, str) and _data:
-                output_items.insert(0, {"type": "reasoning", "encrypted_content": _data, "summary": []})
+                reasoning_items.append({"type": "reasoning", "encrypted_content": _data, "summary": []})
             else:
                 _debug("  [convert] redacted_thinking sans data → droppé")
         elif btype == "tool_use":
             function_calls.append(
                 {
                     "type": "function_call",
-                    "call_id": _tool_id_or_stable(
-                        block.get("id"), "call_", block.get("name", ""), len(function_calls)
-                    ),
+                    "call_id": _tool_id_or_stable(block.get("id"), "call_", block.get("name", ""), len(function_calls)),
                     # [TROU 3 — A8] Symétrie avec ``_responses_to_anthropic_response``
                     # / ``_responses_to_chat_response`` : le nom RÉELLEMENT émis au
                     # client est le nom d'origine (la map est construite à l'aller
@@ -3163,27 +3296,34 @@ def anthropic_to_openai_responses(anthro: dict, model: str, name_map: dict | Non
                 }
             )
 
+    # [audit 2026-10-30] Preserve reasoning order (two thinking blocks used
+    # to come out reversed because each was inserted at index 0).
+    output_items = reasoning_items + output_items
     if text_content:
         output_items.append({"type": "message", "role": "assistant", "content": text_content})
     output_items.extend(function_calls)
 
     # Status mapping
     sr = anthro.get("stop_reason", "")
-    if sr == "max_tokens":
+    if sr in ("max_tokens", "refusal"):
         status = "incomplete"
     else:
         status = "completed"
 
-    # Usage mapping
-    usage = anthro.get("usage", {})
-    in_t = usage.get("input_tokens", 0)
-    out_t = usage.get("output_tokens", 0)
+    # Usage mapping. [audit 2026-10-30] Same inclusive-total rule as Chat:
+    # Responses ``input_tokens`` includes cached tokens.
+    usage = anthro.get("usage", {}) if isinstance(anthro.get("usage"), dict) else {}
+    _non_cached_resp = _usage_int(usage.get("input_tokens"))
+    _cache_read_resp = _usage_int(usage.get("cache_read_input_tokens"))
+    _cache_write_resp = _usage_int(usage.get("cache_creation_input_tokens"))
+    in_t = _non_cached_resp + _cache_read_resp + _cache_write_resp
+    out_t = _usage_int(usage.get("output_tokens"))
     oai_usage = {
         "input_tokens": in_t,
         "output_tokens": out_t,
         "total_tokens": in_t + out_t,
         "input_tokens_details": {
-            "cached_tokens": usage.get("cache_read_input_tokens", 0),
+            "cached_tokens": _cache_read_resp,
         },
         "output_tokens_details": {
             # [Lot L12 — A18] Était codé en dur à 0 : la part facturée la plus
@@ -3234,24 +3374,34 @@ def openai_chat_to_responses(chat_resp: dict, model: str, name_map: dict | None 
 
     # Text content -> message item with output_text
     content = msg.get("content", "")
+    if isinstance(content, list):
+        # [audit 2026-10-30] Some upstreams return Chat content as a list of
+        # parts; copying it verbatim produced `text: [dict]` (invalid).
+        content = "".join(
+            str(p.get("text", "")) for p in content if isinstance(p, dict)
+        )
+    elif content is None:
+        content = ""
     if content:
         output_items.append(
             {
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": content}],
+                "content": [{"type": "output_text", "text": str(content)}],
             }
         )
 
     # Tool calls -> function_call items
     for tc in msg.get("tool_calls") or []:
-        fn = tc.get("function", {})
+        fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+        _tc_name = restore_tool_name(fn.get("name", ""), name_map)
+        if not isinstance(_tc_name, str) or not _tc_name.strip():
+            _debug("  [convert] SKIP tool_call with empty name (responses response)")
+            continue
         output_items.append(
             {
                 "type": "function_call",
-                "call_id": _tool_id_or_stable(
-                    tc.get("id"), "call_", fn.get("name", ""), len(output_items)
-                ),
+                "call_id": _tool_id_or_stable(tc.get("id"), "call_", fn.get("name", ""), len(output_items)),
                 # [TROU 3 — A8] Restore-retour : le client reçoit le nom qu'il a
                 # envoyé, jamais le raccourci interne de la borne 64.
                 "name": restore_tool_name(fn.get("name", ""), name_map),
@@ -3558,7 +3708,9 @@ def unsupported_modality_error_text(modality: str, filename: str | None = None) 
 
 
 # ── Thinking moderne Anthropic (ports de transform.ts) ──
-_ANTHROPIC_VERSION_RE = re.compile(r"claude-(?:([a-z]+)-)?(\d+)(?:[.-](\d{1,2}))?(?:-([a-z]+))?(?:[.@-]|$)", re.IGNORECASE)
+_ANTHROPIC_VERSION_RE = re.compile(
+    r"claude-(?:([a-z]+)-)?(\d+)(?:[.-](\d{1,2}))?(?:-([a-z]+))?(?:[.@-]|$)", re.IGNORECASE
+)
 
 
 def anthropic_modern_adaptive_thinking(model: str) -> bool:
@@ -3688,12 +3840,7 @@ def fix_mistral_tool_user_sequence(messages: list, model: str) -> int:
     for i, m in enumerate(messages):
         out.append(m)
         nxt = messages[i + 1] if i + 1 < len(messages) else None
-        if (
-            isinstance(m, dict)
-            and m.get("role") == "tool"
-            and isinstance(nxt, dict)
-            and nxt.get("role") == "user"
-        ):
+        if isinstance(m, dict) and m.get("role") == "tool" and isinstance(nxt, dict) and nxt.get("role") == "user":
             out.append({"role": "assistant", "content": "Done."})
             inserted += 1
     if inserted:
@@ -3961,7 +4108,9 @@ def _tool_sort_key(name: str):
     caractère hors de cet alphabet la clé reste **totale** (ponctuation inconnue
     classée par code point) — aucune exception, aucun ordre non déterministe.
     """
-    prim: list[tuple[int, str]] = []
+    # (0, rang entier) pour la ponctuation, (1, casefold str) pour le reste —
+    # le 0/1 tranche avant que str et int ne se rencontrent jamais.
+    prim: list[tuple[int, str | int]] = []
     tert: list[int] = []
     for ch in name:
         if ch.isalnum():
@@ -4468,7 +4617,7 @@ def _relay_chat_optional_fields(req: dict, source: dict) -> None:
         return
     if isinstance(source.get("metadata"), dict) and source["metadata"] and "metadata" not in req:
         req["metadata"] = source["metadata"]
-    for k in ("user", "service_tier"):
+    for k in ("user", "service_tier", "prompt_cache_key"):
         v = source.get(k)
         if isinstance(v, str) and v and k not in req:
             req[k] = v
@@ -4807,9 +4956,7 @@ def _chat_to_responses_request(chat: dict) -> dict:
                     f"  [convert] SKIP function_call with empty name call_id={tc.get('call_id') or tc.get('id', '?')}"
                 )
                 continue
-            _cid = _tool_id_or_stable(
-                tc.get("call_id") or tc.get("id"), "call_", _fn_name.strip(), len(inp)
-            )
+            _cid = _tool_id_or_stable(tc.get("call_id") or tc.get("id"), "call_", _fn_name.strip(), len(inp))
             inp.append(
                 {
                     "type": "function_call",
@@ -5048,7 +5195,14 @@ def _responses_to_chat_response(resp: dict, model: str, name_map: dict | None = 
     if _cached:
         chat_usage["prompt_tokens_details"] = {"cached_tokens": _cached}
     status = resp.get("status", "completed")
-    finish = "stop" if status == "completed" else "length"
+    # [audit 2026-10-30] A response carrying tool_calls must report
+    # finish_reason="tool_calls", never "stop": several SDKs execute tools
+    # only on that signal, so the turn silently ended without running them.
+    finish = (
+        "tool_calls"
+        if tool_calls
+        else ("length" if status != "completed" else "stop")
+    )
     return {
         "id": resp.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}"),
         "object": "chat.completion",
@@ -5085,6 +5239,10 @@ def _responses_to_anthropic_response(resp: dict, model: str, name_map: dict | No
                 if isinstance(blk, dict) and blk.get("type") == "output_text" and blk.get("text"):
                     blocks.append({"type": "text", "text": blk.get("text", "")})
         elif item.get("type") == "function_call":
+            _fc_name = restore_tool_name(item.get("name", ""), name_map)
+            if not isinstance(_fc_name, str) or not _fc_name.strip():
+                _debug("  [convert] SKIP function_call with empty name (anthropic response)")
+                continue
             try:
                 inp = _json_loads(item.get("arguments", "{}"))
             except Exception:
@@ -5092,8 +5250,10 @@ def _responses_to_anthropic_response(resp: dict, model: str, name_map: dict | No
             blocks.append(
                 {
                     "type": "tool_use",
-                    "id": item.get("call_id", item.get("id", "")),
-                    "name": restore_tool_name(item.get("name", ""), name_map),
+                    "id": _tool_id_or_stable(
+                        item.get("call_id") or item.get("id"), "toolu_", _fc_name, len(blocks)
+                    ),
+                    "name": _fc_name,
                     "input": inp,
                 }
             )
@@ -5616,9 +5776,7 @@ class ResponsesStreamEmitter:
             },
         )
 
-    def content_part_done(
-        self, item_id: str, text: str, output_index: int, content_index: int = 0
-    ) -> dict:
+    def content_part_done(self, item_id: str, text: str, output_index: int, content_index: int = 0) -> dict:
         """`response.content_part.done` — ferme une part de contenu texte."""
         return self._wrap(
             "response.content_part.done",
@@ -5632,9 +5790,7 @@ class ResponsesStreamEmitter:
 
     # ── Texte ──
 
-    def text_delta(
-        self, delta: str, item_id: str, output_index: int = 0, content_index: int = 0
-    ) -> dict:
+    def text_delta(self, delta: str, item_id: str, output_index: int = 0, content_index: int = 0) -> dict:
         """`response.output_text.delta` — un fragment de texte.
 
         ``logprobs`` est présent (liste vide) : le champ est documenté dans le
@@ -5651,9 +5807,7 @@ class ResponsesStreamEmitter:
             },
         )
 
-    def text_done(
-        self, text: str, item_id: str, output_index: int = 0, content_index: int = 0
-    ) -> dict:
+    def text_done(self, text: str, item_id: str, output_index: int = 0, content_index: int = 0) -> dict:
         """`response.output_text.done` — texte complet de la part."""
         return self._wrap(
             "response.output_text.done",
@@ -5667,9 +5821,7 @@ class ResponsesStreamEmitter:
 
     # ── Raisonnement ──
 
-    def reasoning_summary_delta(
-        self, delta: str, item_id: str, output_index: int = 0, summary_index: int = 0
-    ) -> dict:
+    def reasoning_summary_delta(self, delta: str, item_id: str, output_index: int = 0, summary_index: int = 0) -> dict:
         """`response.reasoning_summary_text.delta`.
 
         B7 : ce type utilise ``summary_index`` — PAS ``content_index``. Émettre
@@ -5698,9 +5850,7 @@ class ResponsesStreamEmitter:
             {"item_id": item_id, "output_index": output_index, "delta": delta},
         )
 
-    def function_call_arguments_done(
-        self, arguments: str, item_id: str, output_index: int = 0
-    ) -> dict:
+    def function_call_arguments_done(self, arguments: str, item_id: str, output_index: int = 0) -> dict:
         """`response.function_call_arguments.done` — arguments complets."""
         return self._wrap(
             "response.function_call_arguments.done",
@@ -5714,8 +5864,12 @@ class ResponsesStreamEmitter:
     # ── Terminaison ──
 
     def completed(self, response: dict) -> dict:
-        """`response.completed` — terminal, porte l'``usage`` final."""
+        """`response.completed` - terminal, porte l'``usage`` final."""
         return self._wrap("response.completed", {"response": response})
+
+    def incomplete(self, response: dict) -> dict:
+        """`response.incomplete` - terminal pour max_tokens/refus."""
+        return self._wrap("response.incomplete", {"response": response})
 
     def failed(self, response: dict | None = None, message: str = "") -> dict:
         """`response.failed` — terminal cohérent pour un stream avorté.
@@ -5777,9 +5931,7 @@ def _empty_item_for_added(item: dict, output_index: int) -> dict:
         empty["arguments"] = ""
     elif itype == "reasoning":
         summary = item.get("summary") or []
-        empty["summary"] = [
-            {"type": "summary_text", "text": ""} if isinstance(s, dict) else s for s in summary
-        ]
+        empty["summary"] = [{"type": "summary_text", "text": ""} if isinstance(s, dict) else s for s in summary]
 
     return empty
 
@@ -5825,9 +5977,7 @@ def responses_stream_events(
             # côté client ; on émet les fragments de résumé disponibles.
             events.append(emitter.output_item_added(item, output_index))
             summary_dir = item.get("summary") or []
-            text = "".join(
-                s.get("text", "") for s in summary_dir if isinstance(s, dict) and s.get("text")
-            )
+            text = "".join(s.get("text", "") for s in summary_dir if isinstance(s, dict) and s.get("text"))
             item_id = item.get("id") or f"rs_{uuid.uuid4().hex[:16]}"
             for start in range(0, len(text), _RESPONSES_REPLAY_CHUNK):
                 chunk = text[start : start + _RESPONSES_REPLAY_CHUNK]
@@ -5863,9 +6013,7 @@ def responses_stream_events(
                 for start in range(0, len(text), _RESPONSES_REPLAY_CHUNK):
                     chunk = text[start : start + _RESPONSES_REPLAY_CHUNK]
                     if chunk:
-                        events.append(
-                            emitter.text_delta(chunk, item_id, output_index, content_index)
-                        )
+                        events.append(emitter.text_delta(chunk, item_id, output_index, content_index))
                 events.append(emitter.text_done(text, item_id, output_index, content_index))
                 events.append(emitter.content_part_done(item_id, text, output_index, content_index))
                 content_index += 1
@@ -5877,7 +6025,12 @@ def responses_stream_events(
             events.append(emitter.output_item_added(item, output_index))
             events.append(emitter.output_item_done(item, output_index))
 
-    events.append(emitter.completed(response))
+    # [audit 2026-10-30] Do not report a truncated/refused response as
+    # completed: clients that key on the terminal event would miss it.
+    if str(response.get("status") or "") == "incomplete":
+        events.append(emitter.incomplete(response))
+    else:
+        events.append(emitter.completed(response))
     return events
 
 
@@ -5890,4 +6043,3 @@ def responses_stream_sse(events: list[dict]) -> bytes:
     parts = [f"data: {_json_dumps_str(ev, ensure_ascii=False)}\n\n" for ev in events]
     parts.append("data: [DONE]\n\n")
     return "".join(parts).encode()
-

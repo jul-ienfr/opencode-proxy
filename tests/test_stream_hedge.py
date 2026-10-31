@@ -70,9 +70,17 @@ async def test_le_plus_rapide_gagne_et_le_perdant_est_ferme(monkeypatch, hedge_e
     resps = {}
 
     @asynccontextmanager
-    async def _fake_open(endpoint, body, headers, use_free, count_request=True,
-                         fresh_station=False, direct_fallback=True,
-                         forced_pool=None, forced_station=None):
+    async def _fake_open(
+        endpoint,
+        body,
+        headers,
+        use_free,
+        count_request=True,
+        fresh_station=False,
+        direct_fallback=True,
+        forced_pool=None,
+        forced_station=None,
+    ):
         if forced_station is s1:
             r = _Resp("slow", ['data: {"choices":[{"delta":{"content":"lent"}}]}'], delay=0.4)
         else:
@@ -85,13 +93,11 @@ async def test_le_plus_rapide_gagne_et_le_perdant_est_ferme(monkeypatch, hedge_e
 
     monkeypatch.setattr(oc, "_open_free_stream", _fake_open)
 
-    async with oc._open_free_stream_hedged(
-        "https://h", {"stream": True}, {}, True, True, False, True, None
-    ) as resp:
+    async with oc._open_free_stream_hedged("https://h", {"stream": True}, {}, True, True, False, True, None) as resp:
         lines = [ln async for ln in resp.aiter_lines()]
 
     assert "vite" in lines[0]
-    assert resps[2].closed is True          # perdant fermé
+    assert resps[2].closed is True  # perdant fermé
     assert pool.winners and pool.winners[0][0] is s2
 
 
@@ -103,9 +109,17 @@ async def test_pas_de_seconde_requete_si_la_primaire_repond_vite(monkeypatch, he
     opened = []
 
     @asynccontextmanager
-    async def _fake_open(endpoint, body, headers, use_free, count_request=True,
-                         fresh_station=False, direct_fallback=True,
-                         forced_pool=None, forced_station=None):
+    async def _fake_open(
+        endpoint,
+        body,
+        headers,
+        use_free,
+        count_request=True,
+        fresh_station=False,
+        direct_fallback=True,
+        forced_pool=None,
+        forced_station=None,
+    ):
         opened.append(getattr(forced_station, "_station", 0))
         r = _Resp("fast", ['data: {"choices":[{"delta":{"content":"ok"}}]}'])
         try:
@@ -115,12 +129,10 @@ async def test_pas_de_seconde_requete_si_la_primaire_repond_vite(monkeypatch, he
 
     monkeypatch.setattr(oc, "_open_free_stream", _fake_open)
 
-    async with oc._open_free_stream_hedged(
-        "https://h", {"stream": True}, {}, True, True, False, True, None
-    ) as resp:
+    async with oc._open_free_stream_hedged("https://h", {"stream": True}, {}, True, True, False, True, None) as resp:
         _ = [ln async for ln in resp.aiter_lines()]
 
-    assert opened == [1]                    # aucune 2e requête
+    assert opened == [1]  # aucune 2e requête
     assert pool.winners[0][0] is s1
 
 
@@ -131,9 +143,17 @@ async def test_429_sur_la_primaire_laisse_gagner_la_seconde(monkeypatch, hedge_e
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
 
     @asynccontextmanager
-    async def _fake_open(endpoint, body, headers, use_free, count_request=True,
-                         fresh_station=False, direct_fallback=True,
-                         forced_pool=None, forced_station=None):
+    async def _fake_open(
+        endpoint,
+        body,
+        headers,
+        use_free,
+        count_request=True,
+        fresh_station=False,
+        direct_fallback=True,
+        forced_pool=None,
+        forced_station=None,
+    ):
         if forced_station is s1:
             r = _Resp("429", ['{"error":"quota"}'], status=429)
         else:
@@ -145,9 +165,7 @@ async def test_429_sur_la_primaire_laisse_gagner_la_seconde(monkeypatch, hedge_e
 
     monkeypatch.setattr(oc, "_open_free_stream", _fake_open)
 
-    async with oc._open_free_stream_hedged(
-        "https://h", {"stream": True}, {}, True, True, False, True, None
-    ) as resp:
+    async with oc._open_free_stream_hedged("https://h", {"stream": True}, {}, True, True, False, True, None) as resp:
         assert resp.status_code == 200
         lines = [ln async for ln in resp.aiter_lines()]
 
@@ -164,15 +182,9 @@ async def test_replay_rend_la_premiere_ligne_puis_le_reste():
 
 
 def test_hedge_desactive_par_defaut_hors_mode_hedge(monkeypatch):
-    monkeypatch.setitem(
-        oc.IP_ROTATION, "free_parallel", {"enabled": True, "mode": "load-balance"}
-    )
+    monkeypatch.setitem(oc.IP_ROTATION, "free_parallel", {"enabled": True, "mode": "load-balance"})
     assert oc._stream_hedge_enabled() is False
-    monkeypatch.setitem(
-        oc.IP_ROTATION, "free_parallel", {"enabled": True, "mode": "hedge"}
-    )
+    monkeypatch.setitem(oc.IP_ROTATION, "free_parallel", {"enabled": True, "mode": "hedge"})
     assert oc._stream_hedge_enabled() is True
-    monkeypatch.setitem(
-        oc.IP_ROTATION, "free_parallel", {"enabled": False, "mode": "hedge"}
-    )
+    monkeypatch.setitem(oc.IP_ROTATION, "free_parallel", {"enabled": False, "mode": "hedge"})
     assert oc._stream_hedge_enabled() is False

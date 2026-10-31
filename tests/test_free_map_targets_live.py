@@ -100,11 +100,7 @@ def _sites(doc):
         cible = discovery.get("default_target")
         if isinstance(cible, str):
             sites.append(("free_discovery.default_target", cible))
-    return [
-        (site, str(model_id).strip())
-        for site, model_id in sites
-        if isinstance(model_id, str) and model_id.strip()
-    ]
+    return [(site, str(model_id).strip()) for site, model_id in sites if isinstance(model_id, str) and model_id.strip()]
 
 
 def _cibles_depreciees(doc, depreciees=CIBLES_DEPRECIEES):

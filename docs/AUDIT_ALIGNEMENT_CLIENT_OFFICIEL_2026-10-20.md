@@ -248,7 +248,7 @@ Le routeur annonce la nouvelle base (parce que `free_base` avait été modifié 
 |---|---|---|
 | Free | `Authorization: Bearer public`, `Content-Type`, `UA`, `x-opencode-client/project/request/session`, `Connection`, `Accept`, `Host`, `Accept-Encoding` (11 + `Content-Length`) | `opencode.py:5389-5480` |
 | Payée | UA v2, `x-opencode-client/project/session`, `x-session-affinity`, `X-Session-Id`, `x-opencode-session-id` | `opencode.py:5754-5820` |
-| Geo/navigateur | profil d'impersonation + `extra_headers` | `opencode.py:4591-4620, 7605` |
+| Geo/navigateur | **supprimé le 2026-10-25** : identité client officiel (UA v2 + Bun TLS) sur la jambe geo, plus de profil navigateur ni d'`extra_headers` | `opencode.py:_apply_identity`, `vpn/manager.py:_build_identity_pool` |
 
 La jambe free **force** `stream: true` et injecte des outils « shim » (`read`, `bash`) dont les définitions imitent les outils natifs (`opencode.py:4983-5044`, `:5047+`).
 
@@ -433,7 +433,7 @@ L'utilisateur a demandé explicitement de **garder la jambe gratuite** et de l'a
 | Conversion Anthropic→OpenAI systématique sur la free | un seul base URL configuré | **contournable** : le catalogue expose `/inference/anthropic/v1` |
 | Quartet `x-opencode-client/project/request/session` | croyance en une contrainte de porte | **inutile** — mesure : le wire 1.19.3 sans eux passe (200). À supprimer |
 | UA v1 figé sur 1.18.31 | croyance en une contrainte UA | **faux** — 1.19.3 et 1.18.31 passent tous deux. Version à aligner |
-| Rejeu TLS `chrome131` | cohérence de l'empreinte | à conserver tant que la porte reste sensible à l'empreinte, mais **coût** : `CurlCffiWarning: JA3 fingerprint was altered` dans les tests. Non démontré nécessaire : **à réévaluer** |
+| Rejeu TLS Bun officiel (`ja3` + sigalgs + H1, sans GREASE) | cohérence de l'empreinte | **load-bearing** : le ClientHello navigateur est remplacé par celui du client. `impersonate=chrome131` n'est qu'un porteur interne ; le warning `JA3 fingerprint was altered` est attendu (ja3 surchargé volontairement) |
 | 8 reprises sur la free | rotation de stations sur 403 | à remplacer par une classification fine (403 ≠ 429 ≠ 5xx) |
 
 ### 9.2 Ce que la jambe free coûte aujourd'hui

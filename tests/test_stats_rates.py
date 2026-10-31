@@ -43,9 +43,7 @@ def rates_db(tmp_path):
         " account_alias TEXT, tools_used TEXT, free_model_ip TEXT, station INTEGER)"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_requests_station_ts ON requests(station, timestamp)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_station_ts ON requests(station, timestamp)")
     now = datetime.now(UTC)
     rows = []
     # N lignes récentes (dans la minute) — station 1 sauf une (station 2).
@@ -54,14 +52,10 @@ def rates_db(tmp_path):
     rows.append(("m3", _ts(now - timedelta(seconds=20)), "glm", None, 10, 5, 5, 0, 1, "a", None, 2))
     # M lignes dans l'heure mais hors minute.
     for i in range(5):
-        rows.append(
-            (f"h{i}", _ts(now - timedelta(minutes=30)), "glm", None, 10, 5, 5, 0, 1, "a", None, 1)
-        )
+        rows.append((f"h{i}", _ts(now - timedelta(minutes=30)), "glm", None, 10, 5, 5, 0, 1, "a", None, 1))
     # Vieilles lignes hors fenêtre (dans la période 7j, hors 1h).
     for i in range(2):
-        rows.append(
-            (f"o{i}", _ts(now - timedelta(days=1)), "glm", None, 10, 5, 5, 0, 1, "a", None, 1)
-        )
+        rows.append((f"o{i}", _ts(now - timedelta(days=1)), "glm", None, 10, 5, 5, 0, 1, "a", None, 1))
     conn.executemany(
         "INSERT INTO requests(id, timestamp, model, original_model, duration_ms,"
         " tokens_input, tokens_output, tokens_cache, success, account_alias, tools_used, station)"
@@ -90,9 +84,7 @@ def rates_app(rates_db, tmp_path):
 
 
 async def _get_stats(app, **params):
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.get("/api/stats", params=params)
         assert r.status_code == 200, r.text
         return r.json()
@@ -121,9 +113,7 @@ class TestPeriodMinutes:
         # datetime naïf applique la règle DST correcte ; un `.replace(hour=0)`
         # sur un datetime déjà aware garderait le décalage courant et
         # fabriquerait un minuit faux d'une heure.
-        local_midnight = datetime.fromisoformat(
-            now.astimezone().strftime("%Y-%m-%d") + "T00:00:00"
-        ).astimezone(UTC)
+        local_midnight = datetime.fromisoformat(now.astimezone().strftime("%Y-%m-%d") + "T00:00:00").astimezone(UTC)
         elapsed = (now - local_midnight).total_seconds() / 60.0
         assert abs(minutes - elapsed) < 1.0
 
@@ -193,6 +183,21 @@ async def test_no_bounds_avg_is_none(rates_app):
     assert data["rates"]["period_minutes"] is None
 
 
+@pytest.mark.asyncio
+async def test_from_to_aliases_filter_like_from_date(rates_app):
+    """Le front envoie ?from=&to= (Stats.svelte) : les alias doivent filtrer.
+
+    Régression : les paramètres étaient ignorés → agrégation de TOUTE la table
+    (2,5 Go) à chaque affichage des Statistiques, et totaux « aujourd'hui »
+    faux (toute la vie du proxy).
+    """
+    d_alias = await _get_stats(rates_app, **{"from": "2020-01-01", "to": "2020-01-02"})
+    d_canonical = await _get_stats(rates_app, from_date="2020-01-01", to_date="2020-01-02")
+    assert d_alias["totals"]["count"] == 0
+    assert d_alias["totals"]["count"] == d_canonical["totals"]["count"]
+    assert d_alias["rates"]["avg_per_min"] == 0.0
+
+
 class TestPeriodRatesCohérence:
     """_period_rates : avg_per_min doit se réconcilier avec la période PUBLIÉE.
 
@@ -247,8 +252,7 @@ def test_sliding_uses_timestamp_index(rates_db):
     """Les probes glissantes passent par idx_timestamp (range-scan, pas full-scan)."""
     conn, _path, _now = rates_db
     plan = conn.execute(
-        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM requests"
-        " WHERE timestamp >= ? AND timestamp <= ?",
+        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM requests WHERE timestamp >= ? AND timestamp <= ?",
         ("2026-09-08T00:00:00Z", "2026-09-08T23:59:59Z"),
     ).fetchall()
     assert any("idx_timestamp" in str(tuple(row)) for row in plan), [tuple(r) for r in plan]

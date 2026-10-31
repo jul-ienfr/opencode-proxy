@@ -47,8 +47,7 @@ class _Station:
 
 
 def _pool3():
-    s = [_Station(1, current_ip="1.1.1.1"), _Station(2, current_ip="2.2.2.2"),
-         _Station(3, current_ip="3.3.3.3")]
+    s = [_Station(1, current_ip="1.1.1.1"), _Station(2, current_ip="2.2.2.2"), _Station(3, current_ip="3.3.3.3")]
     pool = FreeIPPool(s[0], s[1])
     pool.set_stations(s)
     pool.rotated = []
@@ -71,9 +70,7 @@ class TestUpstreamEvent:
         pool.on_quota_exhausted(s3)
         assert pool._upstream_event_active() is False
         assert pool.rotated == [s1, s2, s3]
-        assert len(pool._upstream_429_log) == 0, (
-            "un quota per-IP ne doit pas alimenter le log corrélé"
-        )
+        assert len(pool._upstream_429_log) == 0, "un quota per-IP ne doit pas alimenter le log corrélé"
         # La 4ᵉ station (autre IP) tourne encore : pas de gel rétroactif.
         s1.current_ip = "1.1.1.2"
         pool.on_quota_exhausted(s1)
@@ -150,11 +147,13 @@ class TestUpstreamEvent:
 
     def test_update_config_hot_reload(self):
         pool, _ = _pool3()
-        pool.update_config({
-            "upstream_event_threshold": 5,
-            "upstream_event_window_s": 120,
-            "upstream_event_cool_s": 300,
-        })
+        pool.update_config(
+            {
+                "upstream_event_threshold": 5,
+                "upstream_event_window_s": 120,
+                "upstream_event_cool_s": 300,
+            }
+        )
         assert pool._upstream_event_threshold == 5
         assert pool._upstream_event_window_s == 120.0
         assert pool._upstream_event_cool_s == 300.0

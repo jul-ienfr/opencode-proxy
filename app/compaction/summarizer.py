@@ -44,28 +44,28 @@ _SUMMARY_TEMPLATE = (
     'or "(none)"]\n'
     "\n"
     "## Decisions\n"
-    "- [decisions already made and why, or \"(none)\"]\n"
+    '- [decisions already made and why, or "(none)"]\n'
     "\n"
     "## Work State\n"
     "Break the objective into smaller goals and report which are completed, which are "
     "being worked on, and which are blocked.\n"
     "### Completed\n"
-    "- [goals that have been completed; otherwise \"(none)\"]\n"
+    '- [goals that have been completed; otherwise "(none)"]\n'
     "\n"
     "### Active\n"
-    "- [goals currently being worked on; otherwise \"(none)\"]\n"
+    '- [goals currently being worked on; otherwise "(none)"]\n'
     "\n"
     "### Blocked\n"
-    "- [anything blocking progress, and why; otherwise \"(none)\"]\n"
+    '- [anything blocking progress, and why; otherwise "(none)"]\n'
     "\n"
     "## Next Move\n"
-    "- [ordered list of next actions, or \"(none)\"]\n"
+    '- [ordered list of next actions, or "(none)"]\n'
     "\n"
     "## Relevant Files\n"
     "List the files and directories, other than the current working directory, that "
     "another agent would need to open to continue this work. Include at most 15, most "
     "important first. Do not list every file that was read or changed. Include paths "
-    "outside the current working directory when relevant. If none, write \"(none)\".\n"
+    'outside the current working directory when relevant. If none, write "(none)".\n'
     "- `[file or directory path]`: [brief reason it matters]\n"
     "\n"
     "## Important Context\n"
@@ -137,8 +137,7 @@ def build_prompt(update: bool, legacy: bool = False) -> str:
                 ]
             )
         parts = [
-            "Update the existing checkpoint in the conversation above into one "
-            "consolidated summary.",
+            "Update the existing checkpoint in the conversation above into one consolidated summary.",
         ]
         if legacy:
             parts.append(
@@ -180,9 +179,11 @@ def has_required_outline(summary_text) -> bool:
         heads = set(_template_headings())
         if not heads:
             return False
+        # Official `filled()` semantics: one exact heading is enough. The
+        # anti-stub guard lives in run_summarizer (minimum length), not here.
         for ln in summary_text.splitlines():
             try:
-                if ln.strip() and ln.strip() in heads:
+                if ln.strip() in heads:
                     return True
             except Exception:
                 continue
@@ -203,9 +204,7 @@ def build_rewrite_prompt(bad_summary: str) -> str:
         attempt = bad_summary if isinstance(bad_summary, str) else ""
     except Exception:
         attempt = ""
-    return (
-        _NUDGE + "\n\nPrevious attempt:\n<attempt>\n" + attempt[:8000] + "\n</attempt>"
-    )
+    return _NUDGE + "\n\nPrevious attempt:\n<attempt>\n" + attempt[:8000] + "\n</attempt>"
 
 
 def build_summary_user_text(history_text: str, previous_summary: str | None = None) -> str:
@@ -222,14 +221,21 @@ def build_summary_user_text(history_text: str, previous_summary: str | None = No
     if prev:
         return (
             build_prompt(True, _LEGACY_HEADING in prev)
-            + "\n\nPrevious summary:\n<previous-summary>\n" + prev + "\n</previous-summary>\n\n"
+            + "\n\nPrevious summary:\n<previous-summary>\n"
+            + prev
+            + "\n</previous-summary>\n\n"
             "Conversation to summarize:\n<conversation>\n" + hist + "\n</conversation>"
         )
     return (
         "Summarize the following conversation concisely.\n\n"
-        "<conversation>\n" + hist + "\n</conversation>\n\n"
-        + build_prompt(False)
+        "<conversation>\n" + hist + "\n</conversation>\n\n" + build_prompt(False)
     )
+
+
+def build_prompt_for_history(messages) -> str:
+    """Official prompt for the real conversation (update when a checkpoint exists)."""
+    prev = extract_previous_summary(messages)
+    return build_prompt(prev is not None, bool(prev and _LEGACY_HEADING in prev))
 
 
 def _norm_cap(cap) -> int:
@@ -377,6 +383,104 @@ def build_summarizer_for_api(summary_text_input: str, max_tokens: int, model_id:
 _MEDIA_PLACEHOLDER = "[Attached {kind}: {name}]"
 
 
+def _copy_messages(messages):
+    """Shallow copy of message dicts (never mutate the caller's request)."""
+    out = []
+    for m in messages if isinstance(messages, list) else []:
+        if isinstance(m, dict):
+            out.append(dict(m))
+    return out
+
+
+def build_summarizer_body_from_history(
+    history_messages,
+    prompt: str,
+    max_tokens: int,
+    model_id: str = "",
+    api: str = "chat",
+    *,
+    system=None,
+    tools=None,
+    instructions=None,
+) -> dict | None:
+    """Official-shape summary request: the real conversation + prompt.
+
+    Mirrors the client: the normal request prefix is kept intact and the
+    summary instructions are appended as one extra user message, so the
+    provider can reuse its prompt cache. ``None`` when the history is not in
+    the destination API shape (the caller then falls back to the text
+    transcript, like the official client does when it has to flatten).
+    """
+    try:
+        if not isinstance(history_messages, list) or not history_messages:
+            return None
+        low = str(api or "chat").lower()
+        cap = _norm_cap(max_tokens)
+        if low == "responses":
+            items = _copy_messages(history_messages)
+            body = {
+                "model": model_id or "",
+                "input": [
+                    *items,
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": prompt}],
+                    },
+                ],
+                "max_output_tokens": cap,
+                "stream": False,
+                "store": False,
+            }
+            if isinstance(instructions, str) and instructions.strip():
+                body["instructions"] = instructions
+            if isinstance(tools, list) and tools:
+                body["tools"] = tools
+            if not body["model"]:
+                body.pop("model", None)
+            return body
+        messages = _copy_messages(history_messages)
+        messages.append({"role": "user", "content": prompt})
+        body = {
+            "model": model_id or "",
+            "messages": messages,
+            "max_tokens": cap,
+            "stream": False,
+        }
+        if low == "anthropic" and isinstance(system, (str, list)) and system:
+            body["system"] = system
+        if isinstance(tools, list) and tools:
+            body["tools"] = tools
+        if not body["model"]:
+            body.pop("model", None)
+        return body
+    except Exception:
+        return None
+
+
+def _append_nudge_to_body(body: dict, api: str = "chat") -> dict | None:
+    """Official corrective: same request + one NUDGE user message."""
+    try:
+        if not isinstance(body, dict):
+            return None
+        out = dict(body)
+        if str(api or "chat").lower() == "responses":
+            out["input"] = list(out.get("input") or []) + [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": _NUDGE}],
+                }
+            ]
+        else:
+            out["messages"] = list(out.get("messages") or []) + [
+                {"role": "user", "content": _NUDGE}
+            ]
+        return out
+    except Exception:
+        return None
+
+
 def _media_descriptor(block) -> str | None:
     """Descripteur texte d'un bloc média (image/fichier), ou None si non-média.
 
@@ -416,9 +520,7 @@ def _serialize_history_for_summary(messages) -> str:
         try:
             from app.compaction.lean import lean_summary_body as _lean_hist
 
-            _looks_responses = any(
-                isinstance(_m, dict) and "type" in _m for _m in (messages or [])
-            )
+            _looks_responses = any(isinstance(_m, dict) and "type" in _m for _m in (messages or []))
             _wrap_key = "input" if _looks_responses else "messages"
             _wrapped, _ = _lean_hist({_wrap_key: messages}, max_chars=2000)
             if isinstance(_wrapped, dict) and isinstance(_wrapped.get(_wrap_key), list):
@@ -428,6 +530,25 @@ def _serialize_history_for_summary(messages) -> str:
         parts = []
         for m in messages:
             if not isinstance(m, dict):
+                continue
+            # [audit 2026-10-30] Responses items have no role/content: the
+            # old serializer dropped function calls and their outputs, so the
+            # summary lost the entire tool history.
+            _mit = m.get("type")
+            if _mit == "function_call":
+                parts.append(
+                    f"assistant tool_call {m.get('name','')}({m.get('arguments','')})"
+                )
+                continue
+            if _mit == "function_call_output":
+                parts.append(f"tool {m.get('call_id','')}: {str(m.get('output',''))[:4000]}")
+                continue
+            if _mit == "reasoning":
+                _sum = " ".join(
+                    str(x.get("text", "")) for x in (m.get("summary") or []) if isinstance(x, dict)
+                )
+                if _sum:
+                    parts.append(f"assistant reasoning: {_sum[:4000]}")
                 continue
             role = m.get("role", "?")
             content = m.get("content")
@@ -446,7 +567,18 @@ def _serialize_history_for_summary(messages) -> str:
             else:
                 txt = "" if content is None else str(content)
             parts.append(f"{role}: {txt[:4000]}")
-        return "\n".join(parts)[:120000]
+            # Chat tool calls live outside content.
+            for _tc in m.get("tool_calls") or []:
+                if isinstance(_tc, dict):
+                    _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
+                    parts.append(
+                        f"assistant tool_call {_fn.get('name','')}({_fn.get('arguments','')})"
+                    )
+        text = "\n".join(parts)
+        if len(text) > 120000:
+            # Keep both ends: the tail carries the current state/next move.
+            text = text[:60000] + "\n...[history truncated]...\n" + text[-60000:]
+        return text
     except Exception:
         return ""
 
@@ -456,7 +588,7 @@ def extract_previous_summary(messages) -> str | None:
     try:
         if not isinstance(messages, list):
             return None
-        for m in messages:
+        for m in reversed(messages):
             if not isinstance(m, dict):
                 continue
             c = m.get("content")
@@ -466,7 +598,7 @@ def extract_previous_summary(messages) -> str | None:
             if "<summary>" in text and "</summary>" in text:
                 s = text.split("<summary>", 1)[1].split("</summary>", 1)[0].strip()
                 if s:
-                    return s[:8000]
+                    return s[:16000]
         return None
     except Exception:
         return None
@@ -483,6 +615,11 @@ async def run_summarizer(
     summary_max_tokens: int = 2048,
     timeout_s: int = 60,
     api: str = "chat",
+    full_history: bool = False,
+    history_api: str | None = None,
+    system=None,
+    tools=None,
+    instructions=None,
 ) -> str | None:
     """Exécute l'appel résumeur interne. Retourne le texte du résumé, ou None.
 
@@ -491,6 +628,10 @@ async def run_summarizer(
       ``chat`` | ``anthropic`` | ``responses`` et choisit la forme du body
       (``build_summarizer_for_api``) — parité avec l'endpoint (``/responses``
       attend ``input``, jamais ``messages``) ;
+    - ``full_history`` : quand l'historique est déjà dans la forme de ``api``,
+      envoie la conversation réelle + le prompt officiel (comme le client,
+      pour réutiliser le cache de prompt). Sinon repli sur le transcript
+      sérialisé (le client officiel fait de même quand il doit aplatir) ;
     - auth_headers_fn(protocol) → headers ; do_request_fn(endpoint, body,
       headers, protocol) → (resp, headers) ;
     - timeout dédié asyncio (timeout_s), 1 seule tentative ;
@@ -507,7 +648,28 @@ async def run_summarizer(
                 _api = "responses"
         except Exception:
             _api = api
-        body = build_summarizer_for_api(user_text, summary_max_tokens, model_id, _api or "chat")
+        _low_api = str(_api or "chat").lower()
+        body = None
+        if full_history and str(history_api or "").lower() == _low_api:
+            body = build_summarizer_body_from_history(
+                history_messages,
+                build_prompt_for_history(history_messages),
+                summary_max_tokens,
+                model_id,
+                _low_api,
+                system=system,
+                tools=tools,
+                instructions=instructions,
+            )
+        if body is None:
+            body = build_summarizer_for_api(user_text, summary_max_tokens, model_id, _api or "chat")
+        _text_body = build_summarizer_for_api(user_text, summary_max_tokens, model_id, _api or "chat")
+        try:
+            _text_body["model"] = model_id
+        except Exception:
+            pass
+        if body is None:
+            body = _text_body
         # build_summarizer_for_api("chat") ne pose pas model : parité historique.
         try:
             body["model"] = model_id
@@ -518,41 +680,74 @@ async def run_summarizer(
         except Exception:
             return None
 
-        async def _once():
-            return await do_request_fn(endpoint, body, headers, protocol)
+        async def _send(request_body):
+            try:
+                resp, _ = await asyncio.wait_for(
+                    do_request_fn(endpoint, request_body, headers, protocol), timeout=timeout_s
+                )
+            except Exception:
+                return None
+            try:
+                if getattr(resp, "status_code", 0) != 200:
+                    return {"status": getattr(resp, "status_code", 0)}
+                raw = resp.content
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = bytes(raw).decode("utf-8", errors="replace")
+                return {"status": 200, "data": _json.loads(raw) if isinstance(raw, str) else {}}
+            except Exception:
+                return None
 
+        sent = await _send(body)
+        # Official fallback: a full-conversation summary that the provider
+        # rejects as too large is resent as a shortened text transcript.
+        if (
+            full_history
+            and isinstance(sent, dict)
+            and sent.get("status") in (400, 413, 422)
+            and body is not _text_body
+        ):
+            sent = await _send(_text_body)
+        if not isinstance(sent, dict) or sent.get("status") != 200:
+            return None
+        data = sent.get("data") or {}
+        # [audit 2026-10-30] A summary truncated by max_tokens is not a
+        # valid replacement for the history.
         try:
-            resp, _ = await asyncio.wait_for(_once(), timeout=timeout_s)
+            _fr = ""
+            _choices = data.get("choices") if isinstance(data, dict) else None
+            if isinstance(_choices, list) and _choices and isinstance(_choices[0], dict):
+                _fr = str(_choices[0].get("finish_reason") or "")
+            if not _fr and isinstance(data, dict):
+                _fr = str(data.get("stop_reason") or "")
+            if _fr in ("length", "max_tokens"):
+                return None
         except Exception:
-            return None
-        try:
-            status = resp.status_code
-        except Exception:
-            return None
-        if status != 200:
-            return None
-        try:
-            raw = resp.content
-            if isinstance(raw, (bytes, bytearray)):
-                raw = bytes(raw).decode("utf-8", errors="replace")
-            data = _json.loads(raw) if isinstance(raw, str) else {}
-        except Exception:
-            return None
+            pass
         summary = _extract_text(data)
-        if summary and has_required_outline(summary):
+        # [audit 2026-10-30] Reject a one-line stub like "## Objective"
+        # (12 chars) while keeping the official one-heading outline rule.
+        # A short/invalid first attempt must still get its corrective retry.
+        if summary and has_required_outline(summary) and len(summary.strip()) >= 14:
             return summary
         # Aligné officiel : 1 SEULE corrective quand les rubriques manquent
         # (résumé vide/hors-format), puis échec franc (None → relais intact).
         if not summary:
             return None
         try:
-            rewrite_body = build_summarizer_for_api(
-                build_rewrite_prompt(summary), summary_max_tokens, model_id, _api or "chat"
-            )
-            try:
-                rewrite_body["model"] = model_id
-            except Exception:
-                pass
+            # Official corrective: resend the SAME request with one NUDGE
+            # user message. The text-transcript fallback keeps the previous
+            # attempt in the message (it has no conversation to append to).
+            rewrite_body = None
+            if full_history and str(history_api or "").lower() == _low_api:
+                rewrite_body = _append_nudge_to_body(body, _low_api)
+            if rewrite_body is None:
+                rewrite_body = build_summarizer_for_api(
+                    build_rewrite_prompt(summary), summary_max_tokens, model_id, _api or "chat"
+                )
+                try:
+                    rewrite_body["model"] = model_id
+                except Exception:
+                    pass
 
             async def _once_more():
                 return await do_request_fn(endpoint, rewrite_body, headers, protocol)
@@ -571,7 +766,7 @@ async def run_summarizer(
             except Exception:
                 return None
             summary2 = _extract_text(data2)
-            if summary2 and has_required_outline(summary2):
+            if summary2 and has_required_outline(summary2) and len(summary2.strip()) >= 14:
                 return summary2
             return None
         except Exception:
@@ -588,8 +783,7 @@ def _extract_text(data) -> str | None:
         content = data.get("content")
         if isinstance(content, list):
             txt = "".join(
-                str(b.get("text", "")) for b in content
-                if isinstance(b, dict) and b.get("type") == "text"
+                str(b.get("text", "")) for b in content if isinstance(b, dict) and b.get("type") == "text"
             ).strip()
             if txt:
                 return txt
@@ -631,8 +825,10 @@ def _extract_text(data) -> str | None:
 
 __all__ = [
     "build_prompt",
+    "build_prompt_for_history",
     "build_summary_user_text",
     "build_summarizer_body",
+    "build_summarizer_body_from_history",
     "build_summarizer_anthropic_body",
     "build_summarizer_responses_body",
     "build_summarizer_for_api",

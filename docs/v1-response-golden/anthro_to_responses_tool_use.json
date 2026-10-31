@@ -67,9 +67,9 @@
       }
     ],
     "usage": {
-      "input_tokens": 11,
+      "input_tokens": 14,
       "output_tokens": 7,
-      "total_tokens": 18,
+      "total_tokens": 21,
       "input_tokens_details": {
         "cached_tokens": 3
       },

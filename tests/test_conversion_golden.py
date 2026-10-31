@@ -88,8 +88,7 @@ FIXTURES = sorted(GOLDEN_DIR.glob("*.json"))
 
 def test_golden_dir_not_empty():
     assert FIXTURES, (
-        "docs/v1-response-golden/ vide — générer les fixtures avant toute "
-        "modification de conversion (§11.5)"
+        "docs/v1-response-golden/ vide — générer les fixtures avant toute modification de conversion (§11.5)"
     )
 
 

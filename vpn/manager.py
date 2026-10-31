@@ -44,8 +44,6 @@ if TYPE_CHECKING:  # annotation seule — pas d'import runtime (déjà injecté 
 # [plan v10 §14.1.9] Sérialise le read-modify-write du .env entre managers
 # concurrents (hot-reload vs auto-flip hétérogène). La section critique est
 # 100% synchrone (file I/O, aucun await) → threading.Lock suffit.
-_ENV_RW_LOCK = threading.Lock()
-
 # [plan 05/09 §1.1] Throttle AUTH inter-stations — NordVPN rate-limited
 # les rafales (6 AUTH en <2s depuis la même IP résidentielle → AUTH_FAILED
 # en cascade, 476 occurrences). Voir vpn.auth (extraction Phase4) :
@@ -54,14 +52,41 @@ _ENV_RW_LOCK = threading.Lock()
 # [audit-2026-10-24 Phase4] noms historiques ré-exportés pour compat
 # (tests + appelants patchent vpn.manager._auth_gate).
 from vpn.auth import (
-    _AUTH_FAIL_TIMES,
-    _AUTH_LAST_BY_STATION,
-    _AUTH_THROTTLE_LOCK,
+    _AUTH_FAIL_TIMES,  # noqa: F401 — réexporté (consommé par vpn_manager.__all__)
+    _AUTH_LAST_BY_STATION,  # noqa: F401 — réexporté (compat tests)
+    _AUTH_THROTTLE_LOCK,  # noqa: F401 — réexporté (consommé par vpn_manager.__all__)
     _auth_connect_done,
     _auth_cooldown_remaining,
     _auth_gate,
     _auth_record_failure,
 )
+
+# [P0.5] Blacklist de hosts partagée par TOUTES les stations du process.
+# Les managers sont recréés (rotation/watchdog) et chacun avait son propre
+# `_failed_hosts` : le même serveur NordVPN était donc re-tenté en boucle
+# (« failure #1 » toutes les ~40 s) au lieu d'être évité globalement.
+_GLOBAL_FAILED_HOSTS: dict[str, dict] = {}
+
+# [plan v10 §14.1.9] Sérialise le read-modify-write du .env entre managers
+# concurrents (hot-reload vs auto-flip hétérogène). La section critique est
+# 100% synchrone (file I/O, aucun await) → threading.Lock suffit.
+_ENV_RW_LOCK = threading.Lock()
+
+# [audit 2026-10-30] Serialize stack flips across managers. Two concurrent
+# global flips used to race (each recomputes the target services and launches
+# its own compose recreate). Keyed by running loop so pytest's multiple
+# asyncio.run() loops never share a bound lock.
+_STACK_FLIP_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _stack_flip_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _STACK_FLIP_LOCKS.get(id(loop))
+    if lock is None:
+        lock = asyncio.Lock()
+        _STACK_FLIP_LOCKS[id(loop)] = lock
+    return lock
+
 # Scalaires (_AUTH_IN_FLIGHT, _AUTH_LAST_CONNECT_AT, ...) : ne PAS les
 # ré-importer ici (un import figerait une copie — ils sont rebindés via
 # `global` dans vpn.auth). Y accéder via vpn.auth ou les fonctions.
@@ -326,6 +351,7 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
     _note_daemon_reachable(False)
     return False
 
+
 # Cross-module registry of active VPN managers ([plan 18/08 §1]): set by
 # opencode.py's lifespan / _apply_station_count, read by _apply_stack to
 # scope a stack flip to the currently configured stations. shared_state est
@@ -348,18 +374,18 @@ CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-# ── Identity rotation (client fingerprint) ─────────────────────
+# ── Identity profiles: TLS carriers (curl_cffi presets) ────────
 
-# Stable desktop impersonation targets of curl_cffi (pinned: see
-# requirements.txt). WARNING: Session(impersonate=...) instantiation does
+# Stable desktop TLS carriers of curl_cffi (pinned: see requirements.txt).
+# WARNING: Session(impersonate=...) instantiation does
 # NOT validate the target — an unknown target only raises ImpersonateError
 # ("Impersonating X is not supported") at request time, so every entry here
 # must exist in curl_cffi's NATIVE_TARGET_NAMES or its FingerprintManager
 # (see tests/test_impersonate_support.py). Alpha (chrome133a), mobile,
 # android, iOS, tor and generic variants are excluded. NOTE: "safari18_4"
 # is deliberately absent — curl_cffi >= 0.15 only ships "safari184" (same
-# Safari 18.4 face, same UA/headers); the underscore alias raises
-# ImpersonateError on every request (503 "no usable VPN station/tunnel").
+# TLS carrier); the underscore alias raises ImpersonateError on every
+# request (503 "no usable VPN station/tunnel").
 _KNOWN_IMPERSONATIONS = frozenset(
     {
         "chrome99",
@@ -398,12 +424,86 @@ _KNOWN_IMPERSONATIONS = frozenset(
 _DEFAULT_IDENTITY_PROFILE: dict = {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
 
 
+# ── Identity profiles: official OpenCode client, not browser ───────────────
+#
+# [2026-10-25] Les profils « navigateur » (UA Chrome/Firefox/Safari +
+# sec-ch-ua/Accept-Language) ne passent pas la gateway : le client officiel
+# émet un UA `opencode/<channel>/<version>/<client>` et AUCUN en-tête
+# navigateur. Le champ `impersonate` ne décrit donc plus une face HTTP : il
+# ne sert que de PORTEUR TLS curl_cffi, remplacé au fil par la fingerprint
+# Bun officielle (`opencode._free_fp_override`). L'identité réelle (version,
+# client, ses_/msg_/project) vient du vault par IP pour la jambe free, et du
+# wire v2 pour la jambe payée/geo.
+OFFICIAL_CLIENT_NAMES = ("cli", "desktop")
+OFFICIAL_CHANNEL = "prod"
+# [audit 2026-10-30] Version du client desktop officiel installé sur cette
+# machine (`resources/opencode-cli.exe --version` → opencode v2.2.2). Le
+# format UA v2 est dérivé du code officiel (`opencode/<channel>/<version>/<client>`).
+OFFICIAL_VERSION = "2.2.2"
+_OFFICIAL_UA_BY_CLIENT = {
+    name: f"opencode/{OFFICIAL_CHANNEL}/{OFFICIAL_VERSION}/{name}" for name in OFFICIAL_CLIENT_NAMES
+}
+# En-têtes de l'ancienne face navigateur : jamais émis, même si un profil
+# legacy les porte encore en config.
+_BROWSER_HEADER_NAMES = frozenset(
+    {
+        "accept-language",
+        "cookie",
+        "dnt",
+        "origin",
+        "referer",
+        "sec-ch-ua",
+        "sec-ch-ua-arch",
+        "sec-ch-ua-bitness",
+        "sec-ch-ua-full-version",
+        "sec-ch-ua-full-version-list",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-model",
+        "sec-ch-ua-platform",
+        "sec-ch-ua-platform-version",
+        "sec-ch-ua-wow64",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "upgrade-insecure-requests",
+        "user-agent",
+    }
+)
+
+
+def _official_ua_for_client(client: str) -> str:
+    """UA officiel v2 pour un nom de client (`cli` par défaut)."""
+    name = (client or "").strip().lower()
+    return _OFFICIAL_UA_BY_CLIENT.get(name, _OFFICIAL_UA_BY_CLIENT["cli"])
+
+
+def _looks_like_browser_ua(ua: str) -> bool:
+    return (ua or "").strip().startswith("Mozilla/")
+
+
+def _sanitize_extra_headers(extra) -> dict:
+    """Retire les en-têtes navigateur d'un profil legacy, garde le reste."""
+    if not isinstance(extra, dict):
+        return {}
+    return {
+        k: v for k, v in extra.items() if str(k).strip().lower() not in _BROWSER_HEADER_NAMES
+    }
+
+
 def _normalize_identity_profiles(profiles) -> list[dict]:
     """Validate user-supplied identity profiles.
 
-    Each entry: {"impersonate": <known target>, "user_agent": str|None,
-    "extra_headers": dict}. Invalid entries are skipped with a warning.
-    Never returns an empty list — falls back to the chrome131 default.
+    Format officiel : {"client": "cli"|"desktop", "impersonate": <porteur TLS>,
+    "extra_headers": dict}. ``client`` dérive l'UA officiel v2
+    (`opencode/prod/<version>/<client>`) ; ``impersonate`` est optionnel
+    (porteur curl_cffi, chrome131 par défaut).
+
+    Format legacy accepté : {"impersonate": ..., "user_agent": ...,
+    "extra_headers": ...}. Un UA navigateur est ignoré et les en-têtes
+    navigateur (sec-ch-ua, Accept-Language, Cookie…) sont retirés : jamais
+    de face navigateur. Jamais de liste vide — repli sur le seed chrome131
+    (porteur TLS, UA officiel posé par la couche wire).
     """
     result = []
     if isinstance(profiles, list):
@@ -411,17 +511,31 @@ def _normalize_identity_profiles(profiles) -> list[dict]:
             if not isinstance(p, dict):
                 logger.warning("[identity] skipping invalid profile (not a dict): %r", p)
                 continue
+            client = str(p.get("client", "")).strip().lower()
             imp = str(p.get("impersonate", "")).strip()
+            if not client and not imp:
+                logger.warning("[identity] skipping profile without client/impersonate: %r", p)
+                continue
+            if client and client not in OFFICIAL_CLIENT_NAMES:
+                logger.warning("[identity] skipping unknown official client %r", client)
+                continue
+            imp = imp or _DEFAULT_IDENTITY_PROFILE["impersonate"]
             if imp not in _KNOWN_IMPERSONATIONS:
                 logger.warning("[identity] skipping unknown impersonation target %r", imp)
                 continue
-            ua = p.get("user_agent")
-            extra = p.get("extra_headers") if isinstance(p.get("extra_headers"), dict) else {}
+            if client:
+                ua = _official_ua_for_client(client)
+            else:
+                ua = p.get("user_agent")
+                if isinstance(ua, str) and ua.strip() and _looks_like_browser_ua(ua):
+                    logger.warning("[identity] browser UA discarded (old profile format): %r", ua[:80])
+                    ua = None
+            extra = _sanitize_extra_headers(p.get("extra_headers"))
             result.append(
                 {
                     "impersonate": imp,
                     "user_agent": ua if isinstance(ua, str) and ua.strip() else None,
-                    "extra_headers": dict(extra) if isinstance(extra, dict) else {},
+                    "extra_headers": extra,
                 }
             )
     if not result:
@@ -433,138 +547,40 @@ def _normalize_identity_profiles(profiles) -> list[dict]:
     return result
 
 
-# Curated User-Agents keyed by impersonation target. curl_cffi does not
-# expose its embedded UA strings to Python, but the httpx fallback paths
-# (opencode._apply_identity) need a coherent UA — these are derived by
-# family from the target name so every _KNOWN_IMPERSONATIONS target has a
-# matching desktop UA. The identity pool keeps user_agent=None so this map
-# (httpx paths) and the curl_cffi bundle (curl_cffi paths) stay the single
-# sources of the outgoing UA.
-def _safari_version(raw: str) -> str:
-    """Map a Safari impersonation tail (153 / 15_3 / 2601 ...) to a macOS
-    Version string."""
-    return {
-        "153": "15.3",
-        "15_3": "15.3",
-        "155": "15.5",
-        "15_5": "15.5",
-        "170": "17.0",
-        "17_0": "17.0",
-        "180": "18.0",
-        "18_0": "18.0",
-        "184": "18.4",
-        "18_4": "18.4",
-        "260": "26.0",
-        "2601": "26.1",
-    }.get(raw, "17.0")
-
-
-def _ua_for_target(imp: str) -> str:
-    """Deterministic desktop UA for an impersonation target (by family)."""
-    if imp.startswith("chrome"):
-        ver = imp[len("chrome") :]
-        return (
-            f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"
-        )
-    if imp.startswith("edge"):
-        ver = imp[len("edge") :]
-        return (
-            f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{ver}.0.4951.64 Safari/537.36 "
-            f"Edg/{ver}.0.1210.53"
-        )
-    if imp.startswith("firefox"):
-        ver = imp[len("firefox") :]
-        return (
-            f"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0"
-        )
-    if imp.startswith("safari"):
-        ver = _safari_version(imp[len("safari") :])
-        return (
-            f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            f"AppleWebKit/605.1.15 (KHTML, like Gecko) "
-            f"Version/{ver} Safari/605.1.15"
-        )
-    return ""
-
-
-# One entry per _KNOWN_IMPERSONATIONS target — the map can never drift
-# out of sync with the supported impersonations.
-_UA_BY_IMPERSONATE = {imp: _ua_for_target(imp) for imp in _KNOWN_IMPERSONATIONS}
-
-# Accept-Language variants for the identity pool (real-language groups
-# with realistic q-values). Chrome/edge targets combine these with two
-# sec-ch-ua brand-order permutations; firefox/safari send no client hints
-# and only vary the language.
-_LANG_VARIANTS = (
-    "fr-FR,fr;q=0.9,en;q=0.8",
-    "en-US,en;q=0.9,fr;q=0.8,fr-FR;q=0.7",
-    "de-DE,de;q=0.9,en;q=0.8",
-    "es-ES,es;q=0.9,en;q=0.8",
-    "it-IT,it;q=0.9,en;q=0.8,fr;q=0.7",
-)
-
-
-def _identity_header_variants(target: str) -> list[dict]:
-    """Per-target extra-header variants for the identity pool.
-
-    chrome/edge -> 2 sec-ch-ua brand-order permutations (same major, greased
-    brand list permuted) x 5 Accept-Language; firefox/safari -> the 5
-    Accept-Languages only (they emit no User-Agent client hints).
-    """
-    langs = [{"Accept-Language": lang} for lang in _LANG_VARIANTS]
-    if target.startswith(("chrome", "edge")):
-        major = "".join(ch for ch in target if ch.isdigit())
-        browser = "Microsoft Edge" if target.startswith("edge") else "Google Chrome"
-        grease = "99" if (major and int(major) >= 113) else "8"
-        chua = (
-            f'"Not/A)Brand";v="{grease}", "Chromium";v="{major}", "{browser}";v="{major}"',
-            f'"{browser}";v="{major}", "Chromium";v="{major}", "Not/A)Brand";v="{grease}"',
-        )
-        variants = []
-        for order in chua:
-            for lang in langs:
-                v = dict(lang)
-                v["sec-ch-ua"] = order
-                variants.append(v)
-        return variants
-    return langs
-
-
 def _headers_key(headers: dict) -> tuple:
     """Hashable, order-insensitive key for an extra_headers dict."""
     return tuple(sorted((str(k).lower(), str(v)) for k, v in (headers or {}).items()))
 
 
 def _build_identity_pool(profiles, diversity: bool, max_profiles: int) -> list[dict]:
-    """Expand explicit identities into a large, varied pool.
+    """Expand the seed into the official-client identity pool.
 
     diversity=False (default, backward compatible): returns the normalized
-    explicit profiles untouched — with only a chrome131 seed the len<=1 gate
-    in current_identity pins everyone to profile[0], exactly as before.
+    explicit profiles untouched.
 
-    diversity=True: returns the explicit profiles plus, for every known
-    impersonation target, a deterministic cartesian grid of per-target
-    header variants (chrome/edge x2 sec-ch-ua x5 languages, others x5
-    languages) — hundreds of distinct client fingerprints, one per IP.
-    Dedup by (impersonate, user_agent, extra_headers), deterministic order,
-    capped at max_profiles. user_agent stays None so the curl_cffi bundle
-    and the curated _UA_BY_IMPERSONATE map remain the UA sources.
+    diversity=True: the official client face is the only valid face, so the
+    pool is the client-name grid (``cli``/``desktop`` → official v2 UA), plus
+    any explicit profile that carries its own UA/headers. The old cartesian
+    grid of browser UAs × sec-ch-ua × Accept-Language is gone: those requests
+    are rejected upstream and only multiplied useless TLS sessions. Per-IP
+    diversity (version/project/ses_) is provided by ``free.identities`` for
+    the free leg, not by this pool.
     """
     base = _normalize_identity_profiles(profiles)
     if not diversity:
         return base
-    pool = list(base)
-    seen = {(p["impersonate"], p["user_agent"], _headers_key(p["extra_headers"])) for p in base}
-    for imp in sorted(_KNOWN_IMPERSONATIONS):
-        for headers in _identity_header_variants(imp):
-            profile = {"impersonate": imp, "user_agent": None, "extra_headers": headers}
-            key = (imp, None, _headers_key(headers))
-            if key in seen:
-                continue
-            seen.add(key)
-            pool.append(profile)
+    # A plain carrier seed (UA None, no extras) is replaced by the official
+    # client grid; explicit profiles are preserved and followed by the grid.
+    keep_base = any(p.get("user_agent") or p.get("extra_headers") for p in base)
+    pool = list(base) if keep_base else []
+    seen = {(p["impersonate"], p["user_agent"], _headers_key(p["extra_headers"])) for p in pool}
+    for _client, ua in _OFFICIAL_UA_BY_CLIENT.items():
+        profile = {"impersonate": "chrome131", "user_agent": ua, "extra_headers": {}}
+        key = (profile["impersonate"], profile["user_agent"], _headers_key(profile["extra_headers"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        pool.append(profile)
     pool.sort(
         key=lambda p: (
             p["impersonate"],
@@ -574,9 +590,7 @@ def _build_identity_pool(profiles, diversity: bool, max_profiles: int) -> list[d
     )
     if len(pool) > max_profiles:
         pool = pool[:max_profiles]
-    logger.info(
-        "[identity] pool: %d profiles (diversity=%s, cap=%d)", len(pool), diversity, max_profiles
-    )
+    logger.info("[identity] pool: %d profiles (diversity=%s, cap=%d)", len(pool), diversity, max_profiles)
     return pool
 
 
@@ -698,10 +712,7 @@ class CircuitBreaker:
 
     def get_status(self) -> dict:
         """Return status of all tracked servers."""
-        return {
-            name: {"failures": info["failures"], "state": info["state"]}
-            for name, info in self._servers.items()
-        }
+        return {name: {"failures": info["failures"], "state": info["state"]} for name, info in self._servers.items()}
 
 
 # ── Backoff Timer ──────────────────────────────────────────────
@@ -811,6 +822,9 @@ def _normalize_country(name: str) -> str:
 # "[<host>] Peer Connection Initiated with [AF_INET]<ip>:1194" (M_INFO,
 # visible from the default verbosity 1) — never "Connecting to [<host>]".
 _NORDVPN_HOST_RE = re.compile(r"[a-z]{2}[0-9]{2,4}\.nordvpn\.com")
+_WIREGUARD_PEER_RE = re.compile(
+    r"\[wireguard\]\s+Connecting to\s+(\d{1,3}(?:\.\d{1,3}){3})", re.IGNORECASE
+)
 
 # [plan 30/08 Lot A2] Blacklist TTL: l'ancien `_FAILED_HOST_TTL = 24h` codé en
 # dur bannissait ~200 serveurs NordVPN 24 h sur un refus transitoire (incident
@@ -840,8 +854,13 @@ def _extract_current_ip(text: str) -> str | None:
     last "[AF_INET]<ip>:port" occurrence is the endpoint currently in play.
     None when no AF_INET address is logged.
     """
-    matches = _NORDVPN_AF_INET_RE.findall(text or "")
-    return matches[-1] if matches else None
+    text = text or ""
+    matches = _NORDVPN_AF_INET_RE.findall(text)
+    if matches:
+        return matches[-1]
+    # WireGuard ne loggue pas [AF_INET] : "Connecting to <entry-ip>:51820".
+    wg = _WIREGUARD_PEER_RE.findall(text)
+    return wg[-1] if wg else None
 
 
 def _parse_server_issue_detail(text: str) -> tuple:
@@ -901,9 +920,7 @@ def _parse_server_issue_detail(text: str) -> tuple:
 
                     _ts = m.group(1)
                     try:
-                        _d = _dt.datetime.strptime(_ts, "%Y-%m-%dT%H:%M:%S").replace(
-                            tzinfo=_dt.UTC
-                        )
+                        _d = _dt.datetime.strptime(_ts, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=_dt.UTC)
                         age_s = max(0.0, time.time() - _d.timestamp())
                     except Exception:
                         age_s = 0.0
@@ -939,9 +956,7 @@ def _clamp_cfg_number(cfg: dict, key: str, default: float, lo: float, hi: float)
         return float(default)
     if val < lo or val > hi:
         clamped = max(lo, min(hi, val))
-        logger.warning(
-            "[vpn-config] %s=%s hors bornes [%s, %s] — clamp à %s", key, raw, lo, hi, clamped
-        )
+        logger.warning("[vpn-config] %s=%s hors bornes [%s, %s] — clamp à %s", key, raw, lo, hi, clamped)
         return clamped
     return val
 
@@ -980,12 +995,7 @@ def _classify_probe_exc(exc: BaseException) -> str:
     # warm-avalanche Q4: EOF = refused immédiat (pas de grace timeout)
     if "eof" in msg or "reading header" in msg or "connection closed" in msg:
         return "refused"
-    if (
-        isinstance(exc, ConnectionRefusedError)
-        or "refused" in msg
-        or "10061" in msg
-        or "econnrefused" in msg
-    ):
+    if isinstance(exc, ConnectionRefusedError) or "refused" in msg or "10061" in msg or "econnrefused" in msg:
         return "refused"
     # Walk the cause chain: httpx/wireproxy tend to wrap the real socket
     # error (ConnectionRefusedError) one or two layers down.
@@ -1022,7 +1032,9 @@ def _classify_error_kind(manager) -> dict:
         kind = "none"
     # probe/control observability — cheap synchronous flags
     try:
-        control_ok = bool(getattr(manager, "_control_api_key", "")) and bool(getattr(manager, "_control_enabled", False))
+        control_ok = bool(getattr(manager, "_control_api_key", "")) and bool(
+            getattr(manager, "_control_enabled", False)
+        )
     except Exception:
         control_ok = False
     try:
@@ -1115,6 +1127,7 @@ class VPNManager:
             # qui écrasait les imbriqués free_parallel/latency_rotation).
             try:
                 import copy as _cpy
+
                 _merged = _cpy.deepcopy(cfg)
                 for _k, _v in _ovr.items():
                     if isinstance(_v, dict) and isinstance(_merged.get(_k), dict):
@@ -1158,19 +1171,11 @@ class VPNManager:
         # station's IP history/circuit breaker, and vice versa).
         self._state_file = cfg.get(
             f"state_file{suffix}",
-            os.path.join(
-                ROOT, "logs", f"vpn_state{station}.json" if station > 1 else "vpn_state.json"
-            ),
+            os.path.join(ROOT, "logs", f"vpn_state{station}.json" if station > 1 else "vpn_state.json"),
         )
-        self._proxy_port = cfg.get(
-            f"vpn_proxy_port{suffix}", 8887 + station if station > 1 else 8888
-        )
-        self._socks5_port = cfg.get(
-            f"socks5_proxy_port{suffix}", 1079 + station if station > 1 else 1080
-        )
-        self._auth_file = cfg.get(
-            "credentials_file", os.path.join(ROOT, "vpn_configs", "credentials.txt")
-        )
+        self._proxy_port = cfg.get(f"vpn_proxy_port{suffix}", 8887 + station if station > 1 else 8888)
+        self._socks5_port = cfg.get(f"socks5_proxy_port{suffix}", 1079 + station if station > 1 else 1080)
+        self._auth_file = cfg.get("credentials_file", os.path.join(ROOT, "vpn_configs", "credentials.txt"))
         self._server_countries = cfg.get("server_countries", "Germany")
         self._server_provider = cfg.get("server_provider", "nordvpn")  # gluetun update -providers
         self._ip_check_url = cfg.get("ip_check_url", "https://api.ipify.org")
@@ -1180,9 +1185,7 @@ class VPNManager:
         # _ip_check_url (tests) stay honored — _probe_urls() falls back to
         # [self._ip_check_url, defaults] when ip_check_urls is absent.
         _urls = cfg.get("ip_check_urls")
-        self._ip_check_urls = (
-            [str(u).strip() for u in _urls if str(u).strip()] if isinstance(_urls, list) else []
-        )
+        self._ip_check_urls = [str(u).strip() for u in _urls if str(u).strip()] if isinstance(_urls, list) else []
         self._ip_check_idx = 0
         # [multi-source 2026-10-24] rotation de la PRIORITÉ des sources
         # d'IP (control / socks / http) à chaque appel : une source en
@@ -1195,6 +1198,10 @@ class VPNManager:
         # Country rotation pins the country via PUT /v1/vpn/settings; both
         # default OFF so existing configs/tests keep the legacy random-pool
         # path ([plan] A).
+        # [audit 2026-10-30] The secret must not live in tracked config.yaml.
+        # config.yaml may still carry it for backward compatibility, but the
+        # supported source is the process env (compose env_file
+        # credentials.env); the container reads its own copy for auth.
         self._control_api_key = str(cfg.get("control_api_key") or "").strip()
         # Host-side enable gate [incident 17/08]: config.yaml ships
         # control_api_key: '' — the real key lives in credentials.env,
@@ -1212,18 +1219,12 @@ class VPNManager:
         self._current_country: str | None = None  # pinned country (control server)
         self._country_pinned_at: float | None = None
         # local cursor fallback (no shared state) — décalé par offset effectif
-        self._country_index = (
-            self._country_offset + self._country_offset_stride * (self._station - 1)
-        ) % 1000000
+        self._country_index = (self._country_offset + self._country_offset_stride * (self._station - 1)) % 1000000
         # [PC-11] partage explicite quand N > len(pays) (O1 : observable).
         try:
             _assigned = self._assigned_country()
             _n_countries = len(self._countries_list())
-            if (
-                _assigned
-                and _n_countries
-                and int(getattr(self, "_station", 1) or 1) > _n_countries
-            ):
+            if _assigned and _n_countries and int(getattr(self, "_station", 1) or 1) > _n_countries:
                 logger.info(
                     "[countries] s%s→%s (partagé : %d pays au périmètre)",
                     self._station,
@@ -1251,9 +1252,7 @@ class VPNManager:
         self._stack_manual = False
         # Key file lives NEXT TO the compose file (vpn_configs/ is gitignored
         # as a whole; the key never enters config.yaml, .env or state).
-        self._wg_key_file = os.path.join(
-            os.path.dirname(self._compose_file_path()), "vpn_configs", "wireguard.env"
-        )
+        self._wg_key_file = os.path.join(os.path.dirname(self._compose_file_path()), "vpn_configs", "wireguard.env")
         if self._stack == "wireguard":
             self._stack_effective: str | None = "wireguard"
         elif self._stack == "openvpn":
@@ -1270,16 +1269,12 @@ class VPNManager:
             # La clé ne décide plus que de la PERMISSION d'un retour WG
             # ultérieur — retour désormais validé par le canari egress.
             try:
-                _boot_env = os.path.join(
-                    os.path.dirname(self._compose_file_path()), ".env"
-                )
+                _boot_env = os.path.join(os.path.dirname(self._compose_file_path()), ".env")
                 self._stack_effective = _stack_from_env_file(_boot_env, self._station)
             except Exception:
                 self._stack_effective = None
             if self._stack_effective is None:
-                self._stack_effective = (
-                    "wireguard" if os.path.exists(self._wg_key_file) else "openvpn"
-                )
+                self._stack_effective = "wireguard" if os.path.exists(self._wg_key_file) else "openvpn"
         # OpenVPN protocol fallback (udp/tcp) — gluetun OPENVPN_PROTOCOL, defaults udp.
         # WG is always UDP 51820, OV can be udp 1194 or tcp 443/8443. The protocol
         # is the remote-port dimension for the OV stack; all OV stations share it
@@ -1290,7 +1285,9 @@ class VPNManager:
             _proto = "udp"
         self._ovpn_protocol = _proto  # selected
         self._ovpn_protocol_effective = _proto if self._stack_effective == "openvpn" else "udp"
-        _port_cfg = str(cfg.get("ovpn_endpoint_port", cfg.get("endpoint_port", "1194" if _proto == "udp" else "443"))).strip()
+        _port_cfg = str(
+            cfg.get("ovpn_endpoint_port", cfg.get("endpoint_port", "1194" if _proto == "udp" else "443"))
+        ).strip()
         if not _port_cfg:
             _port_int = 1194 if _proto == "udp" else 443
         else:
@@ -1301,7 +1298,9 @@ class VPNManager:
             except Exception:
                 _port_int = 1194 if _proto == "udp" else 443
         self._ovpn_endpoint_port = str(_port_int)
-        self._ovpn_endpoint_port_effective = str(_port_int) if self._stack_effective == "openvpn" else ("1194" if _proto == "udp" else "443")
+        self._ovpn_endpoint_port_effective = (
+            str(_port_int) if self._stack_effective == "openvpn" else ("1194" if _proto == "udp" else "443")
+        )
         # [plan 18/08 §1d/§E2] Shared dead-tunnel counter (WG AND OpenVPN):
         # the light egress probe below is the single authority for egress_dead
         # on both stacks — the old "stack not WG: counter is meaningless" reset
@@ -1334,9 +1333,7 @@ class VPNManager:
         # [plan 30/08 — constante → config] cadence des sondes de boot du
         # canari : instance attr qui surclasse la constante de classe
         # (fallback 4.0 s pour les tests qui court-circuitent __init__).
-        self._WG_CANARY_POLL_INTERVAL_S = _clamp_cfg_number(
-            cfg, "wg_canary_poll_interval_s", 4.0, 0.5, 60.0
-        )
+        self._WG_CANARY_POLL_INTERVAL_S = _clamp_cfg_number(cfg, "wg_canary_poll_interval_s", 4.0, 0.5, 60.0)
         # [plan 20/08] Gluetun healthcheck-restart churn: a marginal WG
         # tunnel makes gluetun's INTERNAL healthcheck restart the VPN every
         # ~12 s — invisible to the SOCKS5 probe (it samples the live
@@ -1356,9 +1353,7 @@ class VPNManager:
         # _egress_failure_tick_interval seconds (light probe only — the docker
         # CLI refresh would blow past the cadence). ip_probe_budget bounds the
         # probe's SOCKS5 CONNECT (an httpx timeout does not, am.10).
-        self._egress_failure_tick_interval = max(
-            0.5, float(cfg.get("egress_failure_tick_interval", 2.0))
-        )
+        self._egress_failure_tick_interval = max(0.5, float(cfg.get("egress_failure_tick_interval", 2.0)))
         self._ip_probe_budget = max(1.0, float(cfg.get("ip_probe_budget", 8.0)))
         # [PR2 cascade] Per-server technology cascade: WG → OV UDP → OV TCP
         # (3 attempts <120s — 2 recreates ~30s each + detection, P2.2). OFF by
@@ -1377,9 +1372,7 @@ class VPNManager:
         # [plan 30/08 — constante → config] hard cap per-server cascade
         # (2 recreates ~30s each + detection). Clé cascade_max_duration_s,
         # défaut 120 s (= comportement historique), bornes 30–600.
-        self._cascade_max_duration: float = _clamp_cfg_number(
-            cfg, "cascade_max_duration_s", 120.0, 30.0, 600.0
-        )
+        self._cascade_max_duration: float = _clamp_cfg_number(cfg, "cascade_max_duration_s", 120.0, 30.0, 600.0)
         self._cascade_pending_proto: str | None = None  # structured proto for watchdog intercept (no reason parsing)
         # [cascade intra-OV 05/09] AUTH_FAILED localisé OV → proto opposé avant WG.
         # Contexte : la cascade WG→OV ne démarre que sur flip WG→OV ; une station
@@ -1409,7 +1402,9 @@ class VPNManager:
         else:
             self._least_loaded_enabled = bool(cfg.get("least_loaded_enabled", True))
         self._least_loaded_topk = int(str(os.getenv("VPN_LEAST_LOADED_TOPK", cfg.get("least_loaded_topk", 5))))
-        self._least_loaded_cache_s = int(str(os.getenv("VPN_LEAST_LOADED_CACHE_S", cfg.get("least_loaded_cache_s", 300))))
+        self._least_loaded_cache_s = int(
+            str(os.getenv("VPN_LEAST_LOADED_CACHE_S", cfg.get("least_loaded_cache_s", 300)))
+        )
         self._server_cooldown_s = int(str(os.getenv("VPN_SERVER_COOLDOWN_S", cfg.get("server_cooldown_s", 1800))))
         # [phase 1] Qui choisit les serveurs : "proxy" (nous — short-list
         # least-loaded imposée via PUT hostnames) ou "gluetun" (délégué —
@@ -1417,13 +1412,17 @@ class VPNManager:
         # Invalide → "proxy" + warning (jamais de délégation silencieuse).
         _spm = str(cfg.get("server_pick_mode", "proxy") or "proxy").strip().lower()
         if _spm not in ("proxy", "gluetun"):
-            logger.warning(
-                "[vpn-config] server_pick_mode=%r invalide — repli sur 'proxy'", _spm
-            )
+            logger.warning("[vpn-config] server_pick_mode=%r invalide — repli sur 'proxy'", _spm)
             _spm = "proxy"
         self._server_pick_mode = _spm
-        self._nord_loads_cache: tuple[float, dict] | None = None  # (fetched_at, {(tech,country): [(hostname, load), ...]})
+        self._nord_loads_cache: tuple[float, dict] | None = (
+            None  # (fetched_at, {(tech,country): [(hostname, load), ...]})
+        )
         self._nord_loads_cache_tech: str | None = None  # tech of cached loads
+        # IP d'entrée NordVPN → hostname : les logs WireGuard ne montrent que
+        # l'IP de peering, jamais le hostname. Rempli par _fetch_nord_loads.
+        self._nord_ip_hosts: dict[str, str] = {}
+        self._nord_ip_map_at: float = 0.0
         self._nord_country_ids: dict[str, int] | None = None  # {country_name: numeric id}
         # [plan 18/08 §B] Control-pin budget: how long a rotation pin may
         # poll "running" (timeout) + how long it then waits for a REAL IP
@@ -1481,6 +1480,9 @@ class VPNManager:
         self._last_seen_started_at: str | None = None
         self._last_own_docker_op_at: float = 0.0
         self._auth_failed_window: list[float] = []  # monotonic ts, 30-min sliding
+        # [P0.5] Dédup du re-scan de la MÊME ligne AUTH_FAILED sur un tunnel sain.
+        self._last_auth_line_fp: int | None = None
+        self._last_auth_line_at: float = 0.0
         self._last_auto_flip_at: float | None = None  # cooldown (monotonic)
         self._stack_since: float | None = None  # when the effective stack took over
         self._flip_annule_cooldown_until: float = 0.0
@@ -1521,6 +1523,10 @@ class VPNManager:
         )
         self._identity_index = 0  # restored/clamped by load_state()
         self._rotation_task: asyncio.Task | None = None  # single-flight rotation ([1]+[18])
+        # [audit watchdog 2026-10-30] Le setter `enabled` créait la tâche dès
+        # le boot, avant le registry/pool/reconcile. On ne démarre la boucle
+        # qu'après `start()` ; un toggle post-boot reste couvert par le setter.
+        self._started = False
         # [plan v10 §14.1.2] downscale : abandon COOPÉRATIF d'une rotation en
         # vol avant stop_container (le shield de connect_next détache sinon
         # l'implémentation, qui recréerait le conteneur condamné).
@@ -1567,9 +1573,7 @@ class VPNManager:
             from ops.health import HealthPolicy, StatusDebouncer
 
             self._health_policy = HealthPolicy.from_yaml()
-            self._status_debouncer = StatusDebouncer(
-                policy=self._health_policy, stable=str(self._status)
-            )
+            self._status_debouncer = StatusDebouncer(policy=self._health_policy, stable=str(self._status))
         except Exception:
             self._health_policy = None
             self._status_debouncer = None
@@ -1587,6 +1591,13 @@ class VPNManager:
         self._error: str | None = None
         self._current_ip: str | None = None
         self._current_server: dict | None = None
+        # Hostname du serveur réellement utilisé (ex. nl1050.nordvpn.com) :
+        # l'IP publique mesurée n'est PAS l'IP d'entrée de l'API NordVPN.
+        # Renseigné au pin puis confirmé par les logs gluetun.
+        self._current_host: str | None = None
+        self._last_host_resolve_at: float = 0.0
+        # Callback injecté par FreeIPPool : qualité mesurée par hostname.
+        self._host_quality_fn = None
         # [roadmap] dernière charge connue du serveur choisi (pour le score).
         self._server_load: float | None = None
         self._quality_low_count: int = 0
@@ -1660,9 +1671,7 @@ class VPNManager:
         # 30/08 : 3 probes ratés pendant le montage du tunnel = station gelée
         # 300 s sur un tunnel sain). Consommée par _breaker_charge_failure,
         # clôturée immédiatement au premier probe réussi (_breaker_charge_success).
-        self._breaker_warmup_grace_s = _clamp_cfg_number(
-            cfg, "breaker_warmup_grace_s", 60.0, 10.0, 600.0
-        )
+        self._breaker_warmup_grace_s = _clamp_cfg_number(cfg, "breaker_warmup_grace_s", 60.0, 10.0, 600.0)
         self._warmup_until = 0.0  # deadline monotonic ; 0.0 = fenêtre fermée
 
         # [plan 30/08 Lot A4] Anti-churn : compteur de rotations par station
@@ -1670,12 +1679,8 @@ class VPNManager:
         # (défaut 10), cooldown storm (rotation_storm_cooldown_s, défaut 600 s)
         # + alerte dashboard au lieu de poursuivre la tempête qui armait le
         # breaker (15 rotations en 18 min, incident 30/08).
-        self._max_rotations_per_hour = int(
-            _clamp_cfg_number(cfg, "station_max_rotations_per_hour", 10.0, 1.0, 720.0)
-        )
-        self._rotation_storm_cooldown_s = _clamp_cfg_number(
-            cfg, "rotation_storm_cooldown_s", 600.0, 30.0, 7200.0
-        )
+        self._max_rotations_per_hour = int(_clamp_cfg_number(cfg, "station_max_rotations_per_hour", 10.0, 1.0, 720.0))
+        self._rotation_storm_cooldown_s = _clamp_cfg_number(cfg, "rotation_storm_cooldown_s", 600.0, 30.0, 7200.0)
         self._rotation_history: list[float] = []  # timestamps monotonic, fenêtre 1 h
         self._storm_cooldown_until = 0.0  # deadline monotonic ; 0.0 = pas de storm
 
@@ -1683,39 +1688,27 @@ class VPNManager:
         # codés en dur (comportement à défaut strictement identique).
         # _cascade_max_duration : assignée plus haut (ligne ~941) via
         # _clamp_cfg_number — ne pas réassigner ici.
-        self._stack_age_guard_s = _clamp_cfg_number(
-            cfg, "stack_age_guard_s", 600.0, 60.0, 3600.0
-        )
+        self._stack_age_guard_s = _clamp_cfg_number(cfg, "stack_age_guard_s", 600.0, 60.0, 3600.0)
 
         # ── [graceful-aurora] LOT A/B/C/D/E/F — config + état per-station ──
         # Toutes les clés sont hot-reloadables (voir update_config) avec les
         # mêmes bornes. Rollback global par lot via les kill-switches du plan.
-        self._server_issue_grace_s = _clamp_cfg_number(
-            cfg, "server_issue_grace_s", 25.0, 5.0, 120.0
-        )
+        self._server_issue_grace_s = _clamp_cfg_number(cfg, "server_issue_grace_s", 25.0, 5.0, 120.0)
         self._server_issue_recheck = bool(cfg.get("server_issue_recheck", True))
         self._server_issue_pending = False
         self._server_issue_recheck_task: asyncio.Task | None = None
         self._last_reset_age_s: float | None = None
         self._last_init_ok_at: str | None = None
-        self._wait_healthy_late_retry_s = _clamp_cfg_number(
-            cfg, "wait_healthy_late_retry_s", 30.0, 0.0, 120.0
-        )
-        self._socks_catchup_s = _clamp_cfg_number(
-            cfg, "socks_catchup_s", 90.0, 10.0, 300.0
-        )
-        self._wait_healthy_require_socks = bool(
-            cfg.get("wait_healthy_require_socks", False)
-        )
+        self._wait_healthy_late_retry_s = _clamp_cfg_number(cfg, "wait_healthy_late_retry_s", 30.0, 0.0, 120.0)
+        self._socks_catchup_s = _clamp_cfg_number(cfg, "socks_catchup_s", 90.0, 10.0, 300.0)
+        self._wait_healthy_require_socks = bool(cfg.get("wait_healthy_require_socks", False))
         self._egress_socks_pending = False
         self._socks_catchup_task: asyncio.Task | None = None
         # LOT C — cooldown AUTH local (deque monotonic, mémoire seule)
         from collections import deque as _deque
 
         self._auth_fail_times: Any = _deque()
-        self._ov_auth_window_s = _clamp_cfg_number(
-            cfg, "ov_auth_window_s", 1800.0, 30.0, 3600.0
-        )
+        self._ov_auth_window_s = _clamp_cfg_number(cfg, "ov_auth_window_s", 1800.0, 30.0, 3600.0)
         # Rollback plan : ov_auth_station_threshold=999 → désactivé (les
         # bornes 2–20 s'appliquent aux valeurs normales ; ≥999 = jamais).
         try:
@@ -1725,21 +1718,11 @@ class VPNManager:
         if _thr_raw >= 999:
             self._ov_auth_station_threshold = 10**9
         else:
-            self._ov_auth_station_threshold = int(
-                _clamp_cfg_number(cfg, "ov_auth_station_threshold", 5.0, 2.0, 20.0)
-            )
-        self._ov_auth_cool_s = _clamp_cfg_number(
-            cfg, "ov_auth_cool_s", 300.0, 30.0, 3600.0
-        )
-        self._ov_auth_backoff_s = _clamp_cfg_number(
-            cfg, "ov_auth_backoff_s", 90.0, 30.0, 3600.0
-        )
-        self._ov_auth_backoff_max_s = _clamp_cfg_number(
-            cfg, "ov_auth_backoff_max_s", 600.0, 60.0, 3600.0
-        )
-        self._ov_auth_host_blacklist_min = _clamp_cfg_number(
-            cfg, "ov_auth_host_blacklist_min", 60.0, 5.0, 1440.0
-        )
+            self._ov_auth_station_threshold = int(_clamp_cfg_number(cfg, "ov_auth_station_threshold", 5.0, 2.0, 20.0))
+        self._ov_auth_cool_s = _clamp_cfg_number(cfg, "ov_auth_cool_s", 300.0, 30.0, 3600.0)
+        self._ov_auth_backoff_s = _clamp_cfg_number(cfg, "ov_auth_backoff_s", 90.0, 30.0, 3600.0)
+        self._ov_auth_backoff_max_s = _clamp_cfg_number(cfg, "ov_auth_backoff_max_s", 600.0, 60.0, 3600.0)
+        self._ov_auth_host_blacklist_min = _clamp_cfg_number(cfg, "ov_auth_host_blacklist_min", 60.0, 5.0, 1440.0)
         self._auth_cool_until = 0.0  # deadline monotonic ; 0.0 = pas de cooldown
         self._auth_backoff_delay = 0.0  # backoff piloté courant (s)
         self._auth_consec_count = 0
@@ -1747,16 +1730,10 @@ class VPNManager:
         self._auth_last_pin_at = 0.0
         self._auth_repin_needed = False
         # LOT D — watchdog grâce + budget restarts (0 = rollback historique).
-        self._watchdog_auth_grace_s = _clamp_cfg_number(
-            cfg, "watchdog_auth_grace_s", 240.0, 0.0, 900.0
-        )
-        _eg_ticks = _clamp_cfg_number(
-            cfg, "watchdog_egress_grace_ticks", 6.0, 2.0, 20.0
-        )
+        self._watchdog_auth_grace_s = _clamp_cfg_number(cfg, "watchdog_auth_grace_s", 240.0, 0.0, 900.0)
+        _eg_ticks = _clamp_cfg_number(cfg, "watchdog_egress_grace_ticks", 6.0, 2.0, 20.0)
         self._watchdog_egress_grace_ticks = int(_eg_ticks)
-        _mx_rst = _clamp_cfg_number(
-            cfg, "watchdog_max_restarts_per_hour", 3.0, 1.0, 10.0
-        )
+        _mx_rst = _clamp_cfg_number(cfg, "watchdog_max_restarts_per_hour", 3.0, 1.0, 10.0)
         self._watchdog_max_restarts_per_hour = int(_mx_rst)
         self._auth_grace_until = 0.0
         self._watchdog_last_action: str | None = None
@@ -1805,21 +1782,13 @@ class VPNManager:
         except (TypeError, ValueError):
             _pw_a_raw = 8.0
         self._pin_widen_resets = (
-            10**9
-            if _pw_r_raw >= 999
-            else int(_clamp_cfg_number(cfg, "pin_widen_resets", 6.0, 1.0, 100.0))
+            10**9 if _pw_r_raw >= 999 else int(_clamp_cfg_number(cfg, "pin_widen_resets", 6.0, 1.0, 100.0))
         )
         self._pin_widen_auths = (
-            10**9
-            if _pw_a_raw >= 999
-            else int(_clamp_cfg_number(cfg, "pin_widen_auths", 8.0, 1.0, 100.0))
+            10**9 if _pw_a_raw >= 999 else int(_clamp_cfg_number(cfg, "pin_widen_auths", 8.0, 1.0, 100.0))
         )
-        self._pin_widen_minutes = _clamp_cfg_number(
-            cfg, "pin_widen_minutes", 30.0, 10.0, 120.0
-        )
-        self._pin_widen_stagger_s = _clamp_cfg_number(
-            cfg, "pin_widen_stagger_s", 60.0, 0.0, 600.0
-        )
+        self._pin_widen_minutes = _clamp_cfg_number(cfg, "pin_widen_minutes", 30.0, 10.0, 120.0)
+        self._pin_widen_stagger_s = _clamp_cfg_number(cfg, "pin_widen_stagger_s", 60.0, 0.0, 600.0)
         self._pin_resets_1h: list[float] = []
         self._pin_auths_1h: list[float] = []
         # Timestamp du dernier reset distinct compté (dédup des relectures
@@ -1859,7 +1828,9 @@ class VPNManager:
         # and /api/vpn/toggle only flips this flag — spawn the watchdog loop
         # here so enabling mid-session activates it too. All call sites run
         # inside the event loop; tolerate otherwise (start() creates it).
-        if self._enabled and (not self._watchdog_task or self._watchdog_task.done()):
+        if self._enabled and getattr(self, "_started", False) and (
+            not self._watchdog_task or self._watchdog_task.done()
+        ):
             try:
                 self._watchdog_task = asyncio.create_task(self._watchdog_loop())
             except RuntimeError:
@@ -1962,9 +1933,7 @@ class VPNManager:
         docker-compose.yml then points at the host project dir, which is
         mounted read-only at the same absolute path ([13]).
         """
-        return os.environ.get("VPN_DOCKER_COMPOSE_FILE") or os.path.join(
-            ROOT, self._docker_compose_file
-        )
+        return os.environ.get("VPN_DOCKER_COMPOSE_FILE") or os.path.join(ROOT, self._docker_compose_file)
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -1986,6 +1955,7 @@ class VPNManager:
         fail-fast cooldown (``_last_rotation_failed_at`` is only set by
         ``connect_next``), so a later retry is not gated.
         """
+        self._started = True
         self.load_state()
         if self._enabled:
             self._desired_connected = True
@@ -2025,8 +1995,7 @@ class VPNManager:
             await self.connect()
         except Exception as e:
             logger.warning(
-                "[vpn] startup connect failed (docker compose up) — "
-                "retried on first free request / manual connect: %s",
+                "[vpn] startup connect failed (docker compose up) — retried on first free request / manual connect: %s",
                 e,
             )
 
@@ -2043,52 +2012,79 @@ class VPNManager:
         fresh upscale builds NEW VPNManager instances (opencode
         ``_apply_station_count``), so the retired manager is never
         re-enabled."""
-        if self._startup_connect_task:
-            self._startup_connect_task.cancel()
-            self._startup_connect_task = None
-        if self._watchdog_task:
-            self._watchdog_task.cancel()
-            self._watchdog_task = None
-        if self._update_task:
-            self._update_task.cancel()
-            self._update_task = None
+        # [audit 2026-10-30] Arrêt ordonné : couper d'abord les intentions,
+        # abandonner coopérativement une rotation en vol, puis attendre les
+        # tâches avant de laisser l'appelant supprimer le conteneur.
         self._desired_connected = False
         self._enabled = False
-        self.save_state()
+        self._started = False
+        try:
+            await self.request_rotation_cancel(cap=2.0)
+        except Exception:
+            pass
+
+        async def _cancel_task(task) -> None:
+            if task is None or task is asyncio.current_task():
+                return
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+            except (asyncio.CancelledError, TimeoutError, Exception):
+                pass
+
+        for _attr in (
+            "_startup_connect_task",
+            "_watchdog_task",
+            "_update_task",
+            "_server_issue_recheck_task",
+            "_socks_catchup_task",
+            "_save_state_task",
+            # [audit watchdog 2026-10-30] Si la rotation n'a pas quitté
+            # proprement après le cap coopératif, on l'annule vraiment.
+            "_rotation_task",
+        ):
+            _task = getattr(self, _attr, None)
+            await _cancel_task(_task)
+            try:
+                setattr(self, _attr, None)
+            except Exception:
+                pass
+        # Écriture synchrone : ne pas recréer une `_save_state_task` après
+        # l'annulation de toutes les tâches.
+        try:
+            self._save_state_sync()
+        except Exception:
+            self.save_state()
 
     async def stop_container(self) -> None:
-        """Downscale path only: stop the service, then DELETE the container.
-
-        [fix 19/08] compose stop ALONE left a retired station sitting in
-        ``Exited`` state — read by the operator as "les stations désactivées
-        ne sont pas supprimées". The container is now removed via
-        ``docker rm -f`` (idempotent: stale containers that already died —
-        or were created but never started — are gone too). ``rm`` without
-        ``-v`` KEEPS the named gluetun volume, so an upscale recreates the
-        container from the same volume and the persisted config survives.
-        ``stop()`` never calls this: proxy shutdown leaves the tunnels
-        running (compose-managed)."""
-        # 1) graceful gluetun shutdown — best-effort: the container may
-        #    already be dead, or live under a different compose project.
-        compose_file = self._compose_file_path()
-        result = await asyncio.to_thread(self._docker_run,
-            ["compose", "-f", compose_file, "stop", self._compose_service],
-            120,
-            env=self._compose_env(),
-        )
-        if result.returncode != 0:
-            logger.warning(
-                "[vpn] compose stop failed (continuing to rm): %s",
-                result.stderr.strip() or result.stdout.strip(),
+        """Downscale path only: stop the service, then DELETE the container."""
+        self._docker_op_begin()
+        try:
+            compose_file = self._compose_file_path()
+            result = await asyncio.to_thread(
+                self._docker_run,
+                ["compose", "-f", compose_file, "stop", self._compose_service],
+                120,
+                env=self._compose_env(),
             )
-        # 2) actually delete the container (keep the volume). "No such
-        #    container" is success — already removed by an earlier pass.
-        rm = await asyncio.to_thread(self._docker_run, ["rm", "-f", self._docker_container], 120)
-        if rm.returncode != 0 and "No such container" not in (rm.stderr or ""):
-            raise RuntimeError(f"échec suppression docker : {rm.stderr.strip() or rm.stdout.strip()}")
+            if result.returncode != 0:
+                logger.warning(
+                    "[vpn] compose stop failed (continuing to rm): %s",
+                    result.stderr.strip() or result.stdout.strip(),
+                )
+            rm = await asyncio.to_thread(self._docker_run, ["rm", "-f", self._docker_container], 120)
+            if rm.returncode != 0 and "No such container" not in (rm.stderr or ""):
+                raise RuntimeError(f"\u00e9chec suppression docker : {rm.stderr.strip() or rm.stdout.strip()}")
+        finally:
+            self._docker_op_end()
 
     async def connect(self) -> None:
         """Bring the tunnel up: compose up + wait healthy + record IP."""
+        # [audit 2026-10-30] A station disabled by config/stop must not be
+        # recreated by heal/toggle/connect. Explicit start/connect endpoints
+        # clear _disabled first (FleetController).
+        if getattr(self, "_disabled", False):
+            raise RuntimeError(f"station {getattr(self, '_station', '?')} is disabled")
         self._desired_connected = True
         async with self._lock:
             # [graceful-aurora LOT C] auth_cooling : le pilotage se tait
@@ -2181,9 +2177,7 @@ class VPNManager:
                 remaining,
                 extra={"storm_cooldown_until": self._storm_cooldown_until},
             )
-            raise RotationFailed(
-                f"rotation storm cooldown ({int(remaining)}s restant)"
-            )
+            raise RotationFailed(f"rotation storm cooldown ({int(remaining)}s restant)")
         self._rotation_history = [t for t in self._rotation_history if now_mono - t < 3600.0]
         self._rotation_history.append(now_mono)
         if len(self._rotation_history) > self._max_rotations_per_hour:
@@ -2233,9 +2227,7 @@ class VPNManager:
         if self._last_rotation_failed_at is not None:
             since = time.monotonic() - self._last_rotation_failed_at
             if since < self._ROTATION_FAIL_COOLDOWN:
-                raise RotationFailed(
-                    f"cooldown rotation actif ({self._ROTATION_FAIL_COOLDOWN - int(since)}s restant)"
-                )
+                raise RotationFailed(f"cooldown rotation actif ({self._ROTATION_FAIL_COOLDOWN - int(since)}s restant)")
         # Circuit breaker gate ([25]): no rotation while the breaker is open.
         if not self._circuit_breaker.is_available(self._docker_container):
             raise RotationFailed("circuit breaker ouvert — rotation ignorée")
@@ -2250,7 +2242,20 @@ class VPNManager:
             return await asyncio.shield(task)
         finally:
             if self._rotation_task is task:
-                self._rotation_task = None
+                if task.done():
+                    self._rotation_task = None
+                else:
+                    # [audit 2026-10-30] The caller was cancelled (client
+                    # disconnect) but the shielded rotation is still running.
+                    # Clearing the reference here made request_rotation_cancel
+                    # blind: a downscale could delete the container while the
+                    # detached job recreated it. Keep the reference until the
+                    # task really finishes.
+                    task.add_done_callback(self._clear_rotation_task_ref)
+
+    def _clear_rotation_task_ref(self, task) -> None:
+        if getattr(self, "_rotation_task", None) is task:
+            self._rotation_task = None
 
     async def request_rotation_cancel(self, cap: float = 5.0) -> None:
         """[v10 §14.1.2] Appelé par le downscale AVANT stop_container : pose
@@ -2274,6 +2279,11 @@ class VPNManager:
         Returns the new IP on success; raises RotationFailed otherwise
         (CRITIC(5)).
         """
+        # [audit 2026-10-30] A new egress means a new peer hostname. Never
+        # carry the previous host into the quality ledger; re-resolve it from
+        # the logs once the tunnel is up.
+        self._current_host = None
+        self._last_host_resolve_at = 0.0
         async with self._lock:
             # [plan 30/08 Lot A1] ouvre la fenêtre warm-up AVANT la 1re
             # tentative : les probes du/nouveau tunnel naissant ne doivent pas
@@ -2354,7 +2364,9 @@ class VPNManager:
                     self._auth_failed = False
 
                 # Let the new tunnel stabilize before probing the IP
-                await asyncio.sleep(self._switch_delay * (random.uniform(0.8, 1.2) if not os.getenv("PYTEST_CURRENT_TEST") else 1.0))  # [P3.5] jitter ±20% healthy
+                await asyncio.sleep(
+                    self._switch_delay * (random.uniform(0.8, 1.2) if not os.getenv("PYTEST_CURRENT_TEST") else 1.0)
+                )  # [P3.5] jitter ±20% healthy
 
                 new_ip = await self.get_public_ip()
                 if not new_ip:
@@ -2441,15 +2453,16 @@ class VPNManager:
                         self._breaker_charge_failure(f"rotation attempt {attempt + 1} timeout")
                         self._backoff.record_failure()
                         logger.warning(
-                            "[vpn] rotation attempt %d/3 hit the %.0f s wall — "
-                            "draining in-flight docker op",
+                            "[vpn] rotation attempt %d/3 hit the %.0f s wall — draining in-flight docker op",
                             attempt + 1,
                             self._rotation_max_duration,
                         )
                         await self._await_rotation_ops_drained()
                     except Exception as e:
                         last_error = e
-                        if "could not determine public IP" in str(e) or "impossible de déterminer l'IP publique" in str(e):
+                        if "could not determine public IP" in str(e) or "impossible de déterminer l'IP publique" in str(
+                            e
+                        ):
                             # The rotation died asking for a REAL IP through
                             # the tunnel — the tunnel itself is dead (the
                             # 445 s stall class, incident 18/08 S2). NOT set
@@ -2511,12 +2524,13 @@ class VPNManager:
             # task (_skipped_rotation_task, commit 1), and this arm runs
             # inside the dying rotation itself.
             if self._rotation_probe_dead:
-                self._egress_failures = max(self._egress_failures, self._auto_wg_egress_ticks)
-                if self._watchdog_event is not None:
-                    self._watchdog_event.set()  # loop wait(timeout) returns → live tick
+                # [audit 2026-10-30] Passer par le chemin d'armement commun :
+                # compteur, timestamp de signal et event sont ainsi cohérents
+                # avec un échec de requête free (l'ancien code sautait
+                # `_last_conn_failure_at` et `_conn_failure_signal_count`).
+                self.arm_egress_watchdog()
                 logger.warning(
-                    "[vpn] rotation died on a dead tunnel — egress watchdog "
-                    "armed (real IP probe never answered)"
+                    "[vpn] rotation died on a dead tunnel - egress watchdog armed (real IP probe never answered)"
                 )
             raise RotationFailed(self._error)
 
@@ -2583,12 +2597,7 @@ class VPNManager:
             return
         if str(status) == VPNState.DEGRADED:
             try:
-                _hold = float(
-                    getattr(
-                        getattr(self, "_health_policy", None), "degraded_hold_s", 0.0
-                    )
-                    or 0.0
-                )
+                _hold = float(getattr(getattr(self, "_health_policy", None), "degraded_hold_s", 0.0) or 0.0)
             except Exception:
                 _hold = 0.0
             self._degraded_hold_until = time.monotonic() + _hold if _hold > 0 else 0.0
@@ -2617,7 +2626,9 @@ class VPNManager:
                 "station": self._station,
                 "status": str(self._status),
                 "ip": self._current_ip,
-                "server": self._current_server.get("name") if isinstance(self._current_server, dict) and self._current_server else None,
+                "server": self._current_server.get("name")
+                if isinstance(self._current_server, dict) and self._current_server
+                else None,
             }
             get_event_manager().publish("vpn_event", compact)
         except Exception as e:
@@ -2636,9 +2647,7 @@ class VPNManager:
             # [P3 perf] compteur d'events depuis le dernier tick watchdog :
             # 0 → le tick sain saute le refresh docker lourd (inspect+logs),
             # la détection temps réel restant assurée par CE watcher.
-            self._docker_events_since_tick = getattr(
-                self, "_docker_events_since_tick", 0
-            ) + 1
+            self._docker_events_since_tick = getattr(self, "_docker_events_since_tick", 0) + 1
             if self._watchdog_event is not None:
                 self._watchdog_event.set()  # not awaited -- simply wake the loop
             status = event.get("status")
@@ -2716,7 +2725,11 @@ class VPNManager:
                 except Exception:
                     _confirmed_absent = False
                 if not _confirmed_absent:
-                    logger.debug("[vpn] docker inspect transient failure for %s — keeping %s", self._docker_container, self._status)
+                    logger.debug(
+                        "[vpn] docker inspect transient failure for %s — keeping %s",
+                        self._docker_container,
+                        self._status,
+                    )
                     return self.get_status()
             if not info and _confirmed_absent:
                 if self._status != VPNState.DISCONNECTED:
@@ -2761,16 +2774,10 @@ class VPNManager:
             )
             _shared_log = _res.stdout if _res.returncode == 0 else None
             auth_failed = await self._check_auth_failed(_started_at, text=_shared_log)
-            server_issue = (
-                await self._check_server_issue(_started_at, text=_shared_log)
-                if not auth_failed
-                else False
-            )
+            server_issue = await self._check_server_issue(_started_at, text=_shared_log) if not auth_failed else False
         else:
             auth_failed = await self._check_auth_failed(_started_at)
-            server_issue = (
-                await self._check_server_issue(_started_at) if not auth_failed else False
-            )
+            server_issue = await self._check_server_issue(_started_at) if not auth_failed else False
         if auth_failed or server_issue:
             # [graceful-aurora LOT E] compteurs pin. Les AUTH restent
             # comptées par refresh ; les RESETS sont dédupliqués par
@@ -2803,10 +2810,7 @@ class VPNManager:
                 try:
                     _event_at = self._now_fn() - float(_age)
                     _last_event = getattr(self, "_last_pin_reset_event_at", None)
-                    _new_reset = (
-                        _last_event is None
-                        or _event_at > float(_last_event) + 2.0
-                    )
+                    _new_reset = _last_event is None or _event_at > float(_last_event) + 2.0
                 except Exception:
                     _new_reset = True
                 if _new_reset and not _healed:
@@ -2829,9 +2833,7 @@ class VPNManager:
                     # INIT postérieur = guérison prouvée → pas d'error du tout,
                     # on retombe sur le chemin nominal ci-dessous.
                     server_issue = False
-                elif _age is not None and _age <= _grace and bool(
-                    getattr(self, "_server_issue_recheck", True)
-                ):
+                elif _age is not None and _age <= _grace and bool(getattr(self, "_server_issue_recheck", True)):
                     self._auth_failed = False
                     self._server_issue = True
                     self._server_issue_pending = True
@@ -2842,9 +2844,7 @@ class VPNManager:
                         pass
                     # L'IP courante reste servable (renégo ~10 s) : ne pas la
                     # purger comme sur le chemin error.
-                    self._error = (
-                        "serveur VPN instable (reset récent) — ré-évaluation en cours"
-                    )
+                    self._error = "serveur VPN instable (reset récent) — ré-évaluation en cours"
                     try:
                         if VPNState.can_transition(self._status, VPNState.DEGRADED):
                             self._set_status(VPNState.DEGRADED)
@@ -2883,15 +2883,11 @@ class VPNManager:
                         _egress_ok = False
                     try:
                         _n_recent_resets = sum(
-                            1
-                            for _t in (getattr(self, "_pin_resets_1h", None) or [])
-                            if self._now_fn() - _t < 3600.0
+                            1 for _t in (getattr(self, "_pin_resets_1h", None) or []) if self._now_fn() - _t < 3600.0
                         )
                     except Exception:
                         _n_recent_resets = 0
-                    _pin_loop_active = _n_recent_resets >= int(
-                        getattr(self, "_pin_widen_resets", 6)
-                    )
+                    _pin_loop_active = _n_recent_resets >= int(getattr(self, "_pin_widen_resets", 6))
                     if _egress_ok and _stale_issue and not _pin_loop_active:
                         # Reset ancien (> grâce), jamais ré-émis, egress réel
                         # OK et aucun compteur de boucle : la station est
@@ -2938,10 +2934,7 @@ class VPNManager:
                             self._egress_socks_pending = False
                         except Exception:
                             pass
-                        self._error = (
-                            "resets voie secondaire (pin instable) — "
-                            "tunnel effectif OK, dégradé routable"
-                        )
+                        self._error = "resets voie secondaire (pin instable) — tunnel effectif OK, dégradé routable"
                         try:
                             if VPNState.can_transition(self._status, VPNState.DEGRADED):
                                 self._set_status(VPNState.DEGRADED)
@@ -2952,9 +2945,7 @@ class VPNManager:
                         # [roadmap] Marqueur explicite : tant que la voie
                         # secondaire produit des resets, le watchdog ne doit
                         # pas effacer l'état degraded à chaque tick.
-                        self._secondary_path_issue = bool(
-                            str(getattr(self, "_stack_effective", "") or "") != "openvpn"
-                        )
+                        self._secondary_path_issue = bool(str(getattr(self, "_stack_effective", "") or "") != "openvpn")
                         try:
                             _hold = float(
                                 getattr(
@@ -2966,9 +2957,7 @@ class VPNManager:
                             )
                         except Exception:
                             _hold = 0.0
-                        self._secondary_path_issue_until = (
-                            time.monotonic() + _hold if _hold > 0 else 0.0
-                        )
+                        self._secondary_path_issue_until = time.monotonic() + _hold if _hold > 0 else 0.0
                         self._current_server = {
                             "name": self._docker_container,
                             "country": self._current_country or self._server_countries,
@@ -2976,8 +2965,7 @@ class VPNManager:
                         # [roadmap] bruit : ces resets sont une information de
                         # voie secondaire, pas une erreur du tunnel effectif.
                         logger.debug(
-                            "[vpn] s%s resets voie secondaire mais egress OK "
-                            "(stack %s) — degraded pin-loop, IP gardée",
+                            "[vpn] s%s resets voie secondaire mais egress OK (stack %s) — degraded pin-loop, IP gardée",
                             getattr(self, "_station", "?"),
                             getattr(self, "_stack_effective", "?"),
                         )
@@ -3001,15 +2989,13 @@ class VPNManager:
                     except Exception:
                         _stack_eff = ""
                     _qual = (
-                        " (resets voie secondaire OV, stack effectif %s — "
-                        "tunnel effectif down)" % _stack_eff
+                        " (resets voie secondaire OV, stack effectif %s — tunnel effectif down)" % _stack_eff
                         if _stack_eff and _stack_eff != "openvpn"
                         else ""
                     )
                     self._set_status(VPNState.ERROR)
                     self._error = (
-                        "Serveur VPN injoignable - échec négociation TLS "
-                        "(liste serveurs obsolète ?)%s" % _qual
+                        "Serveur VPN injoignable - échec négociation TLS (liste serveurs obsolète ?)%s" % _qual
                     )
                     self._current_ip = None  # stale IP must not be served ([5])
                     logger.error("[vpn] %s", self._error)
@@ -3093,9 +3079,7 @@ class VPNManager:
                     # le reconcile watchdog ; son verdict ne change pas la
                     # classification). Kill-switch : socks_down_routable=false
                     # = chemin historique (CONNECTED direct, zéro sonde extra).
-                    _routable_socks_down = bool(
-                        getattr(self, "_socks_down_routable", True)
-                    )
+                    _routable_socks_down = bool(getattr(self, "_socks_down_routable", True))
                     if _routable_socks_down and self._needs_egress_check():
                         try:
                             _socks_ok = await self._socks_egress_ok()
@@ -3115,9 +3099,7 @@ class VPNManager:
                             # (timeouts) ne rougit pas la GUI : confirmation
                             # legere bornee par le budget (pattern watchdog).
                             try:
-                                _pending_at_entry = bool(
-                                    getattr(self, "_egress_socks_pending", False)
-                                )
+                                _pending_at_entry = bool(getattr(self, "_egress_socks_pending", False))
                             except Exception:
                                 _pending_at_entry = False
                             try:
@@ -3155,9 +3137,7 @@ class VPNManager:
                                     self._launch_socks_catchup()
                                 except Exception:
                                     pass
-                                self._error = (
-                                    "tunnel UP mais egress SOCKS5 KO — dégradé routable"
-                                )
+                                self._error = "tunnel UP mais egress SOCKS5 KO — dégradé routable"
                                 try:
                                     if VPNState.can_transition(self._status, VPNState.DEGRADED):
                                         self._set_status(VPNState.DEGRADED)
@@ -3297,9 +3277,7 @@ class VPNManager:
                 urls = list(getattr(self, "_ip_check_urls", None) or [self._ip_check_url])
                 for _url in urls:
                     try:
-                        resp = await asyncio.wait_for(
-                            client.get(_url), max(1.0, self._ip_probe_budget / len(urls))
-                        )
+                        resp = await asyncio.wait_for(client.get(_url), max(1.0, self._ip_probe_budget / len(urls)))
                     except Exception:
                         continue
                     candidate = resp.text.strip()
@@ -3319,9 +3297,7 @@ class VPNManager:
                 async with self._lock:
                     if new_ip != self._current_ip:
                         result["ip_changed"] = True
-                        logger.warning(
-                            "[vpn] health check: IP changed %s → %s", self._current_ip, new_ip
-                        )
+                        logger.warning("[vpn] health check: IP changed %s → %s", self._current_ip, new_ip)
                         self._current_ip = new_ip
                         # The tunnel re-picked an IP outside a rotation — keep
                         # the shared registry and identity in sync so the next
@@ -3602,9 +3578,7 @@ class VPNManager:
             all_timeout = True
             for i in range(n):
                 try:
-                    verdict = await self._probe_connect(
-                        urls[(base + i) % n], per_attempt=per_attempt
-                    )
+                    verdict = await self._probe_connect(urls[(base + i) % n], per_attempt=per_attempt)
                 except Exception:
                     continue
                 if verdict == "ok":
@@ -3618,9 +3592,7 @@ class VPNManager:
             remaining = budget - n * per_attempt
             if remaining > 0.5:
                 try:
-                    verdict = await self._probe_connect(
-                        urls[base % n], per_attempt=min(8.0, remaining)
-                    )
+                    verdict = await self._probe_connect(urls[base % n], per_attempt=min(8.0, remaining))
                 except Exception:
                     verdict = "timeout"
                 if verdict == "ok":
@@ -3726,9 +3698,7 @@ class VPNManager:
                 n_a = sum(1 for t in getattr(self, "_pin_auths_1h", []) if self._now_fn() - t < 3600.0)
             except Exception:
                 return
-            if n_r < int(getattr(self, "_pin_widen_resets", 6)) and n_a < int(
-                getattr(self, "_pin_widen_auths", 8)
-            ):
+            if n_r < int(getattr(self, "_pin_widen_resets", 6)) and n_a < int(getattr(self, "_pin_widen_auths", 8)):
                 return
             try:
                 stagger = float(getattr(self, "_pin_widen_stagger_s", 60.0))
@@ -3747,8 +3717,7 @@ class VPNManager:
             except Exception:
                 pass
             logger.warning(
-                "[vpn] pin_widened s%s : %s instable (%d resets/h, %d auths/h) — "
-                "élargissement %s min vers %s",
+                "[vpn] pin_widened s%s : %s instable (%d resets/h, %d auths/h) — élargissement %s min vers %s",
                 getattr(self, "_station", "?"),
                 original,
                 n_r,
@@ -3793,9 +3762,7 @@ class VPNManager:
             n_a = sum(1 for t in getattr(self, "_pin_auths_1h", []) if self._now_fn() - t < 3600.0)
         except Exception:
             n_r = n_a = 0
-        over = n_r >= int(getattr(self, "_pin_widen_resets", 6)) or n_a >= int(
-            getattr(self, "_pin_widen_auths", 8)
-        )
+        over = n_r >= int(getattr(self, "_pin_widen_resets", 6)) or n_a >= int(getattr(self, "_pin_widen_auths", 8))
         if over and not bool(getattr(self, "_pin_widen_extended", False)):
             try:
                 mins = float(getattr(self, "_pin_widen_minutes", 30.0))
@@ -3811,9 +3778,7 @@ class VPNManager:
         self._pin_widen_extended = False
         if over:
             try:
-                self._auth_cool_until = self._now_fn() + float(
-                    getattr(self, "_ov_auth_cool_s", 300.0)
-                )
+                self._auth_cool_until = self._now_fn() + float(getattr(self, "_ov_auth_cool_s", 300.0))
             except Exception:
                 pass
             logger.warning("[vpn] pin widen expiré, toujours instable — escalade auth_cooling")
@@ -3888,9 +3853,7 @@ class VPNManager:
                 used = len(urls) * per_attempt
                 remaining = self._ip_probe_budget - used
                 if remaining > 0.5:
-                    verdict = await self._probe_connect(
-                        urls[(base + 0) % len(urls)], per_attempt=remaining
-                    )
+                    verdict = await self._probe_connect(urls[(base + 0) % len(urls)], per_attempt=remaining)
                     if verdict == "ok":
                         VPNManager._note_effective_ok(self)
                         return True
@@ -4001,15 +3964,21 @@ class VPNManager:
                         # working tunnel).
                         # getattr x2 (pas self._eof_tolerated_at direct) : l'attribut
                         # n'est posé qu'en cas de burst (mypy has-type sinon).
-                        if not getattr(self, "_eof_tolerated_at", 0) or now - getattr(self, "_eof_tolerated_at", 0) > 300:
+                        if (
+                            not getattr(self, "_eof_tolerated_at", 0)
+                            or now - getattr(self, "_eof_tolerated_at", 0) > 300
+                        ):
                             logger.warning(
                                 "[vpn] socks5 EOF burst x%d station %s — tolerated, HTTP egress check",
-                                self._socks5_eof_count, self._station,
+                                self._socks5_eof_count,
+                                self._station,
                             )
                             self._eof_tolerated_at = now
                         try:
                             if not await self._http_proxy_egress_ok():
-                                logger.warning("[vpn] socks5 EOF + HTTP egress down station %s — egress dead", self._station)
+                                logger.warning(
+                                    "[vpn] socks5 EOF + HTTP egress down station %s — egress dead", self._station
+                                )
                                 self.arm_egress_watchdog()
                                 if self._watchdog_event is not None:
                                     self._watchdog_event.set()
@@ -4031,9 +4000,12 @@ class VPNManager:
             return False
         if self._shared is not None:
             try:
-                return self._shared.is_recent(ip)
+                if self._shared.is_recent(ip):
+                    return True
             except Exception:
                 pass
+        # [audit 2026-10-30] OR, not exclusive: an empty/corrupted shared
+        # registry must not disable the station's own recent-IP guard.
         return ip in [s.get("ip") for s in self._ip_history[-10:]]
 
     def _record_ip_change(self, ip: str) -> None:
@@ -4120,7 +4092,9 @@ class VPNManager:
                     # the recovery doesn't undo the rotation ([plan] A). The
                     # cursor always advances, so this picks a NEW country.
                     await self._pin_country_for_rotation()
-                    await asyncio.sleep(self._switch_delay * (random.uniform(0.8, 1.2) if not os.getenv("PYTEST_CURRENT_TEST") else 1.0))  # [P3.5] jitter ±20% healthy
+                    await asyncio.sleep(
+                        self._switch_delay * (random.uniform(0.8, 1.2) if not os.getenv("PYTEST_CURRENT_TEST") else 1.0)
+                    )  # [P3.5] jitter ±20% healthy
                 except Exception as e:
                     logger.debug("[vpn] finalize recovery round failed: %s", e)
         return False
@@ -4192,7 +4166,11 @@ class VPNManager:
         # not per-station manager settings).
         try:
             from config.settings import _yaml_data as _cfg_data
-            from config.settings import get_429_action, resolved_station_count
+            from config.settings import (
+                get_429_action,
+                get_free_substitution_policy,
+                resolved_station_count,
+            )
 
             _dual = _cfg_data.get("ip_rotation", {}).get("dual_station", False)
             _strict = _cfg_data.get("ip_rotation", {}).get("strict_free", False)
@@ -4206,9 +4184,8 @@ class VPNManager:
             # read from the config mirror (persisted selection, hot-reload).
             _free_attempts = _cfg_data.get("ip_rotation", {}).get("max_free_attempts", 2)
             _auto_free_attempts = _cfg_data.get("ip_rotation", {}).get("auto_max_free_attempts", True)
-            _exc_fallback = _cfg_data.get("ip_rotation", {}).get(
-                "free_exception_fallback", "station-first"
-            )
+            _exc_fallback = _cfg_data.get("ip_rotation", {}).get("free_exception_fallback", "station-first")
+            _free_substitution_policy = get_free_substitution_policy()
             # [free_parallel] Stations free parallel routing (persisted)
             _free_parallel = _cfg_data.get("ip_rotation", {}).get("free_parallel", {})
             if not isinstance(_free_parallel, dict):
@@ -4225,9 +4202,7 @@ class VPNManager:
             try:
                 # Cooldown station en SECONDES (GUI « Cooldown (s) »), distinct
                 # du bad_ttl fast-pin en MINUTES.
-                _station_bad_ttl_s = int(
-                    _cfg_data.get("ip_rotation", {}).get("station_bad_ttl_s", 60)
-                )
+                _station_bad_ttl_s = int(_cfg_data.get("ip_rotation", {}).get("station_bad_ttl_s", 60))
             except Exception:
                 _station_bad_ttl_s = 60
             _station_bad_ttl_s = max(1, min(3600, _station_bad_ttl_s))
@@ -4239,6 +4214,7 @@ class VPNManager:
             _free_attempts = 2
             _auto_free_attempts = True
             _exc_fallback = "station-first"
+            _free_substitution_policy = "homonym"
             _free_parallel = {}
             _on_429_action = "both"
             _bad_ttl = 60
@@ -4303,9 +4279,7 @@ class VPNManager:
             "profiles_count": len(self._identity_profiles),
             "recent_ip_window": self._config.get("recent_ip_window", 20),
             "recent_ip_max_age": self._config.get("recent_ip_max_age", 1800),
-            "shared_rotation_file": self._config.get(
-                "shared_rotation_file", "logs/shared_rotation.json"
-            ),
+            "shared_rotation_file": self._config.get("shared_rotation_file", "logs/shared_rotation.json"),
             "dual_station": _dual,
             "strict_free": _strict,
             # [plan 18/08 §3d] stack selection (auto/wireguard/openvpn) —
@@ -4325,6 +4299,8 @@ class VPNManager:
             "max_free_attempts": _free_attempts,
             "auto_max_free_attempts": _auto_free_attempts,
             "free_exception_fallback": _exc_fallback,
+            # [free-substitution] Politique payant → gratuit (homonym|family).
+            "free_substitution_policy": _free_substitution_policy,
             # [free_parallel] Stations free parallel routing (persisted)
             "free_parallel": _free_parallel,
             "on_429_action": _on_429_action,
@@ -4341,11 +4317,22 @@ class VPNManager:
         # stations share the same IP_ROTATION dict, so both stay symmetric.
         self._config.update(updates)
         if "enabled" in updates:
-            self._enabled = bool(updates["enabled"])
+            # [audit 2026-10-30] Passer par le setter : il crée le watchdog
+            # à l'activation (la tâche pouvait manquer après un toggle via
+            # /api/vpn-config). La désactivation reste un simple gate de tick.
+            self.enabled = bool(updates["enabled"])
         if "proxy_mode" in updates and updates["proxy_mode"] in ("vpn", "socks5", "direct"):
             self._proxy_mode = updates["proxy_mode"]
         if "quota_per_ip" in updates:
             self._quota_per_ip = max(1, int(updates["quota_per_ip"]))
+            # [audit 2026-10-30] A per-station override must survive a global
+            # quota_per_ip hot-reload (the constructor merge was not replayed).
+            try:
+                _ps = (self._config.get("per_station") or {}).get(str(self._station)) or {}
+                if isinstance(_ps, dict) and "quota_per_ip" in _ps:
+                    self._quota_per_ip = max(1, int(_ps["quota_per_ip"]))
+            except Exception:
+                pass
         if "switch_delay" in updates:
             self._switch_delay = max(0.0, float(updates["switch_delay"]))
         if "server_countries" in updates:
@@ -4363,18 +4350,18 @@ class VPNManager:
         if "country_offset" in updates:
             self._country_offset = max(0, int(updates["country_offset"] or 0))
         if "country_offset_stride" in updates:
-            self._country_offset_stride = max(
-                0, int(updates.get("country_offset_stride", 0) or 0)
-            )
+            self._country_offset_stride = max(0, int(updates.get("country_offset_stride", 0) or 0))
         # [PC-11] périmètre d'egress (hot-reloadable).
         if "egress_allow_any_country" in updates:
             self._egress_allow_any_country = bool(updates["egress_allow_any_country"])
         # [v10 §4 Lot 6] per_station hot-reload : les overrides de CETTE
         # station sont re-fusionnés par-dessus les updates globaux.
         _per = updates.get("per_station") if isinstance(updates.get("per_station"), dict) else None
+        _station_ovr = None
         if _per:
             _ovr = _per.get(str(self._station)) or _per.get(self._station)
             if isinstance(_ovr, dict):
+                _station_ovr = _ovr
                 for k, v in _ovr.items():
                     self._config[k] = v
         if "wait_healthy_poll" in updates:
@@ -4388,17 +4375,11 @@ class VPNManager:
         if "wg_churn_fallback" in updates:
             self._wg_churn_fallback = bool(updates["wg_churn_fallback"])
         if "circuit_breaker_threshold" in updates or "circuit_breaker_recovery" in updates:
-            threshold = updates.get(
-                "circuit_breaker_threshold", self._circuit_breaker._failure_threshold
-            )
+            threshold = updates.get("circuit_breaker_threshold", self._circuit_breaker._failure_threshold)
             recovery = updates.get("circuit_breaker_recovery", self._circuit_breaker._recovery_time)
-            self._circuit_breaker = CircuitBreaker(
-                failure_threshold=int(threshold), recovery_time=float(recovery)
-            )
+            self._circuit_breaker = CircuitBreaker(failure_threshold=int(threshold), recovery_time=float(recovery))
         if "backoff_max_delay" in updates:
-            self._backoff = BackoffTimer(
-                base_delay=self._switch_delay, max_delay=float(updates["backoff_max_delay"])
-            )
+            self._backoff = BackoffTimer(base_delay=self._switch_delay, max_delay=float(updates["backoff_max_delay"]))
         if "watchdog_interval" in updates:
             self._watchdog_interval = max(1, int(updates["watchdog_interval"]))
         # [plan 18/08] armed cadence + probe budget + egress threshold — hot-
@@ -4439,13 +4420,8 @@ class VPNManager:
         if "identity_max_profiles" in updates:
             self._identity_max_profiles = max(1, int(updates["identity_max_profiles"]))
         if "identity_profiles" in updates:
-            self._identity_profiles_base = _normalize_identity_profiles(
-                updates["identity_profiles"]
-            )
-        if any(
-            k in updates
-            for k in ("identity_diversity", "identity_max_profiles", "identity_profiles")
-        ):
+            self._identity_profiles_base = _normalize_identity_profiles(updates["identity_profiles"])
+        if any(k in updates for k in ("identity_diversity", "identity_max_profiles", "identity_profiles")):
             # Rebuild from the explicit base (seed), not from the current pool.
             self._identity_profiles = _build_identity_pool(
                 self._identity_profiles_base,
@@ -4455,23 +4431,26 @@ class VPNManager:
             if self._identity_profiles:
                 self._identity_index %= len(self._identity_profiles)  # clamp (config may shrink)
         if "watchdog_backoff_base" in updates or "watchdog_backoff_max" in updates:
-            _wbase = max(
-                1.0, float(updates.get("watchdog_backoff_base", self._watchdog_backoff._base_delay))
-            )
+            # [audit 2026-10-30] Muter le timer existant : recréer un
+            # BackoffTimer remettait `consecutive_failures` à zéro et la
+            # cadence repartait à `base` alors que l'incident durait.
+            _wbase = max(1.0, float(updates.get("watchdog_backoff_base", self._watchdog_backoff._base_delay)))
             _wmax = max(
                 _wbase,
                 float(updates.get("watchdog_backoff_max", self._watchdog_backoff._max_delay)),
             )
-            self._watchdog_backoff = BackoffTimer(base_delay=_wbase, max_delay=_wmax)
+            self._watchdog_backoff._base_delay = _wbase
+            self._watchdog_backoff._max_delay = _wmax
+            self._watchdog_backoff._current_delay = min(
+                max(self._watchdog_backoff._current_delay, _wbase), _wmax
+            )
         # [plan 30/08 — règle transversale] hot-reload des nouvelles clés des
         # lots A/B (mêmes bornes qu'à l'__init__, via _clamp_cfg_number).
         # bad_ttl / bad_ttl_factor / bad_ttl_max n'ont PAS de handler ici :
         # _host_ttl_seconds() lit self._config à chaque blacklist (déjà
         # re-synchronisé par self._config.update(updates) en tête).
         if "breaker_warmup_grace_s" in updates:
-            self._breaker_warmup_grace_s = _clamp_cfg_number(
-                updates, "breaker_warmup_grace_s", 60.0, 10.0, 600.0
-            )
+            self._breaker_warmup_grace_s = _clamp_cfg_number(updates, "breaker_warmup_grace_s", 60.0, 10.0, 600.0)
         if "station_max_rotations_per_hour" in updates:
             self._max_rotations_per_hour = int(
                 _clamp_cfg_number(updates, "station_max_rotations_per_hour", 10.0, 1.0, 720.0)
@@ -4481,9 +4460,7 @@ class VPNManager:
                 updates, "rotation_storm_cooldown_s", 600.0, 30.0, 7200.0
             )
         if "cascade_max_duration_s" in updates:
-            self._cascade_max_duration = _clamp_cfg_number(
-                updates, "cascade_max_duration_s", 120.0, 30.0, 600.0
-            )
+            self._cascade_max_duration = _clamp_cfg_number(updates, "cascade_max_duration_s", 120.0, 30.0, 600.0)
         if "ov_auth_cascade_cooldown_min" in updates:
             self._ov_auth_cascade_cooldown_s = (
                 _clamp_cfg_number(updates, "ov_auth_cascade_cooldown_min", 30.0, 5.0, 120.0) * 60.0
@@ -4491,13 +4468,9 @@ class VPNManager:
         if "ov_auth_cascade_enabled" in updates:
             self._ov_auth_cascade_enabled = bool(updates["ov_auth_cascade_enabled"])
         if "stack_age_guard_s" in updates:
-            self._stack_age_guard_s = _clamp_cfg_number(
-                updates, "stack_age_guard_s", 600.0, 60.0, 3600.0
-            )
+            self._stack_age_guard_s = _clamp_cfg_number(updates, "stack_age_guard_s", 600.0, 60.0, 3600.0)
         if "wg_canary_poll_interval_s" in updates:
-            self._WG_CANARY_POLL_INTERVAL_S = _clamp_cfg_number(
-                updates, "wg_canary_poll_interval_s", 4.0, 0.5, 60.0
-            )
+            self._WG_CANARY_POLL_INTERVAL_S = _clamp_cfg_number(updates, "wg_canary_poll_interval_s", 4.0, 0.5, 60.0)
         if "ovpn_protocol" in updates or "openvpn_protocol" in updates:
             _p = str(updates.get("ovpn_protocol", updates.get("openvpn_protocol", "udp"))).lower()
             if _p not in ("udp", "tcp"):
@@ -4536,19 +4509,13 @@ class VPNManager:
         # qu'à l'__init__). server_issue_recheck / socks_down_routable /
         # wait_healthy_require_socks sont des booléens (kill-switches).
         if "server_issue_grace_s" in updates:
-            self._server_issue_grace_s = _clamp_cfg_number(
-                updates, "server_issue_grace_s", 25.0, 5.0, 120.0
-            )
+            self._server_issue_grace_s = _clamp_cfg_number(updates, "server_issue_grace_s", 25.0, 5.0, 120.0)
         if "server_issue_recheck" in updates:
             self._server_issue_recheck = bool(updates["server_issue_recheck"])
         if "wait_healthy_late_retry_s" in updates:
-            self._wait_healthy_late_retry_s = _clamp_cfg_number(
-                updates, "wait_healthy_late_retry_s", 30.0, 0.0, 120.0
-            )
+            self._wait_healthy_late_retry_s = _clamp_cfg_number(updates, "wait_healthy_late_retry_s", 30.0, 0.0, 120.0)
         if "socks_catchup_s" in updates:
-            self._socks_catchup_s = _clamp_cfg_number(
-                updates, "socks_catchup_s", 90.0, 10.0, 300.0
-            )
+            self._socks_catchup_s = _clamp_cfg_number(updates, "socks_catchup_s", 90.0, 10.0, 300.0)
         if "wait_healthy_require_socks" in updates:
             self._wait_healthy_require_socks = bool(updates["wait_healthy_require_socks"])
         if "socks_down_routable" in updates:
@@ -4598,10 +4565,70 @@ class VPNManager:
                     setattr(
                         self,
                         _attr,
-                        10**9 if _r >= 999 else int(_clamp_cfg_number(updates, _k, 8.0 if "auths" in _k else 6.0, 1.0, 100.0)),
+                        10**9
+                        if _r >= 999
+                        else int(_clamp_cfg_number(updates, _k, 8.0 if "auths" in _k else 6.0, 1.0, 100.0)),
                     )
                 except Exception:
                     pass
+        # [audit 2026-10-30] Appliquer réellement les overrides per_station du
+        # watchdog : l'ancien code les fusionnait dans `_config` sans toucher
+        # les attributs live (seul `_config` changeait). Les clés globales ont
+        # déjà été traitées ; les overrides de CETTE station gagnent en dernier.
+        if isinstance(_station_ovr, dict):
+            try:
+                if "watchdog_interval" in _station_ovr:
+                    self._watchdog_interval = max(1, int(_station_ovr["watchdog_interval"]))
+                if "watchdog_auth_grace_s" in _station_ovr:
+                    self._watchdog_auth_grace_s = _clamp_cfg_number(
+                        _station_ovr, "watchdog_auth_grace_s", 240.0, 0.0, 900.0
+                    )
+                if "watchdog_egress_grace_ticks" in _station_ovr:
+                    self._watchdog_egress_grace_ticks = int(
+                        _clamp_cfg_number(_station_ovr, "watchdog_egress_grace_ticks", 6.0, 2.0, 20.0)
+                    )
+                if "watchdog_max_restarts_per_hour" in _station_ovr:
+                    self._watchdog_max_restarts_per_hour = int(
+                        _clamp_cfg_number(_station_ovr, "watchdog_max_restarts_per_hour", 3.0, 1.0, 10.0)
+                    )
+                for _k, _conv, _floor in (
+                    ("egress_failure_tick_interval", float, 0.5),
+                    ("ip_probe_budget", float, 1.0),
+                    ("auto_wg_egress_ticks", int, 1),
+                ):
+                    if _k in _station_ovr:
+                        setattr(self, f"_{_k}", max(_floor, _conv(_station_ovr[_k])))
+                if "watchdog_backoff_base" in _station_ovr or "watchdog_backoff_max" in _station_ovr:
+                    _pbase = max(
+                        1.0, float(_station_ovr.get("watchdog_backoff_base", self._watchdog_backoff._base_delay))
+                    )
+                    _pmax = max(
+                        _pbase,
+                        float(_station_ovr.get("watchdog_backoff_max", self._watchdog_backoff._max_delay)),
+                    )
+                    self._watchdog_backoff._base_delay = _pbase
+                    self._watchdog_backoff._max_delay = _pmax
+                    self._watchdog_backoff._current_delay = min(
+                        max(self._watchdog_backoff._current_delay, _pbase), _pmax
+                    )
+            except (TypeError, ValueError):
+                logger.warning("[vpn] ignored invalid per_station watchdog override for s%s", self._station)
+        if "disabled_stations" in updates:
+            # [audit 2026-10-30] Hot-reload de la liste : `_disabled` était
+            # figé au boot, une station ajoutée/retirée dans config.yaml ne
+            # changeait jamais d'état avant un restart.
+            try:
+                _dis = {int(x) for x in (updates.get("disabled_stations") or []) if str(x).strip().isdigit()}
+            except Exception:
+                _dis = set()
+            _was_disabled = bool(getattr(self, "_disabled", False))
+            self._disabled = int(self._station) in _dis
+            if self._disabled:
+                self.enabled = False
+                self._desired_connected = False
+            elif _was_disabled and bool(self._config.get("enabled", True)):
+                self.enabled = True
+                self._desired_connected = True
         if self._shared is not None and any(
             k in updates for k in ("recent_ip_window", "recent_ip_max_age", "shared_rotation_file")
         ):
@@ -4609,6 +4636,19 @@ class VPNManager:
             # created once by opencode's lifespan; it re-reads these itself).
             self._shared.set_window(self._config)
         return self.get_config()
+
+    def update_health_policy(self, health: dict | None) -> None:
+        """[audit watchdog 2026-10-30] Recharge ``stations.health`` à chaud.
+
+        `HealthPolicy` était construit une seule fois dans `__init__` : une
+        modification de l'hystérésis/holds n'avait aucun effet avant restart.
+        """
+        try:
+            from ops.health import HealthPolicy
+
+            self._status_debouncer.policy = HealthPolicy.from_config({"health": health or {}})
+        except Exception as e:
+            logger.warning("[vpn] update_health_policy failed for s%s: %s", self._station, e)
 
     def get_status(self) -> dict:
         """Return current VPN status for the dashboard."""
@@ -4620,6 +4660,7 @@ class VPNManager:
             # réussie (évite "connecté 0s"/null à l'écran).
             try:
                 import datetime as _dt
+
                 _last = self._ip_history[-1].get("time")
                 if _last:
                     _dt_utc = _dt.datetime.strptime(_last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.UTC)
@@ -4649,6 +4690,7 @@ class VPNManager:
                 else None
             ),
             "ip": self._current_ip,
+            "current_host": getattr(self, "_current_host", None),
             "server": self._current_server.get("name") if self._current_server else None,
             "country": self._current_server.get("country") if self._current_server else None,
             "current_country": self._current_country,
@@ -4670,9 +4712,7 @@ class VPNManager:
             "degraded_reason": getattr(self, "_degraded_reason", None),
             "egress_socks_pending": bool(getattr(self, "_egress_socks_pending", False)),
             # [graceful-aurora LOT C/J] cooldown AUTH local.
-            "auth_fail_30min": len(
-                [t for t in getattr(self, "_auth_fail_times", []) if self._now_fn() - t < 1800.0]
-            )
+            "auth_fail_30min": len([t for t in getattr(self, "_auth_fail_times", []) if self._now_fn() - t < 1800.0])
             if hasattr(self, "_auth_fail_times")
             else 0,
             "auth_cool_remaining_s": max(
@@ -4701,12 +4741,8 @@ class VPNManager:
                 if getattr(self, "_pin_widened_until", 0.0) > self._now_fn()
                 else None
             ),
-            "pin_resets_1h": sum(
-                1 for t in getattr(self, "_pin_resets_1h", []) if self._now_fn() - t < 3600.0
-            ),
-            "pin_auths_1h": sum(
-                1 for t in getattr(self, "_pin_auths_1h", []) if self._now_fn() - t < 3600.0
-            ),
+            "pin_resets_1h": sum(1 for t in getattr(self, "_pin_resets_1h", []) if self._now_fn() - t < 3600.0),
+            "pin_auths_1h": sum(1 for t in getattr(self, "_pin_auths_1h", []) if self._now_fn() - t < 3600.0),
             "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
             "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
             # [phase 1] qui choisit les serveurs : proxy (nous) | gluetun.
@@ -4729,16 +4765,13 @@ class VPNManager:
             # [plan 30/08 Lot A4] visibilité anti-churn (alerte dashboard).
             # getattr : des tests construisent la coquille sans __init__.
             "rotation_storm": {
-                "cooldown_active": time.monotonic()
-                < getattr(self, "_storm_cooldown_until", 0.0),
+                "cooldown_active": time.monotonic() < getattr(self, "_storm_cooldown_until", 0.0),
                 "cooldown_remaining_s": max(
                     0,
                     int(getattr(self, "_storm_cooldown_until", 0.0) - time.monotonic()),
                 ),
                 "rotations_last_hour": sum(
-                    1
-                    for t in getattr(self, "_rotation_history", [])
-                    if time.monotonic() - t < 3600.0
+                    1 for t in getattr(self, "_rotation_history", []) if time.monotonic() - t < 3600.0
                 ),
                 "max_per_hour": getattr(self, "_max_rotations_per_hour", 10),
             },
@@ -4746,6 +4779,14 @@ class VPNManager:
             "backoff_delay": self._backoff.delay,
             "watchdog": {
                 "interval": self._watchdog_interval,
+                # [audit 2026-10-30] Âge du dernier heartbeat : le heartbeat
+                # n'était visible que dans les logs, donc invisible pour un
+                # moniteur qui ne tail pas debug.log.
+                "heartbeat_age_s": (
+                    None
+                    if not getattr(self, "_last_watchdog_hb_at", 0.0)
+                    else round(max(0.0, self._now_fn() - float(self._last_watchdog_hb_at)), 1)
+                ),
                 "failures": self._watchdog_backoff.consecutive_failures,
                 "next_delay": self._watchdog_backoff.delay,
                 "server_issue": self._server_issue,
@@ -4756,7 +4797,9 @@ class VPNManager:
                 # parasitic fast-recover / missed wake straight from the API.
                 "egress_failures": self._egress_failures,
                 "egress_armed": self._egress_failures > 0,
-                "egress_threshold": self._auto_wg_egress_ticks,
+                # [audit 2026-10-30] Le seuil réel est la grâce watchdog, pas
+                # le compteur de flip WG (auto_wg_egress_ticks).
+                "egress_threshold": self._egress_dead_threshold(),
                 "egress_tick_interval": self._egress_failure_tick_interval,
                 "last_conn_failure_at": self._last_conn_failure_at,
                 # [review 18/08] key aligned with stack_info's signal_count
@@ -4781,24 +4824,17 @@ class VPNManager:
                 "cooldown_remaining_s": (
                     0
                     if self._last_auto_flip_at is None
-                    else max(0, int(
-                        self._auto_flip_cooldown_min * 60
-                        - (self._now_fn() - self._last_auto_flip_at)
-                    ))
+                    else max(0, int(self._auto_flip_cooldown_min * 60 - (self._now_fn() - self._last_auto_flip_at)))
                 ),
                 "auth_failed_window_len": len(self._auth_failed_window),
                 "auth_failed_oldest_age_s": (
-                    None
-                    if not self._auth_failed_window
-                    else max(0, int(self._now_fn() - self._auth_failed_window[0]))
+                    None if not self._auth_failed_window else max(0, int(self._now_fn() - self._auth_failed_window[0]))
                 ),
                 "wg_key_present": self._wg_key_present(),
                 "wg_key_file": self._wg_key_file,
                 "stack_effective": self._stack_effective,
                 "stack_since_age_s": (
-                    None
-                    if self._stack_since is None
-                    else max(0, int(self._now_fn() - self._stack_since))
+                    None if self._stack_since is None else max(0, int(self._now_fn() - self._stack_since))
                 ),
                 # [PR2 cascade] Per-server technology cascade state
                 "cascade_enabled": self._cascade_enabled,
@@ -4808,9 +4844,7 @@ class VPNManager:
                 "skipped_ticks": int(getattr(self, "_watchdog_skipped_ticks", 0) or 0),
                 "cascade_step": self._cascade_step,
                 "cascade_elapsed_s": round(self._cascade_elapsed(), 1),
-                "cascade_remaining_s": round(
-                    max(0.0, self._cascade_max_duration - self._cascade_elapsed()), 1
-                ),
+                "cascade_remaining_s": round(max(0.0, self._cascade_max_duration - self._cascade_elapsed()), 1),
                 # [cascade intra-OV 05/09] observabilité flip proto sur AUTH_FAILED
                 "ov_auth_last_proto": getattr(self, "_ov_auth_last_proto", None),
                 # [graceful-aurora LOT D/J] grâce watchdog + budget restarts.
@@ -4822,9 +4856,7 @@ class VPNManager:
                 if getattr(self, "_auth_grace_until", 0.0) > self._now_fn()
                 else 0,
                 "watchdog_restarts_1h": sum(
-                    1
-                    for t in getattr(self, "_watchdog_restarts_1h", [])
-                    if self._now_fn() - t < 3600.0
+                    1 for t in getattr(self, "_watchdog_restarts_1h", []) if self._now_fn() - t < 3600.0
                 ),
                 "ov_auth_cooldown_remaining_s": max(
                     0,
@@ -4860,9 +4892,7 @@ class VPNManager:
 
     # ── Docker helpers (all blocking — run via asyncio.to_thread) ──
 
-    def _docker_run(
-        self, args: list[str], timeout: int = 30, env: dict | None = None
-    ) -> subprocess.CompletedProcess:
+    def _docker_run(self, args: list[str], timeout: int = 30, env: dict | None = None) -> subprocess.CompletedProcess:
         """Run a docker CLI command (blocking — call via asyncio.to_thread).
 
         ``env`` [plan 18/08 §2.1]: explicit child environment for `docker
@@ -4978,9 +5008,7 @@ class VPNManager:
         # into a WireGuard stanza, and gluetun ignores it under WG anyway.
         custom_ovpn = self._config.get("custom_ovpn_file")
         if stack == "openvpn" and custom_ovpn:
-            cu_path = os.path.join(
-                os.path.dirname(self._compose_file_path()), str(custom_ovpn).replace("/", os.sep)
-            )
+            cu_path = os.path.join(os.path.dirname(self._compose_file_path()), str(custom_ovpn).replace("/", os.sep))
             if os.path.isfile(cu_path):
                 env["OPENVPN_CUSTOM_CONFIG"] = f"/vpn-custom/{os.path.basename(cu_path)}"
         return env
@@ -5007,8 +5035,7 @@ class VPNManager:
     async def _docker_inspect(self) -> dict:
         """Inspect the gluetun container. Returns {} if absent or docker unavailable."""
         try:
-            result = await asyncio.to_thread(self._docker_run, ["inspect", self._docker_container], 15
-            )
+            result = await asyncio.to_thread(self._docker_run, ["inspect", self._docker_container], 15)
         except RuntimeError as e:
             logger.warning("[vpn] %s", e)
             return {}
@@ -5069,19 +5096,27 @@ class VPNManager:
             finally:
                 self._restart_in_progress = False
 
-    async def _docker_restart(self) -> None:
-        """Restart the gluetun container to get a fresh IP.
+    def _docker_op_begin(self) -> None:
+        """[audit 2026-10-30] Mark a self-induced docker operation.
 
-        Note ([25]): this deliberately bypasses docker compose — a plain
-        ``docker restart`` keeps the compose definition untouched (no drift
-        of the declared service). Image updates go through ``apply_update``
-        instead, which recreates the container from the new image.
+        ``_on_container_event`` ignores die/stop/kill while this counter is
+        positive; it was read but never incremented, so a restart/stop could
+        flip a connected station to ERROR mid-operation.
         """
-        result = await asyncio.to_thread(self._docker_run, ["restart", self._docker_container], 60)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"échec redémarrage docker : {result.stderr.strip() or result.stdout.strip()}"
-            )
+        self._docker_ops_in_flight = int(getattr(self, "_docker_ops_in_flight", 0)) + 1
+
+    def _docker_op_end(self) -> None:
+        self._docker_ops_in_flight = max(0, int(getattr(self, "_docker_ops_in_flight", 0)) - 1)
+
+    async def _docker_restart(self) -> None:
+        """Restart the gluetun container to get a fresh IP."""
+        self._docker_op_begin()
+        try:
+            result = await asyncio.to_thread(self._docker_run, ["restart", self._docker_container], 60)
+            if result.returncode != 0:
+                raise RuntimeError(f"\u00e9chec red\u00e9marrage docker : {result.stderr.strip() or result.stdout.strip()}")
+        finally:
+            self._docker_op_end()
 
     # ── gluetun control server client ────────────────────────────
     #
@@ -5097,9 +5132,7 @@ class VPNManager:
     # merge -> validate -> stop+start). NEVER call GET /v1/vpn/settings — it
     # discloses credentials; we track the country in our own state.
 
-    async def _control_exec(
-        self, method: str, path: str, body: str | None = None, timeout: float = 10.0
-    ) -> list[str]:
+    async def _control_exec(self, method: str, path: str, body: str | None = None, timeout: float = 10.0) -> list[str]:
         """Run one wget call against gluetun's control server inside the
         container. Returns the decoded stdout lines on success, [] on any
         failure (non-zero exit, wget absent, control server down, timeout).
@@ -5199,9 +5232,7 @@ class VPNManager:
                 return str(ip)
         return None
 
-    async def _control_pin_country(
-        self, country: str, timeout: float = 60.0, catchup: float = 0.0
-    ) -> bool:
+    async def _control_pin_country(self, country: str, timeout: float = 60.0, catchup: float = 0.0) -> bool:
         """Ask gluetun to connect through ``country`` (PUT settings -> real
         stop+start reconnect). Polls ``status: running`` at the healthy-poll
         cadence until ``timeout``. Returns True only when the VPN came back
@@ -5232,14 +5263,24 @@ class VPNManager:
         # statut). Le slot est libéré dès le PUT parti — tenir un slot pendant
         # tout le poll bloquerait les autres stations des minutes.
         await _auth_gate()
+        self._pin_auth_released = False
         try:
             return await self._control_pin_country_gated(country, timeout, catchup)
         finally:
-            _auth_connect_done()
+            if not getattr(self, "_pin_auth_released", False):
+                _auth_connect_done()
 
-    async def _control_pin_country_gated(
-        self, country: str, timeout: float = 60.0, catchup: float = 0.0
-    ) -> bool:
+    def _release_pin_auth(self) -> None:
+        """[audit 2026-10-30] Release the AUTH slot as soon as the PUT is
+        sent; the status/IP poll does not hold a NordVPN session."""
+        if not getattr(self, "_pin_auth_released", False):
+            self._pin_auth_released = True
+            try:
+                _auth_connect_done()
+            except Exception:
+                pass
+
+    async def _control_pin_country_gated(self, country: str, timeout: float = 60.0, catchup: float = 0.0) -> bool:
         """Corps du pin control, appelé SOUS slot de la gate _auth_gate
         (voir _control_pin_country) — ne jamais appeler directement."""
         if not self._control_enabled or not country:
@@ -5248,9 +5289,7 @@ class VPNManager:
         # [PC-11 — audit 2026-09-08] périmètre d'egress (F4 : sorties Brésil /
         # NZ / Afrique du Sud alors que server_countries = de/nl/fr/se/ch) :
         # jamais de pin hors périmètre sauf opt-out explicite.
-        if not self._country_in_perimeter(country) and not bool(
-            getattr(self, "_egress_allow_any_country", False)
-        ):
+        if not self._country_in_perimeter(country) and not bool(getattr(self, "_egress_allow_any_country", False)):
             logger.warning(
                 "[POLICY] pays refusé hors périmètre s%s: %s (server_countries=%s) — "
                 "pin ignoré (egress_allow_any_country: true pour autoriser)",
@@ -5269,7 +5308,8 @@ class VPNManager:
             except Exception as e:
                 logger.warning(
                     "[least-loaded] selection failed for %s — pinning by country: %s",
-                    country, e,
+                    country,
+                    e,
                 )
                 hostnames = []
         # WireGuard: never pin hostnames (gluetun picks internally)
@@ -5277,15 +5317,23 @@ class VPNManager:
             hostnames = []
         sel = {"countries": [country]}
         if hostnames:
+            # [audit 2026-10-30] gluetun picks among top-K: hostnames[0] is
+            # only a candidate, not the chosen server. Keep it unknown until
+            # the logs confirm the real peer, otherwise quality/quota tiers
+            # are attributed to the wrong hostname.
+            self._current_host = None
+            self._last_host_resolve_at = 0.0
             sel["hostnames"] = hostnames
             logger.info(
                 "[least-loaded] s%s pinning %s top-%d load: %s",
-                self._station, country, len(hostnames), hostnames,
+                self._station,
+                country,
+                len(hostnames),
+                hostnames,
             )
-        payload = json.dumps(
-            {"provider": {"server_selection": sel}}, separators=(",", ":")
-        )
+        payload = json.dumps({"provider": {"server_selection": sel}}, separators=(",", ":"))
         lines = await self._control_exec("PUT", "/v1/vpn/settings", body=payload, timeout=10)
+        self._release_pin_auth()
         # [17/08 live] gluetun v3.41.3 answers a SUCCESSFUL settings PUT
         # with "200 OK" + body "running" (7 bytes, text/plain) — NOT 204
         # No Content. We must not treat that body as a rejection, or every
@@ -5306,10 +5354,19 @@ class VPNManager:
                         # [plan 30/08 Lot A2] TTL progressif configuré (plus de 24 h en dur)
                         try:
                             _now_ts = time.time()
-                            self._failed_hosts[h] = {"failures": 1, "first_failed_at": _now_ts, "bad_until": _now_ts + _host_ttl_seconds(1, self._config)}
+                            self._failed_hosts[h] = {
+                                "failures": 1,
+                                "first_failed_at": _now_ts,
+                                "bad_until": _now_ts + _host_ttl_seconds(1, self._config),
+                            }
                         except Exception:
                             pass
-                    logger.warning("[vpn] control pin %s rejected (choices/hostnames): %s — blacklisted %d hosts, retrying filtered", country, lines[0][:200], len(hostnames))
+                    logger.warning(
+                        "[vpn] control pin %s rejected (choices/hostnames): %s — blacklisted %d hosts, retrying filtered",
+                        country,
+                        lines[0][:200],
+                        len(hostnames),
+                    )
                     # One filtered retry: refetch loads with tech filter (cache bust) and try next candidates
                     try:
                         self._nord_loads_cache = None
@@ -5321,9 +5378,13 @@ class VPNManager:
                             lines2 = await self._control_exec("PUT", "/v1/vpn/settings", body=payload2, timeout=10)
                             if lines2 and lines2[0].strip().lower() == "running":
                                 hostnames = retry_hosts
+                                self._current_host = str(retry_hosts[0])
                             else:
                                 if lines2 and ("choices" in lines2[0].lower() or "hostnames" in lines2[0].lower()):
-                                    logger.warning("[vpn] retry pin also rejected: %s — falling back to country-only", lines2[0][:200])
+                                    logger.warning(
+                                        "[vpn] retry pin also rejected: %s — falling back to country-only",
+                                        lines2[0][:200],
+                                    )
                                 # Fall back to country-only
                                 sel3 = {"countries": [country]}
                                 payload3 = json.dumps({"provider": {"server_selection": sel3}}, separators=(",", ":"))
@@ -5380,7 +5441,8 @@ class VPNManager:
                 if await self._check_auth_failed(since_pin):
                     return True
                 return await self._check_server_issue(since_pin)
-            result = await asyncio.to_thread(self._docker_run,
+            result = await asyncio.to_thread(
+                self._docker_run,
                 ["logs", "--since", since_pin, "--tail", "1000", self._docker_container],
                 30,
             )
@@ -5444,8 +5506,7 @@ class VPNManager:
                             # a TLS failure mid-catch-up was silent before
                             # (the incident was diagnosed through logs).
                             logger.warning(
-                                "[vpn] control pin %s: auth/TLS failure "
-                                "during catch-up — abandoning",
+                                "[vpn] control pin %s: auth/TLS failure during catch-up — abandoning",
                                 country,
                             )
                             return False
@@ -5628,9 +5689,7 @@ class VPNManager:
                 pick = sorted(candidates)[0]
             try:
                 ok = await asyncio.wait_for(
-                    self._control_pin_country(
-                        pick, timeout=min(20, budget), catchup=min(25, budget)
-                    ),
+                    self._control_pin_country(pick, timeout=min(20, budget), catchup=min(25, budget)),
                     timeout=budget,
                 )
                 if ok:
@@ -5647,11 +5706,23 @@ class VPNManager:
         return False
 
     async def pin_country(self, country: str, timeout: float = 30.0) -> bool:
-        """[v10 §12.1.5] Pin MANUEL d'un pays pour cette station (dashboard).
+        """[v10 ?12.1.5] Pin MANUEL d'un pays pour cette station (dashboard).
 
         Réutilise _control_pin_country (PUT settings + scan auth/TLS fail-fast).
         Le pays est épinglé jusqu'à unpin_country() ou la prochaine rotation."""
-        return await self._control_pin_country(country, timeout=timeout)
+        ok = await self._control_pin_country(country, timeout=timeout)
+        if ok:
+            # [audit 2026-10-30] A manual pin must update the state used by
+            # get_status/_station_usable/next-country, otherwise the
+            # selection filters on the OLD country until a rotation.
+            try:
+                self._current_country = _normalize_country(country)
+                self._country_pinned_at = time.time()
+                self._current_host = None
+                self._last_host_resolve_at = 0.0
+            except Exception:
+                pass
+        return ok
 
     async def unpin_country(self) -> bool:
         """[v10 §12.1.5] Restaure la sélection complète (SERVER_COUNTRIES) :
@@ -5713,19 +5784,13 @@ class VPNManager:
                 if nxt != self._current_country:
                     pin_timeout = self._control_pin_timeout if timeout is None else timeout
                     pin_catchup = self._control_pin_catchup if catchup is None else catchup
-                    if await self._control_pin_country(
-                        nxt, timeout=pin_timeout, catchup=pin_catchup
-                    ):
+                    if await self._control_pin_country(nxt, timeout=pin_timeout, catchup=pin_catchup):
                         self._current_country = nxt
                         self._country_pinned_at = time.monotonic()
                         return nxt
             return None
         idx = None
-        if (
-            forced_pool is None
-            and self._shared is not None
-            and hasattr(self._shared, "next_country")
-        ):
+        if forced_pool is None and self._shared is not None and hasattr(self._shared, "next_country"):
             try:
                 idx = self._shared.next_country(self._station, self._country_offset, len(countries))
             except Exception as e:
@@ -5756,11 +5821,49 @@ class VPNManager:
         "Connecting to [...]". The SIGUSR1 retry loop re-logs the same
         remote every ~11 s, so the last occurrence is the host in play.
         None when the container is absent or no hostname is logged."""
-        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
+        result = await asyncio.to_thread(
+            self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
         )
         if result.returncode != 0:
             return None
         return _extract_current_hostname(result.stdout)
+
+    async def _resolve_current_host(self) -> None:
+        """Complète ``_current_host`` depuis les logs après un boot sans pin.
+
+        Au démarrage, les conteneurs peuvent être lancés par compose (pays
+        seul) : aucun hostname n'est alors mémorisé. On lit le dernier
+        "[host] Peer Connection Initiated" une fois par minute, jamais en
+        boucle serrée (docker logs = subprocess coûteux).
+        """
+        if self._current_host:
+            return
+        now = time.monotonic()
+        if now - float(getattr(self, "_last_host_resolve_at", 0.0)) < 60.0:
+            return
+        self._last_host_resolve_at = now
+        if self._status not in (VPNState.CONNECTED, VPNState.DEGRADED):
+            return
+        try:
+            since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 21600))
+            host = await self._current_hostname(since)
+            if not host:
+                if not self._nord_ip_hosts:
+                    try:
+                        await self._fetch_nord_loads()
+                    except Exception:
+                        pass
+                ip = await self._current_remote_ip(since)
+                if ip:
+                    host = self._nord_ip_hosts.get(str(ip))
+                    if not host:
+                        await self._fetch_nord_ip_map()
+                        host = self._nord_ip_hosts.get(str(ip))
+        except Exception:
+            return
+        if host:
+            self._current_host = host
+            logger.info("[vpn] s%s current hostname resolved: %s", self._station, host)
 
     async def _current_remote_ip(self, since: str) -> str | None:
         """Remote IP gluetun is currently trying — the LAST "[AF_INET]<ip>"
@@ -5769,15 +5872,14 @@ class VPNManager:
         [incident st1 12/10] quand le chunk ne contient aucun hostname
         (boucle SIGUSR1 précoce sur un serveur qui refuse), l'IP reste
         lisible et permet au fast-pin de sauter un serveur blacklisté."""
-        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
+        result = await asyncio.to_thread(
+            self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
         )
         if result.returncode != 0:
             return None
         return _extract_current_ip(result.stdout)
 
-    async def _fast_recover_via_control(
-        self, max_skips: int = 3, timeout: float = 15.0, catchup: float = 15.0
-    ) -> bool:
+    async def _fast_recover_via_control(self, max_skips: int = 3, timeout: float = 15.0, catchup: float = 15.0) -> bool:
         """Recover an AUTH_FAILED/TLS tunnel WITHOUT compose: re-pin the
         next country via the control API (PUT /v1/vpn/settings — a real
         stop+start reconnect, ~8-15 s, vs minutes for --force-recreate).
@@ -5809,8 +5911,7 @@ class VPNManager:
             if nxt is None:
                 if await self._check_auth_failed(since) or await self._check_server_issue(since):
                     logger.warning(
-                        "[vpn] fast-pin: still rejecting (attempt %d/%d) — "
-                        "re-pinning a different country",
+                        "[vpn] fast-pin: still rejecting (attempt %d/%d) — re-pinning a different country",
                         attempt + 1,
                         max_skips + 1,
                     )
@@ -5830,6 +5931,8 @@ class VPNManager:
                     continue  # dead host: the next country can work
                 return False  # infra failure: compose path is the escalation
             host = await self._current_hostname(since)
+            if host:
+                self._current_host = host
             # [phase 1] en mode "gluetun" la blacklist n'est pas appliquée
             # aux pins (gluetun choisit) — seul le re-pin pays sur AUTH
             # persiste, sans boucle d'évitement de host.
@@ -5860,6 +5963,7 @@ class VPNManager:
                 self._watchdog_backoff.record_success()
                 self._set_status(VPNState.CONNECTED)
                 self._error = None
+                self._watchdog_mark_recovered()
                 # [plan 20/08] Mark the recovery boundary BEFORE the internal
                 # refresh re-scans the churn window: docker logs span
                 # recoveries, so pre-recovery churn markers are stale — the
@@ -5885,9 +5989,7 @@ class VPNManager:
         idx = None
         if self._shared is not None and hasattr(self._shared, "peek_next_country"):
             try:
-                idx = self._shared.peek_next_country(
-                    self._station, self._country_offset, len(countries)
-                )
+                idx = self._shared.peek_next_country(self._station, self._country_offset, len(countries))
             except Exception:
                 idx = None
         if idx is not None:
@@ -5902,6 +6004,13 @@ class VPNManager:
 
     async def _compose_up(self, force_recreate: bool = False) -> None:
         """Start the gluetun service via docker compose (idempotent)."""
+        self._docker_op_begin()
+        try:
+            await self._compose_up_impl(force_recreate)
+        finally:
+            self._docker_op_end()
+
+    async def _compose_up_impl(self, force_recreate: bool = False) -> None:
         compose_file = self._compose_file_path()
         cmd = ["compose", "-f", compose_file, "up", "-d", self._compose_service]
         if force_recreate:
@@ -5916,17 +6025,11 @@ class VPNManager:
             # conteneur stale hors compose — rm -f puis UN retry.
             err_txt = f"{result.stderr or ''} {result.stdout or ''}"
             if "already in use" in err_txt or "Conflict" in err_txt:
-                rm = await asyncio.to_thread(
-                    self._docker_run, ["rm", "-f", self._docker_container], 60
-                )
+                rm = await asyncio.to_thread(self._docker_run, ["rm", "-f", self._docker_container], 60)
                 if rm.returncode == 0 or "No such container" in (rm.stderr or ""):
-                    result = await asyncio.to_thread(
-                        self._docker_run, cmd, 120, env=self._compose_env()
-                    )
+                    result = await asyncio.to_thread(self._docker_run, cmd, 120, env=self._compose_env())
         if result.returncode != 0:
-            raise RuntimeError(
-                f"échec docker compose up : {result.stderr.strip() or result.stdout.strip()}"
-            )
+            raise RuntimeError(f"échec docker compose up : {result.stderr.strip() or result.stdout.strip()}")
 
     async def _ensure_container(self, force_recreate: bool | None = None) -> None:
         """Compose up if the container is absent, else restart it.
@@ -5954,6 +6057,9 @@ class VPNManager:
             self._note_watchdog_restart()
             await self._compose_up(force_recreate=True)
         else:
+            # [audit 2026-10-30] Le restart « plain » est un vrai redémarrage
+            # lui aussi : l'ancien code ne le comptait pas dans le budget.
+            self._note_watchdog_restart()
             await self._docker_restart()
 
     async def _refresh_server_list(self) -> None:
@@ -5979,38 +6085,50 @@ class VPNManager:
         try:
             await asyncio.to_thread(
                 self._docker_run,
-                ["exec", self._docker_container, "sh", "-c",
-                 "rm -rf /gluetun/servers.json /gluetun/servers"],
+                ["exec", self._docker_container, "sh", "-c", "rm -rf /gluetun/servers.json /gluetun/servers"],
                 30,
             )
             wiped = True
         except Exception as e:
             logger.warning(
                 "[vpn] s%s server-list cache wipe via exec failed (%s) — trying volume fallback",
-                self._station, e,
+                self._station,
+                e,
             )
         if not wiped:
             try:
                 vol = await asyncio.to_thread(
                     self._docker_run,
-                    ["inspect", "-f",
-                     "{{range .Mounts}}{{if eq .Destination \"/gluetun\"}}{{.Name}}{{end}}{{end}}",
-                     self._docker_container],
+                    [
+                        "inspect",
+                        "-f",
+                        '{{range .Mounts}}{{if eq .Destination "/gluetun"}}{{.Name}}{{end}}{{end}}',
+                        self._docker_container,
+                    ],
                     30,
                 )
                 vol_name = vol.stdout.strip()
                 if vol_name:
                     await asyncio.to_thread(
                         self._docker_run,
-                        ["run", "--rm", "-v", f"{vol_name}:/gluetun", "alpine",
-                         "sh", "-c", "rm -rf /gluetun/servers.json /gluetun/servers"],
+                        [
+                            "run",
+                            "--rm",
+                            "-v",
+                            f"{vol_name}:/gluetun",
+                            "alpine",
+                            "sh",
+                            "-c",
+                            "rm -rf /gluetun/servers.json /gluetun/servers",
+                        ],
                         60,
                     )
                     wiped = True
             except Exception as e:
                 logger.warning(
                     "[vpn] s%s server-list cache wipe via volume fallback failed (continuing): %s",
-                    self._station, e,
+                    self._station,
+                    e,
                 )
         if wiped:
             logger.warning(
@@ -6025,8 +6143,11 @@ class VPNManager:
     # load. Any failure degrades gracefully to the legacy country-only pin.
     # ------------------------------------------------------------------
     _NORD_COUNTRY_IDS_FALLBACK = {
-        "Germany": 81, "Netherlands": 153, "France": 74,
-        "Sweden": 208, "Switzerland": 209,
+        "Germany": 81,
+        "Netherlands": 153,
+        "France": 74,
+        "Sweden": 208,
+        "Switzerland": 209,
     }
 
     async def _http_get_json(self, url: str, timeout: int = 8):
@@ -6057,9 +6178,7 @@ class VPNManager:
     async def _load_nord_country_ids(self) -> None:
         self._nord_country_ids = dict(self._NORD_COUNTRY_IDS_FALLBACK)
         try:
-            data = await self._http_get_json(
-                "https://api.nordvpn.com/v1/servers/countries", 15
-            )
+            data = await self._http_get_json("https://api.nordvpn.com/v1/servers/countries", 15)
             if isinstance(data, list):
                 for c in data:
                     if c.get("name") and c.get("id"):
@@ -6106,17 +6225,32 @@ class VPNManager:
                 if tech:
                     tech_q = f"&filters%5Bservers_technologies%5D%5Bidentifier%5D={tech}"
                 url = (
-                    "https://api.nordvpn.com/v1/servers/recommendations"
-                    f"?filters%5Bcountry_id%5D={cid}&limit=50{tech_q}"
+                    f"https://api.nordvpn.com/v1/servers/recommendations?filters%5Bcountry_id%5D={cid}&limit=50{tech_q}"
                 )
                 data = await self._http_get_json(url, 8)
                 entries = [
                     (s["hostname"], s["load"])
                     for s in (data or [])
-                    if s.get("status") == "online"
-                    and s.get("hostname")
-                    and isinstance(s.get("load"), (int, float))
+                    if s.get("status") == "online" and s.get("hostname") and isinstance(s.get("load"), (int, float))
                 ]
+                # [qualité hostname] mémorise entry IP → hostname (OpenVPN et
+                # WireGuard partagent la même IP d'entrée NordVPN).
+                try:
+                    for s in data or []:
+                        h = str(s.get("hostname") or "").strip().lower()
+                        if not h:
+                            continue
+                        cand = [s.get("station")]
+                        for ip_obj in s.get("ips") or []:
+                            if isinstance(ip_obj, dict):
+                                cand.append((ip_obj.get("ip") or {}).get("ip"))
+                        for ip in cand:
+                            if ip:
+                                self._nord_ip_hosts[str(ip)] = h
+                    if len(self._nord_ip_hosts) > 4096:
+                        self._nord_ip_hosts = dict(list(self._nord_ip_hosts.items())[-4096:])
+                except Exception:
+                    pass
                 return c, entries
             except Exception as e:
                 logger.warning("[least-loaded] %s load fetch failed: %s", c, e)
@@ -6135,6 +6269,45 @@ class VPNManager:
         self._nord_loads_cache_tech = tech
         return result
 
+    async def _fetch_nord_ip_map(self) -> None:
+        """Carte complète entry-IP → hostname (WireGuard ne loggue que l'IP).
+
+        L'API recommendations ne renvoie que le top-50 par pays : un pair
+        WireGuard peut être hors fenêtre. La liste complète (~7 200 serveurs)
+        est donc récupérée au plus une fois par heure, uniquement quand un
+        hostname manque réellement.
+        """
+        now = time.time()
+        if self._nord_ip_hosts and now - float(getattr(self, "_nord_ip_map_at", 0.0)) < 3600.0:
+            return
+        try:
+            data = await self._http_get_json(
+                "https://api.nordvpn.com/v1/servers?limit=8000", 30
+            )
+        except Exception as e:
+            logger.debug("[quality] full NordVPN IP map fetch failed: %s", e)
+            return
+        if not isinstance(data, list):
+            return
+        mapping: dict[str, str] = {}
+        for s in data:
+            if not isinstance(s, dict):
+                continue
+            h = str(s.get("hostname") or "").strip().lower()
+            if not h:
+                continue
+            if s.get("station"):
+                mapping[str(s["station"])] = h
+            for ip_obj in s.get("ips") or []:
+                if isinstance(ip_obj, dict):
+                    _ip = (ip_obj.get("ip") or {}).get("ip")
+                    if _ip:
+                        mapping[str(_ip)] = h
+        if mapping:
+            self._nord_ip_hosts.update(mapping)
+            self._nord_ip_map_at = now
+            logger.info("[quality] NordVPN IP→hostname map: %d entries", len(mapping))
+
     def _least_loaded_hostnames(self, country: str) -> list:
         """Top-K online lowest-load hostnames for `country`, excluding the
         auth-failure blacklist AND recently-used servers (cooldown). The
@@ -6144,14 +6317,47 @@ class VPNManager:
         if not self._least_loaded_enabled or self._nord_loads_cache is None:
             return []
         entries = self._nord_loads_cache[1].get(country, [])
-        out: list = []
-        for h, _ in entries:
+        qcfg = self._config.get("quality_preselection") if isinstance(self._config, dict) else None
+        qenabled = isinstance(qcfg, dict) and bool(qcfg.get("enabled", True))
+        fn = getattr(self, "_host_quality_fn", None)
+        try:
+            fast = float((qcfg or {}).get("fast_tps", 50.0))
+            slow = float((qcfg or {}).get("slow_tps", 20.0))
+            max_load = float((qcfg or {}).get("max_load", 80.0))
+        except (TypeError, ValueError):
+            fast, slow, max_load = 50.0, 20.0, 80.0
+        ranked: list[tuple] = []
+        for h, load in entries:
             if self._host_blacklisted(h) or self._server_recent(h):
                 continue
-            out.append(h)
-            if len(out) >= self._least_loaded_topk:
-                break
-        return out
+            if max_load > 0 and float(load) > max_load:
+                continue
+            tier = 1  # B : inconnu / moyen → load
+            tps = None
+            if qenabled and callable(fn):
+                try:
+                    q = fn(h)
+                except Exception:
+                    q = None
+                if isinstance(q, dict) and int(q.get("n") or 0) >= 3 and q.get("tps") is not None:
+                    tps = float(q["tps"])
+                    if q.get("slow") or tps < slow:
+                        tier = 2  # C : lent connu
+                    elif tps >= fast:
+                        tier = 0  # A : prouvé rapide
+            ranked.append((tier, -(tps if tps is not None else 0.0), float(load), h))
+        if not qenabled:
+            # [audit 2026-10-30] Rebuilding the list here used to drop the
+            # max_load filter and the IP/hostname blacklist, so a >80 % load
+            # server could be pinned when quality preselection was disabled.
+            ranked = [
+                (1, 0.0, float(load), h)
+                for h, load in entries
+                if not (self._host_blacklisted(h) or self._server_recent(h))
+                and (max_load <= 0 or float(load) <= max_load)
+            ]
+        ranked.sort()
+        return [h for _, _, _, h in ranked[: self._least_loaded_topk]]
 
     # [recently-used] Cooldown registry: servers used SUCCESSFULLY are avoided
     # for _server_cooldown_s so the pinner spreads across FRESHER servers
@@ -6172,7 +6378,9 @@ class VPNManager:
         VPNManager._recent_servers[host] = time.monotonic()
         logger.debug(
             "[recently-used] s%s server %s marked used (cooldown %ds)",
-            self._station, host, self._server_cooldown_s,
+            self._station,
+            host,
+            self._server_cooldown_s,
         )
 
     # ------------------------------------------------------------------
@@ -6253,10 +6461,7 @@ class VPNManager:
         # Lazy prune of the sliding window.
         cutoff = now - 30 * 60
         self._auth_failed_window = [t for t in self._auth_failed_window if t >= cutoff]
-        if (
-            self._last_auto_flip_at is not None
-            and now - self._last_auto_flip_at < self._auto_flip_cooldown_min * 60
-        ):
+        if self._last_auto_flip_at is not None and now - self._last_auto_flip_at < self._auto_flip_cooldown_min * 60:
             return None  # cooldown — anti-flapping
         if self._stack_effective == "wireguard":
             if self._egress_failures >= self._auto_wg_egress_ticks:
@@ -6331,7 +6536,9 @@ class VPNManager:
                         self._cascade_pending_proto = target
                         logger.warning(
                             "[vpn-cascade] ov-auth %s → %s (%d AUTH_FAILED/30min) — proto opposé avant WG",
-                            cur, target, len(self._auth_failed_window),
+                            cur,
+                            target,
+                            len(self._auth_failed_window),
                         )
                         return (
                             "openvpn",
@@ -6340,7 +6547,8 @@ class VPNManager:
                     else:
                         logger.debug(
                             "[vpn-cascade] ov-auth skip: cooldown local %.0fs restant (anti ping-pong %s)",
-                            _cd - (now - _last), cur,
+                            _cd - (now - _last),
+                            cur,
                         )
             # Cascade non applicable (désactivée / cooldown) → fall through
             # vers la logique normale OV→WG ci-dessous.
@@ -6376,20 +6584,17 @@ class VPNManager:
         ):
             return ("wireguard", f"OV healthy {self._auto_ov_return_min} min — return to WG")
         # Path C'' : OV bloqué ≥ (return_min+30) min — escape hatch
-        if (
-            self._stack_since is not None
-            and now - self._stack_since >= (self._auto_ov_return_min + 30) * 60
-        ):
+        if self._stack_since is not None and now - self._stack_since >= (self._auto_ov_return_min + 30) * 60:
             return ("wireguard", f"OV stuck {int((now - self._stack_since) / 60)}min — escape to WG")
         # Path D' : slow-burn 1-2 AUTH_FAILED persistés ≥10 min sur OV
         # (pas un bool, pas 5 min de flapping — old=oldest monotonic, déjà pruné 30 min)
         if self._auth_failed_window and self._stack_since is not None:
             oldest = self._auth_failed_window[0]
-            if (
-                now - oldest >= self._stack_age_guard_s
-                and now - self._stack_since >= self._stack_age_guard_s
-            ):
-                return ("wireguard", f"{len(self._auth_failed_window)} AUTH_FAILED/30min persisted 10min — slow-burn escape")
+            if now - oldest >= self._stack_age_guard_s and now - self._stack_since >= self._stack_age_guard_s:
+                return (
+                    "wireguard",
+                    f"{len(self._auth_failed_window)} AUTH_FAILED/30min persisted 10min — slow-burn escape",
+                )
         return None
 
     # ── [Bug #1] Flip classification — auth/churn driven flips must not be
@@ -6423,10 +6628,7 @@ class VPNManager:
         now = self._now_fn()
         cutoff = now - 30 * 60
         self._auth_failed_window = [t for t in self._auth_failed_window if t >= cutoff]
-        if (
-            self._last_auto_flip_at is not None
-            and now - self._last_auto_flip_at < self._auto_flip_cooldown_min * 60
-        ):
+        if self._last_auto_flip_at is not None and now - self._last_auto_flip_at < self._auto_flip_cooldown_min * 60:
             return None  # cooldown — anti-flapping (shared with auto)
         # Manual = stay in type, try all ports/protocols of that type only
         # WireGuard manual: never flip to OV, just keep healing WG (re-pin country,
@@ -6496,9 +6698,7 @@ class VPNManager:
         except Exception:
             return False
         try:
-            resp = await asyncio.wait_for(
-                client.send(httpx.Request("GET", self._ip_check_url)), timeout=5.0
-            )
+            resp = await asyncio.wait_for(client.send(httpx.Request("GET", self._ip_check_url)), timeout=5.0)
             return getattr(resp, "status_code", 500) < 500
         except Exception:
             return False
@@ -6521,11 +6721,7 @@ class VPNManager:
         st = self._wg_canary_state
         # [Bug #3] TTL asymétrique : PASS → long cache, FAIL → re-test rapide
         _ttl = self._WG_CANARY_PASS_TTL_S if st["ok"] else self._WG_CANARY_FAIL_TTL_S
-        if (
-            st["ok"] is not None
-            and st["at"] is not None
-            and now - st["at"] < _ttl
-        ):
+        if st["ok"] is not None and st["at"] is not None and now - st["at"] < _ttl:
             return bool(st["ok"])
         logger.warning("[vpn-canary] validation egress WireGuard (%s)…", reason)
         compose_path = self._compose_file_path()
@@ -6535,11 +6731,13 @@ class VPNManager:
         # verdict INDÉTERMINÉ) de l'egress négative MESURÉE (verdict FAIL).
         _bringup_failed = False
         try:
-            await asyncio.to_thread(self._docker_run,
+            await asyncio.to_thread(
+                self._docker_run,
                 ["compose", "-f", compose_path, "rm", "-sf", self._WG_CANARY_SERVICE],
                 60,
             )
-            result = await asyncio.to_thread(self._docker_run,
+            result = await asyncio.to_thread(
+                self._docker_run,
                 ["compose", "-f", compose_path, "up", "-d", self._WG_CANARY_SERVICE],
                 240,
             )
@@ -6548,10 +6746,7 @@ class VPNManager:
             deadline = t0 + self._WG_CANARY_BOOT_TIMEOUT_S
             # Borne d'itérations : un budget en secondes ne suffit pas si une
             # horloge est pathologique (tests) — jamais de boucle infinie.
-            max_iters = (
-                int(self._WG_CANARY_BOOT_TIMEOUT_S / max(self._WG_CANARY_POLL_INTERVAL_S, 0.001))
-                + 2
-            )
+            max_iters = int(self._WG_CANARY_BOOT_TIMEOUT_S / max(self._WG_CANARY_POLL_INTERVAL_S, 0.001)) + 2
             iters = 0
             while self._now_fn() < deadline and iters < max_iters:
                 iters += 1
@@ -6564,7 +6759,8 @@ class VPNManager:
             logger.warning("[vpn-canary] bring-up échoué: %s", e)
         finally:
             try:
-                await asyncio.to_thread(self._docker_run,
+                await asyncio.to_thread(
+                    self._docker_run,
                     [
                         "compose",
                         "-f",
@@ -6583,9 +6779,7 @@ class VPNManager:
             # le flip n'est pas annulé (cf. _cancel_wg_flip_if_canary_dead).
             st["ok"] = None
             st["at"] = None
-            logger.warning(
-                "[vpn-canary] verdict: INDÉTERMINÉ (bring-up, retry prochain tick)"
-            )
+            logger.warning("[vpn-canary] verdict: INDÉTERMINÉ (bring-up, retry prochain tick)")
             return False
         st["ok"] = ok
         st["at"] = self._now_fn()
@@ -6619,8 +6813,7 @@ class VPNManager:
             # mort — flip MAINTENU, retry court. Le cooldown 30 min
             # (remove_wait) est réservé au verdict négatif MESURÉ.
             logger.warning(
-                "[vpn-canary] flip →wireguard maintenu (canari indéterminé, "
-                "retry) ; maintien sur %s",
+                "[vpn-canary] flip →wireguard maintenu (canari indéterminé, retry) ; maintien sur %s",
                 self._stack_effective,
             )
             return False
@@ -6635,6 +6828,20 @@ class VPNManager:
         return True
 
     async def _apply_stack(
+        self,
+        mode: str,
+        reason: str = "manual",
+        auto: bool = False,
+        stations: list | None = None,
+        force: bool = False,
+    ) -> bool:
+        """Serialize stack flips, then delegate to ``_apply_stack_impl``."""
+        async with _stack_flip_lock():
+            return await self._apply_stack_impl(
+                mode, reason=reason, auto=auto, stations=stations, force=force
+            )
+
+    async def _apply_stack_impl(
         self,
         mode: str,
         reason: str = "manual",
@@ -6687,9 +6894,7 @@ class VPNManager:
                     services.append(_m._compose_service)
             if not stations:
                 stations = [1, 2] if self._station <= 2 else [self._station]
-                services = (
-                    ["vpn-gluetun", "vpn-gluetun-2"] if self._station <= 2 else [self._compose_service]
-                )
+                services = ["vpn-gluetun", "vpn-gluetun-2"] if self._station <= 2 else [self._compose_service]
             station_keys = {f"VPN_TYPE_STATION{s}" for s in stations}
         compose_path = self._compose_file_path()
         env_path = os.path.join(os.path.dirname(compose_path), ".env")
@@ -6739,7 +6944,18 @@ class VPNManager:
         # re-synced even when the stack is already effective — the compose
         # default ${VPN_TYPE_STATIONn:-openvpn} would otherwise boot a newly
         # upscaled station on OpenVPN under a running WireGuard fleet.
-        if mode == self._stack_effective and not force:
+        # [audit 2026-10-30] For a global flip, compare EVERY active
+        # manager, not just the caller: station 1 could see the target
+        # stack while the others still had a stale _stack_effective.
+        _target_ids = set(stations or [])
+        _target_managers = [
+            _m for _m in _managers if _m is not None and (_is_global_flip or _m._station in _target_ids)
+        ]
+        if _target_managers:
+            _same_stack = all(getattr(_m, "_stack_effective", None) == mode for _m in _target_managers)
+        else:
+            _same_stack = mode == self._stack_effective
+        if _same_stack and not force:
             logger.info("[vpn] stack already %s — no-op (env synced)", mode)
             return True
         # Recreate ALL active stations in the target stack in one compose
@@ -6757,14 +6973,17 @@ class VPNManager:
         # services d'un coup — pas un slot par station). Slot libéré dès
         # le compose lancé (le poll de santé ne fait que lire le statut).
         if _is_global_flip:
-            logger.warning("[vpn] _apply_stack: flip GLOBAL %s services %s — préférer per-station en auto", mode, services)
+            logger.warning(
+                "[vpn] _apply_stack: flip GLOBAL %s services %s — préférer per-station en auto", mode, services
+            )
         try:
             await _auth_gate(self._docker_container)
             cmd = ["compose", "-f", compose_path, "up", "-d", "--force-recreate"] + sorted(services)
             # Explicit env: the TARGET stack reaches the compose child even
             # when the parent env is stale (19/08 root cause — §2.1).
             try:
-                result = await asyncio.to_thread(self._docker_run, cmd, 300, env=self._compose_env(stations=stations, stack=mode)
+                result = await asyncio.to_thread(
+                    self._docker_run, cmd, 300, env=self._compose_env(stations=stations, stack=mode)
                 )
             finally:
                 _auth_connect_done()
@@ -6775,6 +6994,15 @@ class VPNManager:
             return False
         previous = self._stack_effective
         self._stack_effective = mode
+        # [audit 2026-10-30] A global/per-station flip applies to every
+        # targeted manager: leaving the others on a stale effective stack
+        # made the next flip recreate a fleet that was already correct.
+        for _m in _target_managers:
+            try:
+                _m._stack_effective = mode
+                _m._stack_since = self._now_fn()
+            except Exception:
+                pass
         self._stack_since = self._now_fn()
         self._last_flip_blocked_reason = None  # [Bug #4] clear on successful flip
         # [Bug #3] Invalider le cache canari après flip OV→WG réussi — le verdict
@@ -6954,7 +7182,11 @@ class VPNManager:
                     seen_port = True
                 elif stripped.startswith("OPENVPN_PROTOCOL=") and not stripped.startswith("OPENVPN_PROTOCOL_STATION"):
                     out.append(ln)
-                elif self._config.get("custom_ovpn_file") and stripped.startswith("OPENVPN_ENDPOINT_PORT=") and not stripped.startswith("OPENVPN_ENDPOINT_PORT_STATION"):
+                elif (
+                    self._config.get("custom_ovpn_file")
+                    and stripped.startswith("OPENVPN_ENDPOINT_PORT=")
+                    and not stripped.startswith("OPENVPN_ENDPOINT_PORT_STATION")
+                ):
                     out.append(ln)
                 else:
                     out.append(ln)
@@ -6967,7 +7199,9 @@ class VPNManager:
                 out.append(f"OPENVPN_PROTOCOL={protocol}")
             else:
                 for i, l in enumerate(out):
-                    if l.strip().startswith("OPENVPN_PROTOCOL=") and not l.strip().startswith("OPENVPN_PROTOCOL_STATION"):
+                    if l.strip().startswith("OPENVPN_PROTOCOL=") and not l.strip().startswith(
+                        "OPENVPN_PROTOCOL_STATION"
+                    ):
                         out[i] = f"OPENVPN_PROTOCOL={protocol}"
                         break
             if self._config.get("custom_ovpn_file"):
@@ -6975,7 +7209,9 @@ class VPNManager:
                     out.append(f"OPENVPN_ENDPOINT_PORT={target_port_str}")
                 else:
                     for i, l in enumerate(out):
-                        if l.strip().startswith("OPENVPN_ENDPOINT_PORT=") and not l.strip().startswith("OPENVPN_ENDPOINT_PORT_STATION"):
+                        if l.strip().startswith("OPENVPN_ENDPOINT_PORT=") and not l.strip().startswith(
+                            "OPENVPN_ENDPOINT_PORT_STATION"
+                        ):
                             out[i] = f"OPENVPN_ENDPOINT_PORT={target_port_str}"
                             break
             tmp = env_path + ".tmp"
@@ -7097,22 +7333,29 @@ class VPNManager:
             stack, proto = self._cascade_sequence[self._cascade_step]
             eff = getattr(self, "_ovpn_protocol_effective", "udp")
             if proto == eff:
-                logger.info("[vpn-cascade] skip step %d proto %s == effective — advancing",
-                            self._cascade_step, proto)
+                logger.info("[vpn-cascade] skip step %d proto %s == effective — advancing", self._cascade_step, proto)
                 self._cascade_step += 1
                 continue
             break
         if self._cascade_step >= len(self._cascade_sequence):
-            logger.info("[vpn-cascade] all %d steps exhausted within %.0fs",
-                        len(self._cascade_sequence), self._cascade_elapsed())
+            logger.info(
+                "[vpn-cascade] all %d steps exhausted within %.0fs",
+                len(self._cascade_sequence),
+                self._cascade_elapsed(),
+            )
             self._cascade_reset()
             return None
         stack, proto = self._cascade_sequence[self._cascade_step]
         self._cascade_step += 1
         self._cascade_pending_proto = proto
-        logger.info("[vpn-cascade] step %d/%d: %s %s (%.0fs elapsed)",
-                     self._cascade_step, len(self._cascade_sequence),
-                     stack, proto, self._cascade_elapsed())
+        logger.info(
+            "[vpn-cascade] step %d/%d: %s %s (%.0fs elapsed)",
+            self._cascade_step,
+            len(self._cascade_sequence),
+            stack,
+            proto,
+            self._cascade_elapsed(),
+        )
         return (stack, proto)
 
     def _cascade_reset(self) -> None:
@@ -7150,9 +7393,7 @@ class VPNManager:
             logger.info("[vpn] stack: auto (effective %s, watchdog resumes)", self._stack_effective)
             return {"ok": True, "effective": self._stack_effective}
         if propagate:
-            ok = await self._apply_stack(
-                mode, reason="manual", stations=stations, force=force
-            )
+            ok = await self._apply_stack(mode, reason="manual", stations=stations, force=force)
             if ok:
                 self._stack = mode  # manual selection wins over auto policy
                 self._stack_manual = True
@@ -7178,7 +7419,7 @@ class VPNManager:
             "effective": self._stack_effective,
             "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
             "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
-            "ovpn_ports": getattr(self, "_ovpn_ports", ["udp:1194","tcp:443"]),
+            "ovpn_ports": getattr(self, "_ovpn_ports", ["udp:1194", "tcp:443"]),
             "ovpn_port_idx": getattr(self, "_ovpn_port_idx", 0),
             "auto_hetero_boot": getattr(self, "_auto_hetero_boot", False),
             "keys_present": self._wg_key_present(),
@@ -7201,27 +7442,16 @@ class VPNManager:
             "cooldown_remaining_s": (
                 0
                 if self._last_auto_flip_at is None
-                else max(0, int(
-                    self._auto_flip_cooldown_min * 60
-                    - (now - self._last_auto_flip_at)
-                ))
+                else max(0, int(self._auto_flip_cooldown_min * 60 - (now - self._last_auto_flip_at)))
             ),
             "auth_failed_oldest_age_s": (
-                None
-                if not self._auth_failed_window
-                else max(0, int(now - self._auth_failed_window[0]))
+                None if not self._auth_failed_window else max(0, int(now - self._auth_failed_window[0]))
             ),
             "wg_key_file": self._wg_key_file,
-            "stack_since_age_s": (
-                None
-                if self._stack_since is None
-                else max(0, int(now - self._stack_since))
-            ),
+            "stack_since_age_s": (None if self._stack_since is None else max(0, int(now - self._stack_since))),
             "wg_canary_ok": self._wg_canary_state["ok"],
             "wg_canary_age_s": (
-                None
-                if self._wg_canary_state["at"] is None
-                else max(0, int(now - self._wg_canary_state["at"]))
+                None if self._wg_canary_state["at"] is None else max(0, int(now - self._wg_canary_state["at"]))
             ),
             # [Bug #3] canary TTL config for dashboard observability
             "wg_canary_fail_ttl": self._WG_CANARY_FAIL_TTL_S,
@@ -7232,9 +7462,7 @@ class VPNManager:
             "cascade_active": self._cascade_is_active(),
             "cascade_step": self._cascade_step,
             "cascade_elapsed_s": round(self._cascade_elapsed(), 1),
-            "cascade_remaining_s": round(
-                max(0.0, self._cascade_max_duration - self._cascade_elapsed()), 1
-            ),
+            "cascade_remaining_s": round(max(0.0, self._cascade_max_duration - self._cascade_elapsed()), 1),
             # [cascade intra-OV 05/09] observabilité flip proto sur AUTH_FAILED
             "ov_auth_last_proto": getattr(self, "_ov_auth_last_proto", None),
             "ov_auth_cascade_cooldown_s": float(getattr(self, "_ov_auth_cascade_cooldown_s", 1800.0)),
@@ -7257,7 +7485,8 @@ class VPNManager:
         """
         if text is None:
             since = started_at if started_at else "10m"
-            result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
+            result = await asyncio.to_thread(
+                self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
             )
             if result.returncode != 0:
                 return False
@@ -7267,6 +7496,37 @@ class VPNManager:
         # Recovered tunnel: the last logged openvpn success supersedes the
         # last AUTH_FAILED. rfind on the chunk is cheap (str scan).
         if text.rfind("Initialization Sequence Completed") < text.rfind("AUTH_FAILED"):
+            # [P0.5] Le scan relit la MÊME queue de logs toutes les ~20 s : sur
+            # un tunnel CONNECTED, la même ligne AUTH_FAILED ne doit pas être
+            # recomptée (elle gonflait le blacklist et les logs sans tentative
+            # réelle). Une nouvelle ligne (ou un tunnel down) passe normalement.
+            _last_line = ""
+            for _ln in reversed(text.splitlines()):
+                if "AUTH_FAILED" in _ln or "auth failed" in _ln.lower():
+                    _last_line = _ln.strip()
+                    break
+            _fp = hash(_last_line or text[-500:])
+            _now = self._now_fn()
+            # `_status` peut être CONNECTING/DEGRADED alors que l'egress est
+            # déjà sain (s3/s6 observés) : l'egress full suffit à qualifier la
+            # ligne de stale.
+            _egress_ok = str(getattr(self, "_egress_state", "") or "") == "tunnel_up_full"
+            if (
+                (self._status == VPNState.CONNECTED or _egress_ok)
+                and _fp == self._last_auth_line_fp
+                and (_now - self._last_auth_line_at) < 600.0
+            ):
+                return False
+            self._last_auth_line_fp = _fp
+            self._last_auth_line_at = _now
+            # [P0.5] Hôte déjà blacklisté : le scan suivant relit la même
+            # queue de logs. Ne pas ré-incrémenter le TTL ni réécrire le
+            # warning à chaque tick (41 lignes/2 min observées).
+            _host_now = _extract_current_hostname(text) or ""
+            if _host_now and self._host_blacklisted(_host_now):
+                # Hôte déjà blacklisté : la ligne est stale, ne PAS signaler
+                # « auth live » (sinon le watchdog relance → boucle).
+                return False
             # [plan 18/08] LIVE rejection (after the last success) — blacklist
             # the current hostname for fast-pin (Phase 1c). Recorded only
             # here, where live-ness is already established: an AUTH_FAILED
@@ -7396,8 +7656,7 @@ class VPNManager:
                     entry["bad_until"] = time.time() + max(60.0, ttl_min * 60.0)
                     self._auth_repin_needed = True
                     logger.warning(
-                        "[vpn] 3× AUTH consécutives sur %s — host blacklisté "
-                        "(%.0f min), re-pin autre host demandé",
+                        "[vpn] 3× AUTH consécutives sur %s — host blacklisté (%.0f min), re-pin autre host demandé",
                         host,
                         ttl_min,
                     )
@@ -7415,19 +7674,19 @@ class VPNManager:
     # ── [graceful-aurora LOT D] Watchdog : grâce + budget ─────────
 
     def _egress_dead_threshold(self) -> int:
-        """Seuil egress_dead : max(auto_wg_egress_ticks, grace_ticks).
+        """Seuil egress_dead : la fenêtre de grâce du watchdog uniquement.
 
-        Le tick exige autant de probes consécutifs avant restart (le compteur
-        est remis à zéro dès qu'un seul probe réussit — déjà en place)."""
-        try:
-            auto = int(getattr(self, "_auto_wg_egress_ticks", 3))
-        except Exception:
-            auto = 3
+        [audit 2026-10-30] Ne PAS réutiliser ``auto_wg_egress_ticks`` ici :
+        ce dernier pilote le flip automatique WireGuard (20 ticks avec la
+        config actuelle), pas la santé du tunnel. Le mélanger au seuil
+        d'egress repoussait la recovery à 40 ticks (~10 min à 15 s/tick).
+        Le compteur est remis à zéro dès qu'un seul probe réussit.
+        """
         try:
             grace = int(getattr(self, "_watchdog_egress_grace_ticks", 6))
         except Exception:
             grace = 6
-        return max(1, auto, grace)
+        return max(1, min(20, grace))
 
     def _watchdog_restarts_recent(self) -> list:
         """Restarts watchdog des 60 dernières minutes (fenêtre glissante)."""
@@ -7454,11 +7713,20 @@ class VPNManager:
         return len(self._watchdog_restarts_recent()) >= max(1, mx)
 
     def _note_watchdog_restart(self) -> None:
+        # [audit 2026-10-30] Un seul crédit par tick watchdog : le light
+        # restart, l'escalade compose et la recovery d'IP d'une même passe
+        # décrivent le même incident, pas trois incidents.
+        if getattr(self, "_watchdog_tick_active", False) and getattr(
+            self, "_watchdog_tick_restart_counted", False
+        ):
+            return
         try:
             store = getattr(self, "_watchdog_restarts_1h", None)
             if store is not None:
                 store.append(self._now_fn())
                 self._watchdog_restarts_recent()
+                if getattr(self, "_watchdog_tick_active", False):
+                    self._watchdog_tick_restart_counted = True
         except Exception:
             pass
 
@@ -7476,9 +7744,19 @@ class VPNManager:
         async (AUTH frais dans les logs ? cooldown AUTH global ?) avant de
         restarter. Toutes les autres actions sont terminales.
         """
-        auth_path = (kind == "AUTH_FAILED") or bool(
-            getattr(self, "_auth_failed", False)
-        )
+        # [audit 2026-10-30] Un cooldown AUTH local protège TOUTES les voies :
+        # un tick classé `egress dead` ne doit pas redémarrer la station
+        # pendant la fenêtre de refroidissement AUTH.
+        try:
+            if self._auth_cooling():
+                try:
+                    _rem_all = int(self._auth_cool_remaining_s())
+                except Exception:
+                    _rem_all = 0
+                return ("auth-cooling", f"{_rem_all}s")
+        except Exception:
+            pass
+        auth_path = (kind == "AUTH_FAILED") or bool(getattr(self, "_auth_failed", False))
         if auth_path:
             try:
                 _cooling = self._auth_cooling()
@@ -7515,9 +7793,13 @@ class VPNManager:
             return ("budget-exhausted", f"{_n}/h")
         return ("restart", kind)
 
-    def _record_auth_failure(self, text: str) -> None:
+    def _record_auth_failure(self, text: str, *, kind: str = "auth") -> None:
         """Blacklist le serveur fautif après un rejet LIVE (AUTH_FAILED ou
         server_issue).
+
+        ``kind="server"`` vient de ``_check_server_issue`` : il ne doit PAS
+        écrire « AUTH_FAILED » (les logs conteneurs n'en contenaient pas ;
+        c'était une fausse alerte AUTH comptée à chaque tick).
 
         L'appelant a déjà établi que le rejet est vivant (pas de
         "Initialization Sequence Completed" postérieur). La blacklist est
@@ -7541,8 +7823,14 @@ class VPNManager:
             entry["failures"] += 1
             ttl_s = _host_ttl_seconds(entry["failures"], self._config)
             entry["bad_until"] = now + ttl_s
+            # [P0.5] Blacklist PARTAGÉE entre stations : sans elle, chaque
+            # manager re-tentait le même serveur (failure #1 en boucle) et la
+            # rafale AUTH_FAILED pouvait faire rate-limiter le compte.
+            _GLOBAL_FAILED_HOSTS[host] = dict(entry)
             logger.warning(
-                "[vpn] AUTH_FAILED on %s (failure #%d, TTL %.0fmin) — fast-pin will skip it",
+                "[vpn] s%s %s on %s (failure #%d, TTL %.0fmin) — fast-pin will skip it",
+                getattr(self, "_station", "?"),
+                "AUTH_FAILED" if kind == "auth" else "server-refused",
                 host,
                 entry["failures"],
                 ttl_s / 60.0,
@@ -7556,17 +7844,29 @@ class VPNManager:
             entry["failures"] += 1
             ttl_s = _host_ttl_seconds(entry["failures"], self._config)
             entry["bad_until"] = now + ttl_s
+            _GLOBAL_FAILED_HOSTS[ip] = dict(entry)
             logger.warning(
-                "[vpn] server-refused on %s (failure #%d, TTL %.0fmin) — fast-pin will avoid it",
+                "[vpn] s%s server-refused on %s (failure #%d, TTL %.0fmin) — fast-pin will avoid it",
+                getattr(self, "_station", "?"),
                 ip,
                 entry["failures"],
                 ttl_s / 60.0,
             )
+        # [P0.5] Ne PAS alimenter le throttle AUTH global ici : ces lignes
+        # proviennent du scan de logs (parfois stale alors que le tunnel est
+        # sain, cf. s4 connected / auth_fail_30min=0). Le throttle reste
+        # alimenté par les chemins de connexion réels (L2035/L2263/L7921).
 
     def _host_blacklisted(self, host: str) -> bool:
         """True while a host is inside its blacklist window (TTL progressif
         A2 : `bad_ttl`/`bad_ttl_factor`/`bad_ttl_max`, défaut 24 h). Prunes
         the entry when it expires, so the dict never grows unbounded."""
+        _g = _GLOBAL_FAILED_HOSTS.get(host)
+        if _g is not None:
+            if time.time() >= _g.get("bad_until", 0):
+                _GLOBAL_FAILED_HOSTS.pop(host, None)
+            else:
+                return True
         entry = self._failed_hosts.get(host)
         if entry is None:
             return False
@@ -7588,13 +7888,25 @@ class VPNManager:
 
         Retourne True si le breaker a été informé."""
         if self._warmup_until and time.monotonic() < self._warmup_until:
-            remaining = self._warmup_until - time.monotonic()
-            logger.info(
-                "[breaker] warm-up grace — échec ignoré (%s), fenêtre restante %.0fs",
-                reason,
-                remaining,
-            )
-            return False
+            # [audit 2026-10-30] A half-open probe MUST always deliver its
+            # verdict. Ignoring its failure left _half_open_probe armed
+            # forever, so the breaker refused every later rotation.
+            try:
+                _state = (self._circuit_breaker.get_status().get(self._docker_container) or {}).get("state")
+            except Exception:
+                _state = None
+            if _state != "half-open":
+                remaining = self._warmup_until - time.monotonic()
+                logger.info(
+                    "[breaker] warm-up grace — échec ignoré (%s), fenêtre restante %.0fs",
+                    reason,
+                    remaining,
+                )
+                return False
+            logger.warning("[breaker] half-open probe failed during warm-up — recording failure")
+        # Any failure ends the boot grace: a second failure must not be
+        # silently absorbed by an ever-extending warm-up window.
+        self._warmup_until = 0.0
         self._circuit_breaker.record_failure(self._docker_container)
         return True
 
@@ -7623,7 +7935,8 @@ class VPNManager:
         ``_last_reset_age_s`` / ``_last_init_ok_at``."""
         if text is None:
             since = started_at if started_at else "10m"
-            result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
+            result = await asyncio.to_thread(
+                self._docker_run, ["logs", "--since", since, "--tail", "2000", self._docker_container], 30
             )
             if result.returncode != 0:
                 return False
@@ -7641,7 +7954,14 @@ class VPNManager:
         if live:
             # blacklist the offending host so fast-pin / re-pin skips it
             try:
-                self._record_auth_failure(raw)
+                _h = _extract_current_hostname(raw) or ""
+                _ip = _extract_current_ip(raw) or ""
+                _known = bool((_h and self._host_blacklisted(_h)) or (_ip and self._host_blacklisted(_ip)))
+                if _known:
+                    # Même hôte déjà blacklisté : ne pas re-signaler « live »
+                    # (sinon re-pin → server-refused → re-scan en boucle).
+                    return False
+                self._record_auth_failure(raw, kind="server")
             except Exception:
                 pass
         return live
@@ -7732,7 +8052,17 @@ class VPNManager:
             since = f"{max(1, int(window_s))}s"
         else:
             since = f"{max(2, int(window_min))}m"
-        result = await asyncio.to_thread(self._docker_run, ["logs", "--since", since, "--tail", str(max(100, int(getattr(self._health_policy, "log_scan_tail", 2000)))), self._docker_container], 30
+        result = await asyncio.to_thread(
+            self._docker_run,
+            [
+                "logs",
+                "--since",
+                since,
+                "--tail",
+                str(max(100, int(getattr(self._health_policy, "log_scan_tail", 2000)))),
+                self._docker_container,
+            ],
+            30,
         )
         if result.returncode != 0:
             return False
@@ -7797,15 +8127,10 @@ class VPNManager:
                             self._egress_socks_pending = False
                         except Exception:
                             pass
-                        logger.info(
-                            "[vpn] socks catch-up OK — egress SOCKS5 revenu"
-                        )
+                        logger.info("[vpn] socks catch-up OK — egress SOCKS5 revenu")
                         return
                     await asyncio.sleep(5.0)
-                logger.warning(
-                    "[vpn] socks catch-up expiré — egress SOCKS5 toujours KO "
-                    "(tunnel UP, voir egress_state)"
-                )
+                logger.warning("[vpn] socks catch-up expiré — egress SOCKS5 toujours KO (tunnel UP, voir egress_state)")
 
             self._socks_catchup_task = loop.create_task(_catch())
         except Exception:
@@ -7911,10 +8236,7 @@ class VPNManager:
                     info = {}
                 try:
                     if info.get("running") and await self._tunnel_up_via_control():
-                        logger.warning(
-                            "[vpn] late_healthy_recovered — tunnel UP après timeout, "
-                            "RuntimeError effacé"
-                        )
+                        logger.warning("[vpn] late_healthy_recovered — tunnel UP après timeout, RuntimeError effacé")
                         try:
                             self._last_rotation_error = None
                         except Exception:
@@ -7961,14 +8283,14 @@ class VPNManager:
             self._active_free_streams -= 1
 
     async def _docker_image_id(self, image: str) -> str | None:
-        result = await asyncio.to_thread(self._docker_run, ["image", "inspect", image, "--format", "{{.Id}}"], 30
-        )
+        result = await asyncio.to_thread(self._docker_run, ["image", "inspect", image, "--format", "{{.Id}}"], 30)
         if result.returncode != 0:
             return None
         return result.stdout.strip() or None
 
     async def _docker_repo_digest(self, image: str) -> str | None:
-        result = await asyncio.to_thread(self._docker_run,
+        result = await asyncio.to_thread(
+            self._docker_run,
             ["image", "inspect", image, "--format", "{{index .RepoDigests 0}}"],
             30,
         )
@@ -7992,7 +8314,8 @@ class VPNManager:
                 return False  # image not installed yet — nothing to update
             old_id = await self._docker_image_id(image)
             compose_file = self._compose_file_path()
-            result = await asyncio.to_thread(self._docker_run,
+            result = await asyncio.to_thread(
+                self._docker_run,
                 ["compose", "-f", compose_file, "pull", self._compose_service],
                 300,
                 env=self._compose_env(),
@@ -8069,7 +8392,8 @@ class VPNManager:
                 # le compose lancé (le wait ne fait que poller).
                 await _auth_gate()
                 try:
-                    result = await asyncio.to_thread(self._docker_run,
+                    result = await asyncio.to_thread(
+                        self._docker_run,
                         [
                             "compose",
                             "-f",
@@ -8136,7 +8460,8 @@ class VPNManager:
             image = "qmcgaw/gluetun"
             await asyncio.to_thread(self._docker_run, ["tag", old_image_id, image], 30)
             compose_file = self._compose_file_path()
-            await asyncio.to_thread(self._docker_run,
+            await asyncio.to_thread(
+                self._docker_run,
                 [
                     "compose",
                     "-f",
@@ -8174,9 +8499,7 @@ class VPNManager:
             self._update_known_since
             and time.monotonic() - self._update_known_since > self._update_max_defer_hours * 3600
         ):
-            logger.info(
-                "[vpn-update] deferring >%dh — applying anyway", self._update_max_defer_hours
-            )
+            logger.info("[vpn-update] deferring >%dh — applying anyway", self._update_max_defer_hours)
             return True
         try:
             start_str, end_str = self._update_apply_window.split("-")
@@ -8235,11 +8558,50 @@ class VPNManager:
         absorbed, no recovery at all), dead → threshold reached → recovery.
         Both stacks: the shared counter reaches the threshold in every mode.
         """
-        self._egress_failures = max(self._egress_failures, self._auto_wg_egress_ticks)
+        # [audit 2026-10-30] Le signal pool arme directement le seuil réel du
+        # watchdog (grâce), pas seulement le compteur WG. Un vrai échec de
+        # requête est une preuve : la prochaine sonde doit soit confirmer le
+        # retour, soit déclencher la recovery.
+        self._egress_failures = max(
+            self._egress_failures,
+            self._auto_wg_egress_ticks,
+            self._egress_dead_threshold(),
+        )
         self._last_conn_failure_at = self._now_fn()
         self._conn_failure_signal_count += 1
         if self._watchdog_event is not None:
             self._watchdog_event.set()  # loop wait(timeout) returns → live tick
+
+    def _watchdog_mark_recovered(self) -> None:
+        """[audit 2026-10-30] Rendre une station récupérée exploitable.
+
+        L'ancienne queue de recovery remettait seulement le statut à
+        ``CONNECTED`` : ``_egress_state`` pouvait rester ``tunnel_down`` (pool
+        qui exclut une station saine) et les breakers VPN/superviseur
+        pouvaient rester ouverts (rotations bloquées). Best-effort strict :
+        aucune exception ne doit sortir d'ici.
+        """
+        try:
+            self._egress_state = "tunnel_up_full"
+        except Exception:
+            pass
+        try:
+            if not getattr(self, "_secondary_path_issue", False):
+                self._degraded_reason = None
+        except Exception:
+            pass
+        try:
+            self._breaker_charge_success()
+        except Exception:
+            pass
+        try:
+            import shared_state as _ss_rec
+            for _sup in getattr(_ss_rec, "station_supervisors", None) or []:
+                if int(getattr(_sup, "station", -1)) == int(self._station):
+                    _sup.record_success()
+                    break
+        except Exception:
+            pass
 
     async def _watchdog_recover_fresh_ip(self) -> bool:
         """[plan 18/08 §E3/am.20] Shared recovery tail for the watchdog tick,
@@ -8257,6 +8619,7 @@ class VPNManager:
         self._watchdog_backoff.record_success()
         self._set_status(VPNState.CONNECTED)
         self._error = None
+        self._watchdog_mark_recovered()
         # [plan 20/08] Recovery boundary: pre-recovery churn markers are
         # stale (docker logs span recoveries) — set BEFORE the internal
         # refresh so its churn scan snaps to after this instant.
@@ -8334,9 +8697,7 @@ class VPNManager:
                 return
             self._last_seen_started_at = cur
             try:
-                own_age = self._now_fn() - float(
-                    getattr(self, "_last_own_docker_op_at", 0.0) or 0.0
-                )
+                own_age = self._now_fn() - float(getattr(self, "_last_own_docker_op_at", 0.0) or 0.0)
             except Exception:
                 own_age = 10**9
             if own_age < 120.0:
@@ -8352,11 +8713,33 @@ class VPNManager:
             pass
 
     async def _watchdog_tick(self) -> None:
+        """[audit 2026-10-30] Wrapper de tick : un seul restart compté/tick.
+
+        Une même passe peut faire un restart léger puis une escalade compose
+        (et parfois une recovery d'IP qui redémarre encore). Sans ce garde,
+        un seul incident consommait 2 ou 3 crédits du budget horaire.
+        """
+        self._watchdog_tick_active = True
+        self._watchdog_tick_restart_counted = False
+        try:
+            await self._watchdog_tick_impl()
+        finally:
+            self._watchdog_tick_active = False
+            self._watchdog_tick_restart_counted = False
+
+    async def _watchdog_tick_impl(self) -> None:
         """One watchdog pass: scan for AUTH_FAILED/TLS failure; restart when found."""
         if not self._enabled or self._proxy_mode != "vpn":
             return  # VPN feature off or tunnel bypassed — nothing to watch
         if not getattr(self, "_desired_connected", True):
             return  # disconnect explicite : le watchdog ne doit pas reconnecter
+        # [qualité] Hostname réel après un boot compose (sans pin) — une
+        # lecture de logs par minute maximum, jamais dans la boucle chaude.
+        if not self._current_host:
+            try:
+                await self._resolve_current_host()
+            except Exception:
+                pass
         # [PC-15 — audit routabilité] heartbeat toutes les 5 min même sans
         # événement (F10) : la supervision externe lit la présence des lignes.
         try:
@@ -8405,17 +8788,13 @@ class VPNManager:
             # incident le refresh est déjà piloté par la recovery (jamais
             # de double wipe). Best-effort, jamais bloquant pour le tick.
             try:
-                _srv_iv = float(
-                    getattr(self, "_server_list_refresh_interval_s", 21600.0)
-                )
+                _srv_iv = float(getattr(self, "_server_list_refresh_interval_s", 21600.0))
             except Exception:
                 _srv_iv = 21600.0
             if (
                 _srv_iv > 0
                 and not (self._auth_failed or self._server_issue)
-                and self._now_fn()
-                - float(getattr(self, "_last_server_list_refresh_at", 0.0))
-                >= _srv_iv
+                and self._now_fn() - float(getattr(self, "_last_server_list_refresh_at", 0.0)) >= _srv_iv
             ):
                 self._last_server_list_refresh_at = self._now_fn()
                 try:
@@ -8441,23 +8820,26 @@ class VPNManager:
                 _events = getattr(self, "_docker_events_since_tick", 0)
                 _status_fresh = (
                     self._last_status_refresh_at is not None
-                    and time.monotonic() - self._last_status_refresh_at
-                    < max(self._STATUS_CACHE_SECONDS, 30.0)
+                    and time.monotonic() - self._last_status_refresh_at < max(self._STATUS_CACHE_SECONDS, 30.0)
                 )
                 if _events > 0 or not _status_fresh:
                     await self.refresh_status(force=True)
                 self._docker_events_since_tick = 0
             egress_dead = False
             try:
-                tunnel_alive = await asyncio.wait_for(
-                    self._probe_tunnel_light(), self._ip_probe_budget
-                )
+                tunnel_alive = await asyncio.wait_for(self._probe_tunnel_light(), self._ip_probe_budget)
             except TimeoutError:
                 tunnel_alive = False
             if not tunnel_alive:
                 self._egress_failures += 1
-                # [graceful-aurora LOT D] seuil = max(auto, grâce) ; reset à
-                # zéro dès qu'un seul probe réussit (ci-dessous, inchangé).
+                # [audit 2026-10-30] Dès le premier échec, la station n'est
+                # plus un tunnel sain pour le pool : sans ce marqueur, une
+                # station qui était `tunnel_up_full` restait routable alors
+                # que la sonde data-plane échouait.
+                try:
+                    self._egress_state = "tunnel_down"
+                except Exception:
+                    pass
                 _eg_thr = self._egress_dead_threshold()
                 if self._egress_failures >= _eg_thr:
                     egress_dead = True
@@ -8475,7 +8857,18 @@ class VPNManager:
                 if self._egress_failures:
                     logger.info("[vpn-watchdog] egress OK — counter reset")
                 self._egress_failures = 0
+                try:
+                    self._egress_state = "tunnel_up_full"
+                except Exception:
+                    pass
                 VPNManager._note_effective_ok(self)
+                # [audit 2026-10-30] Un tunnel qui répond referme le breaker
+                # VPN : sinon une station réparée restait bloquée pour les
+                # rotations suivantes.
+                try:
+                    self._breaker_charge_success()
+                except Exception:
+                    pass
             # [plan 18/08 §3c] auto-mode policy — decided inside the lock on
             # fresh counters, applied AFTER it (_apply_stack takes the lock;
             # asyncio.Lock is not reentrant, calling it here would deadlock).
@@ -8493,11 +8886,11 @@ class VPNManager:
             # failing tunnel even while the SOCKS5 probe happens to land in a
             # live window — the flag alone routes the tick into the recovery
             # chain (the refresh scan that armed it keeps the flag fresh).
-            if (
-                not (self._auth_failed or self._server_issue or self._restart_churn)
-                and not egress_dead
-            ):
+            if not (self._auth_failed or self._server_issue or self._restart_churn) and not egress_dead:
                 self._watchdog_backoff.record_success()  # failure cleared: full cadence
+                # [audit 2026-10-30] Une action de recovery ne doit pas rester
+                # affichée comme état courant après un tick sain.
+                self._watchdog_last_action = None
                 # [graceful-aurora LOT D] tick sain → la grâce AUTH est purgée.
                 try:
                     self._auth_grace_until = 0.0
@@ -8543,7 +8936,9 @@ class VPNManager:
                                 finally:
                                     _auth_connect_done()
                             except Exception as e:
-                                logger.warning("[vpn-watchdog] heal VPN arrêté %s failed: %s", self._docker_container, e)
+                                logger.warning(
+                                    "[vpn-watchdog] heal VPN arrêté %s failed: %s", self._docker_container, e
+                                )
                                 # [docker-autostart 2026-10-07] daemon down ?
                                 # → relance Desktop en tâche de fond (cooldown
                                 # anti-boucle, 1 fois / 10 min max). Le classifieur
@@ -8580,10 +8975,12 @@ class VPNManager:
                     _up_ctrl = await self._control_status()
                 except Exception:
                     _up_ctrl = None
-                _transient = self._egress_failures < (self._auto_wg_egress_ticks * 2)
+                # [audit 2026-10-30] La fenêtre « transitoire » est bornée par
+                # le seuil egress réel, jamais par auto_wg_egress_ticks*2 :
+                # une fois `egress_dead`, on doit aller vers la recovery.
+                _transient = self._egress_failures < self._egress_dead_threshold()
                 if _up_egress and (
-                    getattr(self, "_secondary_path_issue", False)
-                    or VPNManager._secondary_path_active(self)
+                    getattr(self, "_secondary_path_issue", False) or VPNManager._secondary_path_active(self)
                 ):
                     # Marqueur voie secondaire encore présent : on reste
                     # degraded, on ne flappe pas vers connected et on ne
@@ -8594,14 +8991,11 @@ class VPNManager:
                     )
                     return
                 if _up_egress and not churn_driven:
-                    _clear_log = (
-                        logger.warning
-                        if (self._auth_failed or self._egress_failures > 0)
-                        else logger.debug
-                    )
+                    _clear_log = logger.warning if (self._auth_failed or self._egress_failures > 0) else logger.debug
                     _clear_log(
                         "[vpn-watchdog] s%s egress OK — clearing stale error (auth_failed=%s), set CONNECTED",
-                        self._station, self._auth_failed,
+                        self._station,
+                        self._auth_failed,
                     )
                     self._auth_failed = False
                     self._server_issue = False
@@ -8612,6 +9006,13 @@ class VPNManager:
                     self._restart_churn_recovered_at = time.time()
                     self._churn_next_due = 0.0
                     self._egress_failures = 0
+                    # La sonde SOCKS a échoué mais le proxy HTTP répond :
+                    # c'est l'état `tunnel_up_socks_down`, pas `tunnel_down`
+                    # (le chemin free HTTP reste utilisable).
+                    try:
+                        self._egress_state = "tunnel_up_socks_down"
+                    except Exception:
+                        pass
                     VPNManager._note_effective_ok(self)
                     try:
                         self._auth_grace_until = 0.0
@@ -8626,7 +9027,8 @@ class VPNManager:
                     # egress counter so a persistent half-open escalates.
                     logger.warning(
                         "[vpn-watchdog] s%s control=running (egress dead, transient eg_fail=%d) — clearing stale error, set CONNECTED",
-                        self._station, self._egress_failures,
+                        self._station,
+                        self._egress_failures,
                     )
                     self._auth_failed = False
                     self._server_issue = False
@@ -8656,8 +9058,7 @@ class VPNManager:
                 if _action == "auth-cooling":
                     self._watchdog_last_action = "auth-cooling"
                     logger.warning(
-                        "[vpn-watchdog] s%s AUTH en auth_cooling (%s) — "
-                        "pas de restart, renégo spontanée libre",
+                        "[vpn-watchdog] s%s AUTH en auth_cooling (%s) — pas de restart, renégo spontanée libre",
                         self._station,
                         _reason,
                     )
@@ -8665,8 +9066,7 @@ class VPNManager:
                 if _action == "grace":
                     self._watchdog_last_action = "grace"
                     logger.info(
-                        "[vpn-watchdog] s%s AUTH en grâce (%s restantes) — "
-                        "attente guérison spontanée",
+                        "[vpn-watchdog] s%s AUTH en grâce (%s restantes) — attente guérison spontanée",
                         self._station,
                         _reason,
                     )
@@ -8679,8 +9079,7 @@ class VPNManager:
                     self._auth_grace_until = self._now_fn() + _g
                     self._watchdog_last_action = "grace-first"
                     logger.warning(
-                        "[vpn-watchdog] s%s 1er AUTH — grâce %.0fs, "
-                        "pas de restart (compteur LOT C alimenté)",
+                        "[vpn-watchdog] s%s 1er AUTH — grâce %.0fs, pas de restart (compteur LOT C alimenté)",
                         self._station,
                         _g,
                     )
@@ -8691,9 +9090,7 @@ class VPNManager:
                     # d'INIT postérieur (= _check_auth_failed False) ?
                     # (c) pas de cooldown AUTH global actif ?
                     try:
-                        _fresh = await self._check_auth_failed(
-                            info.get("started_at", "")
-                        )
+                        _fresh = await self._check_auth_failed(info.get("started_at", ""))
                     except Exception:
                         _fresh = True
                     if not _fresh:
@@ -8701,8 +9098,7 @@ class VPNManager:
                         self._auth_failed = False
                         self._watchdog_last_action = "healed"
                         logger.warning(
-                            "[vpn-watchdog] s%s AUTH guéri (INIT postérieur) — "
-                            "pas de restart",
+                            "[vpn-watchdog] s%s AUTH guéri (INIT postérieur) — pas de restart",
                             self._station,
                         )
                         return
@@ -8713,8 +9109,7 @@ class VPNManager:
                     if _global > 0:
                         self._watchdog_last_action = "cooldown-global"
                         logger.warning(
-                            "[vpn-watchdog] s%s AUTH persistant mais cooldown "
-                            "global %.0fs — pas de restart",
+                            "[vpn-watchdog] s%s AUTH persistant mais cooldown global %.0fs — pas de restart",
                             self._station,
                             _global,
                         )
@@ -8755,27 +9150,49 @@ class VPNManager:
                 # FIX always functional: OV with cascade may still fast-pin (TCP->UDP) even when auth_driven,
                 # because OV->WG is blocked by canary and OV UDP may still work.
                 # PROACTIVE: always try fast-pin for OV, even when auth_driven, if cascade ON
-                _allow_fast = not (auth_driven or churn_driven) or (self._stack_effective == "openvpn" and self._cascade_enabled)
+                _allow_fast = not (auth_driven or churn_driven) or (
+                    self._stack_effective == "openvpn" and self._cascade_enabled
+                )
                 if _allow_fast and await self._fast_recover_via_control(max_skips=5):
                     return
                 # PROACTIVE 4/4: if 0/4 or 1/4 connected, force country rotation via control pin even when
                 # egress not yet dead — don't wait for 2 ticks, heal immediately
-                if not (auth_driven or churn_driven) and self._egress_failures >= 1 and await self._pin_country_for_rotation(timeout=12, catchup=8):
-                    logger.warning("[vpn-watchdog] proactive country pin for s%s (egress %s/%s)", self._station, self._egress_failures, self._auto_wg_egress_ticks)
+                if (
+                    not (auth_driven or churn_driven)
+                    and self._egress_failures >= 1
+                    and await self._pin_country_for_rotation(timeout=12, catchup=8)
+                ):
+                    logger.warning(
+                        "[vpn-watchdog] proactive country pin for s%s (egress %s/%s)",
+                        self._station,
+                        self._egress_failures,
+                        self._auto_wg_egress_ticks,
+                    )
                     if await self._finalize_ip(allow_stale=False):
                         self._watchdog_backoff.record_success()
                         self._set_status(VPNState.CONNECTED)
+                        self._watchdog_mark_recovered()
                         return
                 # PROACTIVE 0/4: all stations error → heal this station in parallel (don't wait for sequential ticks)
                 try:
                     import shared_state as _ss
+
                     _all = getattr(_ss, "vpn_managers", None) or []
-                    if _all and all(not VPNState.is_up(str(getattr(m, "_status", None) or getattr(m, "status", "disconnected"))) for m in _all if m) and not (auth_driven or churn_driven):
+                    if (
+                        _all
+                        and all(
+                            not VPNState.is_up(str(getattr(m, "_status", None) or getattr(m, "status", "disconnected")))
+                            for m in _all
+                            if m
+                        )
+                        and not (auth_driven or churn_driven)
+                    ):
                         logger.warning("[vpn-watchdog] 0/4 detected — parallel heal s%s", self._station)
                         if await self._pin_country_for_rotation(timeout=12, catchup=8):
                             if await self._finalize_ip(allow_stale=False):
                                 self._watchdog_backoff.record_success()
                                 self._set_status(VPNState.CONNECTED)
+                                self._watchdog_mark_recovered()
                                 return
                 except Exception:
                     pass
@@ -8807,7 +9224,11 @@ class VPNManager:
                         _guard_cp = await self._http_proxy_egress_ok()
                     except Exception:
                         pass
-                    _transient = self._egress_failures < (self._auto_wg_egress_ticks * 2)
+                    # [audit 2026-10-30] La fenêtre « transitoire » est bornée
+                    # par le seuil egress réel, jamais par
+                    # auto_wg_egress_ticks*2 : une fois `egress_dead`, on doit
+                    # aller vers la recovery.
+                    _transient = self._egress_failures < self._egress_dead_threshold()
                     # [stabilité 25/08] Un AUTH_FAILED OV EST un échec réel même
                     # si le control gluetun rapporte "running" (le tunnel tourne
                     # mais l'auth est rejetée). Ne PAS court-circuiter le reboot/
@@ -8817,13 +9238,21 @@ class VPNManager:
                     if (_guard_cp or (_guard_cs is True and _transient)) and not churn_driven and not self._auth_failed:
                         logger.warning(
                             "[vpn-watchdog] s%s actually up (control=%s, http_egress=%s, eg_fail=%d) — skip reboot",
-                            self._station, _guard_cs, _guard_cp, self._egress_failures,
+                            self._station,
+                            _guard_cs,
+                            _guard_cp,
+                            self._egress_failures,
                         )
                         self._auth_failed = False
                         self._server_issue = False
                         self._restart_churn = False
                         if _guard_cp:
                             self._egress_failures = 0
+                            try:
+                                # HTTP répond mais la sonde SOCKS a échoué.
+                                self._egress_state = "tunnel_up_socks_down"
+                            except Exception:
+                                pass
                         self._watchdog_backoff.record_success()
                         self._set_status(VPNState.CONNECTED)
                         return
@@ -8845,6 +9274,9 @@ class VPNManager:
                             self._station,
                             kind,
                         )
+                        # [audit 2026-10-30] Un seul crédit pour cette passe :
+                        # le wrapper de tick déduplique l'escalade compose et
+                        # la reprise d'IP qui suivent le même incident.
                         self._note_watchdog_restart()
                         # [fiab 09/09] restart = VRAI AUTH : gate, slot libéré
                         # dès le restart lancé (le wait ne fait que poller).
@@ -8855,26 +9287,21 @@ class VPNManager:
                             _auth_connect_done()
                         started_at = await self._wait_healthy(timeout=60)
                     except Exception as e:
-                        logger.warning(
-                            "[vpn-watchdog] light restart failed: %s — escalating to compose", e
-                        )
+                        logger.warning("[vpn-watchdog] light restart failed: %s — escalating to compose", e)
                         started_at = None
                     # [mypy] _wait_healthy -> str | None ; le court-circuit
                     # bool() protégeait déjà l'exécution, on l'explicite.
                     healed = False
                     if started_at:
                         healed = not (
-                            await self._check_auth_failed(started_at)
-                            or await self._check_server_issue(started_at)
+                            await self._check_auth_failed(started_at) or await self._check_server_issue(started_at)
                         )
                     # [Bug #1] gate: auth/churn-driven flips must not be cancelled
                     # by a temporary heal — the root cause persists.
                     if healed and not (auth_driven or churn_driven) and await self._watchdog_recover_fresh_ip():
                         return
                     if not healed:
-                        logger.info(
-                            "[vpn-watchdog] restart did not clear %s — compose escalation", kind
-                        )
+                        logger.info("[vpn-watchdog] restart did not clear %s — compose escalation", kind)
                         try:
                             if self._server_issue or self._auth_failed:
                                 # idem refresh liste fraîche sur AUTH_FAILED [stabilité 25/08]
@@ -8893,8 +9320,7 @@ class VPNManager:
                         healed = False
                         if started_at:
                             healed = not (
-                                await self._check_auth_failed(started_at)
-                                or await self._check_server_issue(started_at)
+                                await self._check_auth_failed(started_at) or await self._check_server_issue(started_at)
                             )
                         if healed and not (auth_driven or churn_driven) and await self._watchdog_recover_fresh_ip():
                             return
@@ -8907,8 +9333,7 @@ class VPNManager:
                     if self._pending_flip is None and self._stack != "auto":
                         self._pending_flip = self._emergency_flip_decision()
                     logger.error(
-                        "[vpn-watchdog] restart did not recover — next "
-                        "attempt in %ds (failure #%d)",
+                        "[vpn-watchdog] restart did not recover — next attempt in %ds (failure #%d)",
                         int(self._watchdog_backoff.delay),
                         self._watchdog_backoff.consecutive_failures,
                     )
@@ -8957,7 +9382,11 @@ class VPNManager:
                 if ok:
                     return
                 # Protocol flip failed -> fall through to stack flip as escalation
-            elif self._cascade_enabled and ("cascade step" in reason or "ov-auth cascade" in reason) and mode == "openvpn":
+            elif (
+                self._cascade_enabled
+                and ("cascade step" in reason or "ov-auth cascade" in reason)
+                and mode == "openvpn"
+            ):
                 # Fallback: legacy reason parsing (only if pending was lost)
                 # [cascade intra-OV 05/09] "ov-auth cascade udp -> tcp (...)" → dernier mot
                 # nettoyé ("(3", "tcp)"…) — on extrait udp/tcp par recherche, pas par split brut.
@@ -9044,10 +9473,11 @@ class VPNManager:
                 logger.error("[vpn-watchdog] escalation update failed: %s", e)
         if not applied:
             # No new image applied: plain restart re-picks a server from the
-            # freshly refreshed list. Re-check the lock — a rotation/connect
-            # may have started while the update check was running.
+            # freshly refreshed list. [audit 2026-10-30] Prendre le lock au
+            # lieu de le tester : une rotation pouvait démarrer entre le
+            # `locked()` et `_ensure_container()`.
             try:
-                if not self._lock.locked():
+                async with self._lock:
                     # [fiab 09/09] restart = VRAI AUTH : gate, slot libéré
                     # dès le restart lancé.
                     await _auth_gate()
@@ -9068,11 +9498,7 @@ class VPNManager:
         own docker run-era name) so the refresh still has a target."""
         info = await self._docker_inspect()
         for m in info.get("mounts") or []:
-            if (
-                m.get("Type") == "volume"
-                and m.get("Destination", "").rstrip("/") == "/gluetun"
-                and m.get("Name")
-            ):
+            if m.get("Type") == "volume" and m.get("Destination", "").rstrip("/") == "/gluetun" and m.get("Name"):
                 return m["Name"]
         return "gluetun"
 
@@ -9083,7 +9509,8 @@ class VPNManager:
         precedence over the embedded list at next start. Fails soft."""
         try:
             volume = await self._resolve_gluetun_volume()
-            result = await asyncio.to_thread(self._docker_run,
+            result = await asyncio.to_thread(
+                self._docker_run,
                 [
                     "run",
                     "--rm",
@@ -9138,8 +9565,8 @@ class VPNManager:
                 # toujours — d'où des rm -f de tunnels SAINS au reboot
                 # (s1/s3/s5 recréés inutilement, cf. debug.log 09:17/09:49).
                 "stack_effective": getattr(self, "_stack_effective", None),
-            "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
-            "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
+                "ovpn_protocol": getattr(self, "_ovpn_protocol", "udp"),
+                "ovpn_protocol_effective": getattr(self, "_ovpn_protocol_effective", "udp"),
                 "ovpn_endpoint_port": getattr(self, "_ovpn_endpoint_port", "1194"),
                 "ovpn_endpoint_port_effective": getattr(self, "_ovpn_endpoint_port_effective", "1194"),
                 "auto_hetero_boot": getattr(self, "_auto_hetero_boot", False),
@@ -9222,9 +9649,7 @@ class VPNManager:
                 # corruption du fichier principal persistait jusqu'au
                 # prochain save réussi. Fallback last-good maintenant.
                 bak = state_path + ".bak"
-                logger.warning(
-                    "[vpn] state corrupt (%s) — retry last-good %s", _corrupt, bak
-                )
+                logger.warning("[vpn] state corrupt (%s) — retry last-good %s", _corrupt, bak)
                 with open(bak) as f:
                     state = json.load(f)
             self._ip_history = state.get("ip_history", [])
@@ -9278,9 +9703,7 @@ class VPNManager:
                 # sans drapeau restent ignorés (un flip one-off ne doit pas
                 # verrouiller la station pour toujours).
                 if self._stack == "auto" and restored_stack != "auto":
-                    if _restored_manual and (
-                        restored_stack != "wireguard" or self._wg_key_present()
-                    ):
+                    if _restored_manual and (restored_stack != "wireguard" or self._wg_key_present()):
                         self._stack = restored_stack
                         self._stack_manual = True
                         self._stack_effective = restored_stack
@@ -9291,16 +9714,13 @@ class VPNManager:
                         )
                     else:
                         logger.info(
-                            "[vpn] state stack %s ignored — config is auto "
-                            "(legacy or key missing, effective %s)",
+                            "[vpn] state stack %s ignored — config is auto (legacy or key missing, effective %s)",
                             restored_stack,
                             self._stack_effective,
                         )
                 else:
                     self._stack = restored_stack
-                    self._stack_manual = (
-                        _restored_manual if restored_stack != "auto" else False
-                    )
+                    self._stack_manual = _restored_manual if restored_stack != "auto" else False
             # [audit 2026-09-09] stack_effective restaurée (flotte mixte auto) :
             # _stack reste "auto" (le mode choisi) mais l'EFFECTIVE — posée par
             # apply_mixed_slot() au boot précédent ou par un flip auto — est
@@ -9352,9 +9772,7 @@ class VPNManager:
 # ── Boot reconcile — orphan / stale-stack container cleanup (plan 18/08 §2.2) ──
 
 
-def _docker_cli(
-    args: list[str], timeout: int = 30, env: dict | None = None
-) -> subprocess.CompletedProcess:
+def _docker_cli(args: list[str], timeout: int = 30, env: dict | None = None) -> subprocess.CompletedProcess:
     """Blocking docker CLI call WITHOUT the rotation funnel.
 
     Boot-time only (reconcile_orphan_containers runs before any rotation
@@ -9488,16 +9906,12 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
             )
 
     try:
-        result = await run(
-            ["ps", "-a", "--filter", "name=^/opencode-vpn", "--format", "{{.Names}}"], 30, None
-        )
+        result = await run(["ps", "-a", "--filter", "name=^/opencode-vpn", "--format", "{{.Names}}"], 30, None)
     except (RuntimeError, subprocess.SubprocessError) as e:
         logger.warning("[vpn] boot reconcile: ps failed — %s", e)
         return []
     if result.returncode != 0:
-        logger.warning(
-            "[vpn] boot reconcile: ps failed rc=%d: %s", result.returncode, result.stderr.strip()
-        )
+        logger.warning("[vpn] boot reconcile: ps failed rc=%d: %s", result.returncode, result.stderr.strip())
         return []
     names = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
     by_name = {m._docker_container: m for m in managers}
@@ -9531,8 +9945,7 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
             running = bool((info or {}).get("State", {}).get("Running"))
             if running:
                 logger.warning(
-                    "[vpn] boot reconcile: %s running mais absent du registre — "
-                    "conservé (course probable)",
+                    "[vpn] boot reconcile: %s running mais absent du registre — conservé (course probable)",
                     name,
                 )
                 continue
@@ -9569,8 +9982,7 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
             and vpn_type != expected_stack
         ):
             logger.info(
-                "[vpn] boot reconcile: %s stack=%s == mémoire (≠ .env=%s) — "
-                "conservé (fichier stale, pas de rm)",
+                "[vpn] boot reconcile: %s stack=%s == mémoire (≠ .env=%s) — conservé (fichier stale, pas de rm)",
                 name,
                 vpn_type,
                 expected_stack,
@@ -9586,9 +9998,7 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
             removed.append(name)
             await _rm(name)
     if removed:
-        logger.warning(
-            "[vpn] boot reconcile removed %d container(s): %s", len(removed), ", ".join(removed)
-        )
+        logger.warning("[vpn] boot reconcile removed %d container(s): %s", len(removed), ", ".join(removed))
     return removed
 
 
@@ -9600,8 +10010,17 @@ def _serialized_refresh(fn):
         lock = getattr(self, "_refresh_lock", None)
         if lock is None:
             return await fn(self, *args, **kwargs)
+        # [audit watchdog 2026-10-30] `force=True` doit attendre le scan réel :
+        # l'ancien wrapper renvoyait `get_status()` dès que le verrou était
+        # pris, même pour le watchdog qui venait de redémarrer le tunnel.
+        force = kwargs.get("force")
+        if force is None and args:
+            force = args[0]
         if lock.locked():
-            return self.get_status()
+            if not force:
+                return self.get_status()
+            async with lock:
+                return await fn(self, *args, **kwargs)
         async with lock:
             return await fn(self, *args, **kwargs)
 

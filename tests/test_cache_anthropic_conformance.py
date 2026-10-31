@@ -15,7 +15,6 @@ Décision de périmètre documentée dans `mapping.py` : la traduction vers
 l'émettre au niveau du message serait un placement contraire à la spec citée.
 """
 
-
 import protocol_mapping as pm
 from app.protocol import mapping as _canon
 
@@ -81,10 +80,7 @@ def test_count_tolerates_malformed_input():
 def test_client_with_four_breakpoints_plus_our_addition_is_capped():
     """A20 — LE scénario de panne : le client pose 4 breakpoints, nos
     convertisseurs en ajoutent un 5ᵉ → 400 amont. Après élagage : 4."""
-    messages = [
-        {"role": "user", "content": f"m{i}", "cache_control": {"type": "ephemeral"}}
-        for i in range(4)
-    ]
+    messages = [{"role": "user", "content": f"m{i}", "cache_control": {"type": "ephemeral"}} for i in range(4)]
     messages.append({"role": "user", "content": "dernier", "cache_control": {"type": "ephemeral"}})
     result = {"messages": messages}
     _canon._enforce_cache_breakpoint_limit(result)
@@ -114,16 +110,11 @@ def test_oldest_breakpoints_are_pruned_first():
 
 def test_no_pruning_when_within_limit():
     """Contre-preuve : à 4 breakpoints ou moins, on ne touche à rien."""
-    messages = [
-        {"role": "user", "content": f"m{i}", "cache_control": {"type": "ephemeral"}}
-        for i in range(4)
-    ]
+    messages = [{"role": "user", "content": f"m{i}", "cache_control": {"type": "ephemeral"}} for i in range(4)]
     result = {"messages": messages}
     before = [dict(m) for m in messages]
     _canon._enforce_cache_breakpoint_limit(result)
-    assert [m.get("cache_control") for m in result["messages"]] == [
-        m.get("cache_control") for m in before
-    ]
+    assert [m.get("cache_control") for m in result["messages"]] == [m.get("cache_control") for m in before]
 
 
 def test_pruning_handles_part_level_breakpoints():
@@ -146,20 +137,14 @@ def test_pruning_is_safe_on_malformed_body():
 def test_p2_output_respects_the_limit():
     """A20 de bout en bout : même avec 8 breakpoints clients, la sortie de P2
     reste sous la limite (nos ajouts compris)."""
-    messages = [
-        {"role": "user", "content": f"m{i}", "cache_control": {"type": "ephemeral"}}
-        for i in range(8)
-    ]
+    messages = [{"role": "user", "content": f"m{i}", "cache_control": {"type": "ephemeral"}} for i in range(8)]
     out = pm.anthropic_to_openai(_anthropic_body(messages, system="sys"), "deepseek-v4-flash")
     assert _canon._count_cache_breakpoints(out["messages"], out.get("tools")) <= MAX_CC
 
 
 def test_p2_output_respects_limit_with_many_tools():
     """Variante : le quota est partagé entre messages ET outils."""
-    messages = [
-        {"role": "user", "content": f"m{i}", "cache_control": {"type": "ephemeral"}}
-        for i in range(3)
-    ]
+    messages = [{"role": "user", "content": f"m{i}", "cache_control": {"type": "ephemeral"}} for i in range(3)]
     tools = [
         {
             "name": f"t{i}",
@@ -169,9 +154,7 @@ def test_p2_output_respects_limit_with_many_tools():
         }
         for i in range(3)
     ]
-    out = pm.anthropic_to_openai(
-        _anthropic_body(messages, system="sys", tools=tools), "deepseek-v4-flash"
-    )
+    out = pm.anthropic_to_openai(_anthropic_body(messages, system="sys", tools=tools), "deepseek-v4-flash")
     assert _canon._count_cache_breakpoints(out["messages"], out.get("tools")) <= MAX_CC
 
 

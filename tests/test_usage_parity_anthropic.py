@@ -85,7 +85,7 @@ class _Ctx:
 class _Pool:
     enabled = True
     active_station = None
-    _stations = []
+    _stations: list = []
 
     def _best_station(self):
         return None

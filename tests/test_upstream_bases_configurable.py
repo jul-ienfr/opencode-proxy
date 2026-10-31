@@ -43,8 +43,7 @@ def test_base_comes_from_config(yaml_key, attr):
     declared = cs.yaml_get("upstream", yaml_key)
     assert declared, f"upstream.{yaml_key} absent de config.yaml"
     assert getattr(cs, attr) == declared, (
-        f"{attr} ({getattr(cs, attr)!r}) ne suit pas la config ({declared!r}) : "
-        "un litteral a repris la main"
+        f"{attr} ({getattr(cs, attr)!r}) ne suit pas la config ({declared!r}) : un litteral a repris la main"
     )
 
 
@@ -60,7 +59,7 @@ def test_legs_stay_distinct():
     """Payant et free ne doivent jamais pointer la meme URL par accident."""
     assert cs.API_BASE_OPENAI != cs.API_BASE_FREE
     assert cs._RESPONSES_ENDPOINT != cs._RESPONSES_FREE_ENDPOINT
-    assert "/inference/" in cs.API_BASE_FREE and "/zen/go/" in cs.API_BASE_OPENAI
+    assert "/inference/openai/" in cs.API_BASE_FREE and "/inference/go/" in cs.API_BASE_OPENAI
 
 
 # ── Garde-fou contre le retour des litteraux ────────────────────────────────

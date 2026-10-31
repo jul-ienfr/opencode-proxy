@@ -21,13 +21,26 @@ from app.compaction import (  # noqa: E402
 )
 
 
+@pytest.fixture(autouse=True)
+def _jambe_free_figee(monkeypatch):
+    """[CATALOGUE 2026-10-27] la politique de substitution active (homonyme)
+    ne mappe plus `mimo-v2.5` : sans jambe free, le gate ferme et le worker
+    retombe en live. On fige la carte pour que ces tests ne dépendent pas de
+    la config utilisateur."""
+    monkeypatch.setattr(oc, "_effective_free_model_map", lambda: {"mimo-v2.5": "mimo-v2.5-free"})
+
+
 def test_gate_matrix():
-    assert should_buffer_compaction(
-        is_stream=True, is_compaction=True,
-        tiny_retry_enabled=True, has_free_leg=True,
-    ) is True
-    kw = {"is_stream": True, "is_compaction": True,
-          "tiny_retry_enabled": True, "has_free_leg": True}
+    assert (
+        should_buffer_compaction(
+            is_stream=True,
+            is_compaction=True,
+            tiny_retry_enabled=True,
+            has_free_leg=True,
+        )
+        is True
+    )
+    kw = {"is_stream": True, "is_compaction": True, "tiny_retry_enabled": True, "has_free_leg": True}
     assert should_buffer_compaction(**{**kw, "is_stream": False}) is False
     assert should_buffer_compaction(**{**kw, "is_compaction": False}) is False
     assert should_buffer_compaction(**{**kw, "tiny_retry_enabled": False}) is False
@@ -35,8 +48,7 @@ def test_gate_matrix():
     # Pas de veto outils : les compactions Claude Code déclarent 15+ outils.
     assert should_buffer_compaction(**kw) is True
     assert should_buffer_compaction() is False
-    assert should_buffer_compaction(is_stream=1, is_compaction={},
-                                    tiny_retry_enabled=1, has_free_leg="x") is False
+    assert should_buffer_compaction(is_stream=1, is_compaction={}, tiny_retry_enabled=1, has_free_leg="x") is False
 
 
 def test_final_has_nontext_blocks_matrix():
@@ -87,8 +99,12 @@ def test_tiny_ratio_catches_pseudo_summaries():
 
 def test_chat_sse_roundtrip():
     evs = chat_sse_from_completion(
-        "RESUME", model="m", msg_id="c1", created=1,
-        prompt_tokens=50000, completion_tokens=500,
+        "RESUME",
+        model="m",
+        msg_id="c1",
+        created=1,
+        prompt_tokens=50000,
+        completion_tokens=500,
     )
     raw = b"".join(evs).decode()
     assert "RESUME" in raw
@@ -98,12 +114,22 @@ def test_chat_sse_roundtrip():
 
 def test_anthropic_sse_sequence():
     evs = anthropic_sse_from_completion(
-        "RESUME", model="m", msg_id="msg1",
-        input_tokens=50000, output_tokens=500, cache_read=49000,
+        "RESUME",
+        model="m",
+        msg_id="msg1",
+        input_tokens=50000,
+        output_tokens=500,
+        cache_read=49000,
     )
     raw = b"".join(evs).decode()
-    order = ["message_start", "content_block_start", "content_block_delta",
-             "content_block_stop", "message_delta", "message_stop"]
+    order = [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
     idx = -1
     for name in order:
         j = raw.find("event: " + name)
@@ -116,10 +142,17 @@ def test_anthropic_sse_sequence():
 def test_completion_text_formats():
     assert completion_text({"content": [{"type": "text", "text": "A"}]}) == "A"
     assert completion_text({"choices": [{"message": {"content": "B"}}]}) == "B"
-    assert completion_text({"output": [
-        {"type": "compaction", "id": "c", "encrypted_content": "zzz"},
-        {"type": "message", "content": [{"type": "output_text", "text": "C"}]},
-    ]}) == "C"
+    assert (
+        completion_text(
+            {
+                "output": [
+                    {"type": "compaction", "id": "c", "encrypted_content": "zzz"},
+                    {"type": "message", "content": [{"type": "output_text", "text": "C"}]},
+                ]
+            }
+        )
+        == "C"
+    )
     assert completion_text({}) == ""
     assert completion_text(None) == ""
 
@@ -160,8 +193,10 @@ def test_tiny_retry_refetches_fresh_station(monkeypatch):
     monkeypatch.setattr(oc, "_try_free_model_first", _fake_pool)
     import asyncio
 
-    out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        oc._try_free_with_tiny_retry({"messages": []}, {}, "anthropic", "paid-m")
+    out = (
+        asyncio.get_event_loop_policy()
+        .new_event_loop()
+        .run_until_complete(oc._try_free_with_tiny_retry({"messages": []}, {}, "anthropic", "paid-m"))
     )
     assert len(calls) == 2, "un seul refetch attendu"
     data = out[0].json()
@@ -175,8 +210,10 @@ def test_tiny_retry_fail_open_on_pool_exhaustion(monkeypatch):
     monkeypatch.setattr(oc, "_try_free_model_first", _fake_none)
     import asyncio
 
-    out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        oc._try_free_with_tiny_retry({"messages": []}, {}, "anthropic", "paid-m")
+    out = (
+        asyncio.get_event_loop_policy()
+        .new_event_loop()
+        .run_until_complete(oc._try_free_with_tiny_retry({"messages": []}, {}, "anthropic", "paid-m"))
     )
     assert out is None
 
@@ -217,11 +254,24 @@ async def test_buffered_worker_streams_synthesized_sse(monkeypatch):
     req = SimpleNamespace(state=SimpleNamespace())
     body = {"model": "mimo-v2.5", "messages": [{"role": "user", "content": "x" * 1500}]}
     resp = await oc._buffered_compaction_stream(
-        porte="messages", request=req, req_id="t1", original_model="mimo-v2.5",
-        model_id="mimo-v2.5", endpoint="https://e", protocol="anthropic",
-        headers={}, send_body=body, paid_body=body, client_ip="127.0.0.1",
-        start_time=0.0, is_stream=True, thinking_type="none", effort="none",
-        tool_names=[], request_body=body, is_compaction=True,
+        porte="messages",
+        request=req,
+        req_id="t1",
+        original_model="mimo-v2.5",
+        model_id="mimo-v2.5",
+        endpoint="https://e",
+        protocol="anthropic",
+        headers={},
+        send_body=body,
+        paid_body=body,
+        client_ip="127.0.0.1",
+        start_time=0.0,
+        is_stream=True,
+        thinking_type="none",
+        effort="none",
+        tool_names=[],
+        request_body=body,
+        is_compaction=True,
     )
     assert resp is not None, "le worker doit prendre en charge ce cas"
     assert len(calls) == 2, "refetch sur tiny attendu"
@@ -245,11 +295,24 @@ async def test_buffered_worker_falls_back_to_live_on_failure(monkeypatch):
     req = SimpleNamespace(state=SimpleNamespace())
     body = {"model": "mimo-v2.5", "messages": [{"role": "user", "content": "x" * 1500}]}
     resp = await oc._buffered_compaction_stream(
-        porte="messages", request=req, req_id="t1", original_model="mimo-v2.5",
-        model_id="mimo-v2.5", endpoint="https://e", protocol="anthropic",
-        headers={}, send_body=body, paid_body=body, client_ip="127.0.0.1",
-        start_time=0.0, is_stream=True, thinking_type="none", effort="none",
-        tool_names=[], request_body=body, is_compaction=True,
+        porte="messages",
+        request=req,
+        req_id="t1",
+        original_model="mimo-v2.5",
+        model_id="mimo-v2.5",
+        endpoint="https://e",
+        protocol="anthropic",
+        headers={},
+        send_body=body,
+        paid_body=body,
+        client_ip="127.0.0.1",
+        start_time=0.0,
+        is_stream=True,
+        thinking_type="none",
+        effort="none",
+        tool_names=[],
+        request_body=body,
+        is_compaction=True,
     )
     assert resp is None
 
@@ -285,11 +348,24 @@ async def test_buffered_worker_engages_with_tools_declared(monkeypatch):
         "tools": [{"name": f"tool{i}", "description": "d", "input_schema": {"type": "object"}} for i in range(15)],
     }
     resp = await oc._buffered_compaction_stream(
-        porte="messages", request=req, req_id="t1", original_model="mimo-v2.5",
-        model_id="mimo-v2.5", endpoint="https://e", protocol="anthropic",
-        headers={}, send_body=body, paid_body=body, client_ip="127.0.0.1",
-        start_time=0.0, is_stream=True, thinking_type="none", effort="none",
-        tool_names=[], request_body=body, is_compaction=True,
+        porte="messages",
+        request=req,
+        req_id="t1",
+        original_model="mimo-v2.5",
+        model_id="mimo-v2.5",
+        endpoint="https://e",
+        protocol="anthropic",
+        headers={},
+        send_body=body,
+        paid_body=body,
+        client_ip="127.0.0.1",
+        start_time=0.0,
+        is_stream=True,
+        thinking_type="none",
+        effort="none",
+        tool_names=[],
+        request_body=body,
+        is_compaction=True,
     )
     assert resp is not None, "avec outils déclarés le bufferisé doit s'enclencher"
     assert len(calls) == 2, "refetch sur tiny attendu"
@@ -305,14 +381,21 @@ async def test_buffered_worker_yields_to_live_on_tool_use_output(monkeypatch):
     from types import SimpleNamespace
 
     async def _fake_tool_out(body, headers, protocol, model_id, forced_pool=None, req_id=None):
-        return _FakeResp({
-            "content": [
-                {"type": "text", "text": "appel outil"},
-                {"type": "tool_use", "id": "c1", "name": "Bash", "input": {}},
-            ],
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 50000, "output_tokens": 120},
-        }), {}, "free-m", "9.9.9.9"
+        return (
+            _FakeResp(
+                {
+                    "content": [
+                        {"type": "text", "text": "appel outil"},
+                        {"type": "tool_use", "id": "c1", "name": "Bash", "input": {}},
+                    ],
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 50000, "output_tokens": 120},
+                }
+            ),
+            {},
+            "free-m",
+            "9.9.9.9",
+        )
 
     async def _no_save(*a, **k):
         return None
@@ -324,10 +407,23 @@ async def test_buffered_worker_yields_to_live_on_tool_use_output(monkeypatch):
     req = SimpleNamespace(state=SimpleNamespace())
     body = {"model": "mimo-v2.5", "messages": [{"role": "user", "content": "x" * 1500}]}
     resp = await oc._buffered_compaction_stream(
-        porte="messages", request=req, req_id="t1", original_model="mimo-v2.5",
-        model_id="mimo-v2.5", endpoint="https://e", protocol="anthropic",
-        headers={}, send_body=body, paid_body=body, client_ip="127.0.0.1",
-        start_time=0.0, is_stream=True, thinking_type="none", effort="none",
-        tool_names=[], request_body=body, is_compaction=True,
+        porte="messages",
+        request=req,
+        req_id="t1",
+        original_model="mimo-v2.5",
+        model_id="mimo-v2.5",
+        endpoint="https://e",
+        protocol="anthropic",
+        headers={},
+        send_body=body,
+        paid_body=body,
+        client_ip="127.0.0.1",
+        start_time=0.0,
+        is_stream=True,
+        thinking_type="none",
+        effort="none",
+        tool_names=[],
+        request_body=body,
+        is_compaction=True,
     )
     assert resp is None

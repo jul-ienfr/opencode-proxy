@@ -12,8 +12,6 @@ produire exactement la même chose que la forme canonique à parts
 `{"type": "input_text", ...}`.
 """
 
-import pytest
-
 from app.protocol.mapping import openai_responses_to_anthropic
 
 
@@ -33,9 +31,7 @@ def test_input_string_produit_un_message_utilisateur():
 
 
 def test_content_string_produit_un_bloc_texte():
-    out = openai_responses_to_anthropic(
-        {"input": [{"role": "user", "content": "Combien font 2+2 ?"}]}
-    )
+    out = openai_responses_to_anthropic({"input": [{"role": "user", "content": "Combien font 2+2 ?"}]})
     assert _texts(out) == ["Combien font 2+2 ?"]
 
 

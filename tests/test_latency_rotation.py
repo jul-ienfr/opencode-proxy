@@ -211,11 +211,16 @@ def _pool_with_stations(monkeypatch, ips_by_sid):
 
     pool = object.__new__(fp.FreeIPPool)
     stations = [
-        SimpleNamespace(_station=sid, current_ip=ip, status="connected",
-                        proxy_mode="vpn", socks5_url=f"socks5://h:{port}",
-                        note_free_request=lambda: None,
-                        _quota_per_ip=500,
-                        current_server={"name": "?"})
+        SimpleNamespace(
+            _station=sid,
+            current_ip=ip,
+            status="connected",
+            proxy_mode="vpn",
+            socks5_url=f"socks5://h:{port}",
+            note_free_request=lambda: None,
+            _quota_per_ip=500,
+            current_server={"name": "?"},
+        )
         for sid, (ip, port) in ips_by_sid.items()
     ]
     pool._stations = stations

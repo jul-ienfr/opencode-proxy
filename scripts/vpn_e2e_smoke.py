@@ -101,9 +101,7 @@ async def test_smoke_non_stream(base: str) -> None:
         "max_tokens": 16,
     }
     async with httpx.AsyncClient(base_url=base, timeout=120) as client:
-        r = await client.post(
-            "/v1/chat/completions", json=payload, headers={"Authorization": f"Bearer {FAKE_KEY}"}
-        )
+        r = await client.post("/v1/chat/completions", json=payload, headers={"Authorization": f"Bearer {FAKE_KEY}"})
         check("non-stream → HTTP 200", r.status_code == 200, f"HTTP {r.status_code}")
         st = await vpn_status(client)
     check("vpn connected", st.get("vpn_status") == "connected", st.get("vpn_status", ""))
@@ -234,9 +232,7 @@ async def test_graceful_failure(base: str) -> None:
                     ok = isinstance(b, dict) and bool(b.get("error") or b.get("message"))
                 except ValueError:
                     ok = False
-                check(
-                    "outage: structured JSON error", ok, f"HTTP {r.status_code}: {r.text[:120]!r}"
-                )
+                check("outage: structured JSON error", ok, f"HTTP {r.status_code}: {r.text[:120]!r}")
         finally:
             docker(["start", CONTAINER])
         # wait for reconnection (up to 120 s)
@@ -312,9 +308,7 @@ async def test_quota_rotation(base: str, token: str) -> None:
                 await asyncio.sleep(2)
             check("quota rotation fired", switched, detail)
         finally:
-            rr = await client.post(
-                "/api/vpn-config", json={"quota_per_ip": original_quota}, headers=headers
-            )
+            rr = await client.post("/api/vpn-config", json={"quota_per_ip": original_quota}, headers=headers)
             if rr.status_code != 200:
                 check("quota restored", False, f"HTTP {rr.status_code}")
 
@@ -343,9 +337,7 @@ async def test_update_contract(base: str) -> None:
 async def main() -> None:
     parser = argparse.ArgumentParser(description="VPN e2e smoke tests (instance 4001 only)")
     parser.add_argument("--port", type=int, default=4001)
-    parser.add_argument(
-        "--token", default="", help="dashboard token (else DASHBOARD_TOKEN env/.env)"
-    )
+    parser.add_argument("--token", default="", help="dashboard token (else DASHBOARD_TOKEN env/.env)")
     parser.add_argument(
         "--quota-trigger",
         action="store_true",

@@ -6,8 +6,11 @@ logs/paused_keys.yaml) jusqu'ici sans AUCUN test dédié. Horloge contrôlée
 zéro sleep. Fichier de persistance redirigé vers tmp_path.
 """
 
+import threading
 
 import pytest
+
+from core.keys import select_next_key
 
 import opencode as oc
 
@@ -100,6 +103,63 @@ def test_best_available_shortest_pause_when_all_paused(clock):
     kp.pause_key(long["api_key"], 600, "401")
     best = kp.best_available([long, short])
     assert best is not None and best["api_key"] == short["api_key"]
+
+
+def test_model_scoped_pause_does_not_block_other_models(clock):
+    clk, kp = clock
+    key = "sk-ant-api03-modelscoped1"
+    kp.pause_key(key, 60, "403 model A", model="model-a")
+    assert kp.is_paused(key) is False, "global pause must stay clear"
+    assert kp.is_paused(key, model="model-a") is True
+    assert kp.is_paused(key, model="model-b") is False
+    assert kp.remaining(key, model="model-a") == pytest.approx(60, abs=0.5)
+    assert kp.remaining(key, model="model-b") == 0.0
+    kp.unpause_all()
+    assert kp.is_paused(key, model="model-a") is False
+
+
+def test_model_scoped_pause_survives_reload(clock, tmp_path):
+    clk, kp = clock
+    key = "sk-ant-api03-modelscoped2"
+    kp.pause_key(key, 120, "403 model A", model="model-a")
+    kp2 = oc._KeyPauser(max_pause=600)
+    kp2._PAUSED_FILE = kp._PAUSED_FILE
+    kp2.load([])
+    assert kp2.is_paused(key, model="model-a") is True
+    assert kp2.is_paused(key, model="model-b") is False
+    assert kp2.is_paused(key) is False
+
+
+def test_model_scoped_pause_skips_key_only_for_that_model(clock):
+    clk, kp = clock
+    k1 = {"api_key": "sk-ant-api03-modelkey1", "alias": "a"}
+    k2 = {"api_key": "sk-ant-api03-modelkey2", "alias": "b"}
+    kp.pause_key(k1["api_key"], 60, "403", model="model-a")
+    first, *_ = select_next_key(
+        api_keys=[k1, k2],
+        env_key="",
+        routing="round-robin",
+        pauser=kp,
+        failover_index=0,
+        cycle_keys=[],
+        cycle_index=0,
+        cycle_lock=threading.Lock(),
+        model="model-a",
+    )
+    assert first["alias"] == "b"
+    # model-b sees both keys; round-robin starts at k1.
+    first2, *_ = select_next_key(
+        api_keys=[k1, k2],
+        env_key="",
+        routing="round-robin",
+        pauser=kp,
+        failover_index=0,
+        cycle_keys=[],
+        cycle_index=0,
+        cycle_lock=threading.Lock(),
+        model="model-b",
+    )
+    assert first2["alias"] == "a"
 
 
 def test_persist_roundtrip_survives_new_instance(clock, tmp_path):

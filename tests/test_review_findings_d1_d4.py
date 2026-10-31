@@ -110,9 +110,7 @@ def test_function_call_added_has_empty_arguments():
         "m",
     )
     added = [e for e in events if e["type"] == "response.output_item.added"][0]["item"]
-    deltas = "".join(
-        e["delta"] for e in events if e["type"] == "response.function_call_arguments.delta"
-    )
+    deltas = "".join(e["delta"] for e in events if e["type"] == "response.function_call_arguments.delta")
     assert added["arguments"] == ""
     assert deltas == '{"a":1}', "les deltas doivent porter l'intégralité des arguments"
 
@@ -136,9 +134,7 @@ def test_content_parts_are_announced_empty_then_closed_full():
         "m",
     )
     added = [e for e in events if e["type"] == "response.output_item.added"][0]["item"]
-    assert [c["text"] for c in added["content"]] == ["", ""], (
-        "le nombre de parts doit rester annoncé, mais vides"
-    )
+    assert [c["text"] for c in added["content"]] == ["", ""], "le nombre de parts doit rester annoncé, mais vides"
     done = [e for e in events if e["type"] == "response.output_item.done"][0]["item"]
     assert [c["text"] for c in done["content"]] == ["un", "deux"]
 
@@ -273,9 +269,7 @@ def _keyless_fallback_sites():
     """
     from pathlib import Path
 
-    src = Path(__file__).resolve().parent.parent.joinpath("opencode.py").read_text(
-        encoding="utf-8", errors="replace"
-    )
+    src = Path(__file__).resolve().parent.parent.joinpath("opencode.py").read_text(encoding="utf-8", errors="replace")
     lines = src.splitlines()
     out = []
     for i, ln in enumerate(lines):
@@ -323,23 +317,21 @@ def test_non_streaming_client_gets_json_when_all_keys_are_paused(monkeypatch):
 
     monkeypatch.setattr(opencode, "_do_request_with_retry", _fake)
     monkeypatch.setattr(opencode, "_get_auth_headers", _boom)
-    monkeypatch.setattr(
-        opencode, "_try_free_model_first", _fake, raising=False
-    )
+    monkeypatch.setattr(opencode, "_try_free_model_first", _fake, raising=False)
 
     r = TestClient(opencode.app).post(
         "/v1/responses",
         json={
-            "model": "deepseek-v4-flash",
+            # [CATALOGUE 2026-10-27] `deepseek-v4-flash` n'est plus annonce
+            # amont : le gate live renvoyait 404 hors liste de codes.
+            "model": "deepseek-v4.1-flash",
             "stream": False,
             "input": [{"role": "user", "content": "bonjour"}],
         },
     )
     ctype = r.headers.get("content-type", "")
     if r.status_code == 200 and "text/event-stream" in ctype:
-        raise AssertionError(
-            "un client stream:false a reçu du SSE sur le chemin de repli sans clé"
-        )
+        raise AssertionError("un client stream:false a reçu du SSE sur le chemin de repli sans clé")
     assert r.status_code in (200, 429, 503, 500), r.status_code
 
 
@@ -354,9 +346,7 @@ def test_ensure_min_tokens_never_lowers_a_larger_limit():
     ramenait **les deux** champs au minimum — le budget de 100000 posé par le
     client pour ne pas être tronqué était détruit silencieusement.
     """
-    out = opencode.ensure_min_tokens(
-        {"model": "deepseek-v4-flash", "max_output_tokens": 16, "max_tokens": 100000}
-    )
+    out = opencode.ensure_min_tokens({"model": "deepseek-v4-flash", "max_output_tokens": 16, "max_tokens": 100000})
     assert out["max_tokens"] == 100000, "la limite du client a été abaissée"
     assert out["max_output_tokens"] >= 16, "le petit champ doit rester relevé"
 
@@ -425,6 +415,7 @@ def test_store_and_truncation_reach_the_wire_on_the_responses_endpoint(monkeypat
     monkeypatch.setattr(opencode, "_do_request_with_retry", _fake)
     # Forcer la jambe payante : sans modèle free, le handler ne détourne pas.
     monkeypatch.setattr(opencode, "FREE_MODEL_MAP", {})
+    monkeypatch.setattr(opencode, "_known_free_model", lambda _m: False)
 
     r = TestClient(opencode.app).post(
         "/v1/responses",
@@ -570,9 +561,7 @@ _CHAT_JSON = {
     "object": "chat.completion",
     "created": 1,
     "model": "deepseek-v4-flash",
-    "choices": [
-        {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}
-    ],
+    "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
 }
 
@@ -594,7 +583,7 @@ def test_responses_endpoint_honours_the_client_stream_flag(monkeypatch, stream):
     r = TestClient(opencode.app).post(
         "/v1/responses",
         json={
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-v4.1-flash",
             "stream": stream,
             "input": [{"role": "user", "content": "bonjour"}],
         },

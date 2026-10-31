@@ -331,10 +331,7 @@ def test_resolve_effort_clamps_the_model_max_sentinel(isolated_thinking):
     # kimi-k3 : plafond local `high`, allow-list `[max]` → max.
     assert ep.resolve_effort({"thinking": {"type": "enabled"}}, "kimi-k3").level == "max"
     # muse-spark : plafond local `max`, allow-list sans `max` → xhigh.
-    assert (
-        ep.resolve_effort({"thinking": {"type": "adaptive"}}, "muse-spark-1.3").level
-        == "xhigh"
-    )
+    assert ep.resolve_effort({"thinking": {"type": "adaptive"}}, "muse-spark-1.3").level == "xhigh"
 
 
 def test_resolve_effort_leaves_a_disabled_request_disabled(isolated_thinking):

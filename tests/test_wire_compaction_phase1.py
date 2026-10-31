@@ -23,7 +23,21 @@ from fastapi.testclient import TestClient
 import opencode as oc
 from server.cache import ResponseCache
 
+
+@pytest.fixture(autouse=True)
+def _free_wire_models(monkeypatch):
+    """Modèles des tests fil free-class sous la politique live (homonym).
+
+    ``sonnet`` route vers ``glm-5.1`` (free famille) et ``minimax-m2.5`` n'a
+    pas d'homonyme live : sans ces deux paires de test, ``_has_free_leg``
+    serait faux et le stub ``_try_free_model_first`` ne serait jamais appelé.
+    """
+    monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "family")
+    monkeypatch.setitem(oc.FREE_MODEL_MAP, "minimax-m2.5", "minimax-m2.5-free")
+
+
 # ── doubles ──────────────────────────────────────────────────────────
+
 
 def _shape_chat_body(model="sonnet", n_chars=1500):
     """Body shape-compaction : 100 % user texte pur, sans tools/system."""
@@ -241,6 +255,7 @@ def _stream_text(client, url, body) -> str:
 
 # ── (1) passthrough byte-identique sauf body["model"] ────────────────
 
+
 def test_shape_passthrough_identical_except_model(client, recorder):
     """Shape-compaction : le wire amont = le body client, sauf model remappé."""
     recorder.set_upstream(lambda e, b, p: FakeResponse(payload=_chat_completion()))
@@ -260,6 +275,7 @@ def test_shape_passthrough_identical_except_model(client, recorder):
 
 # ── (2) exclusion du response cache ──────────────────────────────────
 
+
 def test_shape_excluded_from_response_cache(client, monkeypatch):
     """Shape-compaction jamais cachée : 2 envois identiques → 2 hits amont."""
     rec = UpstreamRecorder(upstream=lambda e, b, p: FakeResponse(payload=_chat_completion()))
@@ -277,6 +293,7 @@ def test_shape_excluded_from_response_cache(client, monkeypatch):
 
 # ── (3) erreur amont en chat streaming : body inclus ─────────────────
 
+
 def test_chat_stream_upstream_error_includes_body(client, recorder):
     """Chat streaming, amont non-200 : l'event d'erreur porte le body upstream."""
     upstream_body = "upstream exploded: quota gone"
@@ -292,6 +309,7 @@ def test_chat_stream_upstream_error_includes_body(client, recorder):
 
 
 # ── (4) responses streaming non-200 : event d'erreur, pas [DONE] nu ──
+
 
 def test_responses_stream_non200_yields_error_event(client, recorder):
     """Responses streaming, amont non-200 : event erreur, pas [DONE] seul."""
@@ -313,12 +331,11 @@ def test_responses_stream_non200_yields_error_event(client, recorder):
 
 # ── (5) 429 shape relayé intact, jamais 503 ──────────────────────────
 
+
 def test_shape_429_relayed_intact_not_503(client, recorder):
     """429 amont sur shape-compaction : statut + body relayés, pas de 503."""
     upstream_body = json.dumps({"error": {"message": "rate limited, slow down"}})
-    recorder.set_upstream(
-        lambda e, b, p: FakeResponse(status_code=429, text=upstream_body, ctype="application/json")
-    )
+    recorder.set_upstream(lambda e, b, p: FakeResponse(status_code=429, text=upstream_body, ctype="application/json"))
     body = _shape_chat_body(model="sonnet")
 
     r = client.post("/v1/chat/completions", json=body)
@@ -329,6 +346,7 @@ def test_shape_429_relayed_intact_not_503(client, recorder):
 
 
 # ── (6) stream compactage : tiny → refetch station fraîche → SSE complet ──
+
 
 def _tiny_chat_completion():
     return {

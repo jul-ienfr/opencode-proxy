@@ -45,6 +45,10 @@ class FleetController:
         enabled = bool(enabled)
         for m in self._managers:
             try:
+                # [audit 2026-10-30] Never resurrect a station disabled by
+                # config/stop_station through the global toggle or heal.
+                if enabled and getattr(m, "_disabled", False):
+                    continue
                 m.enabled = enabled
                 m._desired_connected = enabled
             except Exception:
@@ -63,6 +67,8 @@ class FleetController:
         async def _one(m):
             async with sem:
                 try:
+                    if getattr(m, "_disabled", False):
+                        return
                     m._desired_connected = True
                     if timeout:
                         await asyncio.wait_for(m.connect(), timeout=timeout)
@@ -75,11 +81,7 @@ class FleetController:
         self._sync_pool_primary()
         return {
             "ok": not errors,
-            "connected": sum(
-                1
-                for m in self._managers
-                if str(getattr(m, "status", "")) in ("connected", "degraded")
-            ),
+            "connected": sum(1 for m in self._managers if str(getattr(m, "status", "")) in ("connected", "degraded")),
             "total": len(self._managers),
             "errors": errors,
         }
@@ -107,6 +109,8 @@ class FleetController:
 
         async def _one(m):
             async with sem:
+                if getattr(m, "_disabled", False):
+                    return
                 status = str(getattr(m, "status", "disconnected") or "disconnected")
                 if status in ("connected", "degraded"):
                     return
@@ -125,6 +129,9 @@ class FleetController:
         if m is None:
             return {"ok": False, "error": f"station {sid} introuvable"}
         try:
+            # Explicit start/connect is the operator's override: clear the
+            # disabled flag so the pool can use the station again.
+            m._disabled = False
             m.enabled = True
             m._desired_connected = True
             await m.start()
@@ -138,10 +145,22 @@ class FleetController:
         if m is None:
             return {"ok": False, "error": f"station {sid} introuvable"}
         try:
+            # [audit 2026-10-30] Exclude the station BEFORE removing its
+            # container. The old stop_station left status="connected" and an
+            # old IP, and the pool kept picking a container that no longer
+            # existed (the manager could not converge because
+            # _desired_connected was False).
+            m._disabled = True
             m._desired_connected = False
             await m.stop()
             if hasattr(m, "stop_container"):
                 await m.stop_container()
+            try:
+                m._status = "disconnected"
+                m._current_ip = None
+                m._error = None
+            except Exception:
+                pass
             return {"ok": True, "station": int(sid)}
         except Exception as e:
             return {"ok": False, "station": int(sid), "error": str(e)[:200]}
@@ -161,6 +180,8 @@ class FleetController:
         if m is None:
             return {"ok": False, "error": f"station {sid} introuvable"}
         try:
+            m._disabled = False
+            m.enabled = True
             m._desired_connected = True
             await m.connect()
             return {"ok": True, "station": int(sid), "ip": getattr(m, "current_ip", None)}
@@ -172,6 +193,7 @@ class FleetController:
         if m is None:
             return {"ok": False, "error": f"station {sid} introuvable"}
         try:
+            m._disabled = True
             m._desired_connected = False
             await m.disconnect()
             return {"ok": True, "station": int(sid)}
@@ -182,9 +204,7 @@ class FleetController:
         return {
             "total": len(self._managers),
             "enabled": sum(1 for m in self._managers if getattr(m, "enabled", False)),
-            "desired_connected": sum(
-                1 for m in self._managers if getattr(m, "_desired_connected", True)
-            ),
+            "desired_connected": sum(1 for m in self._managers if getattr(m, "_desired_connected", True)),
             "stations": [
                 {
                     "station": getattr(m, "_station", None),

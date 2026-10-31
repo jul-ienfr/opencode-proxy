@@ -107,11 +107,7 @@ def _resolve(funcs):
 
 def _violations(rel, src):
     tree = ast.parse(src, filename=rel)
-    funcs = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    funcs = {node.name: node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
     names_of, targets_of = _resolve(funcs)
 
     bad = []
@@ -134,8 +130,7 @@ def _violations(rel, src):
             if const in inherited:
                 continue  # la constante de chemin est détournée (ici, helper ou fixture)
             bad.append(
-                f"{rel}:{fn.lineno} — {name}() appelle {writer}() sans détourner "
-                f"{const} ni remplacer l'écrivain"
+                f"{rel}:{fn.lineno} — {name}() appelle {writer}() sans détourner {const} ni remplacer l'écrivain"
             )
     return bad
 
@@ -160,9 +155,7 @@ def test_le_garde_fou_voit_bien_les_deux_regles():
         "    api._persist_free_model_map({'a': 'b'})\n"
     )
     bare = (
-        "def test_y(monkeypatch):\n"
-        "    import dashboard.api as api\n"
-        "    api._persist_vpn_config({'quota_per_ip': 9})\n"
+        "def test_y(monkeypatch):\n    import dashboard.api as api\n    api._persist_vpn_config({'quota_per_ip': 9})\n"
     )
     clean = (
         "def test_z(monkeypatch, tmp_path):\n"

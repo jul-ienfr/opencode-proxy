@@ -77,9 +77,7 @@ def test_keypauser_save_snapshot_under_concurrent_mutation(tmp_path):
         except Exception as e:  # pragma: no cover
             errors.append(e)
 
-    ts = [threading.Thread(target=mutator) for _ in range(4)] + [
-        threading.Thread(target=saver) for _ in range(2)
-    ]
+    ts = [threading.Thread(target=mutator) for _ in range(4)] + [threading.Thread(target=saver) for _ in range(2)]
     for t in ts:
         t.start()
     for t in ts:
@@ -94,6 +92,7 @@ async def test_event_manager_cross_thread_publish_delivered():
     mgr.bind_loop(asyncio.get_running_loop())
     q = await mgr.subscribe()
     try:
+
         def _sync_publish():
             mgr.publish("stats_updated", {"n": 1})
 

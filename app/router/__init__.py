@@ -91,9 +91,7 @@ def route_for(
             if any(m in ("opus", "sonnet", "haiku") for m in mlist):
                 if any(m in name for m in r.get("match", [])):
                     if debug_fn:
-                        debug_fn(
-                            f"  [route] DISABLE_MAPPING manual alias match: '{name}' → {r.get('model')}"
-                        )
+                        debug_fn(f"  [route] DISABLE_MAPPING manual alias match: '{name}' → {r.get('model')}")
                     return _cache_put(r), seen_version
         # No custom route matched — check if the model exists directly
         if name in models:
@@ -127,12 +125,7 @@ def route_for(
             return _cache_put(r), seen_version
     # 3. Wildcard catch-all: if a custom route "*" (or legacy "") exists, use it
     wildcard = custom_routes.get("*") or custom_routes.get("")
-    if (
-        wildcard
-        and isinstance(wildcard, dict)
-        and wildcard.get("model")
-        and wildcard.get("enabled") is not False
-    ):
+    if wildcard and isinstance(wildcard, dict) and wildcard.get("model") and wildcard.get("enabled") is not False:
         if debug_fn:
             debug_fn(f"  [route] wildcard catch-all: {wildcard.get('model')}")
         return _cache_put(wildcard), seen_version

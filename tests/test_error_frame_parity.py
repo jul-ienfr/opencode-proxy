@@ -36,7 +36,6 @@ if str(ROOT) not in sys.path:
 
 import opencode as oc  # noqa: E402
 
-
 PAYLOAD_ANTHROPIC = {
     "type": "error",
     "error": {"type": "server_error", "message": "Upstream request failed: Model is unavailable."},
@@ -105,7 +104,7 @@ class TestOpenAIClientGetsOpenAIError:
     async def test_the_openai_error_keeps_type_and_message(self):
         brut = await _emettre(PAYLOAD_ANTHROPIC, "openai", client_protocol="openai")
         premiere = brut.decode("utf-8").splitlines()[0]
-        corps = json.loads(premiere[len("data: "):])
+        corps = json.loads(premiere[len("data: ") :])
         assert corps["error"]["type"] == "server_error"
         assert "Model is unavailable" in corps["error"]["message"]
 
@@ -139,7 +138,7 @@ class TestUpstreamTypeFidelity:
         """Le cas qui a motivé le lot : `server_error` était écrasé en `api_error`."""
         payload = {"type": "error", "error": {"type": "api_error", "message": "Free model request failed: …"}}
         brut = await _emettre(payload, "openai", client_protocol="openai")
-        corps = json.loads(brut.decode("utf-8").splitlines()[0][len("data: "):])
+        corps = json.loads(brut.decode("utf-8").splitlines()[0][len("data: ") :])
         assert corps["error"]["type"] in {"api_error", "server_error"}
 
 
@@ -176,3 +175,19 @@ class TestTheCallSitesDeclareTheirClientProtocol:
         declares = bloc.count('client_protocol="openai"')
         assert appels > 0
         assert declares >= appels
+
+
+def test_stream_error_detail_relays_overflow_marker():
+    """Un overflow stream doit rester reconnaissable par le client officiel."""
+    msg, typ = oc._stream_error_detail(
+        400,
+        b'{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens"}}',
+    )
+    assert "prompt is too long" in msg
+    assert typ == "invalid_request_error"
+
+
+def test_stream_error_detail_keeps_generic_400():
+    msg, typ = oc._stream_error_detail(400, b'{"error":"bad request"}')
+    assert msg == "HTTP 400"
+    assert typ == "api_error"

@@ -25,7 +25,10 @@ from fastapi.testclient import TestClient
 import opencode
 
 _TEXT = "Bonjour, ceci est une reponse de test suffisamment longue."
-_MODEL = "deepseek-v4-flash"
+# [CATALOGUE 2026-10-27] `deepseek-v4-flash` n'est plus annonce amont
+# (logs/live_models.json) : le gate live renvoyait 404 « Model not found »
+# des qu'un test du run forçait le rechargement du catalogue.
+_MODEL = "deepseek-v4.1-flash"
 
 
 class _FakeStreamResp:
@@ -98,9 +101,7 @@ def streamed(monkeypatch):
         ctype = r.headers.get("content-type", "")
         raw = b"".join(r.iter_bytes()).decode()
 
-    frames = [
-        ln[6:] for ln in raw.splitlines() if ln.startswith("data: ") and ln[6:].strip() != "[DONE]"
-    ]
+    frames = [ln[6:] for ln in raw.splitlines() if ln.startswith("data: ") and ln[6:].strip() != "[DONE]"]
     return status, ctype, [json.loads(f) for f in frames], raw
 
 
@@ -241,12 +242,9 @@ def test_stream_false_returns_json_not_sse(non_streamed):
     """Une requête `stream: false` doit recevoir du JSON, jamais du SSE."""
     ctype = non_streamed.headers.get("content-type", "")
     assert "text/event-stream" not in ctype, (
-        f"stream:false renvoie du SSE ({ctype}) : une voie non-streaming a été "
-        f"convertie par erreur en streaming"
+        f"stream:false renvoie du SSE ({ctype}) : une voie non-streaming a été convertie par erreur en streaming"
     )
-    assert "response.created" not in non_streamed.text, (
-        "événements SSE émis pour une requête non-streaming"
-    )
+    assert "response.created" not in non_streamed.text, "événements SSE émis pour une requête non-streaming"
 
 
 def test_stream_false_body_is_a_responses_object(non_streamed):

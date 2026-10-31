@@ -153,9 +153,7 @@ async def test_terminate_after_started_flushes_signature_on_abrupt_end():
 
     sig = pm._local_signature("texte partiel")
     events = []
-    async for ev in opencode._terminate_after_started(
-        [0, 1], 7, thinking_idx=1, thinking_sig=sig
-    ):
+    async for ev in opencode._terminate_after_started([0, 1], 7, thinking_idx=1, thinking_sig=sig):
         events.append(_parse_sse(ev))
 
     kinds = [(e, p.get("index"), p.get("delta")) for e, p in events]
@@ -283,7 +281,7 @@ def test_chat_to_responses_emits_reasoning_item_before_output_text():
     req = pm._chat_to_responses_request(chat)
     inp = req["input"]
 
-    types = [i.get("type") or f'message:{i.get("role")}' for i in inp]
+    types = [i.get("type") or f"message:{i.get('role')}" for i in inp]
     # ordre : user → reasoning → assistant(output_text) → user
     assert types == ["message:user", "reasoning", "message:assistant", "message:user"]
 
@@ -329,9 +327,9 @@ def test_chat_to_responses_no_reasoning_item_without_reasoning_content():
             ],
         }
         req = pm._chat_to_responses_request(chat)
-        assert not any(
-            isinstance(i, dict) and i.get("type") == "reasoning" for i in req["input"]
-        ), f"reasoning item émis à tort pour reasoning_content={rc!r}"
+        assert not any(isinstance(i, dict) and i.get("type") == "reasoning" for i in req["input"]), (
+            f"reasoning item émis à tort pour reasoning_content={rc!r}"
+        )
         assert "_has_synthetic_reasoning_items" not in req
 
 
@@ -381,20 +379,14 @@ def test_openai_history_to_anthropic_upstream_no_forged_signature():
     asst_blocks = anthro["messages"][1]["content"]
     thinking = [b for b in asst_blocks if b.get("type") == "thinking"]
     assert len(thinking) == 1
-    assert thinking[0]["signature"] == pm._local_signature(
-        "réflexion d'un autre modèle"
-    )
+    assert thinking[0]["signature"] == pm._local_signature("réflexion d'un autre modèle")
     stripped = pm.strip_synthetic_thinking(anthro)
     assert stripped == 1
     remaining = [
-        b
-        for m in anthro["messages"]
-        for b in m["content"]
-        if isinstance(b, dict) and b.get("type") == "thinking"
+        b for m in anthro["messages"] for b in m["content"] if isinstance(b, dict) and b.get("type") == "thinking"
     ]
     assert not remaining, (
-        "strip_synthetic_thinking retire les blocs forgés avant "
-        "l'envoi à un upstream Anthropic strict"
+        "strip_synthetic_thinking retire les blocs forgés avant l'envoi à un upstream Anthropic strict"
     )
     dumped = pm._json_dumps_str(anthro, ensure_ascii=False)
     assert "réflexion d'un autre modèle" not in dumped
@@ -431,6 +423,7 @@ async def test_T1_retry_no_reasoning_nonstreaming(monkeypatch):
         # Premier appel: marqueur présent → simule 400 upstream
         if body.get("_has_synthetic_reasoning_items"):
             return _FakeResp(), headers
+
         # Retry sans reasoning → 200
         class _Ok:
             status_code = 200
@@ -460,7 +453,11 @@ async def test_T1_retry_no_reasoning_nonstreaming(monkeypatch):
     # _handle_429 is function-local (_make_stream_retry_loop), not module attr — skip
     # Bypass free + cache
     monkeypatch.setattr(opencode, "_try_free_model_first", lambda *a, **kw: None)
-    monkeypatch.setattr(opencode, "_response_cache", type("_C", (), {"make_key": lambda *_a, **_kw: None, "get": lambda *_a, **_kw: None})())
+    monkeypatch.setattr(
+        opencode,
+        "_response_cache",
+        type("_C", (), {"make_key": lambda *_a, **_kw: None, "get": lambda *_a, **_kw: None})(),
+    )
 
     # Construire oai_body avec items reasoning (via _chat_to_responses_request)
     chat = {
@@ -507,7 +504,9 @@ def test_T2_responses_dedupe_multi_part_no_loss_no_dup():
     assert "rs_1:0" in state.reasoning_seen
     # output_item.done 1-part 200 chars — queue perdue avant fix B2 (prefix any → None)
     r2 = pm._responses_sse_to_chat_deltas(
-        '{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"' + "X" * 200 + '"}]}}',
+        '{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"'
+        + "X" * 200
+        + '"}]}}',
         parsed=None,
         state=state,
     )
@@ -518,7 +517,9 @@ def test_T2_responses_dedupe_multi_part_no_loss_no_dup():
     # Sans delta préalable, même done 1-part 200 doit émettre
     state2 = pm.ResponsesSseState()
     r3 = pm._responses_sse_to_chat_deltas(
-        '{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"' + "Y" * 200 + '"}]}}',
+        '{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"'
+        + "Y" * 200
+        + '"}]}}',
         parsed=None,
         state=state2,
     )

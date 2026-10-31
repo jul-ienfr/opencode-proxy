@@ -90,8 +90,7 @@ class TestOfficialClass:
         for c in cas:
             obtenu = classify_status_class(c["status"], c["body"])
             assert obtenu == c["class"], (
-                f"statut {c['status']} corps {c['body']!r} : classe {obtenu!r}, "
-                f"attendu {c['class']!r} (executor.ts)"
+                f"statut {c['status']} corps {c['body']!r} : classe {obtenu!r}, attendu {c['class']!r} (executor.ts)"
             )
 
     def test_content_policy_wins_over_any_status(self):
@@ -159,8 +158,7 @@ class TestWireType:
         for c in cas:
             _, etype = classify_upstream_error(c["status"], c["body"])
             assert etype == c["wire_type"], (
-                f"statut {c['status']} corps {c['body']!r} : type {etype!r}, "
-                f"attendu {c['wire_type']!r}"
+                f"statut {c['status']} corps {c['body']!r} : type {etype!r}, attendu {c['wire_type']!r}"
             )
 
     def test_motifs_keep_priority_over_the_status_table(self, cas):

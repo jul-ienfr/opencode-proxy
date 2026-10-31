@@ -48,6 +48,7 @@ def _iso_keys(monkeypatch, tmp_path):
     polluent le vrai `logs/paused_keys.yaml` du proxy live — incident
     2026-09-07 : entrées k0/k1-lot3 retrouvées dans le fichier réel)."""
     monkeypatch.setattr(oc, "API_KEYS", _two_keys())
+    monkeypatch.setattr(oc, "API_KEY", "")
     pauser = oc._KeyPauser()
     pauser._PAUSED_FILE = str(tmp_path / "paused_keys.yaml")
     monkeypatch.setattr(oc, "_key_pauser", pauser)
@@ -212,9 +213,7 @@ async def test_watchdog_stream_no_alt_single_retry_then_504(_iso_keys, _ttfb_fas
     monkeypatch.setattr(m, "_ensure_http_client", lambda: shared)
     monkeypatch.setattr(m, "_fresh_http_client", lambda: fresh)
     with pytest.raises(m.UpstreamError) as ei:
-        async with m._open_free_stream(
-            "https://up.example/v1", {"model": "x"}, _stream_headers(), use_free=False
-        ):
+        async with m._open_free_stream("https://up.example/v1", {"model": "x"}, _stream_headers(), use_free=False):
             pass
     assert ei.value.status_code == 504
     assert shared.calls == 1, "stage 0 = client partagé"
@@ -245,9 +244,7 @@ async def test_watchdog_stream_alt_key_then_abort(_iso_keys, _ttfb_fast, monkeyp
 
     monkeypatch.setattr(m, "_get_auth_headers", spy_auth)
     with pytest.raises(m.UpstreamError) as ei:
-        async with m._open_free_stream(
-            "https://up.example/v1", {"model": "x"}, _stream_headers(), use_free=False
-        ):
+        async with m._open_free_stream("https://up.example/v1", {"model": "x"}, _stream_headers(), use_free=False):
             pass
     assert ei.value.status_code == 504
     assert shared.calls == 1 and fresh.calls == 2, "stage 0 partagé, stages 1-2 jetables"
@@ -276,9 +273,7 @@ async def test_watchdog_stream_alive_never_interrupted(_iso_keys, _ttfb_fast, mo
 
     monkeypatch.setattr(m, "_ensure_http_client", lambda: shared)
     monkeypatch.setattr(m, "_fresh_http_client", boom_fresh)
-    async with m._open_free_stream(
-        "https://up.example/v1", {"model": "x"}, _stream_headers(), use_free=False
-    ) as got:
+    async with m._open_free_stream("https://up.example/v1", {"model": "x"}, _stream_headers(), use_free=False) as got:
         assert got is resp
     assert shared.calls == 1
     assert m._TTFB_FAILOVER_COUNTS == {}
@@ -306,9 +301,7 @@ async def test_watchdog_disabled_is_exact_rollback(_iso_keys, monkeypatch):
     monkeypatch.setattr(m, "_ensure_http_client", lambda: shared)
     monkeypatch.setattr(m, "_fresh_http_client", boom_fresh)
     monkeypatch.setattr(m, "_ttfb_watchdog_timeout_s", boom_timeout)
-    async with m._open_free_stream(
-        "https://up.example/v1", {"model": "x"}, _stream_headers(), use_free=False
-    ) as got:
+    async with m._open_free_stream("https://up.example/v1", {"model": "x"}, _stream_headers(), use_free=False) as got:
         assert got is resp
     assert shared.calls == 1
     assert m._TTFB_FAILOVER_COUNTS == {}
@@ -325,9 +318,7 @@ async def test_watchdog_nonstream_no_alt_504(_iso_keys, _ttfb_fast, monkeypatch)
     monkeypatch.setattr(m, "_ensure_http_client", lambda: shared)
     monkeypatch.setattr(m, "_fresh_http_client", lambda: fresh)
     with pytest.raises(m.UpstreamError) as ei:
-        await m._do_request_with_retry(
-            "https://up.example/v1", {"model": "x"}, _stream_headers(), "anthropic"
-        )
+        await m._do_request_with_retry("https://up.example/v1", {"model": "x"}, _stream_headers(), "anthropic")
     assert ei.value.status_code == 504
     counts = m._TTFB_FAILOVER_COUNTS
     assert counts.get(("a0", "same_key_new_conn"), 0) == 1

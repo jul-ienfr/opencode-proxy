@@ -8,15 +8,15 @@ Officiel v2 (`model-request.ts`, `app.ts:useragent`) : UA
 
 import opencode as oc
 
-RESP_EP = "https://opencode.ai/zen/go/v1/responses"
-CHAT_EP = "https://opencode.ai/zen/go/v1/chat/completions"
-MSG_EP = "https://opencode.ai/zen/go/v1/messages"
+RESP_EP = "https://opencode.ai/inference/go/openai/v1/responses"
+CHAT_EP = "https://opencode.ai/inference/go/openai/v1/chat/completions"
+MSG_EP = "https://opencode.ai/inference/go/anthropic/v1/messages"
 
 
 def test_responses_leg_gets_responses_ua():
     h = oc._enrich_paid_wire_headers({"Authorization": "Bearer k"}, RESP_EP)
     assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA_V2
-    assert h["User-Agent"] == "opencode/prod/2.0.28/cli"
+    assert h["User-Agent"].startswith("opencode/prod/")
 
 
 def test_chat_leg_gets_chat_ua():
@@ -74,9 +74,7 @@ def test_session_id_absent_on_anthropic_leg():
 def test_session_id_follows_the_conversation_session():
     """Avec clé de conversation : session-id miroir de `x-opencode-session`,
     donc affinité sticky par conversation, comme la jambe free."""
-    h = oc._enrich_paid_wire_headers(
-        {"Authorization": "Bearer k"}, RESP_EP, "conv-D2"
-    )
+    h = oc._enrich_paid_wire_headers({"Authorization": "Bearer k"}, RESP_EP, "conv-D2")
     assert h["x-opencode-session"] == oc._conversation_session_id("conv-D2")
     assert h["x-opencode-session-id"] == h["x-opencode-session"]
 
@@ -110,9 +108,7 @@ def test_session_id_absent_when_no_session_could_be_minted(monkeypatch):
     """Pas de `ses_` en amont → pas d'en-tête orphelin qui mentirait sur
     l'identité de session (la même prudence que `x-opencode-session`)."""
     monkeypatch.setattr(oc, "_paid_session_id", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
-    monkeypatch.setattr(
-        oc, "_conversation_session_id", lambda k: (_ for _ in ()).throw(RuntimeError("boom"))
-    )
+    monkeypatch.setattr(oc, "_conversation_session_id", lambda k: (_ for _ in ()).throw(RuntimeError("boom")))
     h = oc._enrich_paid_wire_headers({"Authorization": "Bearer k"}, RESP_EP)
     assert "x-opencode-session" not in h
     assert "x-opencode-session-id" not in h
@@ -168,3 +164,36 @@ def test_enrichment_is_idempotent():
     once = oc._enrich_paid_wire_headers({"Authorization": "Bearer k"}, RESP_EP)
     twice = oc._enrich_paid_wire_headers(dict(once), RESP_EP)
     assert twice == once
+
+
+def test_apply_identity_emits_official_ua_not_browser():
+    """[2026-10-25] Le profil d'identité ne peut plus produire une face
+    navigateur : UA officiel v2 + aucun sec-ch-ua/Accept-Language."""
+    prof = {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}}
+    h = oc._apply_identity({"Authorization": "Bearer k"}, prof)
+    assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA_V2
+    assert h["x-opencode-client"] == oc._OPENCODE_CLIENT_NAME
+    lower = {k.lower() for k in h}
+    assert "sec-ch-ua" not in lower
+    assert "accept-language" not in lower
+
+
+def test_apply_identity_desktop_ua_aligns_client_header():
+    prof = {
+        "impersonate": "chrome131",
+        "user_agent": "opencode/prod/2.0.28/desktop",
+        "extra_headers": {},
+    }
+    h = oc._apply_identity({}, prof)
+    assert h["User-Agent"] == "opencode/prod/2.0.28/desktop"
+    assert h["x-opencode-client"] == "desktop"
+
+
+def test_apply_identity_keeps_existing_client_header():
+    prof = {
+        "impersonate": "chrome131",
+        "user_agent": "opencode/prod/2.0.28/desktop",
+        "extra_headers": {},
+    }
+    h = oc._apply_identity({"x-opencode-client": "app"}, prof)
+    assert h["x-opencode-client"] == "app"

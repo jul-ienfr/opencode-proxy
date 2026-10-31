@@ -78,6 +78,26 @@ def _is_fresh(pre_path: str, src_path: str) -> bool:
         return False
 
 
+def _iter_assets(static_dir: str):
+    """Parcourt récursivement le dossier d'assets.
+
+    Récursif depuis le découpage du front-end (Vite) : les bundles compilés
+    du dashboard vivent dans ``static/dist/assets/``. Rend
+    ``(chemin_source, nom_relatif)`` avec ``/`` en séparateur, pour des
+    messages d'erreur lisibles et identiques sur tous les OS.
+    """
+    for root, dirs, files in os.walk(static_dir):
+        dirs.sort()
+        for name in sorted(files):
+            if not name.endswith(EXTENSIONS):
+                continue
+            src_path = os.path.join(root, name)
+            if not os.path.isfile(src_path):
+                continue
+            rel = os.path.relpath(src_path, static_dir).replace(os.sep, "/")
+            yield src_path, rel
+
+
 def precompress_dir(static_dir: str, *, check: bool = False, quiet: bool = False) -> int:
     """Pré-compresse les assets du dossier. Retourne le nombre de problèmes."""
     if not os.path.isdir(static_dir):
@@ -87,12 +107,7 @@ def precompress_dir(static_dir: str, *, check: bool = False, quiet: bool = False
     problems = 0
     done = 0
     skipped = 0
-    for name in sorted(os.listdir(static_dir)):
-        if not name.endswith(EXTENSIONS):
-            continue
-        src_path = os.path.join(static_dir, name)
-        if not os.path.isfile(src_path):
-            continue
+    for src_path, name in _iter_assets(static_dir):
         try:
             with open(src_path, "rb") as f:
                 raw = f.read()

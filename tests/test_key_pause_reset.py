@@ -22,7 +22,6 @@ from __future__ import annotations
 import pathlib
 import sys
 
-import pytest
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -83,9 +82,7 @@ class TestUnpauseAllReallyClearsEverything:
 
         apres_redemarrage = _pauser(tmp_path)
         apres_redemarrage.load(["sk-test-1"])
-        assert apres_redemarrage.get_all_status() == {}, (
-            "le pause est revenu au boot : unpause_all n'a pas persisté"
-        )
+        assert apres_redemarrage.get_all_status() == {}, "le pause est revenu au boot : unpause_all n'a pas persisté"
 
     def test_unpause_all_on_an_empty_state_is_harmless(self, tmp_path):
         pauser = _pauser(tmp_path)
@@ -118,9 +115,7 @@ class TestTheEndpointPersists:
 
             recharge = _pauser(tmp_path)
             recharge.load(["sk-test-endpoint"])
-            assert recharge.get_all_status() == {}, (
-                "l'endpoint n'a pas persisté : le pause reviendra au prochain boot"
-            )
+            assert recharge.get_all_status() == {}, "l'endpoint n'a pas persisté : le pause reviendra au prochain boot"
         finally:
             oc._key_pauser._PAUSED_FILE = ancien
             oc._key_pauser.unpause_all()

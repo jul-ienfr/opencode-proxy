@@ -53,11 +53,11 @@ from protocol_mapping import sanitize_tool_names
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Endpoints amont attendus â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-EP_ANTHRO = "https://opencode.ai/zen/go/v1/messages"
-EP_CHAT = "https://opencode.ai/zen/go/v1/chat/completions"
-EP_RESPONSES = "https://opencode.ai/zen/go/v1/responses"
-EP_FREE_CHAT = "https://opencode.ai/inference/v1/chat/completions"
-EP_FREE_RESPONSES = "https://opencode.ai/inference/v1/responses"
+EP_ANTHRO = "https://opencode.ai/inference/go/anthropic/v1/messages"
+EP_CHAT = "https://opencode.ai/inference/go/openai/v1/chat/completions"
+EP_RESPONSES = "https://opencode.ai/inference/go/openai/v1/responses"
+EP_FREE_CHAT = "https://opencode.ai/inference/openai/v1/chat/completions"
+EP_FREE_RESPONSES = "https://opencode.ai/inference/openai/v1/responses"
 
 # Modeles clients : cible payante unique par chemin.
 # Z1 (plan 19.5, lot Z) : `_install_seams` vide SORTED_CUSTOM_ROUTES, donc
@@ -78,6 +78,37 @@ PAID_RESPONSES = "muse-spark-1.3-contributor"  # â†’ openai /v1/responses
 #   P4 : Â« haiku Â»  â†’ minimax-m2.5 (anthropic) â†’ free mimo-v2.5-free
 FREE_CLIENT_P2 = "sonnet"
 FREE_CLIENT_P4 = "haiku"
+
+
+@pytest.fixture(autouse=True)
+def _free_matrix_pairs(monkeypatch):
+    """Paires free de test pour la matrice protocolaire.
+
+    La politique live par défaut est ``homonym`` (aucun saut de famille) et
+    les ids ``-free`` non déclarés dans ``models:`` ne sont pas « connus ».
+    La matrice teste la CONVERSION de protocole, pas la politique de
+    substitution : on pose ``family`` et on injecte les deux homonymes de
+    test utilisés par P1/P4/P5/P6. Tout est restauré par monkeypatch — aucune
+    écriture config.yaml.
+    """
+    monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "family")
+    monkeypatch.setitem(oc.FREE_MODEL_MAP, "minimax-m2.5", "minimax-m2.5-free")
+    monkeypatch.setitem(
+        oc.MODELS,
+        "minimax-m2.5-free",
+        {"endpoint": EP_FREE_CHAT, "protocol": "openai"},
+    )
+    monkeypatch.setitem(
+        oc.FREE_MODEL_MAP,
+        "muse-spark-1.3-contributor",
+        "muse-spark-1.3-contributor-free",
+    )
+    monkeypatch.setitem(
+        oc.MODELS,
+        "muse-spark-1.3-contributor-free",
+        {"endpoint": EP_FREE_RESPONSES, "protocol": "openai"},
+    )
+
 
 # RÃ©gression P4-stream â€” **CORRIGÃ‰E** (A24).
 # ``_anthro_to_oai_stream`` (opencode.py:12569) dÃ©clarait ``nonlocal endpoint,
@@ -231,7 +262,11 @@ CORPUS_REASONING: dict[str, Any] = {
             {
                 "role": "assistant",
                 "content": [
-                    {"type": "thinking", "thinking": "17 Ã— 23 = 17 Ã— 20 + 17 Ã— 3 = 340 + 51", "signature": "AUTHENTIC=="},
+                    {
+                        "type": "thinking",
+                        "thinking": "17 Ã— 23 = 17 Ã— 20 + 17 Ã— 3 = 340 + 51",
+                        "signature": "AUTHENTIC==",
+                    },
                     {"type": "text", "text": "17 Ã— 23 = 391."},
                 ],
             },
@@ -337,7 +372,7 @@ ANTHRO_SSE_LINES = [
     'data: {"type":"message_stop"}',
 ]
 
-ANTHRO_SSE_BYTES = [(ln + "\n").encode() for ln in ANTHRO_SSE_LINES]
+ANTHRO_SSE_BYTES = [(ln + "\n\n").encode() for ln in ANTHRO_SSE_LINES]
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Doubles amont â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -505,8 +540,10 @@ def _install_seams(monkeypatch, recorder: UpstreamRecorder):
     @asynccontextmanager
     async def _open_via_pool(endpoint, body, headers, is_stream=False, forced_pool=None):
         recorder._record("pool", endpoint, body, extra={"is_stream": bool(is_stream)})
-        resp = recorder._pool_upstream(endpoint, body) if recorder._pool_upstream else recorder._upstream(
-            endpoint, body, "anthropic"
+        resp = (
+            recorder._pool_upstream(endpoint, body)
+            if recorder._pool_upstream
+            else recorder._upstream(endpoint, body, "anthropic")
         )
         yield resp
 
@@ -873,9 +910,7 @@ def test_p3_stream_repare_un_tool_call_amont_sans_nom_ni_id(client, recorder):
                         "tool_calls": [
                             {
                                 "index": 0,
-                                "function": {
-                                    "arguments": '": "npm test","description":"test"}'
-                                },
+                                "function": {"arguments": '": "npm test","description":"test"}'},
                             }
                         ]
                     },
@@ -1063,9 +1098,9 @@ def test_free_model_subpath_p4_stream(client, recorder):
     assert oc.get_model_config(target)["protocol"] == "anthropic", f"{target} doit dÃ©clarer le protocole anthropic"
     free_model = oc._resolve_free_model(target)
     assert free_model, f"{target} doit avoir un Ã©quivalent free pour ce test"
-    assert "/responses" not in _cfg_settings._free_endpoint_for(
-        free_model
-    ), "l'Ã©quivalent free doit Ãªtre un endpoint Chat, sinon ce chemin n'est pas celui du dÃ©faut"
+    assert "/responses" not in _cfg_settings._free_endpoint_for(free_model), (
+        "l'Ã©quivalent free doit Ãªtre un endpoint Chat, sinon ce chemin n'est pas celui du dÃ©faut"
+    )
 
     _chat_bytes = [(ln + "\n").encode() for ln in CHAT_CHUNK_LINES]
     recorder.queue_free(FakeResponse(lines=CHAT_CHUNK_LINES, raw_lines=_chat_bytes))
@@ -1110,7 +1145,7 @@ def _free_leg_sans_entetes(monkeypatch, status_code=429):
     ici vient de la traduction "cles en pause" en 503 retryable, pas d'une garde A27. Ce
     test verrouille le contrat visible (erreur exploitable, jamais un 500 nu) ; il ne
     prouve PAS la garde, qui a ete retiree comme inatteignable.
-"""
+    """
 
     appels = []
 
@@ -1130,7 +1165,7 @@ def test_p4_nonstream_jambe_free_sans_entetes_ne_fait_pas_500(client, recorder, 
     ici vient de la traduction "cles en pause" en 503 retryable, pas d'une garde A27. Ce
     test verrouille le contrat visible (erreur exploitable, jamais un 500 nu) ; il ne
     prouve PAS la garde, qui a ete retiree comme inatteignable.
-"""
+    """
     appels = _free_leg_sans_entetes(monkeypatch)
     body = {"model": FREE_CLIENT_P4, "max_tokens": 256, "messages": [{"role": "user", "content": "hi"}]}
 
@@ -1156,7 +1191,7 @@ def test_p1_nonstream_jambe_free_sans_entetes_ne_fait_pas_500(client, recorder, 
     ici vient de la traduction "cles en pause" en 503 retryable, pas d'une garde A27. Ce
     test verrouille le contrat visible (erreur exploitable, jamais un 500 nu) ; il ne
     prouve PAS la garde, qui a ete retiree comme inatteignable.
-"""
+    """
     _free_leg_sans_entetes(monkeypatch)
     body = {"model": P1_CLIENT, "max_tokens": 256, "messages": [{"role": "user", "content": "hi"}]}
 
@@ -1190,9 +1225,9 @@ def test_free_model_subpath_p1_stream_converts_chat_to_anthropic(client, recorde
     assert oc.get_model_config(target)["protocol"] == "anthropic", f"{target} doit dÃ©clarer le protocole anthropic"
     free_model = oc._resolve_free_model(target)
     assert free_model, f"{target} doit avoir un Ã©quivalent free pour ce test"
-    assert "/responses" not in _cfg_settings._free_endpoint_for(
-        free_model
-    ), "l'Ã©quivalent free doit Ãªtre un endpoint Chat, sinon ce chemin n'est pas celui du dÃ©faut"
+    assert "/responses" not in _cfg_settings._free_endpoint_for(free_model), (
+        "l'Ã©quivalent free doit Ãªtre un endpoint Chat, sinon ce chemin n'est pas celui du dÃ©faut"
+    )
 
     _chat_bytes = [(ln + "\n").encode() for ln in CHAT_CHUNK_LINES]
     recorder.queue_free(FakeResponse(lines=CHAT_CHUNK_LINES, raw_lines=_chat_bytes))
@@ -1325,9 +1360,9 @@ def test_corpus_round_trip_p2_conversion_preserves_content(case, client, recorde
         for name in case["tool_names"]:
             assert name in serialized, f"outil {name} perdu Ã  la conversion"
         # tool_use â†’ tool_calls avec le mÃªme id, tool_result â†’ role tool.
-        assert any(
-            m.get("role") == "assistant" and m.get("tool_calls") for m in upstream["messages"]
-        ), "tool_calls attendu cÃ´tÃ© assistant"
+        assert any(m.get("role") == "assistant" and m.get("tool_calls") for m in upstream["messages"]), (
+            "tool_calls attendu cÃ´tÃ© assistant"
+        )
         assert any(m.get("role") == "tool" for m in upstream["messages"]), "message tool attendu"
     if case is CORPUS_IMAGES:
         assert serialized.count("image_url") >= case["image_count"]
@@ -1567,9 +1602,9 @@ def test_l13_strict_upstream_400_triggers_retry_without_reasoning(client, record
     # Le 1er portait le raisonnement, le 2nd non.
     assert "RAISONNEMENT-1" in json.dumps(first)
     assert "RAISONNEMENT-1" not in json.dumps(second)
-    assert not any(
-        isinstance(m, dict) and "reasoning_content" in m for m in second["messages"]
-    ), "le retry doit avoir retirÃ© `reasoning_content` de TOUS les messages"
+    assert not any(isinstance(m, dict) and "reasoning_content" in m for m in second["messages"]), (
+        "le retry doit avoir retirÃ© `reasoning_content` de TOUS les messages"
+    )
     # Et le tour aboutit quand mÃªme.
     assert status == 200
     assert json.loads(text)["content"][0]["text"] == "ok aprÃ¨s repli"
@@ -1841,7 +1876,9 @@ def test_p6_jambe_free_nonstream_endpoint_chat(client, recorder, monkeypatch):
         for part in item.get("content", [])
         if part.get("type") == "output_text"
     ]
-    assert texts == ["FREE-TEXT"], f"texte du modÃ¨le free perdu (output={payload.get('output')!r}) â€” corps : {text[:300]!r}"
+    assert texts == ["FREE-TEXT"], (
+        f"texte du modÃ¨le free perdu (output={payload.get('output')!r}) â€” corps : {text[:300]!r}"
+    )
     assert payload["usage"]["output_tokens"] == 22
     assert "PAID" not in text, "la jambe payante a rÃ©pondu alors que la free Ã©tait disponible"
 
@@ -1984,12 +2021,18 @@ def test_p6_jambe_free_stream_bufferise_et_sans_fuite_de_format(client, recorder
 
     # 3) Contenu reÃ§u, et AUCUNE fuite du format Chat amont dans un flux Responses.
     deltas = "".join(
-        payload.get("delta", "") for _name, payload in _sse_events(text) if payload.get("type") == "response.output_text.delta"
+        payload.get("delta", "")
+        for _name, payload in _sse_events(text)
+        if payload.get("type") == "response.output_text.delta"
     )
-    assert deltas == "FREE-STREAM-TEXT", f"contenu perdu/bufferisÃ© sans conversion : {deltas!r} â€” flux : {text[:300]!r}"
+    assert deltas == "FREE-STREAM-TEXT", (
+        f"contenu perdu/bufferisÃ© sans conversion : {deltas!r} â€” flux : {text[:300]!r}"
+    )
     assert "chat.completion.chunk" not in text, "chunk Chat fuitÃ© dans un flux destinÃ© Ã  /v1/responses"
     assert '"choices"' not in text, "corps Chat fuitÃ© dans un flux destinÃ© Ã  /v1/responses"
     assert "PAID" not in text
+
+
 # Séquence SSE amont d'un endpoint ``/responses`` en streaming — la forme que
 # ``responses_stream_sse`` produit réellement (événements Responses officiels).
 # Utilisée par le volet stream de TROU 6 : un endpoint free ``/responses``
@@ -2038,6 +2081,7 @@ RESPONSES_SSE_LINES = [
 # appliquant au modèle free de la route P2 le choix d'endpoint que le **vrai**
 # `_free_endpoint_for` rend pour ces modèles (assertion de pré-requis dans chaque
 # test), exactement comme le fait le volet `/responses` de TROU 13.
+
 
 def _p2_messages(text: str = "hi", max_tokens: int = 4096, stream: bool = False) -> dict:
     """Corps client ``POST /v1/messages`` minimal (P2)."""
@@ -2106,7 +2150,9 @@ def _assert_corps_responses(call: dict, free_model: str, *, stream: bool, max_ou
 
 def _anthropic_text(payload: dict) -> str:
     return "".join(
-        block.get("text", "") for block in payload.get("content", []) if isinstance(block, dict) and block.get("type") == "text"
+        block.get("text", "")
+        for block in payload.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "text"
     )
 
 

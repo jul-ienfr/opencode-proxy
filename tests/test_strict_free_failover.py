@@ -1,7 +1,5 @@
 """strict_free failover : un bucket trial-mort ne doit plus refuser quand un frere est vivant."""
 
-import asyncio
-
 import pytest
 
 import opencode as oc
@@ -16,8 +14,9 @@ def _clear():
         pass
 
 
-def test_candidate_chain_endpoint_aware():
+def test_candidate_chain_endpoint_aware(monkeypatch):
     _clear()
+    monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "family")
     chain = oc._free_candidate_chain("muse-spark-1.3-contributor", "muse-spark-1.3-contributor-free")
     assert chain[0] == "muse-spark-1.3-contributor-free"
     assert "jev-1.13-free" not in chain
@@ -32,25 +31,26 @@ def test_candidate_chain_endpoint_aware():
     assert chain_sys == ["jev-1.13-free"]
 
 
-def test_deprecated_model_maps_to_official_replacement():
-    """410 ModelDeprecated amont → remplaçant officiel (consigne amont)."""
+def test_free_ids_are_never_remapped():
+    """Un id déjà free est servi tel quel — jamais remplacé par un autre free."""
     _clear()
-    assert oc.FREE_MODEL_MAP.get("mimo-v2.5-free") == "mimo-v2.6-flash-free"
-    assert oc._resolve_free_model("mimo-v2.5-free") == "mimo-v2.6-flash-free"
-    assert oc.FREE_MODEL_MAP.get("minimax-m3.1-flash-free") == "deepseek-v4.1-flash-free"
-    assert oc._resolve_free_model("minimax-m3.1-flash-free") == "deepseek-v4.1-flash-free"
+    assert oc._resolve_free_model("mimo-v2.5-free") == "mimo-v2.5-free"
+    assert oc._resolve_free_model("minimax-m3.1-flash-free") == "minimax-m3.1-flash-free"
 
 
 def test_resolve_failover_to_alive(monkeypatch):
     _clear()
     monkeypatch.setitem(oc.IP_ROTATION, "free_model_spread", False)
+    monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "family")
     monkeypatch.setitem(
-        oc.FREE_MODEL_MAP, "mimo-v2.5", "mimo-v2.6-flash-free",
+        oc.FREE_MODEL_MAP,
+        "mimo-v2.5",
+        "mimo-v2.6-flash-free",
     )
     monkeypatch.setitem(
         oc.IP_ROTATION,
         "free_model_candidates",
-        {"mimo-v2.5": ["mimo-v2.6-flash-free", "deepseek-v4.1-flash-free"]},
+        {"mimo-v2.5": ["mimo-v2.6-flash-free", "mimo-v2.6-pro-free"]},
     )
 
     class _P:
@@ -64,12 +64,34 @@ def test_resolve_failover_to_alive(monkeypatch):
 
     monkeypatch.setattr(oc, "_free_stations_exhausted", _exhausted)
     got = oc._resolve_free_model("mimo-v2.5")
-    assert got == "deepseek-v4.1-flash-free"
+    assert got == "mimo-v2.6-pro-free"
+
+
+def test_resolve_no_cross_family_failover(monkeypatch):
+    """Même si un frère d'une AUTRE famille est vivant, on ne le sert jamais."""
+    _clear()
+    monkeypatch.setitem(oc.IP_ROTATION, "free_model_spread", False)
+    monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "family")
+    monkeypatch.setitem(oc.FREE_MODEL_MAP, "mimo-v2.5", "mimo-v2.6-flash-free")
+    monkeypatch.setitem(
+        oc.IP_ROTATION,
+        "free_model_candidates",
+        {"mimo-v2.5": ["mimo-v2.6-flash-free", "deepseek-v4.1-flash-free"]},
+    )
+
+    class _P:
+        _stations = [object()]
+        enabled = True
+
+    monkeypatch.setattr(oc, "_free_ip_pool", _P())
+    monkeypatch.setattr(oc, "_free_stations_exhausted", lambda m: True)
+    assert oc._resolve_free_model("mimo-v2.5") == "mimo-v2.6-flash-free"
 
 
 def test_resolve_no_failover_when_pool_boot(monkeypatch):
     _clear()
     monkeypatch.setitem(oc.IP_ROTATION, "free_model_spread", False)
+    monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "family")
     monkeypatch.setitem(oc.FREE_MODEL_MAP, "mimo-v2.5", "mimo-v2.6-flash-free")
     monkeypatch.setattr(oc, "_free_ip_pool", None)
     assert oc._resolve_free_model("mimo-v2.5") == "mimo-v2.6-flash-free"
@@ -81,9 +103,11 @@ async def test_all_dead_waits_then_refuses_honestly(monkeypatch):
     _clear()
     monkeypatch.setitem(oc.IP_ROTATION, "strict_free", True)
     monkeypatch.setitem(oc.IP_ROTATION, "free_model_spread", False)
-    monkeypatch.setitem(oc.FREE_MODEL_MAP, "paid-x", "mimo-v2.6-flash-free")
+    monkeypatch.setitem(oc.FREE_MODEL_MAP, "paid-x", "paid-x-free")
     monkeypatch.setitem(
-        oc.IP_ROTATION, "free_model_candidates", {"paid-x": ["mimo-v2.6-flash-free"]},
+        oc.IP_ROTATION,
+        "free_model_candidates",
+        {"paid-x": ["paid-x-free"]},
     )
 
     class _P:
@@ -123,9 +147,11 @@ async def test_all_dead_retries_when_fresh_ip_lands(monkeypatch):
     _clear()
     monkeypatch.setitem(oc.IP_ROTATION, "strict_free", True)
     monkeypatch.setitem(oc.IP_ROTATION, "free_model_spread", False)
-    monkeypatch.setitem(oc.FREE_MODEL_MAP, "paid-x", "mimo-v2.6-flash-free")
+    monkeypatch.setitem(oc.FREE_MODEL_MAP, "paid-x", "paid-x-free")
     monkeypatch.setitem(
-        oc.IP_ROTATION, "free_model_candidates", {"paid-x": ["mimo-v2.6-flash-free"]},
+        oc.IP_ROTATION,
+        "free_model_candidates",
+        {"paid-x": ["paid-x-free"]},
     )
 
     from test_free_multi_attempt import _Station as _RealisticStation

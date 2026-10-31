@@ -118,10 +118,7 @@ def test_drift_bloquant_familles():
         if check.get("famille") not in manifest["bloquant_familles"]:
             continue  # familles warning → bloquantes au Lot 1 (§11.6)
         errors.extend(_CHECKERS[check["type"]](check))
-    assert not errors, (
-        "DRIFT DOC/CODE détecté (bloquant v1/conversion/clients):\n- "
-        + "\n- ".join(errors)
-    )
+    assert not errors, "DRIFT DOC/CODE détecté (bloquant v1/conversion/clients):\n- " + "\n- ".join(errors)
 
 
 def test_no_stale_regex_markers_left():

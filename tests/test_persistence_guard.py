@@ -64,9 +64,7 @@ def test_save_state_bak_holds_last_good(tmp_path):
     mgr.save_state()
 
     assert bak.exists()
-    assert json.loads(bak.read_text())["current_ip"] == "1.2.3.4", (
-        ".bak holds the previous good snapshot"
-    )
+    assert json.loads(bak.read_text())["current_ip"] == "1.2.3.4", ".bak holds the previous good snapshot"
     assert json.loads(p.read_text())["current_ip"] == "5.6.7.8", "live file holds the newest state"
 
 

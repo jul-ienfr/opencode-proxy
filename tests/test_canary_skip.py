@@ -57,4 +57,4 @@ async def test_canary_probes_when_a_candidate_is_alive(monkeypatch):
 
     out = await oc._canary_cycle()
     assert len(calls) == 2, "sonde réseau normale quand un bucket vit"
-    assert out["model"] == "big-pickle"
+    assert out["model"] == oc.yaml_get("canary", "model", "big-pickle")

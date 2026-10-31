@@ -57,9 +57,7 @@ def inject_test_route(text, target):
     if marker not in text:
         text += f"\ncustom_routes:\n  {TEST_KEY}:\n    match:\n    - {TEST_MATCH}\n    model: {target}\n"
         return text
-    block = (
-        f"  {TEST_KEY}:\n    match:\n    - {TEST_MATCH}\n    model: {target}\n"
-    )
+    block = f"  {TEST_KEY}:\n    match:\n    - {TEST_MATCH}\n    model: {target}\n"
     # Retire une éventuelle route de test précédente (run interrompu)
     lines = text.splitlines(keepends=True)
     out, skipping = [], False
@@ -71,7 +69,7 @@ def inject_test_route(text, target):
             # fin du bloc : première ligne indentée "  " qui n'est PAS un enfant
             if line.startswith("    ") or line.startswith("      "):
                 continue
-            if line.strip() == "" :
+            if line.strip() == "":
                 continue
             skipping = False
         out.append(line)

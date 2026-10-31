@@ -158,8 +158,7 @@ class _Seam:
     @property
     def wire(self):
         assert self.calls, (
-            "le double amont n'a jamais été atteint : la jambe free n'a pas été exercée, "
-            "le test ne prouve rien"
+            "le double amont n'a jamais été atteint : la jambe free n'a pas été exercée, le test ne prouve rien"
         )
         return self.calls[0]["body"]
 
@@ -270,6 +269,7 @@ def free_env(monkeypatch):
     monkeypatch.setattr(oc, "_log", lambda *a, **k: None)
     monkeypatch.setattr(oc, "_log_free_model_usage", lambda *a, **k: None)
     monkeypatch.setattr(oc, "_free_ip_pool", _Pool([_Station(1, "1.1.1.1", "socks5://127.0.0.1:1080")]))
+    monkeypatch.setitem(oc.MODELS, PAID_CHAT, {"protocol": "openai"})
     saved = {
         k: oc.IP_ROTATION.get(k)
         for k in (

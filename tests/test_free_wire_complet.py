@@ -46,14 +46,12 @@ from config import free_gate  # noqa: E402
 OFFICIAL_UA_1193 = "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 
 #: Forme attendue d'un UA ai-sdk : c'est elle qui trahit une recopie ratee.
-UA_SHAPE = re.compile(
-    r"^opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/\d+\.\d+\.\d+$"
-)
+UA_SHAPE = re.compile(r"^opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/\d+\.\d+\.\d+$")
 
 #: En-tetes de transport poses explicitement (ordre du client, sauf Connection).
 TRANSPORT_HEADERS = ("Connection", "Accept", "Host", "Accept-Encoding")
 
-ENDPOINT = "https://opencode.ai/inference/v1/chat/completions"
+ENDPOINT = "https://opencode.ai/inference/openai/v1/chat/completions"
 
 
 def _capture_headers(style=None, monkeypatch=None):
@@ -154,8 +152,7 @@ def test_free_wire_values_match_official_client(monkeypatch):
 def test_user_agent_is_the_measured_one():
     """L'UA par defaut est celui du client 1.19.3, et il a la bonne forme."""
     assert oc._OPENCODE_OFFICIAL_UA == OFFICIAL_UA_1193, (
-        "UA par defaut != capture du client officiel : re-mesurer avant de changer "
-        "(voir _research/oc-1.19.3/README.md)"
+        "UA par defaut != capture du client officiel : re-mesurer avant de changer (voir _research/oc-1.19.3/README.md)"
     )
     assert UA_SHAPE.match(oc._OPENCODE_OFFICIAL_UA)
 
@@ -238,9 +235,7 @@ def test_gate_diagnose_names_the_failing_factor():
     assert not v2.passed
     assert v2.failed_factors == ["egress"], "un 403 IP doit etre attribue a l'egress"
 
-    v3 = free_gate.diagnose(
-        {"x-opencode-session-id": "ses_x"}, {"stream": True, "tools": [_read_tool()]}, egress="ok"
-    )
+    v3 = free_gate.diagnose({"x-opencode-session-id": "ses_x"}, {"stream": True, "tools": [_read_tool()]}, egress="ok")
     assert v3.passed
     assert v3.as_log()["gate"]["failed"] == []
 
@@ -256,12 +251,8 @@ def test_gate_legacy_quartet_is_not_required():
     """
     metadonnee = ("x-opencode-client", "x-opencode-project", "x-opencode-request")
     for h in metadonnee:
-        assert h not in free_gate.SESSION_IDENTITY_HEADERS, (
-            f"{h} ne doit pas etre un porteur d'identite"
-        )
-    v = free_gate.diagnose(
-        {"x-opencode-session-id": "ses_x"}, {"stream": True, "tools": [_read_tool()]}, egress="ok"
-    )
+        assert h not in free_gate.SESSION_IDENTITY_HEADERS, f"{h} ne doit pas etre un porteur d'identite"
+    v = free_gate.diagnose({"x-opencode-session-id": "ses_x"}, {"stream": True, "tools": [_read_tool()]}, egress="ok")
     assert v.passed, "le wire officiel (sans quartet) doit suffire"
 
 
@@ -285,7 +276,7 @@ def test_full_headers_kill_switch(monkeypatch):
 
 
 def test_host_recomputed_per_endpoint():
-    a = oc._official_free_headers("https://opencode.ai/inference/v1/chat/completions")
+    a = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions")
     b = oc._official_free_headers("https://exemple.test/v1/chat/completions")
     assert a["Host"] == "opencode.ai"
     assert b["Host"] == "exemple.test"
@@ -295,9 +286,7 @@ def test_free_wire_never_carries_the_paid_key():
     """Invariant A.0 : la jambe free ne recopie JAMAIS la cle du client."""
     h = oc._official_free_headers(ENDPOINT)
     assert h["Authorization"] == "Bearer public"
-    assert all(
-        "bearer public" == str(v).lower() for k, v in h.items() if k.lower() == "authorization"
-    )
+    assert all("bearer public" == str(v).lower() for k, v in h.items() if k.lower() == "authorization")
 
 
 # ── 4. Reasoning multi-tours sur la jambe free (P0-2) ────────────────────────

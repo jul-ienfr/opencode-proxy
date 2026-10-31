@@ -30,6 +30,7 @@ import socket
 import time
 import urllib.parse
 from collections.abc import Callable
+from typing import Any
 
 DDG_CACHE_MAX = 512
 DDG_CACHE_TTL_S = 300
@@ -50,12 +51,8 @@ _TAG_RE = re.compile(r"<[^>]+>")
 # répond 403 depuis cet hôte ; `lite.duckduckgo.com` répond 200 et expose un
 # tableau simple. On l'utilise en priorité, avec repli sur la lib
 # `duckduckgo_search` si le parse échoue.
-_DDG_LINK_RE = re.compile(
-    r"<a\b([^>]*\bclass=['\"]result-link['\"][^>]*)>(.*?)</a>", re.S | re.I
-)
-_DDG_SNIP_RE = re.compile(
-    r"<td[^>]*class=['\"]result-snippet['\"][^>]*>(.*?)</td>", re.S | re.I
-)
+_DDG_LINK_RE = re.compile(r"<a\b([^>]*\bclass=['\"]result-link['\"][^>]*)>(.*?)</a>", re.S | re.I)
+_DDG_SNIP_RE = re.compile(r"<td[^>]*class=['\"]result-snippet['\"][^>]*>(.*?)</td>", re.S | re.I)
 _DDG_HREF_RE = re.compile(r"href=['\"]([^'\"]+)['\"]", re.I)
 _DDG_UDDG_RE = re.compile(r"[?&]uddg=([^&]+)")
 _DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"
@@ -94,7 +91,9 @@ def _search_ddg_lite(query: str, max_results: int, timeout: float, proxy=None) -
     """GET lite.duckduckgo.com via curl_cffi (impersonation navigateur)."""
     from curl_cffi import requests as _cr
 
-    kwargs = {
+    # `dict[str, Any]` (et non l'inférence `dict[str, object]`) : le dépliage
+    # `**kwargs` doit rester compatible avec les surcharges de `curl_cffi`.
+    kwargs: dict[str, Any] = {
         "params": {"q": query},
         "timeout": max(2.0, float(timeout)),
         "impersonate": "chrome131",
@@ -151,7 +150,9 @@ async def is_safe_fetch_url(url: str, blocked_nets) -> bool:
         # IP literal
         try:
             ip = ipaddress.ip_address(host)
-            if any([ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_reserved, ip.is_multicast]) or any(ip in n for n in blocked_nets):
+            if any([ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_reserved, ip.is_multicast]) or any(
+                ip in n for n in blocked_nets
+            ):
                 return False
             return True
         except ValueError:
@@ -161,7 +162,9 @@ async def is_safe_fetch_url(url: str, blocked_nets) -> bool:
             infos = await asyncio.to_thread(socket.getaddrinfo, host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
             for _, _, _, _, sa in infos:
                 ip = ipaddress.ip_address(sa[0])
-                if any([ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_reserved, ip.is_multicast]) or any(ip in n for n in blocked_nets):
+                if any([ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_reserved, ip.is_multicast]) or any(
+                    ip in n for n in blocked_nets
+                ):
                     return False
         except Exception:
             return False
@@ -240,9 +243,7 @@ async def execute_ddg_search(
                         # 1) lite.duckduckgo.com (200 depuis cet hôte,
                         # ~1,3 s) — l'endpoint html de la lib renvoie 403.
                         try:
-                            _lite = _search_ddg_lite(
-                                qnorm, max_results, timeout, proxy=proxy
-                            )
+                            _lite = _search_ddg_lite(qnorm, max_results, timeout, proxy=proxy)
                             if _lite:
                                 return _lite
                         except Exception:
@@ -350,7 +351,9 @@ async def execute_web_fetch(
                     if not loc or not await safe_fn(nxt):
                         raise ValueError(f"SSRF redirect rejected: {loc}")
                     _url = nxt
-                    r = await c.get(_url, headers={"User-Agent": "opencode-proxy/1.0"}, follow_redirects=False, timeout=timeout)
+                    r = await c.get(
+                        _url, headers={"User-Agent": "opencode-proxy/1.0"}, follow_redirects=False, timeout=timeout
+                    )
                 else:
                     break
             # R4 guards
@@ -372,7 +375,9 @@ async def execute_web_fetch(
             try:
                 from bs4 import BeautifulSoup
 
-                extracted = await asyncio.to_thread(lambda: BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True))
+                extracted = await asyncio.to_thread(
+                    lambda: BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
+                )
             except ImportError:
                 extracted = _TAG_RE.sub(" ", html)
         extracted = extracted[:max_bytes].strip()

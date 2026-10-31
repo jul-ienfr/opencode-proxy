@@ -110,9 +110,7 @@ class TestComposeEnv:
         env = m._compose_env()
 
         assert env["VPN_TYPE_STATION3"] == "wireguard", "own station's var = effective stack"
-        assert env["SOME_PARENT_MARKER"] == "yes", (
-            "parent env inherited (compose needs ALL the other vars)"
-        )
+        assert env["SOME_PARENT_MARKER"] == "yes", "parent env inherited (compose needs ALL the other vars)"
         assert os.environ.get("VPN_TYPE_STATION3") is None, (
             "parent env must NOT be mutated (the divergence detector relies on it staying stale)"
         )
@@ -175,17 +173,13 @@ class TestCustomOvpnEnv:
     def test_openvpn_without_custom_key_no_var(self, tmp_path, monkeypatch):
         m = self._ovpn_mgr(tmp_path, monkeypatch, rel=None)
         env = m._compose_env()
-        assert "OPENVPN_CUSTOM_CONFIG" not in env, (
-            "no custom configured → compose's ${VAR:-} interpolation is inert"
-        )
+        assert "OPENVPN_CUSTOM_CONFIG" not in env, "no custom configured → compose's ${VAR:-} interpolation is inert"
 
     def test_openvpn_missing_file_no_var(self, tmp_path, monkeypatch):
         """Upload persisted but the file vanished (manual cleanup / partial
         deploy) — the gate must NOT fabricate a path the container can't
         see (gluetun would fail on a missing /vpn-custom/… file)."""
-        m = self._ovpn_mgr(
-            tmp_path, monkeypatch, rel="vpn_configs/custom/gone.ovpn", create_file=False
-        )
+        m = self._ovpn_mgr(tmp_path, monkeypatch, rel="vpn_configs/custom/gone.ovpn", create_file=False)
         env = m._compose_env()
         assert "OPENVPN_CUSTOM_CONFIG" not in env
 
@@ -193,9 +187,7 @@ class TestCustomOvpnEnv:
         """Stale custom_ovpn_file + wireguard stack → no var (gluetun would
         ignore the setting under WG anyway; the guard keeps the surface
         honest — the 19/08 lesson: the env must never leak across stacks)."""
-        m = self._ovpn_mgr(
-            tmp_path, monkeypatch, stack="wireguard", rel="vpn_configs/custom/nl-01.ovpn"
-        )
+        m = self._ovpn_mgr(tmp_path, monkeypatch, stack="wireguard", rel="vpn_configs/custom/nl-01.ovpn")
         assert m._stack_effective == "wireguard"
         env = m._compose_env()
         assert "OPENVPN_CUSTOM_CONFIG" not in env
@@ -205,9 +197,7 @@ class TestCustomOvpnEnv:
         forward slashes, but hand-edited config.yaml may not) — the gate
         normalizes before the existence check, so /vpn-custom/<basename>
         stays stable on every host."""
-        m = self._ovpn_mgr(
-            tmp_path, monkeypatch, rel=os.path.join("vpn_configs", "custom", "nl-01.ovpn")
-        )
+        m = self._ovpn_mgr(tmp_path, monkeypatch, rel=os.path.join("vpn_configs", "custom", "nl-01.ovpn"))
         env = m._compose_env()
         assert env["OPENVPN_CUSTOM_CONFIG"] == "/vpn-custom/nl-01.ovpn"
 
@@ -245,8 +235,7 @@ class TestCallSitesPassEnv:
         env = managers[0].last_env
         for s in (1, 2, 3):
             assert env[f"VPN_TYPE_STATION{s}"] == "wireguard", (
-                "TARGET stack reaches the compose child despite the stale "
-                "parent env (19/08 root cause)"
+                "TARGET stack reaches the compose child despite the stale parent env (19/08 root cause)"
             )
         assert managers[0]._stack_effective == "wireguard"
 
@@ -255,8 +244,7 @@ class TestCallSitesPassEnv:
         m = self._mgr(tmp_path, monkeypatch)
         await m.stop_container()
         assert m.envs[0]["VPN_TYPE_STATION1"] == "wireguard", (
-            "compose stop child (the FIRST docker op) sees the stack; the "
-            "`docker rm` that follows carries no env"
+            "compose stop child (the FIRST docker op) sees the stack; the `docker rm` that follows carries no env"
         )
         assert m.envs[-1] is None, "docker rm -f needs no compose env"
 
@@ -265,9 +253,7 @@ class TestCallSitesPassEnv:
         m = self._mgr(tmp_path, monkeypatch)
         m._update_enabled = True
         assert await m.check_update() is False  # same digest → no update
-        assert m.last_env["VPN_TYPE_STATION1"] == "wireguard", (
-            "`compose pull` child inherits the explicit stack too"
-        )
+        assert m.last_env["VPN_TYPE_STATION1"] == "wireguard", "`compose pull` child inherits the explicit stack too"
 
     @pytest.mark.asyncio
     async def test_apply_update_compose_passes_env(self, tmp_path, monkeypatch):
@@ -286,9 +272,7 @@ class TestCallSitesPassEnv:
         result = await m.apply_update()
 
         assert result["ok"] is True
-        assert m.envs[-1]["VPN_TYPE_STATION1"] == "wireguard", (
-            "recreate child after update sees the effective stack"
-        )
+        assert m.envs[-1]["VPN_TYPE_STATION1"] == "wireguard", "recreate child after update sees the effective stack"
 
     @pytest.mark.asyncio
     async def test_rollback_compose_passes_env(self, tmp_path, monkeypatch):
@@ -453,14 +437,10 @@ class TestDashboardExposesDivergence:
         return TestClient(fast)
 
     def test_env_divergence_field_present_when_flag(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            settings, "ENV_DIVERGENCE", [("VPN_TYPE_STATION1", "wireguard", "openvpn")]
-        )
+        monkeypatch.setattr(settings, "ENV_DIVERGENCE", [("VPN_TYPE_STATION1", "wireguard", "openvpn")])
         with self._client(tmp_path, monkeypatch) as client:
             data = client.get("/api/vpn-status").json()
-        assert data["env_divergence"] == [
-            {"key": "VPN_TYPE_STATION1", "file": "wireguard", "env": "openvpn"}
-        ]
+        assert data["env_divergence"] == [{"key": "VPN_TYPE_STATION1", "file": "wireguard", "env": "openvpn"}]
 
     def test_env_divergence_absent_when_flag_empty(self, tmp_path, monkeypatch):
         monkeypatch.setattr(settings, "ENV_DIVERGENCE", [])

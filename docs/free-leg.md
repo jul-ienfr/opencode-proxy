@@ -32,7 +32,7 @@ passage = egress ∧ identity ∧ body
 | Facteur | Ce qu'il vérifie | Preuve |
 |---|---|---|
 | **egress** | l'IP de sortie n'est pas grillée (quota, réputation) | rotation d'IP → nouveau quota ; `403` en rafale sur une station = IP morte |
-| **identity** | la face réseau est celle du client officiel (TLS + en-têtes) | `curl_cffi impersonate=chrome131`, UA Bun, en-têtes `x-opencode-*` |
+| **identity** | la face réseau est celle du client officiel (TLS + en-têtes) | replay Bun (`ja3` + sigalgs + H1, `default_headers=False`), UA officiel, en-têtes `x-opencode-*` |
 | **body** | le corps a la forme attendue (voir §3) | bisection octet par octet : quatre variantes mesurées |
 
 Le diagnostic vit dans `config/free_gate.py` (`diagnose`), il est **branché** sur le
@@ -72,8 +72,10 @@ Les définitions restent dans `config.yaml > free.shims` pour la jambe
 
 ## 4. Le fil
 
-- **TLS** : `curl_cffi`, `impersonate="chrome131"` (le client officiel utilise une
-  empreinte navigateur ; un `requests` nu est refusé par le facteur *identity*).
+- **TLS** : `curl_cffi` avec replay de l'empreinte **Bun** du client officiel
+  (`_free_fp_override` : JA3 Bun, sans GREASE, HTTP/1.1, `default_headers=False`) ;
+  `impersonate="chrome131"` n'est que le porteur des comportements natifs, jamais
+  une face navigateur (un `requests` nu est refusé par le facteur *identity*).
 - **En-têtes** : `_official_free_headers()` — UA Bun, `x-opencode-*`, jamais la clé
   payante ni les cookies du client (invariant A.0, testé).
 - **Sessions** : mutualisées par `(proxy, face)` via `_get_pooled_curl_session` ;
@@ -222,3 +224,77 @@ conservée est une opinion avec de la sortie console.
 5. « 81 ids free exposables » — seul `big-pickle` est servable en plus.
 
 Et une prémisse **confirmée** : la porte exige bien `stream:true` (V6.2.3).
+
+## 11. Classer gratuit/payant sans se tromper
+
+La jambe `proxy.leg` du catalogue **n'est pas** le tier de facturation : un id
+annoncé sur `opencode` peut être routé payant, et un id payant peut avoir un
+repli gratuit. Depuis 2026-10-27, le serveur calcule un tier canonique
+(`config/model_tier.py`) et l'expose partout :
+
+| Champ | Valeurs | Sens |
+|---|---|---|
+| `tier` | `free` / `paid` / `unknown` | facturation |
+| `tier_source` | `route` / `suffix` / `discovery` / `mapped` / `endpoint` / `catalog` / `unknown` | origine de la décision ; `route` est résolu en premier |
+| `route_leg` | `free` / `paid` / `internal` / `unknown` | jambe réellement utilisée |
+| `route_target` | id ou `null` | cible réelle d'un alias `ROUTES`/custom route |
+| `free_first` | booléen | le proxy tente un gratuit d'abord (même si `tier=paid`) |
+| `free_target` | id ou `null` | substitut gratuit actif |
+| `free_mapping_active` | booléen | `true` : le mapping explicite sera utilisé (la politique ne filtre que les candidats automatiques) |
+
+```bash
+# Les 10 (ou N) vrais gratuits, et le total par tier
+curl -s 'http://127.0.0.1:4000/v1/models?tier=free' | jq '.counts, [.data[].id]'
+# Les payants qui seront servis gratuitement d'abord
+curl -s 'http://127.0.0.1:4000/v1/models?tier=paid&free_first=true' | jq '[.data[] | {id, target: .proxy.free_target}]'
+```
+
+`tier=free` est **strict** : il ne contient pas les payants à repli. Un payant
+avec `free_first=true` reste `tier=paid` ; son `free_target` dit ce qui sera
+réellement appelé. C'est volontaire : le client sait ce qu'il demande, le proxy
+sait ce qu'il sert.
+
+### Mappings explicites et politique de substitution
+
+Depuis le 2026-10-29, une entrée **explicite** de `free_model_map` est
+souveraine, comme `custom_routes` : elle est toujours honorée. La politique
+`ip_rotation.free_substitution_policy` (`homonym` / `family`) ne filtre plus que
+les candidats **automatiques** (`X → X-free` et `free_model_candidates`).
+
+Le défaut corrigé : `homonym` désactivait silencieusement
+`glm-5.1 → glm-5.3-flash-free`. Avec des clés mortes, les alias Claude
+(`sonnet → glm-5.1`) partaient sur la jambe payante et rendaient 401, alors que
+le free était configuré. Aujourd'hui `glm-5.1` part bien sur
+`glm-5.3-flash-free`.
+
+### 429 « quota épuisé » : ne jamais le fabriquer
+
+Un 429 `Free quota exhausted on all VPN stations` ne doit être émis que si
+l'amont a réellement répondu 429. Deux gardes :
+
+* la chaîne de candidats contient **toujours** la cible résolue, même pour un
+  free sans suffixe (`big-pickle`) ou un mapping explicite. Une chaîne vide ne
+  signifie pas « toutes les stations épuisées » : le garde `strict_free` est
+  fail-open et tente l'upstream ;
+* un 429 n'est refusé qu'après le budget d'essais configuré
+  (`max_free_attempts`) ou si toutes les stations sont réellement épuisées.
+
+Par appel, cinq en-têtes (meilleur effort, figés au début de la réponse) :
+
+```
+X-OpenCode-Proxy-Tier: free|paid|unknown
+X-OpenCode-Proxy-Requested-Tier: free|paid|unknown
+X-OpenCode-Proxy-Model: <id réel>
+X-OpenCode-Proxy-Requested-Model: <id demandé>
+X-OpenCode-Proxy-Fallback: paid_to_free|free_to_paid
+```
+
+`/v1/models` et `/v1/models/count_tokens` sont exclus (le second n'appelle pas
+l'amont). Un repli qui survient **après** l'envoi des en-têtes (stream déjà
+commencé) ne peut pas les réécrire : pour un état autoritaire, interroger
+`GET /v1/models`.
+
+Le dashboard suit la même source : Configuration groupe Gratuit/Payant avec
+filtres et badges ; Modèles Gratuits affiche `detected` (découvert), `routed`
+(présent dans `MODELS`) et `served` (succès observé). « Détecté » n'implique ni
+« routé » ni « prouvé ».

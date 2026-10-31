@@ -22,7 +22,6 @@ def test_dashboard_token_401_when_set(monkeypatch):
     monkeypatch.setattr(api, "_DASHBOARD_REQUIRE_TOKEN", False, raising=False)
     monkeypatch.setattr(api, "_host_for_warning", "127.0.0.1", raising=False)
 
-
     from dashboard.api import _check_dashboard_token
 
     class FakeReq:

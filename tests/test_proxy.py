@@ -50,9 +50,7 @@ class TestAnthropicToOpenAI:
         result = anthropic_to_openai(body, "claude-3-opus")
         assert result["model"] == "claude-3-opus"
         # cache_control is added to the last user message for prefix caching
-        assert result["messages"] == [
-            {"role": "user", "content": "Hello", "cache_control": {"type": "ephemeral"}}
-        ]
+        assert result["messages"] == [{"role": "user", "content": "Hello", "cache_control": {"type": "ephemeral"}}]
         assert result["max_tokens"] == 1024
         assert result["stream"] is False
 
@@ -170,9 +168,7 @@ class TestAnthropicToOpenAI:
                 },
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "tool_result", "tool_use_id": "toolu_abc", "content": "ok"}
-                    ],
+                    "content": [{"type": "tool_result", "tool_use_id": "toolu_abc", "content": "ok"}],
                 },
             ],
             "tools": [{"name": "web_search", "input_schema": {"type": "object", "properties": {}}}],
@@ -186,9 +182,7 @@ class TestAnthropicToOpenAI:
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "tool_result", "tool_use_id": "toolu_c147b7bf", "content": "data"}
-                    ],
+                    "content": [{"type": "tool_result", "tool_use_id": "toolu_c147b7bf", "content": "data"}],
                 },
                 {"role": "user", "content": "next turn"},
             ],
@@ -215,9 +209,7 @@ class TestAnthropicToOpenAI:
             ],
         }
         req = _chat_to_responses_request(chat)
-        out_ids = {
-            i.get("call_id") for i in req["input"] if i.get("type") == "function_call_output"
-        }
+        out_ids = {i.get("call_id") for i in req["input"] if i.get("type") == "function_call_output"}
         assert "toolu_orphan" not in out_ids
         assert "call_keep" in out_ids
 
@@ -594,9 +586,7 @@ def _disable_mapping_off(monkeypatch):
     # SORTED_* are computed at import from the real custom_routes.json —
     # rebuild after replacing the dicts, or _route_for matches the stale
     # production overrides ([43]).
-    monkeypatch.setattr(
-        _cfg_settings, "SORTED_ROUTES", _cfg_settings._sort_routes_by_match(_clean_routes)
-    )
+    monkeypatch.setattr(_cfg_settings, "SORTED_ROUTES", _cfg_settings._sort_routes_by_match(_clean_routes))
     monkeypatch.setattr(_cfg_settings, "SORTED_CUSTOM_ROUTES", [])
     # Prevent maybe_reload_custom_routes (called at top of _route_for) from
     # re-reading config.yaml/custom_routes.json on disk and re-introducing
@@ -833,9 +823,7 @@ class TestAnthropicToOpenAIResponses:
 
     def test_tool_use_response(self):
         anthro = {
-            "content": [
-                {"type": "tool_use", "id": "toolu_123", "name": "search", "input": {"q": "test"}}
-            ],
+            "content": [{"type": "tool_use", "id": "toolu_123", "name": "search", "input": {"q": "test"}}],
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 10, "output_tokens": 5},
         }
@@ -863,9 +851,10 @@ class TestAnthropicToOpenAIResponses:
         }
         result = anthropic_to_openai_responses(anthro, "test-model")
         usage = result["usage"]
-        assert usage["input_tokens"] == 20
+        # [audit 2026-10-30] inclusif : 20 non cach?s + 5 cache = 25
+        assert usage["input_tokens"] == 25
         assert usage["output_tokens"] == 10
-        assert usage["total_tokens"] == 30
+        assert usage["total_tokens"] == 35
         # cache READ tokens → input_tokens_details ( spéc OpenAI Responses :
         # cached_tokens VIT dans input_tokens_details, pas output_* )
         assert usage["input_tokens_details"]["cached_tokens"] == 5
@@ -925,9 +914,7 @@ class TestResolveProtocol:
         expected_openai = {"glm", "kimi", "deepseek", "mimo"}
         expected_anthropic = {"minimax", "qwen"}
         assert expected_openai.issubset({k for k, v in KNOWN_PROTOCOLS.items() if v == "openai"})
-        assert expected_anthropic.issubset(
-            {k for k, v in KNOWN_PROTOCOLS.items() if v == "anthropic"}
-        )
+        assert expected_anthropic.issubset({k for k, v in KNOWN_PROTOCOLS.items() if v == "anthropic"})
 
 
 # ── Chat-to-Responses reasoning forwarding ──────────────────────
@@ -1195,7 +1182,10 @@ class TestWebSearchWebFetch:
     def test_strip_web_tool_removes_both(self):
         import opencode as m
 
-        body = {"tools": [{"name": "web_search"}, {"name": "web_fetch"}], "tool_choice": {"type": "tool", "name": "web_search"}}
+        body = {
+            "tools": [{"name": "web_search"}, {"name": "web_fetch"}],
+            "tool_choice": {"type": "tool", "name": "web_search"},
+        }
         m._strip_web_tool(body, "anthropic", "web_search")
         assert len(body["tools"]) == 1 and m._normalize_tool_name(body["tools"][0]) == "web_fetch"
         m._strip_web_tool(body, "anthropic", "web_fetch")
@@ -1253,7 +1243,12 @@ class TestWebSearchWebFetch:
         monkeypatch.setattr(m, "_execute_ddg_search", fake_ddg)
         # Simulate handler on anthro for anthropic protocol vs openai
         # For openai protocol, handler should act on body, not anthro
-        body_openai = {"model": "mimo-v2.5", "tools": [{"name": "web_search"}], "tool_choice": "auto", "messages": [{"role": "user", "content": "hi"}]}
+        body_openai = {
+            "model": "mimo-v2.5",
+            "tools": [{"name": "web_search"}],
+            "tool_choice": "auto",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
         await m._handle_web_search(body_openai, "mimo-v2.5", "openai")
         assert any("local_search_results" in str(x) for x in body_openai.get("messages", []))
 
@@ -1364,7 +1359,6 @@ class TestWebSearchWebFetch:
     @pytest.mark.asyncio
     async def test_fetch_rejected_content_type(self, monkeypatch):
 
-
         import opencode as m
 
         # Mock httpx to return octet-stream
@@ -1401,7 +1395,11 @@ class TestWebSearchWebFetch:
     async def test_enabled_kill_switch(self, monkeypatch):
         import opencode as m
 
-        body = {"tools": [{"name": "web_search"}], "tool_choice": "auto", "messages": [{"role": "user", "content": "hi"}]}
+        body = {
+            "tools": [{"name": "web_search"}],
+            "tool_choice": "auto",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
         monkeypatch.setattr(m, "yaml_get", lambda s, k, d=None: False if s == "web_search" and k == "enabled" else d)
         await m._handle_web_search(body, "mimo-v2.5", "anthropic")
         assert not m._has_tool(body, "web_search")

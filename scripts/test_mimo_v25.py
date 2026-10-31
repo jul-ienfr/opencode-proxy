@@ -230,7 +230,9 @@ async def main_async(args: argparse.Namespace) -> None:
                 if r.status_code == 200:
                     check("alias haiku ->200 (via minimax-m2.5)", True, r.json().get("model", ""))
                 else:
-                    print(f"[INFO] alias haiku ->HTTP {r.status_code}: {r.text[:300]} (upstream/keys, pas un bug proxy)")
+                    print(
+                        f"[INFO] alias haiku ->HTTP {r.status_code}: {r.text[:300]} (upstream/keys, pas un bug proxy)"
+                    )
             except Exception as e:
                 print(f"[INFO] alias haiku exception: {e}")
 

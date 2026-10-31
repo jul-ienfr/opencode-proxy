@@ -23,11 +23,15 @@ import opencode as oc
 class _FakeResp:
     def __init__(self, status=200, payload=None):
         self.status_code = status
-        self._payload = payload if payload is not None else {
-            "model": "jev-1.13-free",
-            "answers": {"is_urgent": {"type": "noul", "noul": 0.96}},
-            "usage": {"input_tokens": 290, "output_tokens": 23},
-        }
+        self._payload = (
+            payload
+            if payload is not None
+            else {
+                "model": "jev-1.13-free",
+                "answers": {"is_urgent": {"type": "noul", "noul": 0.96}},
+                "usage": {"input_tokens": 290, "output_tokens": 23},
+            }
+        )
         raw = json.dumps(self._payload).encode()
         self.content = raw
         self.text = raw.decode()
@@ -91,9 +95,7 @@ def _body(model="jev-1.13-free"):
     return {
         "model": model,
         "state": "My payments have failed for three days. Please help now.",
-        "questions": {
-            "is_urgent": {"type": "noul", "instructions": "Does this request require urgent attention?"}
-        },
+        "questions": {"is_urgent": {"type": "noul", "instructions": "Does this request require urgent attention?"}},
     }
 
 
@@ -179,7 +181,9 @@ def test_systemone_upstream_error_relayed(client):
         fake.calls.append({"endpoint": endpoint, "content": content, "headers": headers})
         return _FakeResp(
             status=402,
-            payload={"error": {"type": "server_error", "message": "Upstream request failed: Insufficient account funds"}},
+            payload={
+                "error": {"type": "server_error", "message": "Upstream request failed: Insufficient account funds"}
+            },
         )
 
     fake.post = _post_402
