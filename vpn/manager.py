@@ -3106,7 +3106,10 @@ class VPNManager:
                         # nue si une frontière (registre partagé, disque)
                         # lève : refresh_status reste fail-soft.
                         try:
-                            self._adopt_boot_ip(ctl_ip)
+                            if not self._adopt_boot_ip(ctl_ip):
+                                self._current_ip = None
+                                self._error = f"duplicate IP {ctl_ip}"
+                                self._set_status(VPNState.ERROR)
                         except Exception:
                             self._current_ip = ctl_ip
                     # [stabilité 25/08] NE PAS remettre le chrono à zéro ici :
@@ -4064,6 +4067,30 @@ class VPNManager:
         # registry must not disable the station's own recent-IP guard.
         return ip in [s.get("ip") for s in self._ip_history[-10:]]
 
+    def _ip_in_use_by_other(self, ip: str) -> int | None:
+        """Retourne l'id d'une autre station qui sert DÉJÀ cette IP.
+
+        Une IP partagée = quota partagé et corrélation 429. L'unicité est
+        vérifiée à chaque commit/adoption, pas seulement à la sélection.
+        """
+        if not ip:
+            return None
+        try:
+            peers = getattr(shared_state, "vpn_managers", None) or []
+        except Exception:
+            peers = []
+        for peer in peers:
+            if peer is self:
+                continue
+            try:
+                if not VPNState.is_up(str(getattr(peer, "status", "") or "")):
+                    continue
+                if str(getattr(peer, "current_ip", "") or "") == ip:
+                    return int(getattr(peer, "_station", -1))
+            except Exception:
+                continue
+        return None
+
     def _record_ip_change(self, ip: str) -> None:
         """Register ``ip`` as now-active for this station (shared registry)."""
         if self._shared is None:
@@ -4113,6 +4140,16 @@ class VPNManager:
             except Exception as e:
                 new_ip = None
                 logger.debug("[vpn] finalize probe %d failed: %s", attempt, e)
+            if new_ip:
+                _peer = self._ip_in_use_by_other(new_ip)
+                if _peer is not None:
+                    logger.warning(
+                        "[vpn] s%s refuse l'IP %s déjà utilisée par s%s — nouvelle rotation",
+                        self._station,
+                        new_ip,
+                        _peer,
+                    )
+                    new_ip = None
             if new_ip and not self._ip_recent(new_ip):
                 return self._commit_ip(new_ip)
             if new_ip and self._ip_recent(new_ip) and allow_stale and attempt == 2:
@@ -4158,7 +4195,21 @@ class VPNManager:
     def _commit_ip(self, new_ip: str) -> bool:
         """Commit a chosen IP: current IP, shared registry, identity advance
         BEFORE the history append (the entry must carry the NEW face — the
-        old order logged the pre-advance identity), persist."""
+        old order logged the pre-advance identity), persist.
+
+        [P3] Refuse une IP déjà servie par une autre station : le quota est
+        partagé, la doubler ne crée aucune capacité.
+        """
+        _peer = self._ip_in_use_by_other(new_ip)
+        if _peer is not None:
+            logger.warning(
+                "[vpn] s%s commit refusé : IP %s déjà servie par s%s",
+                self._station,
+                new_ip,
+                _peer,
+            )
+            self._last_rotation_error = f"duplicate IP {new_ip} (s{_peer})"
+            return False
         self._current_ip = new_ip
         self._auth_failed = False
         self._server_issue = False
@@ -4181,7 +4232,7 @@ class VPNManager:
         self.save_state()
         return True
 
-    def _adopt_boot_ip(self, ip: str) -> None:
+    def _adopt_boot_ip(self, ip: str) -> bool:
         """Journalise une IP déjà servie par le tunnel existant (fast-path
         boot) : registre partagé anti-réutilisation + entrée d'historique
         avec l'identité LIVE (sans avance — refresh_status constate le
@@ -4190,7 +4241,20 @@ class VPNManager:
         [virgin-client 2026-10-24] IP adoptée = client vierge : si un fichier
         d'identité traîne pour cette IP (bucket peut-être épuisé), on le
         remplace par une installation neuve — même règle qu'en rotation,
-        best-effort, jamais de raise."""
+        best-effort, jamais de raise.
+
+        [P3] Une IP déjà utilisée par une autre station n'est jamais adoptée.
+        """
+        _peer = self._ip_in_use_by_other(ip)
+        if _peer is not None:
+            logger.warning(
+                "[vpn] s%s adoption refusée : IP %s déjà servie par s%s",
+                self._station,
+                ip,
+                _peer,
+            )
+            self._last_rotation_error = f"duplicate IP {ip} (s{_peer})"
+            return False
         self._current_ip = ip
         try:
             from free.identities import get_vault as _get_identity_vault
@@ -4212,6 +4276,7 @@ class VPNManager:
         )
         self._ip_history = self._ip_history[-100:]
         self.save_state()
+        return True
 
     # ── Config ─────────────────────────────────────────────────
 

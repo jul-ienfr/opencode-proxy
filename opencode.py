@@ -21684,6 +21684,7 @@ async def api_free_health():
     quota_leases: list = []
     rotation_planner: dict = {}
     last_selection: dict = {}
+    canary: dict = {}
     try:
         if _free_ip_pool is not None and hasattr(_free_ip_pool, "model_ip_status"):
             model_ip_health = _free_ip_pool.model_ip_status(40)
@@ -21700,6 +21701,8 @@ async def api_free_health():
                 rotation_planner = _free_ip_pool._rotation_planner.snapshot()
             if hasattr(_free_ip_pool, "_best_ip"):
                 last_selection = _free_ip_pool._best_ip.snapshot()
+            if hasattr(_free_ip_pool, "_canary"):
+                canary = _free_ip_pool._canary.snapshot()
     except Exception:
         model_ip_health, model_global_backoff = [], []
     return {
@@ -21715,6 +21718,7 @@ async def api_free_health():
         "quota_leases": quota_leases,
         "rotation_planner": rotation_planner,
         "last_selection": last_selection,
+        "canary": canary,
         "note": (
             "`unproven` = aucun succès observé depuis le démarrage : soit le "
             "modèle n'a pas été appelé, soit il est refusé en amont. Un 200 du "

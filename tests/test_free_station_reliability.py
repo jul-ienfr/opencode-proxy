@@ -122,6 +122,38 @@ def test_spare_station_is_not_selected_until_promoted_and_capacity_excludes_it()
     assert chosen in (st2, st3)
 
 
+def test_duplicate_ip_is_degraded_and_one_station_is_drained():
+    cfg = _cfg(rotation_planner={"enabled": True, "spare_station": 0})
+    st1 = _RelStation(1, "same-ip", config=cfg)
+    st2 = _RelStation(2, "same-ip", config=cfg)
+    st3 = _RelStation(3, "other-ip", config=cfg)
+    pool = fp.FreeIPPool(st1, st2)
+    pool.set_stations([st1, st2, st3])
+    cap = pool.capacity_snapshot()
+    assert cap["duplicate_stations"] == 1
+    assert cap["capacity_degraded"] is True
+    assert "partagent une IP" in str(cap["capacity_reason"])
+    launched = []
+    pool._launch_rotation = lambda station, **kw: launched.append(station)  # type: ignore[method-assign]
+    pool._last_model = "m"
+    pool._plan_proactive_rotation("m")
+    assert len(launched) == 1
+    assert len(pool._draining_stations) == 1
+    # La station conservée n'est pas dans le drain.
+    assert 1 not in pool._draining_stations and 2 in pool._draining_stations
+
+
+def test_spare_is_not_warm_if_it_shares_an_active_ip():
+    cfg = _cfg(rotation_planner={"enabled": True, "spare_station": 3})
+    st1 = _RelStation(1, "1.1.1.1", config=cfg)
+    st2 = _RelStation(2, "2.2.2.2", config=cfg)
+    st3 = _RelStation(3, "1.1.1.1", config=cfg)
+    pool = fp.FreeIPPool(st1, st2)
+    pool.set_stations([st1, st2, st3])
+    assert pool._spare_qualified("m") is False
+    assert pool.capacity_snapshot()["warm_spare_ready"] is False
+
+
 def test_get_status_exposes_reliability_instrumentation():
     pool, st1, _ = _pool()
     pool._last_model = "m"

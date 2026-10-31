@@ -43,6 +43,7 @@ from typing import Any, cast
 
 from free.best_ip import BestIpSelector
 from free.ip_quota import IpQuotaRegistry, QuotaProfile
+from free.reliability_canary import CanaryConfig, CanaryRouter
 from free.rotation_planner import RotationPlanner
 from free.station_health import StationHealthRegistry, station_contract
 from station_repair import RepairPolicy
@@ -501,6 +502,7 @@ class FreeIPPool:
             min_active=1,
         )
         self._repair_policy = RepairPolicy.from_config(_rel_cfg)
+        self._canary = CanaryRouter(CanaryConfig.from_config(_rel_cfg))
         self._last_selection: Any = None
         self._last_model: str | None = None
         self._last_repair: dict[str, Any] = {}
@@ -705,6 +707,29 @@ class FreeIPPool:
         except Exception:
             return usable
 
+    def _dedupe_by_ip(self, stations: list) -> list:
+        """Garde une seule station par IP (le quota est une propriété de l'IP)."""
+        out = []
+        seen: set[str] = set()
+        try:
+            ordered = sorted(
+                stations,
+                key=lambda st: (_egress_rank(st), self._degraded_rank(st), self._station_id(st)),
+            )
+        except Exception:
+            ordered = list(stations)
+        for st in ordered:
+            try:
+                ip = str(getattr(st, "current_ip", "") or "")
+            except Exception:
+                ip = ""
+            if ip and ip != "unknown":
+                if ip in seen:
+                    continue
+                seen.add(ip)
+            out.append(st)
+        return out
+
     def _quality_stats(self, station) -> tuple[int, int, float | None, float | None]:
         """(requêtes sur l'IP, quota, charge serveur, in-flight) pour le sélecteur."""
         inflight: float | None = None
@@ -795,19 +820,28 @@ class FreeIPPool:
         configured = len(active)
         usable = 0
         with_quota = 0
+        usable_ips: set[str] = set()
+        quota_ips: set[str] = set()
         repairing = 0
         parked = 0
         model = getattr(self, "_last_model", None) or ""
         for st in active:
             try:
+                ip = str(getattr(st, "current_ip", "") or "")
                 if self.station_usable(st):
                     usable += 1
+                    if ip and ip != "unknown":
+                        usable_ips.add(ip)
                 if model:
                     ok, _ = self.model_usable(model, st)
                     if ok:
                         with_quota += 1
+                        if ip and ip != "unknown":
+                            quota_ips.add(ip)
                 elif self.station_usable(st):
                     with_quota += 1
+                    if ip and ip != "unknown":
+                        quota_ips.add(ip)
                 h = self._station_health.get(self._station_id(st)) if hasattr(self, "_station_health") else None
                 if h is not None and h.state in ("repairing", "probing"):
                     repairing += 1
@@ -815,23 +849,31 @@ class FreeIPPool:
                     parked += 1
             except Exception:
                 continue
-        degraded = usable < configured
+        duplicate_stations = self._duplicate_station_count()
+        duplicate_groups = len(self._duplicate_ip_groups())
+        degraded = usable < configured or duplicate_stations > 0
         reason = None
-        if degraded:
+        if duplicate_stations > 0:
+            reason = f"{duplicate_stations} station(s) partagent une IP"
+        elif degraded:
             reason = f"{usable}/{configured} stations usable"
-        elif model and with_quota < configured:
-            reason = f"{with_quota}/{configured} stations avec quota"
+        elif model and len(quota_ips) < configured:
+            reason = f"{len(quota_ips)}/{configured} IP avec quota"
         return {
             "configured_stations": configured,
             "stations_total": len(all_stations),
             "usable_stations": usable,
+            "unique_usable_ips": len(usable_ips),
             "active_stations_with_quota": with_quota,
+            "unique_ips_with_quota": len(quota_ips),
+            "duplicate_ip_groups": duplicate_groups,
+            "duplicate_stations": duplicate_stations,
             "warm_spare_ready": self._spare_qualified(model or None),
             "spare_station": spare_id or None,
             "spare_promoted": promoted,
             "repairing_stations": repairing,
             "parked_stations": parked,
-            "capacity_degraded": bool(degraded or (model and with_quota < configured)),
+            "capacity_degraded": bool(degraded or (model and len(quota_ips) < configured)),
             "capacity_reason": reason,
         }
 
@@ -967,6 +1009,42 @@ class FreeIPPool:
             pass
         return max(1, base - 10 - self._rotation_stagger * max(0, station._station - 1))
 
+    def _plan_duplicate_rotation(self, model: str | None) -> bool:
+        """Une IP partagée = quota partagé : on rotate tout sauf la meilleure."""
+        groups = self._duplicate_ip_groups()
+        if not groups or self.any_rotation_in_flight():
+            return False
+        for _ip, stations in groups.items():
+            candidates = [
+                st for st in stations if self._station_id(st) not in getattr(self, "_draining_stations", set())
+            ]
+            if len(candidates) < 2:
+                continue
+
+            def _keep_key(st):
+                try:
+                    lease = self._quota.lease_for(model, st) if model else None
+                    headroom = lease.headroom if lease is not None else 0
+                except Exception:
+                    headroom = 0
+                return (1 if self._is_spare(st) else 0, -headroom, self._station_id(st))
+
+            keeper = min(candidates, key=_keep_key)
+            for st in candidates:
+                if st is keeper:
+                    continue
+                sid = self._station_id(st)
+                self._draining_stations.add(sid)
+                logger.warning(
+                    "[free-ip] s%s partage l'IP %s avec s%s — rotation pour IP distincte",
+                    sid,
+                    getattr(st, "current_ip", "?"),
+                    self._station_id(keeper),
+                )
+                self._launch_rotation(st)
+                return True
+        return False
+
     def _plan_proactive_rotation(self, model: str | None, station=None) -> None:
         """Applique le RotationPlanner (P4) après une requête servie.
 
@@ -977,6 +1055,8 @@ class FreeIPPool:
         if not getattr(self, "_rotation_planner_enabled", False) or not model:
             return
         try:
+            if self._plan_duplicate_rotation(model):
+                return
             leases = self._quota.leases_for_model(model)
             if not leases:
                 return
@@ -1046,10 +1126,37 @@ class FreeIPPool:
             return False
         if not self.station_usable(st, model=None):
             return False
+        # Un spare qui partage l'IP d'une station active n'apporte aucun quota
+        # neuf : il n'est pas « chaud » au sens quota.
+        try:
+            spare_ip = str(getattr(st, "current_ip", "") or "")
+            if spare_ip and spare_ip != "unknown":
+                for other in self._stations:
+                    if other is st:
+                        continue
+                    if str(getattr(other, "current_ip", "") or "") == spare_ip:
+                        return False
+        except Exception:
+            pass
         if model:
             ok, _ = self.model_usable(model, st)
             return ok
         return True
+
+    def _duplicate_ip_groups(self) -> dict[str, list]:
+        groups: dict[str, list] = {}
+        for st in self._stations:
+            try:
+                ip = str(getattr(st, "current_ip", "") or "")
+            except Exception:
+                ip = ""
+            if not ip or ip == "unknown":
+                continue
+            groups.setdefault(ip, []).append(st)
+        return {ip: sts for ip, sts in groups.items() if len(sts) > 1}
+
+    def _duplicate_station_count(self) -> int:
+        return sum(max(0, len(sts) - 1) for sts in self._duplicate_ip_groups().values())
 
     def _maybe_demote_spare(self, forced_pool=None, model: str | None = None) -> None:
         """Le spare n'est promu que tant qu'aucune station active ne peut servir."""
@@ -1909,11 +2016,28 @@ class FreeIPPool:
             ]
         if not usable:
             return None
+        # Une seule station par IP : deux stations sur la même IP consomment le
+        # même quota et ne doivent jamais être sélectionnées ensemble.
+        usable = self._dedupe_by_ip(usable)
         # [P3] Sélection lexicographique par quota restant. En shadow, le
-        # calcul est exposé sans changer le routage (P0).
+        # calcul est exposé sans changer le routage (P0/P6).
         _best_ip = getattr(self, "_best_ip", None)
+        _use_new = True
+        _canary_on = False
+        try:
+            _canary = getattr(self, "_canary", None)
+            _canary_on = bool(_canary is not None and _canary.cfg.enabled)
+            if _canary_on:
+                _use_new = _canary.use_new(self._total_free_requests)
+                if _canary.cfg.shadow:
+                    _use_new = False
+        except Exception:
+            _use_new = True
+            _canary_on = False
         if _best_ip is not None and model is not None and (
-            getattr(self, "_quota_enabled", False) or getattr(self, "_shadow_selector", False)
+            getattr(self, "_quota_enabled", False)
+            or getattr(self, "_shadow_selector", False)
+            or _canary_on
         ):
             try:
                 ranked = _best_ip.rank(self._prefer_healthy(usable), model)
@@ -1921,9 +2045,9 @@ class FreeIPPool:
                 ranked = []
             if ranked:
                 self._last_selection = ranked[0]
-                if not getattr(self, "_shadow_selector", False):
+                if _use_new and not getattr(self, "_shadow_selector", False):
                     return ranked[0].station
-            elif getattr(self, "_quota_enabled", False):
+            elif getattr(self, "_quota_enabled", False) and _use_new:
                 return None
         # [roadmap] Sélection par score mesuré quand activée. Le legacy reste
         # le fallback exact (flag OFF, tests, rollback).
@@ -2078,6 +2202,8 @@ class FreeIPPool:
             except Exception:
                 pass
             return [usable[0]]
+        # Une seule station par IP (quota partagé sinon).
+        usable = self._dedupe_by_ip(usable)
         # [P3] Sélection lexicographique quota si activée.
         _best_ip = getattr(self, "_best_ip", None)
         if _best_ip is not None and model is not None and (
@@ -4118,6 +4244,7 @@ class FreeIPPool:
                 self._rotation_planner.profile = self._quota_profile
                 self._rotation_planner.enabled = self._rotation_planner_enabled
                 self._repair_policy = RepairPolicy.from_config(_rel_cfg)
+                self._canary = CanaryRouter(CanaryConfig.from_config(_rel_cfg))
             except Exception:
                 pass
         # [roadmap] Recharge le flag qualité (canary / rollback à chaud).
@@ -4533,6 +4660,18 @@ class FreeIPPool:
         _configured = len(_active_rows)
         _usable_n = sum(1 for _s in _active_rows if _s.get("station_usable"))
         _with_quota_n = sum(1 for _s in _active_rows if _s.get("model_usable"))
+        _usable_ips = {
+            str(_s.get("current_ip"))
+            for _s in _active_rows
+            if _s.get("station_usable") and _s.get("current_ip")
+        }
+        _quota_ips = {
+            str(_s.get("current_ip"))
+            for _s in _active_rows
+            if _s.get("model_usable") and _s.get("current_ip")
+        }
+        _duplicate_groups = self._duplicate_ip_groups()
+        _duplicate_stations = sum(max(0, len(_v) - 1) for _v in _duplicate_groups.values())
         _repairing_n = sum(
             1 for _s in _active_rows if (_s.get("health") or {}).get("state") in ("repairing", "probing")
         )
@@ -4563,10 +4702,12 @@ class FreeIPPool:
             _retry_in = max(_retry_in, float(_h.get("next_retry_in_s", 0) or 0))
             _action_required = _action_required or bool(_h.get("action_required", False))
         _capacity_reason = None
-        if _configured and _usable_n < _configured:
+        if _duplicate_stations > 0:
+            _capacity_reason = f"{_duplicate_stations} station(s) partagent une IP"
+        elif _configured and _usable_n < _configured:
             _capacity_reason = f"{_usable_n}/{_configured} stations usable"
-        elif _configured and _with_quota_n < _configured:
-            _capacity_reason = f"{_with_quota_n}/{_configured} stations avec quota"
+        elif _configured and len(_quota_ips) < _configured:
+            _capacity_reason = f"{len(_quota_ips)}/{_configured} IP avec quota"
         _planner_snap = self._rotation_planner.snapshot() if hasattr(self, "_rotation_planner") else {}
         return {
             "enabled": self._vpn.enabled,
@@ -4582,7 +4723,11 @@ class FreeIPPool:
             "configured_stations": _configured,
             "stations_total": len(stations),
             "usable_stations": _usable_n,
+            "unique_usable_ips": len(_usable_ips),
             "active_stations_with_quota": _with_quota_n,
+            "unique_ips_with_quota": len(_quota_ips),
+            "duplicate_ip_groups": len(_duplicate_groups),
+            "duplicate_stations": _duplicate_stations,
             "warm_spare_ready": self._spare_qualified(getattr(self, "_last_model", None)),
             "spare_station": _spare_id or None,
             "spare_promoted": _promoted,
@@ -4601,6 +4746,7 @@ class FreeIPPool:
             "capacity_reason": _capacity_reason,
             "rotation_planner": _planner_snap,
             "rotation_planner_enabled": bool(getattr(self, "_rotation_planner_enabled", False)),
+            "canary": self._canary.snapshot() if hasattr(self, "_canary") else {},
             "shadow_selector": bool(getattr(self, "_shadow_selector", False)),
             "last_selection": self._best_ip.snapshot()
             if hasattr(self, "_best_ip")

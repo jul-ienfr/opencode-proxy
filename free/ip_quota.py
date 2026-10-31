@@ -273,18 +273,16 @@ class IpQuotaRegistry:
 
     def __init__(self, profile: QuotaProfile | None = None, *, max_entries: int = 4096) -> None:
         self.profile = profile or QuotaProfile()
-        self._items: dict[tuple[str, int, str], IpQuotaLease] = {}
+        self._items: dict[tuple[str, str], IpQuotaLease] = {}
         self._max_entries = max(1, int(max_entries))
 
     @staticmethod
-    def _key(model: str | None, station: Any, ip: str | None) -> tuple[str, int, str]:
+    def _key(model: str | None, station: Any, ip: str | None) -> tuple[str, str]:
         mid = str(model or "").strip().lower()
-        try:
-            sid = int(getattr(station, "_station", 0) or 0)
-        except (TypeError, ValueError):
-            sid = 0
         logical_ip = str(ip or getattr(station, "current_ip", "") or getattr(station, "pid", "") or "unknown")
-        return mid, sid, logical_ip
+        # Le quota est une propriété de (modèle, IP), pas de la station : deux
+        # stations qui partagent la même IP doivent partager le même lease.
+        return mid, logical_ip
 
     def lease_for(
         self,
@@ -298,10 +296,14 @@ class IpQuotaRegistry:
         key = self._key(model, station, ip)
         item = self._items.get(key)
         if item is None and create:
+            try:
+                sid = int(getattr(station, "_station", 0) or 0)
+            except (TypeError, ValueError):
+                sid = 0
             item = IpQuotaLease(
-                station=key[1],
+                station=sid,
                 model=key[0],
-                ip=key[2],
+                ip=key[1],
                 quota_estimate=self.profile.profile_for(key[0]),
             )
             self._items[key] = item
@@ -427,7 +429,7 @@ class IpQuotaRegistry:
                 model = str(raw.get("model") or "").strip().lower()
                 sid = int(raw.get("station", 0) or 0)
                 ip = str(raw.get("ip") or "unknown")
-                key = (model, sid, ip)
+                key = (model, ip)
                 item = IpQuotaLease(
                     station=sid,
                     model=model,
@@ -456,7 +458,7 @@ class IpQuotaRegistry:
         mid = str(model or "").strip().lower()
         return [item for item in self._items.values() if item.model == mid]
 
-    def prune(self, keep: set[tuple[str, int, str]] | None = None) -> None:
+    def prune(self, keep: set[tuple[str, str]] | None = None) -> None:
         if keep is None:
             return
         for key in list(self._items):
@@ -465,8 +467,8 @@ class IpQuotaRegistry:
 
     def prune_station(self, station_id: int) -> None:
         sid = int(station_id)
-        for key in list(self._items):
-            if key[1] == sid:
+        for key, item in list(self._items.items()):
+            if item.station == sid:
                 self._items.pop(key, None)
 
 

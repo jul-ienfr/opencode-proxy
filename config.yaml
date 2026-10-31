@@ -241,6 +241,11 @@ ip_rotation:
     nemotron-3.5-super-vl-free: 40
   recent_ip_max_age: 1800
   recent_ip_window: 20
+  reliability_canary:
+    enabled: false
+    percent: 0
+    salt: reliability
+    shadow: true
   rotation_concurrency: 1
   rotation_fail_cooldown: 60
   rotation_max_duration: 240
@@ -900,4 +905,12 @@ models:
   gemini-3.7-flash:
     protocol: gemini
   gemini-3.8-flash:
+    protocol: gemini
+  gemini-3-flash:
+    protocol: gemini
+  gemini-3-pro:
+    protocol: gemini
+  gemini-3.1-pro:
+    protocol: gemini
+  gemini-4-argon-contributor:
     protocol: gemini

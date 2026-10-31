@@ -46,6 +46,50 @@ def _metric(text: str, name: str) -> float | None:
     return None
 
 
+def evaluate_health_payload(health: dict) -> list[str]:
+    """Alertes capacity/spare/park à partir de ``/health``."""
+    alerts: list[str] = []
+    cap = health.get("free_capacity") if isinstance(health, dict) else None
+    if not isinstance(cap, dict):
+        return alerts
+    if cap.get("capacity_degraded"):
+        reason = str(cap.get("capacity_reason") or "capacity degraded")
+        alerts.append(f"free capacity degraded: {reason}")
+    spare = int(cap.get("spare_station") or 0)
+    if spare and not bool(cap.get("warm_spare_ready")):
+        alerts.append(f"warm spare #{spare} not ready")
+    parked = int(cap.get("parked_stations") or 0)
+    if parked > 0:
+        alerts.append(f"{parked} station(s) parked")
+    return alerts
+
+
+def evaluate_free_health_payload(payload: dict) -> list[str]:
+    """Alertes auth/quota à partir de ``/api/free-health``."""
+    alerts: list[str] = []
+    if not isinstance(payload, dict):
+        return alerts
+    health = payload.get("station_health")
+    if isinstance(health, dict):
+        for sid, row in health.items():
+            if not isinstance(row, dict):
+                continue
+            if row.get("state") == "parked":
+                alerts.append(f"station {sid} parked ({row.get('cause') or 'unknown'})")
+            elif row.get("action_required"):
+                alerts.append(f"station {sid} action required ({row.get('cause') or row.get('last_error') or '?'})")
+    global_backoff = payload.get("model_global_backoff")
+    if isinstance(global_backoff, list) and global_backoff:
+        models = ",".join(str(x.get("model")) for x in global_backoff[:3] if isinstance(x, dict))
+        alerts.append(f"model global backoff active: {models or '?'}")
+    leases = payload.get("quota_leases")
+    if isinstance(leases, list):
+        bad = sum(1 for row in leases if isinstance(row, dict) and row.get("state") == "bad")
+        if bad:
+            alerts.append(f"{bad} bad IP lease(s)")
+    return alerts
+
+
 def check(base: str) -> tuple[list[str], dict]:
     alerts: list[str] = []
     ctx: dict = {}
@@ -63,6 +107,7 @@ def check(base: str) -> tuple[list[str], dict]:
     ctx["health"] = health[:2000]
     try:
         h = json.loads(health)
+        alerts.extend(evaluate_health_payload(h))
         slo = ((h.get("slo") or {}).get("status") if isinstance(h.get("slo"), dict) else None) or h.get("slo_status")
         if slo == "breached":
             alerts.append("slo breached")
@@ -74,6 +119,13 @@ def check(base: str) -> tuple[list[str], dict]:
     except Exception:
         if "breached" in health.lower():
             alerts.append("slo breached (texte)")
+    sc_fh, free_health = _get(base, "/api/free-health")
+    ctx["free_health_status"] = sc_fh
+    if sc_fh == 200:
+        try:
+            alerts.extend(evaluate_free_health_payload(json.loads(free_health)))
+        except Exception:
+            pass
     return alerts, ctx
 
 

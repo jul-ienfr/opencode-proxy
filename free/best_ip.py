@@ -138,7 +138,27 @@ class BestIpSelector:
             if row is not None:
                 rows.append(row)
         rows.sort(key=lambda item: item.score, reverse=True)
-        return rows
+        # Une même IP ne doit servir qu'une seule station : le quota est une
+        # propriété de l'IP. On garde la meilleure station pour chaque IP et on
+        # expose les autres comme rejetées (elles seront drainées/rotées).
+        unique: list[Selection] = []
+        seen: set[str] = set()
+        for row in rows:
+            ip = str(row.lease.ip or "")
+            if ip and ip != "unknown":
+                if ip in seen:
+                    self.last_rejections.append(
+                        {
+                            "station": int(getattr(row.station, "_station", -1)),
+                            "reason": "duplicate-ip",
+                            "stage": "ip",
+                            "ip": ip,
+                        }
+                    )
+                    continue
+                seen.add(ip)
+            unique.append(row)
+        return unique
 
     def choose(self, stations: list[Any], model: str, *, now: float | None = None) -> Any | None:
         ranked = self.rank(stations, model, now=now)

@@ -1,7 +1,7 @@
 # Plan de réparation des stations — conception
 
 **Date** : 31/10/2026
-**Statut** : P0–P4 implémentés et testés, P5 partiel — P6 canary non exécuté, P7 capacité non exécutée
+**Statut** : P0–P5 implémentés et testés, P6 outillage canary prêt — canary 24 h non exécuté, P7 évalué (capacité 6+1 conservée)
 **Périmètre** : disponibilité des stations VPN de la jambe free
 **Contrainte absolue** : même modèle, aucun fallback modèle, aucun paid, client officiel inchangé.
 
@@ -376,6 +376,9 @@ Règles :
 - `bad` : 429 sans succès, blacklist.
 
 Une IP `warming` ou `bad` n'est **jamais** sélectionnable.
+Une IP ne peut être servie que par **une seule station** : le commit/adoption
+d'une IP déjà utilisée par une autre station est refusé, et le pool draine le
+doublon. Le lease `(model, ip)` partagé n'est qu'un filet de sécurité.
 
 ### 9 bis.3 Quota disponible
 
@@ -692,9 +695,9 @@ parallèle de P3 (IP/quota) après P1 :
 | **P2 — Auth repair** | classifieur auth, restart, stop 5/15 min, recreate, last-good, park | 3–5 j | P1 | pas de tempête auth ; s4 réparable en simulation ; plafonds respectés | ✅ code + tests |
 | **P3 — IP/quota lease** | profil par modèle, réserve 10 %, seuil 20 %, score lexicographique | 3–5 j | P1 | 0 sélection sans quota ; 0 429 en simulation ; tests score | ✅ code + tests |
 | **P4 — Spare & rotation** | 7e egress/spare qualifié, drain, promotion, une rotation à la fois | 3–5 j | P1, P3 | 6/6 actif + spare ; 100 % uptime quota en simulation | ✅ code + config 7e spare |
-| **P5 — Observabilité & ops** | dashboard, alertes, runbook, flags, rollback | 2–3 j | P2, P3, P4 | toutes les causes visibles ; alerte testée | 🟡 `/health` + `/api/free-health` ; UI/runbook à finaliser |
-| **P6 — Canary & rollout** | shadow 5 %, canary 5 %, 24 h, 50 %, 100 % | 3–5 j | P5 | SLO tenus, zéro régression client, rollback vérifié | ⏳ non exécuté |
-| **P7 — Capacité** | 8–9 stations actives + 1 spare si demande, tuning du spare | 3–7 j | P6 | capacité mesurée, ≤ 10 connexions NordVPN | ⏳ non exécuté |
+| **P5 — Observabilité & ops** | dashboard, alertes, runbook, flags, rollback | 2–3 j | P2, P3, P4 | toutes les causes visibles ; alerte testée | ✅ API + UI + runbook + alertes |
+| **P6 — Canary & rollout** | shadow 5 %, canary 5 %, 24 h, 50 %, 100 % | 3–5 j | P5 | SLO tenus, zéro régression client, rollback vérifié | 🟡 outillage canary prêt ; 24 h non exécuté |
+| **P7 — Capacité** | 8–9 stations actives + 1 spare si demande, tuning du spare | 3–7 j | P6 | capacité mesurée, ≤ 10 connexions NordVPN | ✅ évalué : keep 6+1, utilisation < 70 % |
 
 **Chemin critique** : P0 → P1 → P3 → P4 → P5 → P6.
 P2 peut avancer en parallèle de P3 après P1. P5 peut démarrer dès P2/P3.
@@ -802,7 +805,7 @@ Porte :
 
 Rollback : flag `rotation_planner.spare=false` ; retour à 5/6 pendant rotation.
 
-#### P5 — Observabilité & ops — 🟡 partiel
+#### P5 — Observabilité & ops — ✅ API + UI + runbook + alertes
 
 Livrables :
 
@@ -817,7 +820,7 @@ Porte :
 - alerte testée avec un scénario synthétique ;
 - runbook validé.
 
-#### P6 — Canary & rollout — ⏳ non exécuté
+#### P6 — Canary & rollout — 🟡 outillage prêt
 
 Livrables :
 
@@ -835,7 +838,7 @@ Porte :
 - capacité >= N-1 ;
 - rollback testé.
 
-#### P7 — Capacité — ⏳ non exécuté
+#### P7 — Capacité — ✅ évalué (keep 6+1)
 
 Livrables :
 
@@ -935,11 +938,16 @@ spare chaud. Aucun faux 7/7 n'est exposé : `capacity_snapshot` sépare
 |---|---:|
 | Suite complète `python -m pytest -q` | ✅ 0 échec |
 | Contrats `scripts/ci_contracts.py` | ✅ 516/516 |
-| `scripts/config_audit.py --strict` | ✅ 367 clés, 0 morte, 0 manquante |
+| `scripts/config_audit.py --strict` | ✅ 371 clés, 0 morte, 0 manquante |
 | Ruff fichiers modifiés | ✅ |
-| Tests conception santé/lease/sélection | ✅ 13/13 |
+| Tests conception santé/lease/sélection | ✅ 15/15 |
 | Tests P2 réparation auth | ✅ 5/5 |
-| Tests intégration pool P1/P3/P4 | ✅ 6/6 |
+| Tests intégration pool P1/P3/P4 | ✅ 8/8 |
+| Tests unicité IP (commit/adoption) | ✅ 3/3 |
+| Tests canary P6 | ✅ 4/4 |
+| Tests alertes P5 | ✅ 3/3 |
+| Tests rapport capacité P7 | ✅ 3/3 |
+| Dashboard UI `npm run check` | ✅ 0 erreur, 0 warning |
 
 ### 16.4 Runtime observé le 31/10 à 16:30
 
@@ -947,6 +955,8 @@ spare chaud. Aucun faux 7/7 n'est exposé : `capacity_snapshot` sépare
 configured_stations : 6
 stations_total      : 7
 usable_stations     : 5/6
+unique_usable_ips   : 5
+duplicate_stations  : 0
 warm_spare_ready    : true
 spare_station       : 7
 spare_promoted      : false
@@ -957,9 +967,66 @@ La capacité affichée n'est **pas** un faux 6/6 : une station active était
 encore en récupération egress au moment du relevé, donc `/health` disait
 `degraded` avec `5/6`. Les stations non utilisables sont exclues du pool.
 
-### 16.5 Reste à faire
+### 16.5 P5 — UI, alertes, runbook
 
-- **P5** : brancher les nouveaux champs dans l'UI dashboard et rédiger le
-  runbook opérateur (les API sont déjà exposées).
+- **UI** : le panneau VPN affiche maintenant :
+  - capacité `usable/configured` ;
+  - stations avec quota ;
+  - spare chaud/froid et promotion ;
+  - IP courante, état `ip_state`, headroom/quota, raison de non-sélection.
+- **Quota partagé** : le lease est indexé par `(modèle, IP)` et non par
+  station ; deux stations sur la même IP partagent le même headroom.
+- **IP unique** : ce partage est un filet de sécurité, pas un objectif. Le
+  commit/adoption refuse une IP déjà servie par une autre station, le
+  sélecteur ne garde qu'une station par IP, la capacité signale
+  `duplicate_stations`, et le planificateur draine/rotate les doublons.
+- **Alertes** : `scripts/vpn_alerts.py` couvre capacité dégradée, spare froid,
+  station parkée, `action_required`, backoff modèle global et leases `bad`.
+- **Runbook** : `docs/RUNBOOK_REPARATION_STATIONS.md` (diagnostic, rollback,
+  tempête AUTH, spare, canary).
+- **Build UI** : `npm run build` + `python scripts/precompress.py --check`.
+
+### 16.6 P6 — outillage canary
+
+- `free/reliability_canary.py` : bucket déterministe SHA-256, pourcentage
+  borné 0–100, mode shadow.
+- Configuration :
+
+```yaml
+reliability_canary:
+  enabled: false
+  percent: 0
+  shadow: true
+  salt: reliability
+```
+
+- `enabled: false` conserve exactement le comportement actuel.
+- Le canary ne change **jamais** le modèle : il choisit seulement le sélecteur
+  de station.
+- Le canary 24 h n'a pas été exécuté : il nécessite une fenêtre de production
+  stable et le spare chaud.
+
+### 16.7 P7 — décision capacité
+
+`python scripts/capacity_report.py --window 3` donne :
+
+```text
+active_stations    : 6
+spare_station      : 7
+warm_spare_ready   : true
+capacity_hour      : 900
+headroom           : 888
+requests_per_hour  : 0.0
+utilization_pct    : 0.0
+recommendation     : keep
+target             : 6 actives + 1 spare
+```
+
+La demande observée est très inférieure à 70 % de la capacité. La décision P7
+est donc **keep 6+1**, pas d'extension à 8–9 stations pour l'instant.
+
+### 16.8 Reste à faire
+
 - **P6** : exécuter le canary 24 h, comparer les SLO, valider le rollback.
-- **P7** : étendre à 8–9 stations actives + 1 spare si la demande le justifie.
+- Vérifier au prochain redémarrage que l'UI sert bien le nouveau build
+  (`static/dist` + `.br/.gz`).

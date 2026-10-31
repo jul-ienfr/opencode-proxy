@@ -21,12 +21,25 @@
   type ProxyMode = 'vpn' | 'socks5' | 'direct';
 
   interface Station {
+    station?: number;
     name?: string;
     hostname?: string;
     ip?: string;
+    current_ip?: string;
     vpn_status?: string;
     requests?: number;
+    requests_this_ip?: number;
     error_detail?: string;
+    station_usable?: boolean;
+    model_usable?: boolean;
+    model_usable_reason?: string | null;
+    non_routable_reason?: string | null;
+    egress_state?: string;
+    ip_state?: string;
+    quota_headroom?: number | null;
+    quota_estimate?: number | null;
+    quality_score?: number | null;
+    health?: { state?: string; last_error?: string | null; action_required?: boolean };
   }
 
   interface VpnStatus {
@@ -85,6 +98,16 @@
   const s = $derived(statusQ.data ?? {});
   const geo = $derived(geoQ.data ?? {});
   const stations = $derived(s.stations ?? []);
+  const capacity = $derived({
+    configured: Number(s.configured_stations ?? s.total ?? stations.length ?? 0),
+    usable: Number(s.usable_stations ?? s.healthy_routable ?? 0),
+    withQuota: Number(s.active_stations_with_quota ?? s.usable_stations ?? 0),
+    degraded: Boolean(s.capacity_degraded),
+    reason: String(s.capacity_reason ?? ''),
+    spare: Number(s.spare_station ?? 0),
+    warm: Boolean(s.warm_spare_ready),
+    promoted: Boolean(s.spare_promoted)
+  });
 
   let busy = $state<string | null>(null);
   let substitutionStatus = $state('');
@@ -361,21 +384,46 @@
       </div>
     </div>
 
+    <div class="capacity" class:capacity--degraded={capacity.degraded}>
+      <span class="capacity-label">{t('vpn.capacity')}</span>
+      <strong class="mono">{capacity.usable}/{capacity.configured}</strong>
+      <span class="muted small">{t('vpn.capacity_quota')} {capacity.withQuota}/{capacity.configured}</span>
+      {#if capacity.spare > 0}
+        <span class="badge" class:badge--ok={capacity.warm} class:badge--warn={!capacity.warm}>
+          {t('vpn.spare')} #{capacity.spare} · {capacity.warm ? t('vpn.spare_warm') : t('vpn.spare_cold')}
+          {#if capacity.promoted} · {t('vpn.spare_promoted')}{/if}
+        </span>
+      {/if}
+      {#if capacity.reason}
+        <span class="muted small">{capacity.reason}</span>
+      {/if}
+    </div>
+
     {#if stations.length > 0}
       <div class="stations">
-        {#each stations as st, i (i)}
-          <div class="station" title={st.error_detail ?? ''}>
+        {#each stations as st, i (st.station ?? i)}
+          <div class="station" class:station--off={st.station_usable === false} title={st.error_detail ?? st.model_usable_reason ?? ''}>
             <span
               class="dot dot--sm"
-              style="background: {st.vpn_status === 'connected'
+              style="background: {st.station_usable
                 ? 'var(--success)'
                 : st.vpn_status === 'degraded'
                   ? 'var(--warn)'
                   : 'var(--text-dim)'}"
             ></span>
-            <span class="station-name">{st.name ?? st.hostname ?? `#${i + 1}`}</span>
-            <span class="muted mono small">{st.ip ?? ''}</span>
-            <span class="muted small">{st.requests ?? 0}</span>
+            <span class="station-name">#{st.station ?? i + 1}</span>
+            <span class="muted mono small">{st.current_ip ?? st.ip ?? '—'}</span>
+            <span class="badge" class:badge--ok={st.station_usable} class:badge--warn={!st.station_usable}>
+              {st.station_usable ? t('vpn.station_usable') : (st.non_routable_reason ?? t('vpn.station_unusable'))}
+            </span>
+            {#if st.quota_headroom != null}
+              <span class="muted small mono">
+                {t('vpn.quota_remaining')} {st.quota_headroom}/{st.quota_estimate ?? '—'}
+              </span>
+            {/if}
+            {#if st.ip_state}
+              <span class="badge badge--dim">{st.ip_state}</span>
+            {/if}
           </div>
         {/each}
       </div>
@@ -533,6 +581,55 @@
     margin-bottom: var(--sp-3);
   }
 
+  .capacity {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    flex-wrap: wrap;
+    padding: var(--sp-2) var(--sp-3);
+    margin-bottom: var(--sp-3);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--success);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    font-size: var(--fs-sm);
+  }
+
+  .capacity--degraded {
+    border-left-color: var(--warn);
+  }
+
+  .capacity-label {
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 var(--sp-2);
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface-3);
+    color: var(--text-dim);
+    font-size: var(--fs-xs);
+    white-space: nowrap;
+  }
+
+  .badge--ok {
+    border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+    color: var(--success);
+  }
+
+  .badge--warn {
+    border-color: color-mix(in srgb, var(--warn) 50%, var(--border));
+    color: var(--warn);
+  }
+
+  .badge--dim {
+    opacity: 0.75;
+  }
+
   .status-left {
     display: flex;
     align-items: center;
@@ -580,6 +677,10 @@
 
   .station-name {
     font-weight: 600;
+  }
+
+  .station--off {
+    opacity: 0.62;
   }
 
   .warn-box {

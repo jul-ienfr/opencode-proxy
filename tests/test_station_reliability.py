@@ -193,6 +193,32 @@ def test_selector_excludes_draining_and_bad():
     assert reasons & {"draining", "reserve", "quota-blocked", "exhausted"}
 
 
+def test_shared_ip_shares_the_same_quota_lease():
+    profile = QuotaProfile.from_config({"quota_per_ip_by_model": {"m": 20}})
+    reg = IpQuotaRegistry(profile)
+    st1 = _station(1, "same-ip")
+    st2 = _station(2, "same-ip")
+    reg.note_request("m", st1, now=10.0)
+    reg.note_request("m", st2, now=11.0)
+    lease1 = reg.lease_for("m", st1, now=12.0)
+    lease2 = reg.lease_for("m", st2, now=12.0)
+    assert lease1 is lease2
+    assert lease1 is not None
+    assert lease1.used == 2
+    assert lease1.headroom == 18
+
+
+def test_selector_deduplicates_shared_ip():
+    profile = QuotaProfile.from_config({"quota_per_ip_by_model": {"m": 20}})
+    quota = IpQuotaRegistry(profile)
+    st1 = _station(1, "shared-ip")
+    st2 = _station(2, "shared-ip")
+    selector = BestIpSelector(quota)
+    ranked = selector.rank([st1, st2], "m", now=10.0)
+    assert len(ranked) == 1
+    assert any(row.get("reason") == "duplicate-ip" for row in selector.last_rejections)
+
+
 def test_rotation_planner_one_at_a_time_and_spare_promotion():
     profile = QuotaProfile.from_config({"quota_per_ip_by_model": {"m": 20}})
     quota = IpQuotaRegistry(profile)
