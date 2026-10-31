@@ -1541,6 +1541,7 @@ class VPNManager:
         )
         self._identity_index = 0  # restored/clamped by load_state()
         self._rotation_task: asyncio.Task | None = None  # single-flight rotation ([1]+[18])
+        self._rotation_started_at: float | None = None
         # [audit watchdog 2026-10-30] Le setter `enabled` créait la tâche dès
         # le boot, avant le registry/pool/reconcile. On ne démarre la boucle
         # qu'après `start()` ; un toggle post-boot reste couvert par le setter.
@@ -1573,6 +1574,7 @@ class VPNManager:
         # acted on immediately instead of at the next interval.
         self._watchdog_event: asyncio.Event | None = None
         self._startup_connect_task: asyncio.Task | None = None
+        self._startup_connect_started_at: float | None = None
         self._update_available = False
         self._update_current_digest: str | None = None
         self._update_new_digest: str | None = None
@@ -1768,6 +1770,14 @@ class VPNManager:
         self._auth_probe_in_progress: bool = False
         self._repairing: bool = False
         self._parked_until: float = 0.0
+        # [P2b] Récupération egress bornée : quelques secondes à 4 min, puis
+        # park + alerte. Budget séparé du budget auth/restarts global.
+        self._egress_dead_since: float | None = None
+        self._egress_restart_times: list[float] = []
+        self._egress_flip_done: bool = False
+        self._egress_recreate_done: bool = False
+        self._egress_parked: bool = False
+        self._connect_started_at: float | None = None
         self._repair_sleep = asyncio.sleep
         self._last_good_country: str | None = None
         self._last_good_host: str | None = None
@@ -2016,6 +2026,7 @@ class VPNManager:
             # the lazy ensure_connected on the first free request overlap it
             # safely (connect is single-flight under self._lock).
             self._startup_connect_task = asyncio.create_task(self._startup_connect())
+            self._startup_connect_started_at = time.monotonic()
         if not self._watchdog_task or self._watchdog_task.done():
             self._watchdog_task = asyncio.create_task(self._watchdog_loop())
         # [roadmap] Un seul updater de flotte (station 1). Les autres managers
@@ -2034,6 +2045,8 @@ class VPNManager:
                 "[vpn] startup connect failed (docker compose up) — retried on first free request / manual connect: %s",
                 e,
             )
+        finally:
+            self._startup_connect_started_at = None
 
     async def stop(self) -> None:
         """Shutdown: persist state only. The tunnel is left running
@@ -2276,12 +2289,14 @@ class VPNManager:
         self._check_rotation_storm()
         task = asyncio.create_task(self._connect_next_impl())
         self._rotation_task = task
+        self._rotation_started_at = time.monotonic()
         try:
             return await asyncio.shield(task)
         finally:
             if self._rotation_task is task:
                 if task.done():
                     self._rotation_task = None
+                    self._rotation_started_at = None
                 else:
                     # [audit 2026-10-30] The caller was cancelled (client
                     # disconnect) but the shielded rotation is still running.
@@ -2294,6 +2309,7 @@ class VPNManager:
     def _clear_rotation_task_ref(self, task) -> None:
         if getattr(self, "_rotation_task", None) is task:
             self._rotation_task = None
+            self._rotation_started_at = None
 
     async def request_rotation_cancel(self, cap: float = 5.0) -> None:
         """[v10 §14.1.2] Appelé par le downscale AVANT stop_container : pose
@@ -2640,6 +2656,11 @@ class VPNManager:
                 _hold = 0.0
             self._degraded_hold_until = time.monotonic() + _hold if _hold > 0 else 0.0
         self._status = status
+        if str(status) == VPNState.CONNECTING:
+            if getattr(self, "_connect_started_at", None) is None:
+                self._connect_started_at = time.monotonic()
+        else:
+            self._connect_started_at = None
         # [stabilité 25/08] chrono de connexion : démarre à la PREMIÈRE
         # transition vers connected après une déconnexion (monotone — pas de
         # reset à chaque clignotement ERROR↔CONNECTED, sinon "connecté 0s").
@@ -3844,6 +3865,28 @@ class VPNManager:
         """
         ts = time.monotonic()
         self._last_effective_ok_at = ts
+        # [P2b] Une preuve d'egress réelle clôt la séquence de récupération.
+        self._egress_dead_since = None
+        self._egress_flip_done = False
+        self._egress_recreate_done = False
+        try:
+            _pool = getattr(shared_state, "free_ip_pool", None)
+            if _pool is not None and hasattr(_pool, "clear_egress_park"):
+                _pool.clear_egress_park(self)
+        except Exception:
+            pass
+        if getattr(self, "_egress_parked", False):
+            # Un egress réel prouve que le park egress n'a plus lieu d'être.
+            self._egress_parked = False
+            self._parked_until = 0.0
+            try:
+                self._repair_state.parked_until = 0.0
+                self._repair_state.next_retry_at = 0.0
+                self._repair_state.action_required = False
+            except Exception:
+                pass
+            self._mark_pool_repaired()
+            self._note_pool_health(True, cause="egress-recovered")
         try:
             country = getattr(self, "_current_country", None)
             host = getattr(self, "_current_host", None)
@@ -4947,6 +4990,30 @@ class VPNManager:
                 # le compteur de flip WG (auto_wg_egress_ticks).
                 "egress_threshold": self._egress_dead_threshold(),
                 "egress_tick_interval": self._egress_failure_tick_interval,
+                # [P2b] recovery egress bornée (secondes -> 4 min -> park).
+                "egress_dead_elapsed_s": (
+                    None
+                    if getattr(self, "_egress_dead_since", None) is None
+                    else round(max(0.0, self._now_fn() - float(self._egress_dead_since)), 1)
+                ),
+                "egress_restart_budget_used": (
+                    len([t for t in getattr(self, "_egress_restart_times", []) if self._now_fn() - t < 3600.0])
+                ),
+                "egress_restart_budget_max": int(
+                    getattr(self._repair_policy, "egress_restart_budget_per_hour", 6)
+                ),
+                "egress_flip_done": bool(getattr(self, "_egress_flip_done", False)),
+                "egress_recreate_done": bool(getattr(self, "_egress_recreate_done", False)),
+                "connect_age_s": (
+                    None
+                    if getattr(self, "_startup_connect_started_at", None) is None
+                    else round(max(0.0, self._now_fn() - float(self._startup_connect_started_at)), 1)
+                ),
+                "rotation_age_s": (
+                    None
+                    if getattr(self, "_rotation_started_at", None) is None
+                    else round(max(0.0, self._now_fn() - float(self._rotation_started_at)), 1)
+                ),
                 "last_conn_failure_at": self._last_conn_failure_at,
                 # [review 18/08] key aligned with stack_info's signal_count
                 # (the dashboard static reads egress_failures only).
@@ -7615,6 +7682,37 @@ class VPNManager:
         }
 
     # ── [P2] Réparation auth bornée ─────────────────────────────────
+    def _note_egress_restart(self, now: float | None = None) -> None:
+        ts = self._now_fn() if now is None else float(now)
+        self._egress_restart_times.append(ts)
+        self._egress_restart_times = [t for t in self._egress_restart_times if ts - t < 3600.0]
+
+    def _egress_restart_budget_ok(self) -> bool:
+        try:
+            mx = max(1, int(getattr(self._repair_policy, "egress_restart_budget_per_hour", 6)))
+        except Exception:
+            mx = 6
+        now = self._now_fn()
+        self._egress_restart_times = [t for t in self._egress_restart_times if now - t < 3600.0]
+        return len(self._egress_restart_times) < mx
+
+    def _park_egress(self, cause: str, now: float | None = None) -> None:
+        ts = self._now_fn() if now is None else float(now)
+        _park_s = max(60.0, float(getattr(self._repair_policy, "park_s", 1800.0)))
+        self._repair_state.park(self._repair_policy, ts, cause=cause)
+        self._parked_until = ts + _park_s
+        self._auth_park_until = 0.0
+        self._egress_parked = True
+        self._egress_dead_since = None
+        self._watchdog_last_action = f"egress-parked:{cause}"
+        self._error = f"egress parked: {cause}"
+        try:
+            self._set_status(VPNState.ERROR)
+        except Exception:
+            pass
+        self._mark_pool_parked(cause, _park_s)
+        logger.error("[vpn] s%s egress PARKED %.0fs — cause=%s", self._station, _park_s, cause)
+
     def _note_pool_health(self, ok: bool, cause: str | None = None) -> None:
         try:
             _pool = getattr(shared_state, "free_ip_pool", None)
@@ -7700,6 +7798,7 @@ class VPNManager:
         self._auth_next_retry_at = self._auth_park_until
         self._auth_failed = True
         self._repairing = False
+        self._egress_parked = False
         self._watchdog_last_action = f"parked:{cause}"
         self._error = f"station parked: {cause}"
         self._mark_pool_parked(cause, float(self._repair_policy.park_s))
@@ -7884,6 +7983,7 @@ class VPNManager:
         self._auth_failed = False
         self._server_issue = False
         self._credentials_suspect = False
+        self._egress_parked = False
         self._auth_park_until = 0.0
         self._parked_until = 0.0
         self._auth_next_retry_at = 0.0
@@ -8148,6 +8248,12 @@ class VPNManager:
             grace = 6
         return max(1, min(20, grace))
 
+    def _egress_repair_threshold(self) -> int:
+        """Seuil de déclenchement de la réparation egress (2 si activée)."""
+        if getattr(self, "_station_repair_enabled", False):
+            return 2
+        return self._egress_dead_threshold()
+
     def _watchdog_restarts_recent(self) -> list:
         """Restarts watchdog des 60 dernières minutes (fenêtre glissante)."""
         try:
@@ -8204,6 +8310,44 @@ class VPNManager:
         async (AUTH frais dans les logs ? cooldown AUTH global ?) avant de
         restarter. Toutes les autres actions sont terminales.
         """
+        # [P2b] Voie egress : elle ne doit PAS attendre le budget auth 3/h ni
+        # un cooling de 15 min. Objectif : secondes si fast-pin/restart passe,
+        # 4 min maximum, puis park + alerte.
+        try:
+            _egress_path = (kind == "egress dead") or (
+                str(getattr(self, "_egress_state", "") or "") == "tunnel_down"
+                and not bool(getattr(self, "_auth_failed", False))
+            )
+            if _egress_path and getattr(self, "_station_repair_enabled", False):
+                now = self._now_fn()
+                if getattr(self, "_egress_dead_since", None) is None:
+                    self._egress_dead_since = now
+                elapsed = max(0.0, now - float(self._egress_dead_since))
+                deadline = float(getattr(self._repair_policy, "egress_recovery_deadline_s", 240.0))
+                if elapsed >= deadline:
+                    return ("egress-park", f"deadline {int(deadline)}s")
+                try:
+                    _cool_rem = self._auth_cool_remaining_s()
+                except Exception:
+                    _cool_rem = 0
+                _cool_max = float(getattr(self._repair_policy, "egress_auth_cool_max_wait_s", 30.0))
+                if _cool_rem > _cool_max:
+                    return ("auth-cooling", f"{_cool_rem}s")
+                if (
+                    elapsed >= float(getattr(self._repair_policy, "egress_flip_after_s", 60.0))
+                    and not getattr(self, "_egress_flip_done", False)
+                ):
+                    return ("egress-flip", f"{int(elapsed)}s")
+                if (
+                    elapsed >= float(getattr(self._repair_policy, "egress_recreate_after_s", 120.0))
+                    and not getattr(self, "_egress_recreate_done", False)
+                ):
+                    return ("egress-recreate", f"{int(elapsed)}s")
+                if self._egress_restart_budget_ok():
+                    return ("egress-restart", f"{int(elapsed)}s")
+                return ("egress-park", "egress restart budget")
+        except Exception:
+            pass
         # [audit 2026-10-30] Un cooldown AUTH local protège TOUTES les voies :
         # un tick classé `egress dead` ne doit pas redémarrer la station
         # pendant la fenêtre de refroidissement AUTH.
@@ -9240,6 +9384,81 @@ class VPNManager:
                 )
         except Exception:
             pass
+        # [P2b] Un `connecting` bloqué ne doit pas tenir la station hors pool
+        # pendant 30 min. Annule le connect de boot après le deadline, puis
+        # laisse la voie egress reprendre (fast-pin/restart/flip/recreate).
+        try:
+            if (
+                getattr(self, "_station_repair_enabled", False)
+                and str(getattr(self, "_status", "")) == VPNState.CONNECTING
+                and getattr(self, "_connect_started_at", None) is not None
+            ):
+                _deadline = float(getattr(self._repair_policy, "connect_hard_deadline_s", 180.0))
+                _age = self._now_fn() - float(self._connect_started_at)
+                if _age >= _deadline:
+                    self._watchdog_last_action = "connect-timeout"
+                    self._error = f"connect bloqué > {int(_deadline)}s"
+                    logger.warning(
+                        "[vpn-watchdog] s%s connect bloqué %.0fs > %.0fs — annulation, reprise egress",
+                        self._station,
+                        _age,
+                        _deadline,
+                    )
+                    _t = getattr(self, "_startup_connect_task", None)
+                    if _t is not None and not _t.done() and _t is not asyncio.current_task():
+                        _t.cancel()
+                    self._egress_state = "tunnel_down"
+                    self._egress_dead_since = None
+                    self._set_status(VPNState.ERROR, force=True)
+                    return
+        except Exception:
+            pass
+        # [P2b] Tâches bloquées : un connect/rotation qui dépasse le hard
+        # deadline ne doit pas geler le watchdog pendant des dizaines de min.
+        try:
+            _hard = float(getattr(self._repair_policy, "connect_hard_deadline_s", 180.0))
+            _start_task = getattr(self, "_startup_connect_task", None)
+            _start_at = getattr(self, "_startup_connect_started_at", None)
+            if (
+                _start_task is not None
+                and not _start_task.done()
+                and _start_at is not None
+                and self._now_fn() - float(_start_at) >= _hard
+            ):
+                self._watchdog_last_action = "startup-connect-timeout"
+                self._error = f"startup connect bloqué > {int(_hard)}s"
+                logger.warning(
+                    "[vpn-watchdog] s%s startup connect bloqué %.0fs — annulation",
+                    self._station,
+                    self._now_fn() - float(_start_at),
+                )
+                _start_task.cancel()
+                self._egress_state = "tunnel_down"
+                self._egress_dead_since = None
+                self._set_status(VPNState.ERROR, force=True)
+                return
+            _rot_task = getattr(self, "_rotation_task", None)
+            _rot_at = getattr(self, "_rotation_started_at", None)
+            if (
+                _rot_task is not None
+                and not _rot_task.done()
+                and _rot_at is not None
+                and self._now_fn() - float(_rot_at) >= max(_hard, 300.0)
+            ):
+                self._watchdog_last_action = "rotation-timeout"
+                self._last_rotation_error = "rotation hard timeout"
+                logger.warning(
+                    "[vpn-watchdog] s%s rotation bloquée %.0fs — annulation",
+                    self._station,
+                    self._now_fn() - float(_rot_at),
+                )
+                _rot_task.cancel()
+                self._egress_state = "tunnel_down"
+                self._egress_dead_since = None
+                self._set_status(VPNState.ERROR, force=True)
+                return
+        except Exception:
+            pass
         if self._rotation_task and not self._rotation_task.done():
             # Rotation in flight — a restart would race its IP validation
             # (the skip MUST stay). Trace it once per rotation so a lost
@@ -9263,7 +9482,17 @@ class VPNManager:
             self._watchdog_last_action = "auth-repair-in-flight"
             return
         if float(getattr(self, "_auth_park_until", 0.0) or 0.0) > self._now_fn():
-            self._watchdog_last_action = "auth-parked"
+            if bool(getattr(self, "_auth_failed", False)):
+                self._watchdog_last_action = "auth-parked"
+                return
+            # Park auth obsolète : une station dont l'auth est OK doit être
+            # re-testée (surtout si elle a été parkée pour egress).
+            self._auth_park_until = 0.0
+        if (
+            float(getattr(self, "_parked_until", 0.0) or 0.0) > self._now_fn()
+            and not bool(getattr(self, "_egress_parked", False))
+        ):
+            self._watchdog_last_action = "parked"
             return
         if self._lock.locked():
             try:
@@ -9338,7 +9567,7 @@ class VPNManager:
                     self._egress_state = "tunnel_down"
                 except Exception:
                     pass
-                _eg_thr = self._egress_dead_threshold()
+                _eg_thr = self._egress_repair_threshold()
                 if self._egress_failures >= _eg_thr:
                     egress_dead = True
                     pool = getattr(shared_state, "free_ip_pool", None)
@@ -9476,7 +9705,7 @@ class VPNManager:
                 # [audit 2026-10-30] La fenêtre « transitoire » est bornée par
                 # le seuil egress réel, jamais par auto_wg_egress_ticks*2 :
                 # une fois `egress_dead`, on doit aller vers la recovery.
-                _transient = self._egress_failures < self._egress_dead_threshold()
+                _transient = self._egress_failures < self._egress_repair_threshold()
                 if _up_egress and (
                     getattr(self, "_secondary_path_issue", False) or VPNManager._secondary_path_active(self)
                 ):
@@ -9553,6 +9782,62 @@ class VPNManager:
                 # rapide qui nourrit le rejet serveur — cas S4). Rollback :
                 # ``watchdog_auth_grace_s: 0`` = restart immédiat historique.
                 _action, _reason = self._decide_watchdog_action(kind)
+                _skip_budget = False
+                # [P2b] Actions egress bornées, prioritaires sur la grâce et
+                # le budget auth. Le fast-pin/restart existant suit dessous.
+                if _action == "egress-park":
+                    self._watchdog_last_action = "egress-park"
+                    self._park_egress(_reason or kind)
+                    return
+                if _action == "egress-flip":
+                    self._watchdog_last_action = "egress-flip"
+                    self._egress_flip_done = True
+                    _target = "wireguard" if getattr(self, "_stack_effective", "") == "openvpn" else "openvpn"
+                    self._pending_flip = (_target, f"egress dead auto flip ({_reason})")
+                    logger.warning(
+                        "[vpn-watchdog] s%s action=egress-flip %s (elapsed %s) — bascule stack",
+                        self._station,
+                        self._stack_effective,
+                        _reason,
+                    )
+                    return
+                if _action == "egress-recreate":
+                    self._watchdog_last_action = "egress-recreate"
+                    self._egress_recreate_done = True
+                    logger.warning(
+                        "[vpn-watchdog] s%s action=egress-recreate (elapsed %s) — recreate conteneur",
+                        self._station,
+                        _reason,
+                    )
+                    try:
+                        await _auth_gate(self._docker_container)
+                        try:
+                            await self._ensure_container(force_recreate=True)
+                        finally:
+                            _auth_connect_done()
+                        _started = await self._wait_healthy(timeout=120)
+                        if (
+                            _started
+                            and not await self._check_auth_failed(_started)
+                            and await self._probe_tunnel_light()
+                        ):
+                            self._egress_dead_since = None
+                            self._watchdog_backoff.record_success()
+                            self._set_status(VPNState.CONNECTED)
+                            return
+                    except Exception as _e:
+                        logger.warning("[vpn-watchdog] s%s egress recreate failed: %s", self._station, _e)
+                    self._park_egress("egress recreate failed")
+                    return
+                if _action == "egress-restart":
+                    self._watchdog_last_action = "egress-restart"
+                    _skip_budget = True
+                    self._note_egress_restart()
+                    logger.warning(
+                        "[vpn-watchdog] s%s action=egress-restart (elapsed %s) — budget auth contourné",
+                        self._station,
+                        _reason,
+                    )
                 # [P2] Actions de la politique de réparation auth. Elles
                 # sortent AVANT la grâce/cooldown historiques : le restart est
                 # immédiat, les silences sont des arrêts réels de conteneur.
@@ -9653,7 +9938,7 @@ class VPNManager:
                     self._auth_grace_until = 0.0
                 # Budget restarts : au-delà de N/h → escalade auth_cooling,
                 # plus aucun restart avant l'heure suivante.
-                if self._watchdog_budget_exhausted():
+                if self._watchdog_budget_exhausted() and not _skip_budget:
                     self._watchdog_last_action = "budget-exhausted"
                     try:
                         cool = float(getattr(self, "_ov_auth_cool_s", 300.0))
@@ -9761,7 +10046,7 @@ class VPNManager:
                     # par le seuil egress réel, jamais par
                     # auto_wg_egress_ticks*2 : une fois `egress_dead`, on doit
                     # aller vers la recovery.
-                    _transient = self._egress_failures < self._egress_dead_threshold()
+                    _transient = self._egress_failures < self._egress_repair_threshold()
                     # [stabilité 25/08] Un AUTH_FAILED OV EST un échec réel même
                     # si le control gluetun rapporte "running" (le tunnel tourne
                     # mais l'auth est rejetée). Ne PAS court-circuiter le reboot/

@@ -918,6 +918,14 @@ class FreeIPPool:
         except Exception:
             pass
 
+    def clear_egress_park(self, station) -> None:
+        try:
+            item = self._station_health.get(self._station_id(station))
+            if item is not None:
+                item.clear_egress_park()
+        except Exception:
+            pass
+
     def mark_station_parked(self, station, *, cause: str | None = None, seconds: float = 1800.0) -> None:
         try:
             item = self._station_health.get(self._station_id(station))

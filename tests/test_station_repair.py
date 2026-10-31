@@ -47,6 +47,50 @@ def test_decision_park_and_credentials(tmp_path):
     assert mgr._decide_watchdog_action("AUTH_FAILED")[0] == "credentials-parked"
 
 
+def test_egress_recovery_is_minutes_not_hours(tmp_path):
+    mgr = FakeVPNManager(_repair_cfg(tmp_path), tmp_path=tmp_path)
+    mgr._egress_state = "tunnel_down"
+    now = mgr._now_fn()
+    mgr._egress_dead_since = now - 10
+    assert mgr._decide_watchdog_action("egress dead")[0] == "egress-restart"
+
+    mgr._egress_dead_since = now - 70
+    assert mgr._decide_watchdog_action("egress dead")[0] == "egress-flip"
+
+    mgr._egress_flip_done = True
+    mgr._egress_dead_since = now - 130
+    assert mgr._decide_watchdog_action("egress dead")[0] == "egress-recreate"
+
+    mgr._egress_recreate_done = True
+    mgr._egress_dead_since = now - 250
+    assert mgr._decide_watchdog_action("egress dead")[0] == "egress-park"
+
+
+def test_egress_waits_only_bounded_auth_cooling(tmp_path):
+    mgr = FakeVPNManager(_repair_cfg(tmp_path), tmp_path=tmp_path)
+    mgr._egress_state = "tunnel_down"
+    now = mgr._now_fn()
+    mgr._egress_dead_since = now - 10
+    mgr._auth_cool_until = now + 200.0
+    assert mgr._decide_watchdog_action("egress dead")[0] == "auth-cooling"
+    # À moins de 30 s de cooling, la récupération egress reprend.
+    mgr._auth_cool_until = now + 20.0
+    assert mgr._decide_watchdog_action("egress dead")[0] == "egress-restart"
+
+
+def test_egress_success_unparks_egress_station(tmp_path):
+    mgr = FakeVPNManager(_repair_cfg(tmp_path), tmp_path=tmp_path)
+    now = mgr._now_fn()
+    mgr._egress_parked = True
+    mgr._parked_until = now + 1000.0
+    mgr._repair_state.park(mgr._repair_policy, now, cause="egress")
+    mgr._note_effective_ok()
+    assert mgr._egress_parked is False
+    assert mgr._parked_until == 0.0
+    assert mgr._repair_state.parked_until == 0.0
+    assert mgr._repair_state.action_required is False
+
+
 def test_decision_global_pause_when_another_probe_owns(tmp_path):
     mgr = FakeVPNManager(_repair_cfg(tmp_path), tmp_path=tmp_path)
     mgr._auth_failed = True
@@ -57,6 +101,32 @@ def test_decision_global_pause_when_another_probe_owns(tmp_path):
     assert vm._STATION_AUTH_GUARD.allow_probe("2", now=mgr._now_fn()) is True
     assert mgr._decide_watchdog_action("AUTH_FAILED")[0] == "global-pause"
     vm._STATION_AUTH_GUARD.clear()
+
+
+@pytest.mark.asyncio
+async def test_stuck_connecting_is_cancelled_after_hard_deadline(tmp_path):
+    mgr = FakeVPNManager(_repair_cfg(tmp_path, watchdog_interval=20), tmp_path=tmp_path)
+    mgr._status = vm.VPNState.CONNECTING
+    mgr._connect_started_at = mgr._now_fn() - 200.0
+    await mgr._watchdog_tick()
+    assert mgr._watchdog_last_action == "connect-timeout"
+    assert mgr._status == vm.VPNState.ERROR
+    assert mgr._egress_state == "tunnel_down"
+
+
+@pytest.mark.asyncio
+async def test_stuck_rotation_is_cancelled_after_hard_deadline(tmp_path):
+    mgr = FakeVPNManager(_repair_cfg(tmp_path, watchdog_interval=20), tmp_path=tmp_path)
+    mgr._rotation_task = asyncio.create_task(asyncio.sleep(60))
+    mgr._rotation_started_at = mgr._now_fn() - 400.0
+    try:
+        await mgr._watchdog_tick()
+        await asyncio.sleep(0)
+        assert mgr._watchdog_last_action == "rotation-timeout"
+        assert mgr._rotation_task.cancelled() or mgr._rotation_task.done()
+    finally:
+        if not mgr._rotation_task.done():
+            mgr._rotation_task.cancel()
 
 
 @pytest.mark.asyncio

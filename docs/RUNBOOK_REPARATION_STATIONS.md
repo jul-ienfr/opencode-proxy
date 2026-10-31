@@ -77,6 +77,34 @@ Le 7e egress est configuré mais pas qualifié (auth, egress, quota ou health).
 2. Vérifier `spare_station` et `spare_promoted`.
 3. Si le spare est `repairing`, attendre ; ne pas le mettre dans le pool actif.
 
+## 2 bis. Récupération egress — objectif secondes à 4 minutes
+
+Séquence automatique :
+
+```text
+0–30 s   : fast-pin / restart (le fast-pin peut corriger en quelques secondes)
+30 s     : plafond d'attente auth_cooling pour l'egress
+60 s     : bascule de stack OV↔WG
+120 s    : recreate conteneur
+240 s    : park + alerte
+```
+
+Champs utiles :
+
+```text
+vpn.watchdog.egress_dead_elapsed_s
+vpn.watchdog.egress_restart_budget_used
+vpn.watchdog.egress_flip_done
+vpn.watchdog.egress_recreate_done
+```
+
+Si une station dépasse **240 s** en `tunnel_down`, elle doit être `parked` avec
+`action_required=true`; sinon le watchdog ne fait pas son travail.
+
+Le budget auth `3/h` ne doit **pas** bloquer cette séquence : le budget egress
+est séparé (`6/h`). Si tu vois `budget-exhausted` sur un egress dead, c'est un
+bug de politique, pas une limite NordVPN.
+
 ---
 
 ## 3. Tempête AUTH

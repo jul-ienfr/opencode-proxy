@@ -213,6 +213,21 @@ class StationHealth:
             self.good_probes = 0
             self.bad_probes = 0
 
+    def clear_egress_park(self, now: float | None = None) -> bool:
+        """Lève un park egress quand un vrai egress est revenu.
+
+        Un park auth/credentials n'est jamais levé par cette voie : seul un
+        ``cause`` commençant par ``egress`` est concerné.
+        """
+        cause = str(self.cause or "")
+        if self.state != PARKED or not cause.startswith("egress"):
+            return False
+        self.parked_until = 0.0
+        self.next_retry_at = 0.0
+        self.action_required = False
+        self.repair_succeeded(now)
+        return True
+
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
         ts = _now(now)
         return {
@@ -255,7 +270,11 @@ class StationHealthRegistry:
     def observe(self, station_id: int, ok: bool, now: float | None = None, **kw) -> str:
         item = self.get(station_id)
         assert item is not None
-        return item.observe_probe(ok, now, **kw)
+        state = item.observe_probe(ok, now, **kw)
+        if ok:
+            item.clear_egress_park(now)
+            state = item.state
+        return state
 
     def remove(self, station_id: int) -> None:
         self._items.pop(int(station_id), None)

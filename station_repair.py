@@ -93,6 +93,12 @@ class RepairPolicy:
     auth_global_pause_s: float = 300.0
     verify_egress_before_usable: bool = True
     last_good_first: bool = True
+    egress_recovery_deadline_s: float = 240.0
+    egress_restart_budget_per_hour: int = 6
+    egress_flip_after_s: float = 60.0
+    egress_recreate_after_s: float = 120.0
+    egress_auth_cool_max_wait_s: float = 30.0
+    connect_hard_deadline_s: float = 180.0
 
     @classmethod
     def from_config(cls, cfg: dict | None) -> RepairPolicy:
@@ -123,6 +129,22 @@ class RepairPolicy:
             auth_global_pause_s=max(30.0, _as_float(data.get("auth_global_pause_s", 300), 300.0)),
             verify_egress_before_usable=bool(data.get("verify_egress_before_usable", True)),
             last_good_first=bool(data.get("last_good_first", True)),
+            egress_recovery_deadline_s=max(
+                30.0, _as_float(data.get("egress_recovery_deadline_s", 240), 240.0)
+            ),
+            egress_restart_budget_per_hour=max(
+                1, _as_int(data.get("egress_restart_budget_per_hour", 6), 6)
+            ),
+            egress_flip_after_s=max(15.0, _as_float(data.get("egress_flip_after_s", 60), 60.0)),
+            egress_recreate_after_s=max(
+                30.0, _as_float(data.get("egress_recreate_after_s", 120), 120.0)
+            ),
+            egress_auth_cool_max_wait_s=max(
+                0.0, _as_float(data.get("egress_auth_cool_max_wait_s", 30), 30.0)
+            ),
+            connect_hard_deadline_s=max(
+                60.0, _as_float(data.get("connect_hard_deadline_s", 180), 180.0)
+            ),
         )
 
     def stop_delay_for(self, attempt: int) -> float:

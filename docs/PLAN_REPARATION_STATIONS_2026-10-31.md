@@ -276,6 +276,13 @@ station_repair:
   max_restarts_per_hour: 3
   max_recreates_per_hour: 1
 
+  # Egress : récupération bornée en minutes, budget séparé de l'auth.
+  egress_recovery_deadline_s: 240
+  egress_restart_budget_per_hour: 6
+  egress_flip_after_s: 60
+  egress_recreate_after_s: 120
+  egress_auth_cool_max_wait_s: 30
+
   last_good_first: true
 
   auth_global_window_s: 60
@@ -493,6 +500,24 @@ On évite :
 - une IP “favorite” qui s'épuise avant les autres.
 
 Le sélecteur applique une pénalité de charge et une réservation par station.
+
+### 9 bis.9 Récupération egress bornée
+
+Un `tunnel_down` n'est **pas** une attente de 40 min liée au budget auth.
+La voie egress a sa propre séquence :
+
+```text
+0–30 s    : fast-pin / restart immédiat (meilleur cas : secondes)
+30 s      : plafond d'attente auth_cooling pour l'egress
+60 s      : bascule de stack (OV↔WG)
+120 s     : recreate conteneur
+240 s     : park + alerte
+```
+
+Budget séparé : `egress_restart_budget_per_hour = 6`.
+Le budget auth `3/h` ne bloque plus la récupération egress.
+Le fast-pin reste tenté avant le restart : une correction en quelques
+secondes est possible sans redémarrer le conteneur.
 
 ---
 
@@ -940,8 +965,8 @@ spare chaud. Aucun faux 7/7 n'est exposé : `capacity_snapshot` sépare
 | Contrats `scripts/ci_contracts.py` | ✅ 516/516 |
 | `scripts/config_audit.py --strict` | ✅ 371 clés, 0 morte, 0 manquante |
 | Ruff fichiers modifiés | ✅ |
-| Tests conception santé/lease/sélection | ✅ 15/15 |
-| Tests P2 réparation auth | ✅ 5/5 |
+| Tests conception santé/lease/sélection | ✅ 16/16 |
+| Tests P2 réparation auth/egress | ✅ 10/10 |
 | Tests intégration pool P1/P3/P4 | ✅ 8/8 |
 | Tests unicité IP (commit/adoption) | ✅ 3/3 |
 | Tests canary P6 | ✅ 4/4 |
@@ -949,23 +974,22 @@ spare chaud. Aucun faux 7/7 n'est exposé : `capacity_snapshot` sépare
 | Tests rapport capacité P7 | ✅ 3/3 |
 | Dashboard UI `npm run check` | ✅ 0 erreur, 0 warning |
 
-### 16.4 Runtime observé le 31/10 à 16:30
+### 16.4 Runtime observé le 31/10 après correction egress
 
 ```text
 configured_stations : 6
 stations_total      : 7
-usable_stations     : 5/6
-unique_usable_ips   : 5
+usable_stations     : 4/6 (variable pendant les récupérations)
+unique_usable_ips   : 4
 duplicate_stations  : 0
 warm_spare_ready    : true
 spare_station       : 7
 spare_promoted      : false
 ```
 
-Le 7e conteneur `opencode-vpn-7` est démarré et qualifié comme spare.
-La capacité affichée n'est **pas** un faux 6/6 : une station active était
-encore en récupération egress au moment du relevé, donc `/health` disait
-`degraded` avec `5/6`. Les stations non utilisables sont exclues du pool.
+s4 a été récupérée puis **unparkée automatiquement** dès qu'un egress réel est
+revenu. La capacité reste affichée honnêtement : les stations s2/s5 en
+récupération ne sont pas comptées.
 
 ### 16.5 P5 — UI, alertes, runbook
 
@@ -980,6 +1004,9 @@ encore en récupération egress au moment du relevé, donc `/health` disait
   commit/adoption refuse une IP déjà servie par une autre station, le
   sélecteur ne garde qu'une station par IP, la capacité signale
   `duplicate_stations`, et le planificateur draine/rotate les doublons.
+- **Egress borné** : fast-pin/restart en secondes, flip stack à 60 s,
+  recreate à 120 s, park à 240 s. Le budget auth 3/h ne bloque plus la
+  récupération d'un tunnel mort.
 - **Alertes** : `scripts/vpn_alerts.py` couvre capacité dégradée, spare froid,
   station parkée, `action_required`, backoff modèle global et leases `bad`.
 - **Runbook** : `docs/RUNBOOK_REPARATION_STATIONS.md` (diagnostic, rollback,

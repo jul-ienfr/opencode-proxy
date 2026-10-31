@@ -74,6 +74,16 @@ def test_station_health_repairing_can_recover_from_external_probes():
     assert health.action_required is False
 
 
+def test_egress_park_is_cleared_by_egress_proof_but_auth_park_is_not():
+    health = StationHealth(station=4)
+    health.park(now=100.0, seconds=1800.0, cause="egress recreate failed")
+    assert health.clear_egress_park(now=200.0) is True
+    assert health.state == PROBING
+    health.park(now=300.0, seconds=1800.0, cause="auth_throttle")
+    assert health.clear_egress_park(now=400.0) is False
+    assert health.state == PARKED
+
+
 def test_station_health_park_is_excluded_and_resumes_after_deadline():
     health = StationHealth(station=4)
     health.park(now=100.0, seconds=1800.0, cause="auth_throttle")
