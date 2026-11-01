@@ -94,8 +94,12 @@ def test_duplicate_egress_ip_is_not_routable():
     assert pool._station_usable(st1, exclude_approaching=False) is True
 
 
-def test_pinned_station_skips_quota_rotation():
-    """A pinned hostname cannot change IP by restarting: no rotation loop."""
+def test_pinned_station_still_rotates_for_a_fresh_egress():
+    """The hostname pins the server, not its NAT egress: .90 → .86 observed.
+
+    A quota 429 must still launch a rotation on a Compose-pinned station so it
+    can land on a fresh IP; the duplicate-IP guard handles collisions.
+    """
     pool, st1, _ = _pool()
     calls = []
     pool._launch_rotation = lambda station, **kw: calls.append(station)
@@ -103,9 +107,6 @@ def test_pinned_station_skips_quota_rotation():
 
     pool.on_quota_exhausted(st1, quota=True)
 
-    assert calls == []
-    st1._pinned_hostname = None
-    pool.on_quota_exhausted(st1, quota=True)
     assert calls == [st1]
 
 

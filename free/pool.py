@@ -3700,18 +3700,6 @@ class FreeIPPool:
                     )
                 except Exception:
                     pass
-                # [2026-11-01] A Compose-pinned hostname cannot produce a new
-                # egress by restarting: switch_ip reuses the same server and
-                # the "IP inchangée" failure loops (s2 flap_count=12). Skip
-                # the rotation; the (model, IP) ledger reset is the fix.
-                if getattr(station, "_pinned_hostname", None):
-                    logger.info(
-                        "[free-ip] station %s pinned to %s — quota rotation skipped "
-                        "(IP fixed until hostname rebind)",
-                        getattr(station, "_station", "?"),
-                        station._pinned_hostname,
-                    )
-                    return
                 self._launch_rotation(station, forced_pool=forced_pool)
         # [PLAN-corrections-429 G4] failover cascade : en routing=failover,
         # la sticky station reçoit TOUT le trafic — ≥3 429 consécutifs sur

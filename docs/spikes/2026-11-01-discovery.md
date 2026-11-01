@@ -120,8 +120,13 @@ dont le quota est épuisé (429).
 
 Persistance : Compose pin `al41`/`al75`/`al74`/`al36` pour les stations 1/2/3/4
 via `SERVER_HOSTNAMES_STATION1..4`, et `.env` contient les mêmes valeurs. Un
-recreate de station ne perd donc plus le serveur ; un recreate complet a
-reproduit exactement `.90`, `.77`, `.59` et `.9`.
+recreate de station ne perd donc plus le serveur.
+
+**Attention** : le hostname fige le **serveur**, pas l’egress NAT. `al41` a
+produit `87.120.102.90` puis `87.120.102.86` après un redémarrage ; l’IP peut
+donc changer (fraîche ou déjà épuisée). Chaque egress observé doit être
+enregistré dans le registre, et une rotation pinned reste utile pour chasser
+une IP fraîche.
 
 ### Correctif santé station 4
 

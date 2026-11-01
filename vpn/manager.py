@@ -1616,10 +1616,11 @@ class VPNManager:
         # Renseigné au pin puis confirmé par les logs gluetun.
         self._current_host: str | None = None
         self._last_host_resolve_at: float = 0.0
-        # [2026-11-01] Compose-pinned hostname (SERVER_HOSTNAMES_STATIONn).
-        # A pinned station cannot get a new egress by restarting the same
-        # host: quota rotations must be skipped (the ledger reset is the
-        # remediation, not a doomed restart loop).
+        # [2026-11-01] Compose-pinned hostname (SERVER_HOSTNAMES_STATIONn),
+        # exposed in /api/vpn-status. The hostname pins the *server*, not
+        # the NAT egress: restarting the same server can yield a different
+        # public IP (.90 -> .86 observed), so quota rotations are still
+        # allowed to hunt a fresh egress.
         _pin_key = f"SERVER_HOSTNAMES_STATION{self._station}"
         _pin = (os.getenv(_pin_key, "") or "").strip()
         if not _pin:
