@@ -177,9 +177,9 @@ def _needs_chain(station: dict) -> bool:
         return False
     reason = str(station.get("model_usable_reason") or "")
     nonrout = str(station.get("non_routable_reason") or "")
-    if reason in ("daily-bucket-exhausted", "bad-ip"):
+    if reason in ("daily-bucket-exhausted", "bad-ip", "station-unusable"):
         return True
-    if nonrout.startswith(("quota=", "bad_until")):
+    if nonrout.startswith(("quota=", "bad_until", "egress=", "status=error")):
         return True
     return False
 
