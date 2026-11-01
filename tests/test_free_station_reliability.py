@@ -85,6 +85,15 @@ def test_strict_health_rejects_auth_failed_and_stale_egress():
     assert pool.station_usable(st2) is True
 
 
+def test_duplicate_egress_ip_is_not_routable():
+    """Two stations cannot serve the same egress IP (boot race guard)."""
+    pool, st1, st2 = _pool()
+    st2.current_ip = st1.current_ip
+
+    assert pool._station_usable(st2, exclude_approaching=False) is False
+    assert pool._station_usable(st1, exclude_approaching=False) is True
+
+
 def test_pinned_station_skips_quota_rotation():
     """A pinned hostname cannot change IP by restarting: no rotation loop."""
     pool, st1, _ = _pool()

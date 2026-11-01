@@ -2154,6 +2154,20 @@ class FreeIPPool:
         AUCUNE autre n'est disponible (jamais zéro candidat)."""
         if getattr(station, "_disabled", False):
             return False
+        # [2026-11-01] Distinct-IP invariant, enforced at selection time too:
+        # a boot race can connect two stations to the same server before the
+        # manager's `_commit_ip` guard runs (observed s5 == s1 == .90). The
+        # higher station id yields to the lower one; the duplicate gets no
+        # traffic and will rotate on its next selection.
+        _ip = str(getattr(station, "current_ip", "") or "")
+        _sid = int(getattr(station, "_station", 0) or 0)
+        if _ip and _sid > 0:
+            for _other in getattr(self, "_stations", None) or []:
+                if _other is station:
+                    continue
+                _osid = int(getattr(_other, "_station", 0) or 0)
+                if 0 < _osid < _sid and str(getattr(_other, "current_ip", "") or "") == _ip:
+                    return False
         if forced_pool is not None:
             cc = getattr(station, "_current_country", None) or getattr(station, "current_country", None)
             if cc is None:
