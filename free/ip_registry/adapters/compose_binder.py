@@ -49,7 +49,14 @@ class ComposeHostnameBinder:
     def service_name(self, station: int) -> str:
         return "vpn-gluetun" if int(station) == 1 else f"vpn-gluetun-{int(station)}"
 
-    def override_yaml(self, station: int, hostname: str, country: str | None = None) -> str:
+    def override_yaml(
+        self,
+        station: int,
+        hostname: str,
+        country: str | None = None,
+        vpn_type: str | None = None,
+        openvpn_protocol: str | None = None,
+    ) -> str:
         service = self.service_name(station)
         lines = [
             "services:",
@@ -59,10 +66,20 @@ class ComposeHostnameBinder:
         ]
         if country:
             lines.append(f"      - SERVER_COUNTRIES={country}")
+        if vpn_type:
+            lines.append(f"      - VPN_TYPE={vpn_type}")
+        if openvpn_protocol:
+            lines.append(f"      - OPENVPN_PROTOCOL={openvpn_protocol}")
         return "\n".join(lines) + "\n"
 
     async def assign(
-        self, station: int, hostname: str, country: str | None = None
+        self,
+        station: int,
+        hostname: str,
+        country: str | None = None,
+        *,
+        vpn_type: str | None = None,
+        openvpn_protocol: str | None = None,
     ) -> BindResult:
         hostname = str(hostname or "").strip()
         country = str(country or "").strip() or None
@@ -71,7 +88,10 @@ class ComposeHostnameBinder:
         try:
             self._override_path.parent.mkdir(parents=True, exist_ok=True)
             self._override_path.write_text(
-                self.override_yaml(station, hostname, country), encoding="utf-8"
+                self.override_yaml(
+                    station, hostname, country, vpn_type, openvpn_protocol
+                ),
+                encoding="utf-8",
             )
         except Exception as exc:
             return BindResult(False, hostname, error=f"override-write:{type(exc).__name__}")

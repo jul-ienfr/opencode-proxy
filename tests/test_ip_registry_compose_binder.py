@@ -66,6 +66,28 @@ async def test_assign_writes_a_country_override(tmp_path):
     assert "SERVER_COUNTRIES=United Arab Emirates" in override
 
 
+async def test_assign_writes_an_openvpn_override(tmp_path):
+    runner = FakeRunner()
+
+    async def egress(station: int) -> str:
+        return "187.15.106.56"
+
+    binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=runner, egress=egress)
+
+    result = await binder.assign(
+        5,
+        "bg95.nordvpn.com",
+        country="Bulgaria",
+        vpn_type="openvpn",
+        openvpn_protocol="tcp",
+    )
+
+    assert result.ok
+    override = (tmp_path / "logs" / "compose-hostname.yml").read_text(encoding="utf-8")
+    assert "VPN_TYPE=openvpn" in override
+    assert "OPENVPN_PROTOCOL=tcp" in override
+
+
 async def test_assign_reports_recreate_failure(tmp_path):
     runner = FakeRunner(returncode=1, stderr="boom")
     binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=runner)
