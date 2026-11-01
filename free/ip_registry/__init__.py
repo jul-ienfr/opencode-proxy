@@ -3,6 +3,7 @@
 Pure domain, scoring and eligibility rules.  No I/O, no provider import.
 """
 
+from .catalog import NordVpnCatalog
 from .domain import (
     BindResult,
     GeoFilter,
@@ -17,6 +18,7 @@ from .domain import (
 )
 from .eligibility import EligibilityDecision, check_eligibility
 from .scoring import ScoreWeights, score_record
+from .sqlite_registry import SqliteIpRegistry
 
 __all__ = [
     "BindResult",
@@ -26,10 +28,12 @@ __all__ = [
     "IpState",
     "Lease",
     "NeedReason",
+    "NordVpnCatalog",
     "ProbeResult",
     "RuntimeResult",
     "ScoreWeights",
     "Server",
+    "SqliteIpRegistry",
     "can_transition",
     "check_eligibility",
     "score_record",
