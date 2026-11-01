@@ -101,7 +101,7 @@ et `.env` contient `SERVER_HOSTNAMES_STATION1=al41.nordvpn.com`.
 
 ## Quatre stations validées
 
-Après fusion du catalogue embarqué dans chaque volume gluetun :
+Après fusion du catalogue (embarqué + API) dans chaque volume gluetun :
 
 | Station | Serveur | Egress | Free |
 |---|---|---|---|
@@ -130,6 +130,57 @@ nourrissait les bons probes **avant** `repair_succeeded()`, qui remettait
 `good_probes=0` et l'état à `probing`. La station restait donc exclue malgré
 un tunnel sain. L'ordre est désormais réparation → probes → `usable`, et le
 mark 200 efface aussi `last_rotation_error`, `_repairing` et `_parked_until`.
+
+## Catalogue fusionné (embarqué + API)
+
+Remplacer le manifeste par le seul catalogue embarqué était une régression :
+il ne contient pas les serveurs créés après la build gluetun. `ch524` (créé le
+2026-10-28) était rejeté (`not one of the possible choices`), alors que
+l’ancien manifeste téléchargé le connaissait.
+
+`scripts/merge_gluetun_catalog.py` construit maintenant l’**union** :
+
+1. catalogue embarqué (17 103 entrées, serveurs anciens dont `al36..al75`),
+2. manifeste courant du conteneur,
+3. API NordVPN live (7 228 serveurs, clés WireGuard comprises).
+
+Priorité : API > manifeste courant > embarqué, clé `(hostname, vpn)`.
+
+```text
+embedded: 17 103 serveurs (8 552 wireguard)
+api:      14 128 entrées (7 064 wireguard, WG + OpenVPN)
+merged:   19 569 entrées (9 785 wireguard)
+```
+
+L’union est écrite dans `/gluetun/servers/nordvpn.json` et exportée vers
+`logs/gluetun_nordvpn_embedded.json` (gitignored). `NordVpnCatalog` charge cet
+export par défaut et le fusionne avec l’API ; un checkout neuf fonctionne sans
+le fichier, il suffit de lancer le script pour retrouver les serveurs anciens.
+
+## Proxy HTTPS NordVPN
+
+Le proxy `:89` fonctionne **aussi via l’IP** :
+
+```text
+https://USER:PASS@87.120.102.3:89   → 200, egress 87.120.102.14
+https://USER:PASS@37.120.213.83:89  → 200, egress 187.15.173.90
+```
+
+Mais `verify=True` échoue : le certificat ne correspond ni au hostname ni à
+l’IP. Il faut `verify=False` ou épingler le certificat. L’egress HTTPS est
+**distinct** de l’egress WireGuard du même serveur :
+
+```text
+al41   WG .90  → 200     HTTPS .94  → 429
+ch296  WG .93  → 429     HTTPS .90  → 429
+ch296  WG .93  → 429     (nouveau tunnel testé, manifeste fusionné OK)
+```
+
+Le port 89 n’est pas actif partout : sur 297 anciens serveurs résolus, seuls
+`al41`, `ie106` et `us11640` ont produit un egress, tous les trois en 429. Un
+scan de 300 serveurs `proxy_ssl` publics (14 pays) n’a produit **aucun** egress
+fonctionnel. La piste HTTPS reste donc un transport possible mais ne fournit
+pas d’IP fraîche à elle seule.
 
 ## Suite
 
