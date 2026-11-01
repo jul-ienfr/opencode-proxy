@@ -3,7 +3,7 @@
 Pure domain, scoring and eligibility rules.  No I/O, no provider import.
 """
 
-from .adapters import ComposeHostnameBinder
+from .adapters import ComposeHostnameBinder, StationEgress, StationProbe
 from .allocator import AllocationOutcome, AllocationReport, IpAllocator, StationNeed
 from .catalog import NordVpnCatalog
 from .domain import (
@@ -40,7 +40,9 @@ __all__ = [
     "ScoreWeights",
     "Server",
     "SqliteIpRegistry",
+    "StationEgress",
     "StationNeed",
+    "StationProbe",
     "can_transition",
     "check_eligibility",
     "score_record",

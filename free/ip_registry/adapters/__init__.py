@@ -3,5 +3,7 @@
 from __future__ import annotations
 
 from .compose_binder import ComposeHostnameBinder
+from .egress import StationEgress
+from .probe import StationProbe
 
-__all__ = ["ComposeHostnameBinder"]
+__all__ = ["ComposeHostnameBinder", "StationEgress", "StationProbe"]
