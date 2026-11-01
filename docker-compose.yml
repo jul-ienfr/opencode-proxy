@@ -70,7 +70,7 @@ x-gluetun-multi-env: &gluetun-multi-env
   # marcher. DoT = TCP/853. Historique v10 (DoT flanchait) périmé : pool
   # DoT corrigé build 01/09. Repli possible : RESOLVER_TYPE=doh (443 prouvé)
   # ou re-plain si le plan réseau change. Recommandation wiki : 2 providers.
-  DNS_UPSTREAM_RESOLVER_TYPE: dot
+  DNS_UPSTREAM_RESOLVER_TYPE: doh
   DNS_UPSTREAM_RESOLVERS: cloudflare,google
   # [incident v10] PMTUD échoue systématiquement sur ce réseau (ICMP+TCP) ->
   # MTU retombé à 1320 insuffisant : les gros paquets TLS des probes
@@ -238,7 +238,7 @@ services:
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1080
       # [plan B 2026-09-08] DoT (cf. ancre) — pas de plain UDP (mort).
-      - DNS_UPSTREAM_RESOLVER_TYPE=dot
+      - DNS_UPSTREAM_RESOLVER_TYPE=doh
       - DNS_UPSTREAM_RESOLVERS=cloudflare,google
       # [incident v10] blocs littéraux st1/st2 : le MTU de l'ancre partagée
       # n'atteint pas ces services — TLS black-holait au-delà de ~1300 octets.
@@ -340,7 +340,7 @@ services:
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1081
       # [plan B 2026-09-08] DoT (cf. ancre) — pas de plain UDP (mort).
-      - DNS_UPSTREAM_RESOLVER_TYPE=dot
+      - DNS_UPSTREAM_RESOLVER_TYPE=doh
       - DNS_UPSTREAM_RESOLVERS=cloudflare,google
       - WIREGUARD_MTU=1280
       - OPENVPN_MSSFIX=1280
@@ -584,7 +584,7 @@ services:
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1090
       # [plan B 2026-09-08] DoT (cf. ancre) — pas de plain UDP (mort).
-      - DNS_UPSTREAM_RESOLVER_TYPE=dot
+      - DNS_UPSTREAM_RESOLVER_TYPE=doh
       - DNS_UPSTREAM_RESOLVERS=cloudflare,google
       - FIREWALL=on
       - PUID=1000

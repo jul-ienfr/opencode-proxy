@@ -259,8 +259,7 @@ ip_rotation:
   rotation_stagger: 10
   rotation_storm_cooldown_s: 600
   rotation_wait_timeout: 5
-  server_countries: Albania,Japan,Brazil,South Africa,Australia,Singapore,India,South
-    Korea,Mexico,Canada,United Kingdom,Poland,Romania
+  server_countries: Albania
   server_issue_grace_s: 25
   server_issue_recheck: true
   server_list_refresh_interval_s: 21600
