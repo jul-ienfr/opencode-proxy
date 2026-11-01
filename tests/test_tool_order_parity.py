@@ -159,7 +159,7 @@ def test_free_wire_shims_are_sorted_with_the_rest():
     # [audit 2026-10-30] La copie officielle (10 outils, ordre officiel) est
     # envoy?e devant les outils client ; le client garde son ordre.
     assert _names(wire["tools"]) == [
-        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write", "zzz", "aaa"
+        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "websearch", "write", "zzz", "aaa"
     ]
     # Le corps d'origine n'est jamais muté (idempotence des retries/hedges).
     assert _names(body["tools"]) == ["zzz", "aaa"]
@@ -175,7 +175,7 @@ def test_free_wire_is_idempotent_once_sorted():
     first, _ = oc._free_wire_body(body)
     second, _ = oc._free_wire_body(first)
     assert _names(second["tools"]) == _names(first["tools"]) == [
-        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write", "zzz", "aaa"
+        "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "websearch", "write", "zzz", "aaa"
     ]
 
 

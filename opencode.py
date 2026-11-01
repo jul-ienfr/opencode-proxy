@@ -7321,6 +7321,15 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     need_summary_tokens = bool(_is_summary and _summary_token_cap > 0)
     missing = [n for n in ("read",) if n not in have] if is_resp else []
     need_stream = force_stream and body.get("stream") is not True
+    # [2026-11-01] Le client officiel envoie TOUJOURS stream_options quand il
+    # streame. Un client qui pose stream:true sans stream_options avait un
+    # corps différent de l'officiel → faux quota possible.
+    need_stream_options = bool(
+        is_chat
+        and body.get("stream") is True
+        and "stream_options" not in body
+        and isinstance(_payload.get("stream_options"), dict)
+    )
     need_key = is_resp and not body.get("prompt_cache_key")
     will_have_tools = bool(tools) or need_tools or bool(missing)
     # Le client v1 pose « auto » dès qu'il a des tools ; le v2 ne le pose pas.
@@ -7332,12 +7341,14 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     # Idem pour l'ordre des clés : un corps officiel (signature ok) traverse
     # tel quel, quel que soit son ordre (v2 utilise max_completion_tokens).
     need_order = is_chat and will_have_tools and not _signature_ok
+    need_order = bool(need_order or need_stream_options)
     _wire_cap = _free_max_wire_bytes()
     if (
         not missing
         and not need_tools
         and not need_system
         and not need_stream
+        and not need_stream_options
         and not need_key
         and not need_tc
         and not need_order
@@ -7558,6 +7569,10 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         if "stream_options" not in wire and isinstance(_payload.get("stream_options"), dict):
             wire["stream_options"] = copy.deepcopy(_payload["stream_options"])
         forced = True
+    # Client déjà en stream:true mais sans stream_options : aligner sur
+    # l'officiel (le gate peut comparer la forme complète).
+    if wire.get("stream") is True and "stream_options" not in wire and isinstance(_payload.get("stream_options"), dict):
+        wire["stream_options"] = copy.deepcopy(_payload["stream_options"])
     if need_order:
         # [2026-11-01] Le client officiel envoie TOUJOURS max_tokens: 32000
         # (capture 1.18.31/1.19.0/1.19.3/1.19.5). Un corps générique injecté
@@ -22425,6 +22440,33 @@ async def free_hunter_toggle(request: Request):
     from free import hunter
 
     return await asyncio.to_thread(hunter.set_enabled, enabled)
+
+
+@app.post("/api/free/quota/clear")
+async def free_quota_clear(request: Request):
+    """Efface le ledger de quota (tous, une IP ou un bucket modèle)."""
+    _dash = os.getenv("DASHBOARD_TOKEN", "").strip()
+    if _dash:
+        provided = request.headers.get("X-Dashboard-Token", "")
+        if not provided or not hmac.compare_digest(provided, _dash):
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "unauthorized",
+                    "message": "Valid X-Dashboard-Token header required (DASHBOARD_TOKEN env).",
+                },
+            )
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ip = str((body or {}).get("ip") or "").strip() or None
+    model = str((body or {}).get("model") or "").strip() or None
+    pool = _free_ip_pool
+    if pool is None or not hasattr(pool, "clear_quota_buckets"):
+        return JSONResponse(status_code=503, content={"error": "free pool unavailable"})
+    cleared = await asyncio.to_thread(pool.clear_quota_buckets, ip, model)
+    return {"ok": True, "cleared": cleared, "ip": ip, "model": model}
 
 
 @app.post("/api/free-discovery/refresh")

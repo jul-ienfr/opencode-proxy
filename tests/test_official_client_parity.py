@@ -561,16 +561,19 @@ def test_free_wire_body_passthrough():
         "stream": True,
     }
     wire, forced = oc._free_wire_body(full, force_stream=True)
-    # Deja conforme : grille complete + tool_choice pose + stream vrai.
+    # Un corps chat avec tools mais sans prompt système officiel n'est pas un
+    # passthrough : la grille officielle et stream_options sont ajoutés.
     assert forced is False
     assert wire["tool_choice"] == "auto"
-    assert wire == full or list(wire) == [
+    assert wire["stream_options"] == {"include_usage": True}
+    assert list(wire) == [
         "model",
         "max_tokens",
         "messages",
         "tools",
         "tool_choice",
         "stream",
+        "stream_options",
     ]
 
 

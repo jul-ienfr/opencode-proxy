@@ -32,8 +32,6 @@ INTERVAL_S = float(os.getenv("OPENCODE_HUNTER_INTERVAL_S", "600") or 600)
 MAX_ATTEMPTS = max(1, int(os.getenv("OPENCODE_HUNTER_MAX_ATTEMPTS", "36") or 36))
 LOG_PATH = ROOT / "logs" / "fresh_ip_hunter.log"
 
-with open(ROOT / "free" / "official_payload.json", encoding="utf-8") as f:
-    BASE_BODY = json.load(f)["body"]
 IMP, FP = oc._get_free_fp_kwargs("1.19.5")
 
 
@@ -52,10 +50,16 @@ def pool() -> dict:
 
 
 def probe(proxy: str):
-    body = dict(BASE_BODY)
-    body["model"] = MODEL
-    body["messages"] = [{"role": "user", "content": "Reply with exactly OK"}]
-    body["max_tokens"] = 16
+    # Passer par le MÊME constructeur de corps que le proxy : sans le prompt
+    # système officiel, le gate répond un faux FreeUsageLimitError même sur
+    # une IP fraîche.
+    raw = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "Reply with exactly OK"}],
+        "max_tokens": 16,
+        "stream": True,
+    }
+    body, _forced = oc._free_wire_body(raw, force_stream=True)
     ident = IpIdentity(
         "hunter",
         base_project="global",

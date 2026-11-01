@@ -1127,6 +1127,16 @@ class FreeIPPool:
             "buckets": self.quota_bucket_snapshot(40),
         }
 
+    def clear_quota_buckets(self, ip: str | None = None, model: str | None = None) -> int:
+        """Efface le ledger (tous, une IP ou un bucket modèle)."""
+        ledger = self._get_ledger()
+        if ledger is None:
+            return 0
+        try:
+            return int(ledger.clear(ip=ip, model=model))
+        except Exception:
+            return 0
+
     def _note_health_probe(self, station, ok: bool, *, cause: str | None = None) -> None:
         try:
             self._station_health.observe(

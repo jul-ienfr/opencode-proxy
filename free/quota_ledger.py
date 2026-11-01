@@ -502,6 +502,32 @@ class QuotaLedger:
                 self._items[(state.ip, state.day, state.bucket)] = state
             self._enforce_cap_locked()
 
+    def clear(self, ip: Any = None, model: str | None = None) -> int:
+        """Efface des buckets (tous, une IP, ou un bucket modèle).
+
+        Utile après une correction de corps : des 429 « faux quota » ont pu
+        marquer des IPs saines. Le prochain passage les re-teste.
+        """
+        with self._lock:
+            if ip is None and model is None:
+                count = len(self._items)
+                self._items.clear()
+            else:
+                key_ip = server_ip_key(ip) if ip is not None else None
+                key_bucket = bucket_for(model, self.bucket_mode) if model is not None else None
+                keys = [
+                    key
+                    for key in self._items
+                    if (key_ip is None or key[0] == key_ip)
+                    and (key_bucket is None or key[2] == key_bucket)
+                ]
+                count = len(keys)
+                for key in keys:
+                    self._items.pop(key, None)
+            self._dirty = True
+        self._maybe_save(force=True)
+        return count
+
 
 __all__ = [
     "BucketState",
