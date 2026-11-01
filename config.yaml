@@ -124,7 +124,9 @@ ip_rotation:
   country_rotation: false
   credentials_file: vpn_configs/credentials.txt
   custom_ovpn_file: ''
-  disabled_stations: []
+  disabled_stations:
+  - 5
+  - 6
   docker_autostart: true
   docker_autostart_cooldown_s: 600
   docker_compose_file: docker-compose.yml
@@ -188,11 +190,11 @@ ip_rotation:
     stream_metric: ttfb
     window: 20
   max_free_attempts: 6
-  max_inflight_per_model_ip: 2
+  max_inflight_per_model_ip: 8
   model_global_429_min_ips: 3
   model_global_429_window_s: 60
   model_global_cooldown_s: 60
-  model_slot_wait_s: 20
+  model_slot_wait_s: 3
   on_429_action: both
   ov_auth_backoff_max_s: 600
   ov_auth_backoff_s: 90
@@ -921,6 +923,14 @@ models:
   gemini-3.7-flash:
     protocol: gemini
   gemini-3.8-flash:
+    protocol: gemini
+  gemini-3-flash:
+    protocol: gemini
+  gemini-3-pro:
+    protocol: gemini
+  gemini-3.1-pro:
+    protocol: gemini
+  gemini-4-argon-contributor:
     protocol: gemini
 ip_registry:
   enabled: false
