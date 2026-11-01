@@ -381,6 +381,84 @@ pour chaque station dans needs:
 - Erreur de binder : cooldown de la station, pas de l’IP.
 - Limite globale : `max_test_concurrency = 2` (config).
 
+### 7.6 429 en cours d’utilisation (runtime)
+
+Une IP peut tomber en 429 **pendant qu’elle sert**, pas seulement pendant un
+test de présélection. Le plan l’enregistre explicitement et déclenche la
+rotation.
+
+#### Événement
+
+```json
+{
+  "event": "runtime_result",
+  "request_id": "req_...",
+  "station": 6,
+  "hostname": "al109.nordvpn.com",
+  "egress_ip": "87.120.102.53",
+  "observed_at": 1793530000.0,
+  "status": 429,
+  "retry_after_s": 54000,
+  "error_type": "FreeUsageLimitError",
+  "content_started": true
+}
+```
+
+#### Traitement transactionnel
+
+1. Insérer une ligne `observations` (append-only) avec :
+   - `egress_ip`, `hostname`, `station`
+   - `tested_at = observed_at`
+   - `status = 429`
+   - `retry_after_s`
+   - `reset_at = observed_at + Retry-After`
+   - `error = error_type`
+   - `attempt_id = request_id`.
+2. Mettre à jour `ip_state` :
+   - `state = exhausted`
+   - `last_status = 429`
+   - `last_tested_at = observed_at`
+   - `reset_at = max(reset_at_existant, observed_at + retry_after_s)`
+   - `assigned_station = NULL`, `assigned_at = NULL`
+   - `lease_id = NULL`, `lease_expires_at = NULL`.
+3. Fermer l’assignation courante dans `assignments` :
+   - `released_at = observed_at`
+   - `reason = "runtime_429"`
+   - `result = "429"`.
+4. Marquer la station `needs_ip` avec `reason = QUOTA_429` et déclencher
+   l’allocateur.
+5. Côté client :
+   - si le stream n’a pas commencé, le proxy peut rejouer sur une nouvelle IP ;
+   - si le stream a commencé, terminer avec une erreur honnête et laisser
+     l’allocateur trouver une nouvelle IP pour les requêtes suivantes.
+
+#### Idempotence
+
+- `request_id` unique : deux 429 concurrents pour la même IP mettent à jour la
+  même ligne `ip_state`, sans double libération.
+- `reset_at` est le **maximum** des observations : jamais de régression.
+- Si l’IP est déjà `exhausted`, on ajoute une observation et on étend
+  `reset_at` si nécessaire, sans recréer d’assignation.
+
+#### 429 quota vs 429 transitoire
+
+- `FreeUsageLimitError` (ou motif quota) → `exhausted`, exclusion jusqu’à
+  `reset_at`.
+- 429 « Endpoint unavailable » / surcharge → `error` + `error_until` court
+  (60–300 s), pas d’exclusion longue.
+- Un 429 sans `Retry-After` → `reset_at = prochain minuit UTC` (conservateur)
+  ou cooldown court selon le corps ; jamais `0`.
+
+#### Historique et dashboard
+
+- `observations` conserve **toutes** les chutes : IP, serveur, station, date,
+  `Retry-After`, `reset_at`.
+- `assignments` conserve la libération : `released_at`, `reason`, `result`.
+- Dashboard : liste des IP `exhausted`, compte à rebours, station précédente,
+  date de chute, nombre de 429.
+- Après `reset_at`, l’IP passe `candidate` avec un score neutre ; elle doit être
+  **retestée** avant d’être réassignée.
+
 ---
 
 ## 8. Binding serveur (critique)
@@ -556,6 +634,11 @@ station_ip_age_seconds{station}
 - Éligibilité : reset futur, cooldown, geo, assigned, claimed.
 - State machine : transitions autorisées/interdites.
 - Lease : expiration, concurrence, idempotence.
+- **Runtime 429** : observation créée, assignation fermée, `reset_at` posé,
+  station marquée `needs_ip`.
+- **Runtime 429 idempotent** : deux événements concurrents → une seule
+  libération, `reset_at = max`.
+- **429 transitoire** : cooldown court, pas d’état `exhausted`.
 
 ### Propriétés (property-based)
 
@@ -563,6 +646,8 @@ station_ip_age_seconds{station}
 - Jamais de test d’une IP avant `reset_at`.
 - Un `200` ne peut pas être libéré sans raison.
 - Le score reste dans [0, 100].
+- `reset_at` ne régresse jamais après un nouveau 429.
+- Toute IP `assigned` possède une ligne `assignments` ouverte.
 
 ### Intégration
 

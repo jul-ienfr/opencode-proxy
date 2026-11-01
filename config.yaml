@@ -920,11 +920,28 @@ models:
     protocol: gemini
   gemini-3.8-flash:
     protocol: gemini
-  gemini-3-flash:
-    protocol: gemini
-  gemini-3-pro:
-    protocol: gemini
-  gemini-3.1-pro:
-    protocol: gemini
-  gemini-4-argon-contributor:
-    protocol: gemini
+ip_registry:
+  enabled: false
+  db_path: logs/ip_registry.db
+  catalog_refresh_s: 21600
+  max_test_concurrency: 2
+  test_timeout_s: 60
+  lease_ttl_s: 300
+  retention_days: 7
+  score:
+    availability_weight: 0.55
+    latency_weight: 0.25
+    freshness_weight: 0.2
+    latency_budget_ms: 8000
+    freshness_ttl_h: 48
+    min_score: 20
+  eligibility:
+    error_cooldown_s: 1800
+  allocator:
+    mode: false
+    max_attempts_per_need: 20
+  binder:
+    mode: observe
+  preselect:
+    enabled: false
+    max_tests_per_hour: 60
