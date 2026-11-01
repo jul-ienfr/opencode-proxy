@@ -42,6 +42,14 @@ outcome ok=False station=1 ip=None host=None attempts=1 reason=bind_error:no-egr
 - La chaîne allocateur fonctionne de bout en bout ; il manque seulement un
   serveur/egress réellement vivant pour obtenir un `200`.
 
+## Correctif appliqué après le canary
+
+Un échec `bind_error` / `egress_mismatch` ne laisse plus le candidat en
+`candidate` : `release()` le passe en `ERROR` avec `error_until = now +
+error_cooldown_s` (30 min par défaut). Cela évite de retenter immédiatement un
+serveur mort à chaque passage de l’allocateur. Un `probe` ultérieur peut le
+remettre en jeu après le cooldown.
+
 ## Suite
 
 - Alimenter `ip_state` avec des candidats **dont l’hostname est connu** et

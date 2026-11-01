@@ -120,6 +120,23 @@ async def test_bind_failure_tries_next(registry):
     assert outcome.attempts == 2
 
 
+async def test_bind_failure_marks_error_cooldown(registry):
+    _seed(registry, "87.120.102.1", "a.nordvpn.com")
+    binder = FakeBinder({"a.nordvpn.com": "87.120.102.1"}, fail={"a.nordvpn.com"})
+    probe = FakeProbe([])
+    allocator = IpAllocator(
+        registry, binder, probe, model="m", max_attempts=1, clock=lambda: 1000.0
+    )
+
+    outcome = await allocator.allocate(StationNeed(6, NeedReason.NO_IP))
+
+    assert not outcome.ok
+    record = registry.get("87.120.102.1")
+    assert record.state is IpState.ERROR
+    assert record.error_until == 2800.0
+    assert registry.eligible(now=1000.0) == []
+
+
 async def test_egress_mismatch_rejects_candidate(registry):
     _seed(registry, "87.120.102.1", "a.nordvpn.com")
     binder = FakeBinder({"a.nordvpn.com": "87.120.102.1"}, mismatch=True)
@@ -131,7 +148,7 @@ async def test_egress_mismatch_rejects_candidate(registry):
     assert not outcome.ok
     assert outcome.attempts == 1
     record = registry.get("87.120.102.1")
-    assert record.state is IpState.CANDIDATE
+    assert record.state is IpState.ERROR
     assert probe.calls == []
 
 

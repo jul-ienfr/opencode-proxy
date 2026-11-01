@@ -419,15 +419,15 @@ class SqliteIpRegistry:
                     self._rollback()
                     return
                 record = self._record_from_row(row)
-                next_state = self._released_state(record, ts)
+                next_state, error_until = self._released_state(record, ts, reason)
                 self._conn.execute(
                     """
                     UPDATE ip_state SET
-                        state=?, assigned_station=NULL, assigned_at=NULL,
+                        state=?, error_until=?, assigned_station=NULL, assigned_at=NULL,
                         lease_id=NULL, lease_expires_at=NULL, updated_at=?
                     WHERE egress_ip=?
                     """,
-                    (next_state.value, ts, lease.egress_ip),
+                    (next_state.value, error_until, ts, lease.egress_ip),
                 )
                 self._conn.execute(
                     """
@@ -642,13 +642,22 @@ class SqliteIpRegistry:
             error_until=result.tested_at + self._error_cooldown_s,
         )
 
-    @staticmethod
-    def _released_state(record: IpRecord, now: float) -> IpState:
+    def _released_state(
+        self, record: IpRecord, now: float, reason: str
+    ) -> tuple[IpState, float | None]:
+        # A bind/egress failure proves nothing about the quota, but it does
+        # prove the server is not usable right now: short error cooldown,
+        # never an immediate retry of the same dead server.
+        if record.last_status is None and reason.startswith(("bind_", "egress_")):
+            until = record.error_until
+            if until is None or until <= now:
+                until = now + self._error_cooldown_s
+            return IpState.ERROR, until
         if record.last_status == 429 or (record.reset_at is not None and now < record.reset_at):
-            return IpState.EXHAUSTED
+            return IpState.EXHAUSTED, record.error_until
         if record.error_until is not None and now < record.error_until:
-            return IpState.ERROR
-        return IpState.CANDIDATE
+            return IpState.ERROR, record.error_until
+        return IpState.CANDIDATE, record.error_until
 
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> IpRecord:
