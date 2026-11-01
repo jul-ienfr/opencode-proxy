@@ -22540,6 +22540,52 @@ async def free_hunter_status():
     return hunter.status()
 
 
+@app.get("/api/free/chain")
+async def free_chain_status():
+    """Statut des chaînes d'IP fraîches (state, PID, progression)."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    logs = os.path.join(base, "logs")
+    total = 0
+    try:
+        with open(os.path.join(logs, "fresh_chain_candidates.json"), encoding="utf-8") as handle:
+            total = len(json.load(handle) or [])
+    except Exception:
+        total = 0
+    chains = []
+    for sid in (5, 6):
+        state = {}
+        try:
+            with open(os.path.join(logs, f"fresh_chain_state_{sid}.json"), encoding="utf-8") as handle:
+                state = json.load(handle) or {}
+        except Exception:
+            state = {}
+        pid = None
+        try:
+            with open(os.path.join(logs, f"fresh_chain_{sid}.lock"), encoding="utf-8") as handle:
+                pid = int((json.load(handle) or {}).get("pid") or 0) or None
+        except Exception:
+            pid = None
+        results = state.get("results") or []
+        chains.append(
+            {
+                "station": sid,
+                "index": int(state.get("index") or 0),
+                "total": total,
+                "winner": state.get("winner"),
+                "pid": pid,
+                "results": results[-5:],
+                "tested": len(results),
+            }
+        )
+    tail = []
+    try:
+        with open(os.path.join(logs, "fresh_chain_supervisor.log"), encoding="utf-8", errors="replace") as handle:
+            tail = [line.rstrip("\n") for line in handle.readlines()[-10:]]
+    except Exception:
+        tail = []
+    return {"chains": chains, "supervisor_log_tail": tail}
+
+
 @app.post("/api/free/hunter")
 async def free_hunter_toggle(request: Request):
     """Active/désactive le Fresh IP Hunter et persiste le choix."""
