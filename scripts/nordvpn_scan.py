@@ -22,6 +22,11 @@ Usage:
 
 A pass = every country once per station.  ``--passes 0`` loops until every
 station has a winner or the process is stopped (use for an exhaustive hunt).
+
+The count is only a search budget for stations that have **not** found a
+working IP yet: the first 200 freezes that station (sticky winner), and the
+scanner never recreates or re-pins it again.  The remaining attempts are
+not applied to a working station.
 """
 
 from __future__ import annotations
@@ -392,7 +397,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stations", default="1,2,3,4,5,6,7")
     parser.add_argument("--countries", default="")
-    parser.add_argument("--passes", type=int, default=1)
+    parser.add_argument(
+        "--passes",
+        type=int,
+        default=1,
+        help=(
+            "max full country passes per station; with one country this is the "
+            "max number of server draws. A station stops immediately on its "
+            "first 200 — the limit only applies to stations still searching."
+        ),
+    )
     parser.add_argument("--max-attempts", type=int, default=0)
     parser.add_argument("--proxy-url", default="http://127.0.0.1:4000")
     parser.add_argument("--recreate", action="store_true")
