@@ -19,8 +19,10 @@ import sys
 import time
 from pathlib import Path
 
+import requests
+
 ROOT = Path(__file__).resolve().parent.parent
-STATIONS = (5, 6)
+SPARES = (5, 6)
 INTERVAL_S = 60.0
 LOG = ROOT / "logs" / "fresh_chain_supervisor.log"
 
@@ -121,15 +123,107 @@ def _start_chain(station: int) -> None:
     log(f"station {station} chain started pid={proc.pid}")
 
 
+def _status() -> dict:
+    try:
+        return requests.get("http://127.0.0.1:4000/api/vpn-status", timeout=20).json()
+    except Exception:
+        return {}
+
+
+def _needs_chain(station: dict) -> bool:
+    """A station with a real quota/bad-IP failure should be rebound."""
+    if station.get("model_usable") and station.get("station_usable"):
+        return False
+    reason = str(station.get("model_usable_reason") or "")
+    nonrout = str(station.get("non_routable_reason") or "")
+    if reason in ("daily-bucket-exhausted", "bad-ip"):
+        return True
+    if nonrout.startswith(("quota=", "bad_until")):
+        return True
+    return False
+
+
+def _stop_chain(station: int) -> None:
+    path, pid = _lock_state(station)
+    if not pid or not _pid_alive(pid):
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F"],
+                capture_output=True,
+                timeout=20,
+            )
+        else:
+            os.kill(pid, 15)
+        log(f"station {station} chain stopped (station healthy)")
+    except Exception as exc:
+        log(f"station {station} chain stop failed: {type(exc).__name__}: {exc}")
+    try:
+        path.unlink()
+    except Exception:
+        pass
+
+
+def _set_env(key: str, value: str) -> None:
+    path = ROOT / ".env"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        lines = []
+    found = False
+    for index, line in enumerate(lines):
+        if line.strip().startswith(key + "="):
+            lines[index] = f"{key}={value}"
+            found = True
+            break
+    if not found:
+        lines.append(f"{key}={value}")
+    try:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="")
+    except Exception as exc:
+        log(f"env update {key} failed: {type(exc).__name__}: {exc}")
+
+
+def _persist_pin(station: int, winner: dict) -> None:
+    host = str(winner.get("host") or "").strip()
+    country = str(winner.get("country") or "").strip()
+    if not host:
+        return
+    _set_env(f"SERVER_HOSTNAMES_STATION{station}", host)
+    if country:
+        _set_env(f"SERVER_COUNTRIES_STATION{station}", country)
+    _enable_station(station)
+    log(f"station {station} pinned to {host} ({country}) egress={winner.get('ip')}")
+
+
 def main() -> None:
     log("supervisor started")
+    handled: set[int] = set()
     while True:
         try:
-            for station in STATIONS:
+            data = _status()
+            stations = {int(s.get("station") or 0): s for s in data.get("stations", [])}
+            broken = [
+                sid
+                for sid, station in stations.items()
+                if sid in (1, 2, 3, 4) and _needs_chain(station)
+            ]
+            wanted = broken if broken else list(SPARES)
+
+            # Stop chains that are no longer needed (recovered station/less
+            # urgent than an active repair).
+            for sid in list(stations):
+                if sid not in wanted:
+                    _stop_chain(sid)
+
+            for station in wanted:
+                if station in handled:
+                    continue
                 winner = _winner(station)
                 if winner:
-                    log(f"station {station} winner {winner.get('host')} egress={winner.get('ip')}")
-                    _enable_station(station)
+                    _persist_pin(station, winner)
+                    handled.add(station)
                     continue
                 path, pid = _lock_state(station)
                 if pid and _pid_alive(pid):

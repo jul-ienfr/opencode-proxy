@@ -22676,6 +22676,7 @@ async def free_quota_mark(request: Request):
         station_id = int((body or {}).get("station") or 0)
     except (TypeError, ValueError):
         station_id = 0
+    hostname = str((body or {}).get("hostname") or "").strip()
     pool = _free_ip_pool
     if pool is None or not hasattr(pool, "_get_ledger"):
         return JSONResponse(status_code=503, content={"error": "free pool unavailable"})
@@ -22735,6 +22736,12 @@ async def free_quota_mark(request: Request):
                 mgr._repairing = False
                 mgr._parked_until = 0.0
                 mgr._last_effective_ok_at = time.monotonic()
+                if hostname:
+                    # The chain rebound the station to a new hostname; the
+                    # manager must know it so the rotation guard and status
+                    # reflect the new pin.
+                    mgr._pinned_hostname = hostname
+                    mgr._current_host = hostname
             except Exception:
                 pass
             try:

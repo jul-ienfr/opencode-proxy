@@ -272,13 +272,23 @@ def _ledger_exhausted_ips(api_base: str) -> set[str]:
     return out
 
 
-def mark(api_base: str, ip: str, status: int, retry_after: float, station: int, model: str) -> None:
+def mark(
+    api_base: str,
+    ip: str,
+    status: int,
+    retry_after: float,
+    station: int,
+    model: str,
+    hostname: str = "",
+) -> None:
     body: dict[str, Any] = {
         "ip": ip,
         "model": model,
         "status": status,
         "station": station,
     }
+    if hostname:
+        body["hostname"] = hostname
     if status == 429:
         body["retry_after"] = retry_after
     try:
@@ -386,7 +396,7 @@ async def run(args) -> int:
         state["index"] = index + 1
         save_state(state_path, state)
         if result.status == 200:
-            mark(args.api_base, ip, 200, 0.0, args.station, args.model)
+            mark(args.api_base, ip, 200, 0.0, args.station, args.model, hostname=host)
             state["winner"] = {"host": host, "country": country, "ip": ip}
             save_state(state_path, state)
             log(f"WINNER station={args.station} host={host} egress={ip}")

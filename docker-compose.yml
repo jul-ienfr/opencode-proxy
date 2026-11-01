@@ -231,7 +231,7 @@ services:
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
       # choices" and silently break the rotation.
       # Source unique: config.yaml ip_rotation.server_countries (no inline fallback, audit F-H5).
-      - SERVER_COUNTRIES=${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES_STATION1:-${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}}
       # [2026-11-01] Serveur épinglé validé 200 dans le pool 87.120.102.x.
       # Le binder Compose peut écraser cette valeur par override.
       - SERVER_HOSTNAMES=${SERVER_HOSTNAMES_STATION1:-al41.nordvpn.com}
@@ -336,7 +336,7 @@ services:
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
       # choices" and silently break the rotation.
       # Source unique: config.yaml ip_rotation.server_countries (no inline fallback, audit F-H5).
-      - SERVER_COUNTRIES=${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES_STATION2:-${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}}
       - SERVER_HOSTNAMES=${SERVER_HOSTNAMES_STATION2:-al75.nordvpn.com}
       # [PC-8] pas de UPDATER_PERIOD : source unique = refresh applicatif.
       - HTTPPROXY=on
@@ -385,6 +385,7 @@ services:
     environment:
       <<: *gluetun-multi-env
       SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION3:-al74.nordvpn.com}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES_STATION3:-${SERVER_COUNTRIES}}
       VPN_TYPE: ${VPN_TYPE_STATION3:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION3:-${OPENVPN_PROTOCOL:-udp}}
       OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION3:-${OPENVPN_ENDPOINT_PORT:-}}
@@ -406,6 +407,7 @@ services:
     environment:
       <<: *gluetun-multi-env
       SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION4:-al36.nordvpn.com}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES_STATION4:-${SERVER_COUNTRIES}}
       VPN_TYPE: ${VPN_TYPE_STATION4:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION4:-${OPENVPN_PROTOCOL:-udp}}
       OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION4:-${OPENVPN_ENDPOINT_PORT:-}}
