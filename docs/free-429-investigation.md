@@ -342,3 +342,44 @@ La seule voie free est une **IP d'egress fraîche non-datacenter**. La seule
 voie garantie est un **compte payant/Go**. Continuer à rotationner NordVPN
 peut, statistiquement, finir par trouver une IP fraîche, mais ce n'est pas une
 correction : c'est un tirage lent dans un pool majoritairement brûlé.
+
+---
+
+## 12. Vérification finale (2026-11-01) — IP fraîche directe → 200
+
+L'IP directe **37.69.230.71** (AS15557 SFR, France, Saint-Julien-en-Genevois)
+a été testée avec le **corps officiel exact** (`free/official_payload.json`) :
+
+- `POST https://opencode.ai/inference/openai/v1/chat/completions` → **200**,
+  `text/event-stream`, premier chunk en ~1 s, `usage.prompt_tokens=11516` ;
+- le même corps via la jambe VPN (5 IPs / 3 ASN) → 429.
+
+Conclusion : le 429 était bien un **bucket IP datacenter épuisé**. Une IP
+résidentielle fraîche repasse 200 avec exactement le même corps, les mêmes
+headers, la même session et le même TLS.
+
+### Correctif proxy : mode direct = vrai direct
+
+Avant correctif, `proxy_mode: direct` laissait la jambe free passer par le
+pool VPN (station 1), ce qui renvoyait 429 puis un `502 empty stream` côté
+client. Trois causes corrigées dans `opencode.py` :
+
+1. `_open_free_stream` : en mode direct, **aucun** appel au pool ; le flux
+   part en curl_cffi direct (même face Bun/TLS que la jambe VPN).
+2. `_try_free_model_first` : en mode direct, `station=None` et l'egress est
+   `_free_direct_egress_ip()` (IP publique de la machine), pas l'IP d'une
+   station encore connectée.
+3. `_free_usage_ip`, `_free_cooldown_key` et `_save_and_log_request`
+   (stream) : l'IP du ledger et de la DB est celle de l'egress direct,
+   jamais celle d'une station VPN résiduelle.
+
+Résultat après redémarrage :
+
+| Requête | Statut | Egress | DB `free_model_ip` | `station` |
+|---|---|---|---|---|
+| non-stream `/v1/chat/completions` | **200** | direct | `37.69.230.71` | `NULL` |
+| stream `/v1/chat/completions` | **200** SSE | direct | `37.69.230.71` | `NULL` |
+
+Le préflight stream ne consulte plus le ledger VPN en mode direct, et le
+`502 Upstream produced no output` a disparu. `_do_free_direct_request`
+délègue désormais au sender curl_cffi officiel (plus de httpx).

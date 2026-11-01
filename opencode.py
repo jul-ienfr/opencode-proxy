@@ -9416,6 +9416,17 @@ async def _do_free_request_curl_cffi(
             )
         except Exception:
             _egress_ip = ""
+    if proxy_url is None:
+        # Mode direct : l'égress est l'IP publique de la machine, pas la
+        # station VPN encore connectée. Sans cela, l'identité (vault, wire,
+        # pool TLS) serait calibrée sur une IP qui ne reçoit pas la requête.
+        try:
+            if _free_proxy_mode() == "direct":
+                _direct_egress = await _free_direct_egress_ip()
+                if _direct_egress:
+                    _egress_ip = _direct_egress
+        except Exception:
+            pass
     _egress_ip = (_egress_ip or "").strip() or None
     req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _egress_ip)
     _ident_version = ""
@@ -9591,35 +9602,12 @@ async def _do_free_direct_request(endpoint, body: dict, headers: dict):
     REQUÊTE. Erreurs HTTP repassées telles quelles pour le mapping 403/429
     existant ; vide → UpstreamError 502 → repli paid).
     """
-    wire_body, _ = _free_wire_body(body, force_stream=True)
-    req_headers = dict(headers)
-    try:
-        async with _ensure_http_client().stream(
-            "POST", endpoint, content=_serialize_json_body(wire_body), headers=req_headers
-        ) as resp:
-            status = resp.status_code
-            if status != 200:
-                raw = await resp.aread()
-                return (
-                    httpx.Response(status, headers=dict(resp.headers), content=raw, request=resp.request),
-                    req_headers,
-                )
-            lines = [ln async for ln in resp.aiter_lines()]
-    except httpx.RequestError as e:
-        raise UpstreamError(f"Free direct request failed: {type(e).__name__}: {e}", status_code=502, original=e) from e
-    if "/responses" in (endpoint or ""):
-        data = _collect_responses_object(lines, wire_body.get("model", ""))
-    else:
-        data = _collect_chat_completion(lines, wire_body.get("model", ""), tools=body.get("tools"))
-    if not data:
-        raise UpstreamError("free direct: empty SSE collection", status_code=502)
-    out = httpx.Response(
-        200,
-        headers={"content-type": "application/json"},
-        content=_json_dumps(data),
-        request=httpx.Request("POST", endpoint, headers=req_headers),
-    )
-    return out, req_headers
+    # [2026-11-01] Le chemin direct doit utiliser le MÊME TLS Bun/curl_cffi
+    # que la jambe VPN. L'ancien httpx avait une empreinte différente et se
+    # faisait refuser par le gate free (puis 503 paid). On délègue au sender
+    # curl_cffi officiel, sans proxy.
+    resp = await _do_free_request_curl_cffi(body, headers, proxy_url=None, station=None, endpoint=endpoint)
+    return resp, dict(headers or {})
 
 
 class _CompactionTunnelDone(Exception):
@@ -11980,6 +11968,7 @@ async def _open_free_stream(
     if (
         use_free
         and forced_station is None
+        and _free_proxy_mode() != "direct"
         and _stream_hedge_enabled()
         and isinstance(body, dict)
         and body.get("stream")
@@ -12007,7 +11996,7 @@ async def _open_free_stream(
     _debug(
         f"  [free-stream] _open_free_stream called: use_free={use_free} pool={_free_ip_pool is not None} pool_enabled={_free_ip_pool.enabled if _free_ip_pool else False}"
     )
-    if use_free and _free_ip_pool and _free_ip_pool.enabled:
+    if use_free and _free_proxy_mode() != "direct" and _free_ip_pool and _free_ip_pool.enabled:
         _debug("  [free-stream] getting proxy from pool...")
         # [2026-10-29] Exclure les stations dont la clé (modèle, IP) est
         # trial-exhausted. Le pool ne connaît pas le modèle ; sans cet
@@ -12281,15 +12270,13 @@ async def _open_free_stream(
                 _debug(f"  [stream] curl_cffi proxy stream failed: {e}, falling back to direct stream")
                 _log(f"  FREE STREAM via VPN tunnel FAILED ({e}) → direct fallback (residential IP)")
     if use_free:
-        # Direct fallback to the free endpoint: never forward the paid key,
-        # cookies or SDK identifiers (invariant A.0), stamp the identity UA.
+        # Direct fallback to the free endpoint: same Bun/curl_cffi face as
+        # the VPN path. L'ancien httpx avait une empreinte différente et le
+        # gate free renvoyait un flux vide/403 (502 côté client).
         profile = _current_free_identity()
-        # Preserve the station that just failed (the tunnel branch above set
-        # it in the ContextVar before the accident): a disconnect retry must
-        # switch AWAY from it on_disconnect_retry, not re-strike the same IP.
         _prev_attempt = _current_free_attempt.get() or {}
         try:
-            _direct_ip = str(_free_usage_ip() or "")
+            _direct_ip = await _free_direct_egress_ip()
         except Exception:
             _direct_ip = ""
         _direct_inst = {}
@@ -12301,25 +12288,53 @@ async def _open_free_stream(
             _direct_inst = {}
         _current_free_attempt.set(
             {
-                "ip": _free_usage_ip(),
+                "ip": _direct_ip or _free_usage_ip(),
                 "identity": profile.get("impersonate") or "",
                 "station": _prev_attempt.get("station"),
                 "proxy_url": None,
                 "instance": _direct_inst,
             }
         )
-        # [gate 2026-09-17 + copie exacte 2026-09-18] Identité officielle
-        # (direct fallback httpx aussi — même face, sans TLS custom).
-        # [gate body 2026-09-18] grille tools sur le corps stream.
-        # Session par conversation quand le corps porte un chaînage.
-        # [per-IP vault] identité de l'IP résidentielle, pas le singleton.
         free_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _direct_ip or None)
+        _ident_version = str((_direct_inst or {}).get("version") or "")
+        _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version)
         wire_body, _ = _free_wire_body(body, force_stream=True, egress_ip=_direct_ip or None)
-        async with _ensure_http_client().stream(
-            "POST", endpoint, content=_serialize_json_body(wire_body), headers=free_headers
-        ) as resp:
-            _mark_actual_stream(use_free, body, resp)
-            yield resp
+        _dpool = None
+        _dslot = None
+        try:
+            _dpool, _dslot = await _get_pooled_curl_session(
+                None,
+                _free_impersonate,
+                _free_fp,
+                egress_ip=_direct_ip or None,
+                variant=f"free-{_ident_version}" if _ident_version else "",
+            )
+            _dresp = await _dslot.sess.post(
+                endpoint,
+                content=_serialize_json_body(wire_body),
+                headers=free_headers,
+                stream=True,
+            )
+        except BaseException:
+            if _dpool is not None and _dslot is not None:
+                _evict_later(_dpool, _dslot)
+            raise
+        await _dpool.checkin(_dslot)
+        _dwrapped = _CurlCffiStreamResponse(_dresp)
+        _dwrapped._free_ip = _direct_ip
+        _dwrapped._ttfb_ctx = (
+            None,
+            time.monotonic(),
+            str(body.get("model") or body.get("original_model") or ""),
+        )
+        _mark_actual_stream(use_free, body, _dwrapped)
+        try:
+            yield _dwrapped
+        finally:
+            try:
+                await _dresp.aclose()
+            except Exception:
+                pass
         return
     # [Axe A] Paid request with forced tunnel: route through VPN pool when
     # geo gate set _geo_force_tunnel=True (direct IP not in allowed set).
@@ -12612,6 +12627,48 @@ async def _get_direct_ip() -> str:
 _direct_ip_cache: dict[str, Any] = {"ip": "", "ts": 0.0}
 
 
+async def _free_direct_egress_ip() -> str:
+    """Egress IP of the direct (no-tunnel) free leg, cached.
+
+    En mode direct, c'est l'IP publique de la machine qui porte le quota
+    free ET l'identité par IP. Ne jamais renvoyer l'IP d'une station VPN
+    ici : le vault d'identités, le wire et le pool TLS doivent tous être
+    calibrés sur l'égress réel. Best-effort, ne lève jamais.
+    """
+    now = time.monotonic()
+    for _cache in (_direct_ip_cache, _direct_country_cache):
+        try:
+            _ip = str(_cache.get("ip") or "")
+            if _ip and now - float(_cache.get("ts") or 0.0) < 60:
+                return _ip
+        except Exception:
+            pass
+    _ip = ""
+    try:
+        # Sonde réseau seulement hors tests (hermétisme : aucune I/O réelle
+        # dans la suite). En prod, une sonde par fenêtre de cache suffit.
+        if not os.getenv("PYTEST_CURRENT_TEST"):
+            _ip = str(await _get_direct_ip() or "")
+    except Exception:
+        _ip = ""
+    if not _ip or _ip == "unknown":
+        try:
+            _pub = _public_ip_cache
+            if _pub.get("ip") and not _pub.get("via_tunnel"):
+                _ip = str(_pub["ip"])
+            else:
+                _ip = ""
+        except Exception:
+            _ip = ""
+    if _ip and _ip != "unknown":
+        try:
+            _direct_ip_cache.update(ip=_ip, ts=now)
+        except Exception:
+            pass
+        return _ip
+    return ""
+
+
 async def _direct_country() -> str:
     """Resolve the direct (non-tunnel) egress country, cached 10 min.
 
@@ -12705,6 +12762,17 @@ def _free_cooldown_key(free_model: str, station=None) -> str:
     key must stay stable.
     """
     vpn = station or (_free_ip_pool.active_station if _free_ip_pool else None) or _vpn_manager
+    if station is None and _free_proxy_mode() == "direct":
+        # Mode direct : la clé porte le bucket de l'IP réellement utilisée,
+        # jamais celui d'une station VPN encore connectée (sinon un 429 sur
+        # cette station bloque la jambe directe qui sort ailleurs).
+        try:
+            _direct_key_ip = str(
+                _direct_ip_cache.get("ip") or _direct_country_cache.get("ip") or ""
+            )
+        except Exception:
+            _direct_key_ip = ""
+        return f"{free_model}|{_direct_key_ip or 'direct'}"
     if vpn is not None and getattr(vpn, "pid", None):
         # [Axe 3.1] Static SOCKS5 proxy: no docker IP to key on — the
         # proxy's identity IS its host:port. Each proxy gets its own
@@ -13506,6 +13574,13 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
             return None
     except Exception:
         return None
+    # [2026-11-01] En mode direct, le ledger VPN ne doit pas bloquer le
+    # preflight : l'IP résidentielle/mobile a son propre bucket, hors pool.
+    try:
+        if _free_proxy_mode() == "direct":
+            return None
+    except Exception:
+        pass
     pool = _free_ip_pool
     if pool is None or not getattr(pool, "enabled", False):
         return None
@@ -13929,6 +14004,24 @@ def _free_usage_ip(station=None) -> str:
     from the last non-stream probe.
     """
     vpn = station or (_free_ip_pool.active_station if _free_ip_pool else None) or _vpn_manager
+    if station is None and _free_proxy_mode() == "direct":
+        # Mode direct : l'égress free est l'IP publique de la machine.
+        # Renvoyer l'IP d'une station encore connectée fausserait le ledger
+        # et le vault d'identités (bucket free différent de l'IP réelle).
+        for _cache in (_direct_ip_cache, _direct_country_cache):
+            try:
+                _ip = str(_cache.get("ip") or "")
+                if _ip and time.monotonic() - float(_cache.get("ts") or 0.0) < 600:
+                    return _ip
+            except Exception:
+                pass
+        try:
+            _pub = _public_ip_cache
+            if _pub.get("ip") and not _pub.get("via_tunnel"):
+                return str(_pub["ip"])
+        except Exception:
+            pass
+        return ""
     if vpn is not None and getattr(vpn, "pid", None):
         # [Axe 3.1] Static SOCKS5 proxy: no docker IP to report — its
         # host:port identity is the correct usage label.
@@ -14314,18 +14407,27 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     except Exception:
         pass
 
-    try:
-        station = _free_ip_pool._best_station(forced_pool) if _free_ip_pool else None
-    except TypeError:
-        station = _free_ip_pool._best_station() if _free_ip_pool else None
+    if _free_proxy_mode() == "direct":
+        # Mode direct : aucune station ne porte la requête. Sortir sur l'IP
+        # publique de la machine et ne jamais toucher au pool (sinon le 200
+        # vient d'une IP VPN qui n'est pas celle du mode choisi).
+        station = None
+    else:
+        try:
+            station = _free_ip_pool._best_station(forced_pool) if _free_ip_pool else None
+        except TypeError:
+            station = _free_ip_pool._best_station() if _free_ip_pool else None
 
     # Get current public IP for logging (VPN or direct)
     free_ip = ""
-    vpn = station or _vpn_manager
-    if vpn and vpn.current_ip:
-        free_ip = vpn.current_ip
+    if _free_proxy_mode() == "direct":
+        free_ip = await _free_direct_egress_ip()
     else:
-        free_ip = await _get_cached_public_ip()
+        vpn = station or _vpn_manager
+        if vpn and vpn.current_ip:
+            free_ip = vpn.current_ip
+        else:
+            free_ip = await _get_cached_public_ip()
 
     # Ensure VPN is connected if rotation is enabled; on_request returns
     # the BEST station (may differ from the pre-flight pick — e.g. the
@@ -14334,12 +14436,17 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     # winner-only compta (loser not counted).
     _hedge_pre = False
     try:
-        if _free_ip_pool and _free_ip_pool.enabled and _free_parallel_should_hedge(body, forced_pool):
+        if (
+            _free_proxy_mode() != "direct"
+            and _free_ip_pool
+            and _free_ip_pool.enabled
+            and _free_parallel_should_hedge(body, forced_pool)
+        ):
             _hedge_pre = True
             _debug("  [free] hedge pre-check true — skipping on_request")
     except Exception:
         _hedge_pre = False
-    if _free_ip_pool and _free_ip_pool.enabled and not _hedge_pre:
+    if _free_proxy_mode() != "direct" and _free_ip_pool and _free_ip_pool.enabled and not _hedge_pre:
         try:
             _, station = await _free_ip_pool.on_request(forced_pool, model=free_model)
         except TypeError:
@@ -14489,7 +14596,8 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         _hedge_cands = []
         try:
             if (
-                not free_body.get("stream")
+                _free_proxy_mode() != "direct"
+                and not free_body.get("stream")
                 and _free_ip_pool
                 and not getattr(_free_ip_pool, "socks5_mode", False)
                 and _free_parallel_should_hedge(free_body, forced_pool)
@@ -14566,7 +14674,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 # d'autres egress vivent (repli ci-dessous sinon — jamais de
                 # fail-closed inventé : au pire on retente comme avant).
                 attempt = station
-            elif _free_ip_pool:
+            elif _free_ip_pool and _free_proxy_mode() != "direct":
                 if getattr(_free_ip_pool, "socks5_mode", False):
                     # [Axe 3.1] Static list — next round-robin proxy NOT in
                     # ``tried`` (never re-strike the same proxy twice). The
@@ -19700,6 +19808,7 @@ async def messages(request: Request):
                     ttfb_ms=getattr(resp, "_ttfb_ms", None),
                     stop_reason=stop_reason,
                     aborted=_stream_truncated,
+                    free_model_ip=_free_done_ip or None,
                     station_override=getattr(_free_done_station, "_station", None),
                 )
 
@@ -24743,6 +24852,7 @@ async def chat_completions(request: Request):
                             ttfb_ms=getattr(resp, "_ttfb_ms", None),
                             stop_reason=_last_stop_reason,
                             aborted=_stream_truncated,
+                            free_model_ip=_free_done_ip or None,
                             station_override=getattr(_free_done_station, "_station", None),
                         )
                         _cb_record_stream_success(endpoint, final_in, final_out, used_tools)

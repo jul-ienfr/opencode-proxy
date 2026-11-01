@@ -214,7 +214,7 @@ ip_rotation:
     enabled: false
     max_attempts: 2
     max_tokens: 4
-  proxy_mode: vpn
+  proxy_mode: direct
   quality_preselection:
     enabled: true
     fast_tps: 55.0

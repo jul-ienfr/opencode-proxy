@@ -63,9 +63,9 @@ Hermétique : aucun réseau, logs/ redirigé vers tmp_path, curl_cffi faké.
 """
 
 import asyncio
-import json
 import re
 
+import httpx
 import pytest
 
 import opencode as oc
@@ -663,40 +663,85 @@ CHAT_SSE = [
 ]
 
 
-async def test_do_free_direct_request_collects(official_env, monkeypatch):
-    """Jambe directe : stream forcé + collecte → httpx.Response 200 JSON,
-    headers de requête renvoyés (contrat _do_request_with_retry)."""
-    fake = _FakeHttpxStreamClient(_FakeHttpxStreamResp(200, CHAT_SSE))
-    monkeypatch.setattr(oc, "_ensure_http_client", lambda: fake)
+async def test_do_free_direct_request_delegates(official_env, monkeypatch):
+    """Jambe directe : même sender Bun/curl_cffi que la jambe VPN, sans
+    proxy ni station (IP résidentielle). Contract _do_request_with_retry :
+    (resp, headers de requête)."""
+    seen = {}
+    url = "https://h/inference/v1/chat/completions"
+
+    async def _fake_curl(body, headers, proxy_url=None, station=None, endpoint=None):
+        seen.update(body=body, headers=headers, proxy_url=proxy_url, station=station, endpoint=endpoint)
+        req = httpx.Request("POST", endpoint or url)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "pong"}}]},
+            request=req,
+        )
+
+    monkeypatch.setattr(oc, "_do_free_request_curl_cffi", _fake_curl)
     body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     req_h = {"Authorization": "Bearer public"}
-    resp, resp_headers = await oc._do_free_direct_request("https://h/inference/v1/chat/completions", body, req_h)
+    resp, resp_headers = await oc._do_free_direct_request(url, body, req_h)
     assert resp.status_code == 200
     assert resp.json()["choices"][0]["message"]["content"] == "pong"
     assert resp_headers == req_h
-    # Corps wire : stream forcé + shim tools, entrée intacte
-    sent = fake.calls[0][2]
-
-    wire = json.loads(sent["content"].decode())
-    assert wire["stream"] is True
-    # [2026-10-30] gate re-mesuré : les 10 noms officiels sont exiges.
-    assert _chat_names(wire["tools"]) == OFFICIAL_TOOL_NAMES
-    assert "tools" not in body
+    assert seen["endpoint"] == url
+    assert seen["proxy_url"] is None
+    assert seen["station"] is None
+    assert seen["body"] is body
+    assert seen["headers"] == req_h
 
 
 async def test_do_free_direct_request_passthrough_error(official_env, monkeypatch):
     """Non-200 amont → repassé tel quel (mapping 403/429 aval inchangé)."""
-    fake = _FakeHttpxStreamClient(_FakeHttpxStreamResp(403, ['{"error": "x"}']))
-    monkeypatch.setattr(oc, "_ensure_http_client", lambda: fake)
-    resp, _rh = await oc._do_free_direct_request(
-        "https://h/inference/v1/chat/completions", {"model": "m", "messages": []}, {}
-    )
+    url = "https://h/inference/v1/chat/completions"
+
+    async def _fake_curl(body, headers, proxy_url=None, station=None, endpoint=None):
+        req = httpx.Request("POST", endpoint or url)
+        return httpx.Response(403, json={"error": "x"}, request=req)
+
+    monkeypatch.setattr(oc, "_do_free_request_curl_cffi", _fake_curl)
+    resp, _rh = await oc._do_free_direct_request(url, {"model": "m", "messages": []}, {})
     assert resp.status_code == 403
 
 
 async def test_do_free_direct_request_empty_raises(official_env, monkeypatch):
     """SSE vide → UpstreamError 502 (repli paid, comme avant)."""
-    fake = _FakeHttpxStreamClient(_FakeHttpxStreamResp(200, ["data: [DONE]"]))
-    monkeypatch.setattr(oc, "_ensure_http_client", lambda: fake)
+
+    class _EmptyResp:
+        status_code = 200
+        headers: dict = {}
+
+        async def aiter_lines(self):
+            yield "data: [DONE]"
+
+        async def aread(self):
+            return b"data: [DONE]"
+
+        async def aclose(self):
+            return None
+
+    class _EmptySlot:
+        def __init__(self):
+            self.sess = self
+
+        async def post(self, url, content=None, headers=None, timeout=None, **kwargs):
+            return _EmptyResp()
+
+    class _EmptyPool:
+        async def checkin(self, slot):
+            return None
+
+        async def evict(self, slot):
+            return None
+
+    async def _fake_factory(proxy_url, impersonate, fp_override=None, egress_ip=None, variant=""):
+        return _EmptyPool(), _EmptySlot()
+
+    monkeypatch.setattr(oc, "_get_pooled_curl_session", _fake_factory)
+    monkeypatch.setattr(oc, "_ensure_curl_cffi", lambda: True)
     with pytest.raises(oc.UpstreamError):
-        await oc._do_free_direct_request("https://h/inference/v1/chat/completions", {"model": "m", "messages": []}, {})
+        await oc._do_free_request_curl_cffi(
+            {"model": "m", "messages": []}, {}, endpoint="https://h/inference/v1/chat/completions"
+        )
