@@ -97,6 +97,38 @@ def pick_station(d: dict) -> dict | None:
 
 
 tried: dict[str, int] = {}
+
+
+def probe_station(st: dict, ip_override: str | None = None) -> bool:
+    """Teste réellement l'IP de la station. True seulement sur 2xx."""
+    ip = str(ip_override or st.get("current_ip") or "")
+    if not ip:
+        return False
+    if ip in tried:
+        log(f"ip {ip} already tested ({tried[ip]})")
+        return False
+    proxy = str((st.get("vpn") or {}).get("socks5_url") or "").replace("socks5://", "socks5h://")
+    if not proxy:
+        log(f"no socks url for station {st.get('station')}")
+        return False
+    log(f"probing {ip} via {proxy}")
+    try:
+        resp = probe(proxy)
+        status = int(resp.status_code)
+        tried[ip] = status
+        log(
+            f"{ip} -> {status} retry-after={resp.headers.get('retry-after')} "
+            f"body={(resp.text or '')[:180]!r}"
+        )
+        if 200 <= status < 300:
+            log(f"SUCCESS fresh ip {ip} — free is usable; hunter stops")
+            return True
+    except Exception as exc:
+        tried[ip] = -1
+        log(f"probe error on {ip}: {type(exc).__name__}: {exc}")
+    return False
+
+
 log("hunter started")
 for attempt in range(1, MAX_ATTEMPTS + 1):
     try:
@@ -106,11 +138,16 @@ for attempt in range(1, MAX_ATTEMPTS + 1):
         time.sleep(60)
         continue
 
-    fresh = [s for s in d.get("stations", []) if s.get("model_usable")]
+    fresh = [
+        s
+        for s in d.get("stations", [])
+        if s.get("model_usable") and s.get("station_usable") and s.get("current_ip")
+    ]
     if fresh:
-        ip = fresh[0].get("current_ip")
-        log(f"fresh bucket already available on station {fresh[0].get('station')} ip={ip} — stop")
-        sys.exit(0)
+        log(f"{len(fresh)} station(s) marked fresh by ledger — verifying real 200")
+        if any(probe_station(s) for s in fresh):
+            sys.exit(0)
+        log("fresh ledger entries were false positives (429) — continuing")
 
     cool = 0.0
     for s in d.get("stations", []):
@@ -148,27 +185,8 @@ for attempt in range(1, MAX_ATTEMPTS + 1):
         time.sleep(INTERVAL_S)
         continue
 
-    proxy = str((st.get("vpn") or {}).get("socks5_url") or "").replace("socks5://", "socks5h://")
-    if not proxy:
-        log(f"no socks url for station {sid}")
-        time.sleep(60)
-        continue
-
-    log(f"probing {ip} via {proxy}")
-    try:
-        resp = probe(proxy)
-        status = int(resp.status_code)
-        tried[ip] = status
-        log(
-            f"{ip} -> {status} retry-after={resp.headers.get('retry-after')} "
-            f"body={(resp.text or '')[:180]!r}"
-        )
-        if 200 <= status < 300:
-            log(f"SUCCESS fresh ip {ip} — free is usable; hunter stops")
-            sys.exit(0)
-    except Exception as exc:
-        tried[ip] = -1
-        log(f"probe error on {ip}: {type(exc).__name__}: {exc}")
+    if probe_station(st, ip):
+        sys.exit(0)
 
     time.sleep(INTERVAL_S)
 
