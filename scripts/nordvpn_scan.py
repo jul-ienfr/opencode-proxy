@@ -372,6 +372,30 @@ def _wait_egress(station: int, port: int, previous: str, timeout: float = 45.0) 
     return ip
 
 
+def _winner_valid(base: str, station: int, winner: dict) -> bool:
+    """True while the station still has the winning IP and a live tunnel."""
+    try:
+        data = requests.get(base + "/api/vpn-status", timeout=15).json()
+    except Exception:
+        return True  # transient API failure must not drop a valid winner
+    row = next(
+        (
+            st
+            for st in (data.get("stations") or [])
+            if int(st.get("station", -1)) == station
+        ),
+        None,
+    )
+    if row is None:
+        return False
+    cur_ip = str(row.get("current_ip") or "")
+    status = str(row.get("vpn_status") or "")
+    return bool(cur_ip) and cur_ip == winner.get("ip") and status in (
+        "connected",
+        "degraded",
+    )
+
+
 def _scan_station(
     base: str,
     station: int,
