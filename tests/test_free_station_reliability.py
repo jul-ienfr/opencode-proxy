@@ -79,10 +79,23 @@ def test_strict_health_rejects_auth_failed_and_stale_egress():
     assert pool.station_usable(st1) is False
     assert pool.model_usable("m", st1)[0] is False
     st1._auth_failed = False
-    st1._last_effective_ok_at = time.monotonic() - 120.0
+    st1._last_effective_ok_at = time.monotonic() - 600.0
     assert pool.station_usable(st1) is False
     # st2 reste sain.
     assert pool.station_usable(st2) is True
+
+
+def test_recent_health_probe_keeps_an_idle_station_fresh():
+    """Une sonde egress réussie vaut preuve: pas de faux `egress-stale`.
+
+    Le watchdog peut espacer ses ticks au-delà de l'ancien seuil de 60 s ;
+    sans `health.last_ok_at`, une station saine était rotationnée.
+    """
+    pool, st1, _ = _pool()
+    st1._last_effective_ok_at = time.monotonic() - 600.0
+    pool._station_health.observe(1, True, now=time.monotonic())
+    assert pool.station_usable(st1) is True
+    assert pool._max_effective_age_s >= 180.0
 
 
 def test_mark_station_ok_recovers_a_probing_station():

@@ -56,6 +56,11 @@ from free.station_health import SUSPECT, StationHealthRegistry, station_contract
 from station_repair import RepairPolicy
 from vpn.manager import RotationFailed, VPNManager, VPNState
 
+# The stale-egress window must exceed the watchdog cadence (20 s in config)
+# and its worst-case tick delay. A 60 s window produced false
+# "egress-stale" rotations on idle but healthy stations.
+_MIN_EFFECTIVE_AGE_S = 180.0
+
 
 def _station_is_up(station) -> bool:
     """[graceful-aurora] Routable = connected + degraded (duck-typé : les
@@ -486,7 +491,10 @@ class FreeIPPool:
         )
         self._strict_health = bool(_health_cfg.get("strict", False))
         self._shadow_selector = bool(_health_cfg.get("shadow", False))
-        self._max_effective_age_s = max(1.0, float(_health_cfg.get("max_effective_age_s", 60) or 60))
+        self._max_effective_age_s = max(
+            _MIN_EFFECTIVE_AGE_S,
+            float(_health_cfg.get("max_effective_age_s", 60) or 60),
+        )
         self._quota_enabled = bool(_quota_cfg.get("enabled", False))
         self._rotation_planner_enabled = bool(_rotation_cfg.get("enabled", False))
         self._spare_station = int(_rotation_cfg.get("spare_station", 0) or 0)
@@ -4603,7 +4611,8 @@ class FreeIPPool:
                 self._strict_health = bool(_health_cfg.get("strict", False))
                 self._shadow_selector = bool(_health_cfg.get("shadow", False))
                 self._max_effective_age_s = max(
-                    1.0, float(_health_cfg.get("max_effective_age_s", 60) or 60)
+                    _MIN_EFFECTIVE_AGE_S,
+                    float(_health_cfg.get("max_effective_age_s", 60) or 60),
                 )
                 self._quota_enabled = bool(_quota_cfg.get("enabled", False))
                 self._rotation_planner_enabled = bool(_rotation_cfg.get("enabled", False))

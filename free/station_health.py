@@ -380,6 +380,13 @@ def station_contract(
     if egress == "tunnel_down":
         return False, "egress=tunnel_down"
     last_ok = float(getattr(station, "_last_effective_ok_at", 0.0) or 0.0)
+    # A successful egress health probe is also real proof: the watchdog feeds
+    # ``health.last_ok_at`` through ``note_station_probe`` on every
+    # ``_probe_tunnel_light`` success. Without this, an idle station whose
+    # watchdog tick is delayed past ``max_effective_age_s`` is falsely marked
+    # ``egress-stale`` and rotated even though its tunnel answers.
+    if health is not None:
+        last_ok = max(last_ok, float(getattr(health, "last_ok_at", 0.0) or 0.0))
     if last_ok > 0.0 and max_effective_age_s > 0:
         age = ts - last_ok
         if age > max_effective_age_s:
