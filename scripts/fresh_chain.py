@@ -297,6 +297,92 @@ def mark(
         pass
 
 
+async def _run_claims(args, candidates, binder, probe, state_path, state) -> int:
+    """Parallel-safe chain: one shared catalog, exclusive hostname claims."""
+    from free.catalog_claims import CatalogClaims
+
+    claims = CatalogClaims(
+        args.claims_db,
+        rebind_limit_per_min=max(1, int(args.rebind_limit)),
+    )
+    try:
+        seeded = claims.seed(candidates)
+        log(
+            f"claims mode: catalog={seeded} db={args.claims_db} "
+            f"rebind_limit={args.rebind_limit}/min station={args.station}"
+        )
+        tested = 0
+        while True:
+            if args.max and tested >= args.max:
+                log(f"claims mode: max={args.max} reached")
+                return 2
+            claim = claims.claim_next(args.station)
+            if claim is None:
+                log("catalog exhausted or every candidate is claimed/reset")
+                return 2
+            host = str(claim["host"])
+            country = str(claim["country"])
+            tested += 1
+            while not claims.rebind_allowed():
+                await asyncio.sleep(2)
+            log(f"claim {host} ({country})")
+            _clean_station_container(args.station)
+            bind = await binder.assign(args.station, host, country=country)
+            if not bind.ok:
+                log(f"  bind rejected: {bind.error}")
+                claims.record(host, args.station, "bind_error", error=bind.error or "")
+                row = {"host": host, "country": country, "status": "bind-error", "error": bind.error}
+                state["results"] = (state.get("results") or [])[-499:] + [row]
+                save_state(state_path, state)
+                await asyncio.sleep(args.delay)
+                continue
+            ip = str(bind.egress_ip or "")
+            log(f"  egress {ip}")
+            if ip and ip in _active_egress_ips(args.api_base, args.station):
+                log("  egress already used by a serving station — release")
+                claims.record(host, args.station, "duplicate", ip=ip)
+                await asyncio.sleep(args.delay)
+                continue
+            result = await probe.probe(args.station, args.model)
+            log(f"  free status={result.status} ra={result.retry_after_s}")
+            row = {
+                "host": host,
+                "country": country,
+                "ip": ip,
+                "status": result.status,
+                "retry_after": result.retry_after_s,
+            }
+            state["results"] = (state.get("results") or [])[-499:] + [row]
+            if result.status == 200:
+                claims.record(host, args.station, "ok", ip=ip)
+                mark(args.api_base, ip, 200, 0.0, args.station, args.model, hostname=host)
+                state["winner"] = {"host": host, "country": country, "ip": ip}
+                save_state(state_path, state)
+                log(f"WINNER station={args.station} host={host} egress={ip}")
+                return 0
+            if result.status == 429:
+                claims.record(
+                    host,
+                    args.station,
+                    "429",
+                    ip=ip,
+                    retry_after=result.retry_after_s,
+                )
+                mark(args.api_base, ip, 429, result.retry_after_s, args.station, args.model)
+            else:
+                claims.record(
+                    host,
+                    args.station,
+                    "no_egress",
+                    ip=ip,
+                    error=str(result.status),
+                )
+            save_state(state_path, state)
+            await asyncio.sleep(args.delay)
+    finally:
+        claims.close()
+
+
 async def run(args) -> int:
     from free.ip_registry import ComposeHostnameBinder, StationEgress, StationProbe
 
@@ -340,6 +426,8 @@ async def run(args) -> int:
     openvpn_protocol = args.transport.split("-", 1)[1] if vpn_type else None
     exhausted = _ledger_exhausted_ips(args.api_base)
     tested = 0
+    if args.claims:
+        return await _run_claims(args, candidates, binder, probe, state_path, state)
     for index in range(start, len(candidates)):
         if args.max and tested >= args.max:
             break
@@ -427,6 +515,9 @@ def main() -> int:
     parser.add_argument("--candidates", default="")
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--claims", action="store_true")
+    parser.add_argument("--claims-db", default=str(ROOT / "logs" / "catalog_claims.db"))
+    parser.add_argument("--rebind-limit", type=int, default=8)
     args = parser.parse_args()
     return asyncio.run(run(args))
 

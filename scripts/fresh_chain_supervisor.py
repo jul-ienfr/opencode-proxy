@@ -163,6 +163,7 @@ def _start_chain(station: int) -> None:
             str(ROOT / "scripts" / "fresh_chain.py"),
             "--station",
             str(station),
+            "--claims",
             "--delay",
             "8",
         ],
