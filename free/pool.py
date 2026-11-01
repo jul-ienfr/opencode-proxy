@@ -3725,6 +3725,19 @@ class FreeIPPool:
                     )
                 except Exception:
                     pass
+                # [2026-11-01] A Compose-pinned station must not self-rotate:
+                # restarting the same server usually returns the same egress
+                # (three failed attempts, ~20 s each, delayed client requests).
+                # Fresh IPs are the job of `scripts/fresh_chain.py`, which
+                # changes the hostname instead of restarting the same one.
+                if getattr(station, "_pinned_hostname", None):
+                    logger.info(
+                        "[free-ip] station %s pinned to %s — quota rotation skipped "
+                        "(fresh-IP chain owns the rebind)",
+                        getattr(station, "_station", "?"),
+                        station._pinned_hostname,
+                    )
+                    return
                 self._launch_rotation(station, forced_pool=forced_pool)
         # [PLAN-corrections-429 G4] failover cascade : en routing=failover,
         # la sticky station reçoit TOUT le trafic — ≥3 429 consécutifs sur
