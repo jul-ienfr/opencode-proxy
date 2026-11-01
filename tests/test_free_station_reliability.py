@@ -85,6 +85,40 @@ def test_strict_health_rejects_auth_failed_and_stale_egress():
     assert pool.station_usable(st2) is True
 
 
+def test_suspect_station_remains_usable_but_ranked_degraded():
+    """Un probe raté (SUSPECT) ne doit pas faire tomber le pool à 1/7 :
+    la station reste servable en dernier recours, derrière les saines."""
+    pool, st1, st2 = _pool()
+    health = pool._station_health.get(1)
+    assert health is not None
+    health.observe_probe(False, now=time.monotonic())
+    assert pool.station_usable(st1) is True
+    assert pool.station_usable(st2) is True
+    assert pool.usable_station_count() == 2
+    assert pool._degraded_rank(st1) == 1
+    assert pool._degraded_rank(st2) == 0
+    assert pool._prefer_healthy([st1, st2]) == [st2]
+
+
+def test_usable_station_count_tracks_real_routability_only():
+    """Le gate de warmup doit voir 1 station dès qu'elle est routable, et 0
+    quand aucun tunnel ne l'est (auth failed / IP absente / down)."""
+    pool, st1, st2 = _pool()
+    assert pool.usable_station_count() == 2
+    assert pool.has_usable_station() is True
+
+    st1._auth_failed = True
+    assert pool.usable_station_count() == 1
+
+    st2._auth_failed = True
+    assert pool.usable_station_count() == 0
+    assert pool.has_usable_station() is False
+
+    st2._auth_failed = False
+    st2.status = "disconnected"
+    assert pool.has_usable_station() is False
+
+
 def test_capacity_snapshot_counts_usable_and_quota():
     pool, st1, st2 = _pool()
     cap = pool.capacity_snapshot()

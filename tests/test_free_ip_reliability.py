@@ -80,6 +80,16 @@ def test_three_distinct_ips_open_model_global_backoff(monkeypatch):
     assert pool.model_global_remaining("m") == 0
 
 
+def test_note_model_global_cooldown_honors_long_retry_and_never_shortens(monkeypatch):
+    pool = _pool(monkeypatch)
+    pool.note_model_global_cooldown("m", 7200)
+    rem = pool.model_global_remaining("m")
+    assert 7190 < rem <= 7200
+    # Un second 429 plus court ne doit jamais raccourcir le délai annoncé.
+    pool.note_model_global_cooldown("m", 10)
+    assert pool.model_global_remaining("m") > 7190
+
+
 def test_rotation_threshold_uses_model_profile(monkeypatch):
     pool = _pool(monkeypatch, profile={"deepseek-v4.1-flash-free": 150})
     st = _Station(sid=1)

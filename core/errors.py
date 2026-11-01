@@ -687,9 +687,10 @@ def parse_body_retry_seconds(body: object) -> float | None:
 def free_quota_scope(status: object, body: object) -> str:
     """Scope d'un 429 free : de QUEL quota parle le provider ?
 
-    * ``"trial-exhausted"`` — ``FreeUsageLimitError`` (trial anonyme per-IP
-      épuisé, message « Free usage limit reached... », MESURÉ en prod :
-      aucun reset temporel annoncé, le bucket ne revient pas tout seul) ;
+    * ``"trial-exhausted"`` — ``FreeUsageLimitError`` (bucket free par IP,
+      journalier : le ``Retry-After`` long pointe vers 00:00 UTC). Le nom
+      historique est conservé pour compatibilité ; le quota-ledger le traite
+      comme un bucket ``(IP, jour UTC)``, pas comme un quota de compte ;
     * ``"rate-limited"`` — limite de débit explicite ou autre motif quota
       (fenêtres rolling/weekly : un reset existe, durées applicables) ;
     * ``"transient"`` — 429 sans motif quota (surcharge amont) ;

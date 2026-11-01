@@ -45,6 +45,7 @@ OFFICIAL_TOOL_NAMES = [
     "task",
     "todowrite",
     "webfetch",
+    "websearch",
     "write",
 ]
 
@@ -180,12 +181,12 @@ def test_summary_request_caps_output_and_truncates_input():
 
 
 def test_hermes_gets_official_grid_plus_core_client_tools():
-    """Hermes n'a aucun nom officiel : on injecte les 10 + 9 outils client.
+    """Hermes n'a aucun nom officiel : on injecte les 11 + 9 outils client.
 
     Mesure 2026-10-30 : `read` + 18 outils Hermes -> faux quota ; grille
-    officielle + 9 outils client -> 200 ; 10 + 18 -> faux quota. On garde les
-    9 outils client les plus utiles (terminal, read_file, write_file, patch,
-    search_files, execute_code, delegate_task, web_search, skill_view).
+    officielle + 9 outils client -> 200 ; grille + 18 -> faux quota. On garde
+    les 9 outils client les plus utiles (terminal, read_file, write_file,
+    patch, search_files, execute_code, delegate_task, web_search, skill_view).
     """
     body = _body()
     body["tools"] = [
@@ -206,8 +207,8 @@ def test_hermes_gets_official_grid_plus_core_client_tools():
     ]
     wire, _ = oc._free_wire_body(body, force_stream=True)
     names = [t["function"]["name"] for t in wire["tools"]]
-    assert names[:10] == OFFICIAL_TOOL_NAMES
-    assert len(names) == 19
+    assert names[:11] == OFFICIAL_TOOL_NAMES
+    assert len(names) == 20
     for core in (
         "terminal",
         "read_file",

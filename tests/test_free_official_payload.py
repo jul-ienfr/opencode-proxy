@@ -1,8 +1,9 @@
 """Verrouille la copie exacte du client officiel (gate gratuit durci).
 
-Contexte mesuré le 2026-10-25 : depuis le 2026-10-23T23:17:27Z, le gate
-gratuit exige la signature COMPLÈTE du client (10 tools + prompt système).
-Un corps réduit est refusé 403 (``FreeTierError``) ou 429.
+Contexte mesuré le 2026-11-01 sur les clients 1.18.31 / 1.19.0 / 1.19.3 /
+1.19.5 : le gate gratuit exige la signature COMPLÈTE du client (11 tools,
+`websearch` inclus, + prompt système). Un corps réduit est refusé 403
+(``FreeTierError``) ou 429.
 
 Ces tests empêchent une future « optimisation » de re-minimiser le payload
 et de re-casser silencieusement toute la jambe free.
@@ -22,6 +23,7 @@ OFFICIAL_TOOL_NAMES = [
     "task",
     "todowrite",
     "webfetch",
+    "websearch",
     "write",
 ]
 
@@ -206,7 +208,7 @@ def test_l_ordre_des_cles_reste_celui_du_client():
     body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     wire, _ = oc._free_wire_body(body, force_stream=True)
     cles = [k for k in wire if k in ("model", "max_tokens", "messages", "tools", "tool_choice", "stream")]
-    assert cles == ["model", "messages", "tools", "tool_choice", "stream"]
+    assert cles == ["model", "max_tokens", "messages", "tools", "tool_choice", "stream"]
 
 
 def test_le_payload_est_serialisable_et_stable():

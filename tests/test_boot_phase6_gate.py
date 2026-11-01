@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -37,11 +38,15 @@ def _restore_boot_state():
     saved = dict(oc.BOOT_OPTS)
     saved_fanout = getattr(shared_state, "boot_fanout_task", None)
     saved_docker = getattr(shared_state, "docker_ready", None)
+    saved_pool = getattr(shared_state, "free_ip_pool", None)
+    saved_managers = list(getattr(shared_state, "vpn_managers", None) or [])
     yield
     oc.BOOT_OPTS.clear()
     oc.BOOT_OPTS.update(saved)
     shared_state.boot_fanout_task = saved_fanout
     shared_state.docker_ready = saved_docker
+    shared_state.free_ip_pool = saved_pool
+    shared_state.vpn_managers = saved_managers
 
 
 class _PendingTask:
@@ -235,6 +240,61 @@ def test_gate_fails_open_on_broken_state(monkeypatch):
     assert oc._vpn_warmup_gate_active() is False
 
 
+def test_gate_inactive_when_a_station_is_already_routable(monkeypatch):
+    """Cause racine du 503 du 2026-11-01 : le fan-out n'était pas fini alors
+    que plusieurs stations étaient déjà ``connected`` avec une IP. Une seule
+    station routable suffit : le gate doit être inerte."""
+    _arm_warmup(monkeypatch, pool=_PoolCounter([1]))
+    assert oc._vpn_warmup_gate_active() is False
+
+
+def test_gate_waits_for_first_usable_tunnel_then_forwards(monkeypatch):
+    """Une requête free arrivée trop tôt attend le premier tunnel au lieu
+    d'être tuée par un 503 immédiat (le client ne retente pas)."""
+    import time as _t
+
+    _arm_warmup(monkeypatch, wait_s=2.0, pool=_PoolAfterDelay(0.35))
+    body = json.dumps({"model": "deepseek-v4-flash-free"}).encode()
+    started = _t.monotonic()
+    status, headers, inner = _run_gate(body)
+    elapsed = _t.monotonic() - started
+    assert status == 200, status
+    assert headers.get("retry-after") is None
+    assert inner.called is True
+    assert inner.body == body, "le corps doit être rejoué intact après l'attente"
+    assert elapsed >= oc._VPN_GATE_POLL_S * 0.5, f"attente trop courte: {elapsed:.3f}s"
+
+
+def test_gate_still_returns_503_after_wait_timeout(monkeypatch):
+    """Aucun tunnel dans le budget : le 503 explicite reste le dernier recours."""
+    import time as _t
+
+    _arm_warmup(monkeypatch, wait_s=0.3, pool=_PoolCounter([0]))
+    body = json.dumps({"model": "deepseek-v4-flash-free"}).encode()
+    started = _t.monotonic()
+    status, headers, inner = _run_gate(body)
+    elapsed = _t.monotonic() - started
+    assert status == 503
+    assert headers["retry-after"] == str(oc._VPN_GATE_RETRY_AFTER)
+    assert inner.called is False
+    assert elapsed >= 0.25, f"le budget d'attente n'a pas été respecté: {elapsed:.3f}s"
+
+
+def test_gate_skips_wait_when_docker_is_known_down(monkeypatch):
+    """Docker explicitement indisponible : attendre ne sert à rien."""
+    import time as _t
+
+    _arm_warmup(monkeypatch, wait_s=5.0, pool=_PoolCounter([0]))
+    shared_state.docker_ready = False
+    body = json.dumps({"model": "deepseek-v4-flash-free"}).encode()
+    started = _t.monotonic()
+    status, _headers, inner = _run_gate(body)
+    elapsed = _t.monotonic() - started
+    assert status == 503
+    assert inner.called is False
+    assert elapsed < 1.0, f"attente inutile alors que Docker est down: {elapsed:.3f}s"
+
+
 def test_free_model_detection():
     assert oc._is_free_model_route("deepseek-v4-flash-free") is True
     assert oc._is_free_model_route("claude-opus-4") is False
@@ -256,6 +316,14 @@ def test_gate_payload_matches_protocol():
     openai = oc._vpn_gate_payload("/v1/chat/completions", 5)
     assert "type" not in openai, "format OpenAI : pas d'enveloppe Anthropic"
     assert openai["error"]["code"] == "vpn_warming"
+
+
+def test_gate_payload_is_actionable_when_docker_is_down(monkeypatch):
+    """Docker down n'est pas un simple warmup : le message doit le dire."""
+    shared_state.docker_ready = False
+    payload = oc._vpn_gate_payload("/v1/chat/completions", 5)
+    assert "Docker" in payload["error"]["message"]
+    assert payload["error"]["code"] == "vpn_warming"
 
 
 class _CapturingApp:
@@ -312,10 +380,45 @@ def _run_gate(body: bytes, path: str = "/v1/messages") -> tuple[int, dict, _Capt
     return start["status"], headers, inner
 
 
-def _arm_warmup(monkeypatch):
+class _PoolCounter:
+    """Pool factice : nombre de stations routables piloté par le test."""
+
+    def __init__(self, values):
+        self.values = list(values)
+        self.calls = 0
+
+    def usable_station_count(self) -> int:
+        self.calls += 1
+        if not self.values:
+            return 0
+        if len(self.values) == 1:
+            return self.values[0]
+        return self.values.pop(0)
+
+
+class _PoolAfterDelay:
+    """Pool factice qui devient routable après un délai (temps réel)."""
+
+    def __init__(self, delay_s: float):
+        self._ready_at = time.monotonic() + max(0.0, delay_s)
+
+    def usable_station_count(self) -> int:
+        return 1 if time.monotonic() >= self._ready_at else 0
+
+
+def _arm_warmup(monkeypatch, *, wait_s: float = 0.0, pool=None):
+    """Arme le warmup avec les anciens réglages par défaut (rejet immédiat).
+
+    Les tests historiques attendent un 503 immédiat : ``boot_gate_wait_s=0``
+    restaure exactement ce contrat. Les tests de la nouvelle attente passent
+    explicitement ``wait_s``.
+    """
     shared_state.boot_fanout_task = _PendingTask()
     oc.BOOT_OPTS["no_vpn"] = False
     monkeypatch.setitem(oc.IP_ROTATION, "enabled", True)
+    monkeypatch.setitem(oc.IP_ROTATION, "boot_gate_wait_s", wait_s)
+    monkeypatch.setattr(shared_state, "free_ip_pool", pool, raising=False)
+    monkeypatch.setattr(shared_state, "vpn_managers", [], raising=False)
 
 
 def test_gate_returns_503_with_retry_after(monkeypatch):

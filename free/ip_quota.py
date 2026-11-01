@@ -1,5 +1,10 @@
 """Lease IP/quota par modèle — source de vérité pour la sélection free.
 
+[quota-ledger 2026-11-01] Le quota **serveur** réel est un bucket
+``(IP, jour UTC)``, partagé par les modèles « default » (voir
+``free/quota_ledger.py``). Ce registre reste la couche qualité/headroom
+estimé ; le ledger est la couche autoritaire de l'exhaustion journalière.
+
 Le quota est une propriété de ``(modèle, IP)``, pas de la station : une IP
 excellente pour DeepSeek peut être épuisée pour GLM. Ce module maintient un
 lease borné par couple et expose un contrat simple au pool :

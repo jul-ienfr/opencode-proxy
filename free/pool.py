@@ -26,6 +26,12 @@ instances, donc le shim partage tout sans divergence). ``free_ip_pool.py``
 reste un shim de re-export jusqu'à la Phase 9 ; le nouveau code importe
 ``free.pool``. ``vpn_manager`` déplacé au chantier 3 (``vpn.manager``) :
 les imports ci-dessous suivent le domicile canonique.
+
+[quota-ledger 2026-11-01] Le quota **serveur** free est un bucket
+``(IP, jour UTC)``, partagé par les modèles « default » (cf.
+``free/quota_ledger.py``). Le lease ``(modèle, IP)`` de ``free.ip_quota``
+reste la couche qualité/headroom estimé ; le ledger est la couche
+autoritaire « cette IP a-t-elle déjà été 429 aujourd'hui ? ».
 """
 
 import asyncio
@@ -43,9 +49,10 @@ from typing import Any, cast
 
 from free.best_ip import BestIpSelector
 from free.ip_quota import IpQuotaRegistry, QuotaProfile
+from free.quota_ledger import QuotaLedger, bucket_for
 from free.reliability_canary import CanaryConfig, CanaryRouter
 from free.rotation_planner import RotationPlanner
-from free.station_health import StationHealthRegistry, station_contract
+from free.station_health import SUSPECT, StationHealthRegistry, station_contract
 from station_repair import RepairPolicy
 from vpn.manager import RotationFailed, VPNManager, VPNState
 
@@ -489,6 +496,27 @@ class FreeIPPool:
         self._station_health = StationHealthRegistry()
         self._quota_profile = QuotaProfile.from_config(_rel_cfg)
         self._quota = IpQuotaRegistry(self._quota_profile)
+        # [quota-ledger 2026-11-01] Bucket serveur (IP, jour UTC, bucket) :
+        # le quota free est journalier et partagé par les modèles « default ».
+        # Le lease ci-dessus reste la couche qualité/latence ; le ledger est la
+        # couche autoritaire « cette IP a-t-elle déjà été 429 aujourd'hui ? ».
+        self._ledger: QuotaLedger | None = None
+        self._ledger_enabled = bool(_quota_cfg.get("ledger_enabled", True))
+        if self._ledger_enabled:
+            try:
+                self._ledger = QuotaLedger(
+                    bucket_mode=str(_quota_cfg.get("ledger_bucket_mode", "default") or "default"),
+                    daily_limit=max(0, int(_quota_cfg.get("ledger_daily_limit", 0) or 0)),
+                    reserve_pct=max(
+                        0.0,
+                        min(
+                            0.9,
+                            float(_quota_cfg.get("quota_reserve_pct", 10) or 10) / 100.0,
+                        ),
+                    ),
+                )
+            except Exception:
+                self._ledger = None
         self._best_ip = BestIpSelector(
             self._quota,
             self._station_health,
@@ -800,6 +828,9 @@ class FreeIPPool:
         """Contrat public ``model_usable(model, station)``."""
         if not self.station_usable(station, model=None, now=now):
             return False, "station-unusable"
+        _lok, _lwhy = self._ledger_usable(model, station)
+        if not _lok:
+            return False, _lwhy
         if not getattr(self, "_quota_enabled", False):
             return True, None
         return self._quota.model_usable(
@@ -808,6 +839,37 @@ class FreeIPPool:
             now=now,
             allow_draining=allow_draining,
         )
+
+    def usable_station_count(self, *, model: str | None = None) -> int:
+        """Nombre de stations réellement routables MAINTENANT.
+
+        Même filtre que la sélection (``_station_usable``) : c'est la seule
+        réponse honnête à « puis-je servir un free tout de suite ? ». Utilisé
+        par le gate de warmup : tant qu'au moins une station est routable, une
+        requête free ne doit JAMAIS être rejetée en 503 — même si les autres
+        stations finissent encore leur boot.
+
+        Lecture seule ; ``model=None`` ignore le quota par modèle (on veut
+        savoir s'il existe un tunnel utilisable, pas si CE modèle a du quota).
+        """
+        count = 0
+        for station in list(getattr(self, "_stations", None) or []):
+            try:
+                if self._station_usable(station, exclude_approaching=False, model=model):
+                    count += 1
+            except Exception:
+                continue
+        return count
+
+    def has_usable_station(self, *, model: str | None = None) -> bool:
+        """Raccourci booléen de ``usable_station_count`` (sortie anticipée)."""
+        for station in list(getattr(self, "_stations", None) or []):
+            try:
+                if self._station_usable(station, exclude_approaching=False, model=model):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def capacity_snapshot(self) -> dict:
         """Vue capacité légère pour ``/health`` (sans get_status lourd)."""
@@ -883,6 +945,188 @@ class FreeIPPool:
         except Exception:
             return None
 
+    # ── quota ledger (bucket serveur IP × jour UTC) ───────────────────────
+
+    def _ledger_ip(self, station, ip: str | None = None) -> str:
+        try:
+            raw = str(ip or getattr(station, "current_ip", "") or "").strip()
+        except Exception:
+            raw = str(ip or "").strip()
+        if not raw:
+            try:
+                raw = str((self._per_station(station) or {}).get("last_confirmed_ip") or "").strip()
+            except Exception:
+                raw = ""
+        return raw
+
+    def _get_ledger(self):
+        """Ledger de l'instance ; ``__new__`` (doubles/tests) → ledger mémoire."""
+        ledger = getattr(self, "_ledger", None)
+        if ledger is not None:
+            return ledger
+        if hasattr(self, "_ledger"):
+            return None
+        try:
+            self._ledger = QuotaLedger(persist=False)
+            self._ledger_enabled = True
+        except Exception:
+            self._ledger = None
+            self._ledger_enabled = False
+        return self._ledger
+
+    def _ledger_usable(self, model: str | None, station, *, ip: str | None = None) -> tuple[bool, str | None]:
+        """Le bucket journalier de cette IP est-il encore utilisable ?
+
+        Fail-open : une erreur du ledger ne doit jamais couper la jambe free.
+        """
+        ledger = self._get_ledger()
+        if not model or ledger is None or not getattr(self, "_ledger_enabled", False):
+            return True, None
+        raw = self._ledger_ip(station, ip)
+        if not raw or raw == "unknown":
+            return True, None
+        try:
+            return ledger.usable(raw, model)
+        except Exception:
+            return True, None
+
+    def _ledger_note_request(self, model: str | None, station, *, ip: str | None = None) -> None:
+        ledger = self._get_ledger()
+        if not model or ledger is None or not getattr(self, "_ledger_enabled", False):
+            return
+        raw = self._ledger_ip(station, ip)
+        if not raw or raw == "unknown":
+            return
+        try:
+            ledger.note_request(raw, model)
+        except Exception:
+            pass
+
+    def _ledger_note_result(
+        self,
+        model: str | None,
+        station,
+        status: int | None,
+        *,
+        ip: str | None = None,
+        body=None,
+        error_type: str = "",
+        retry_after: float | None = None,
+    ) -> None:
+        ledger = self._get_ledger()
+        if not model or ledger is None or not getattr(self, "_ledger_enabled", False):
+            return
+        raw = self._ledger_ip(station, ip)
+        if not raw or raw == "unknown":
+            return
+        err = str(error_type or "")
+        if not err and body:
+            try:
+                from core.errors import free_quota_scope
+
+                scope = free_quota_scope(status, body)
+                if scope == "trial-exhausted":
+                    err = "FreeUsageLimitError"
+                elif scope == "rate-limited":
+                    err = "RateLimitError"
+                elif scope == "transient":
+                    err = "Transient429"
+            except Exception:
+                pass
+        ra = retry_after
+        if ra is None and body:
+            try:
+                from core.errors import parse_body_retry_seconds
+
+                ra = parse_body_retry_seconds(body)
+            except Exception:
+                ra = None
+        try:
+            ledger.note_result(
+                raw,
+                model,
+                status,
+                error_type=err,
+                retry_after=ra,
+                body=body,
+            )
+        except Exception:
+            pass
+
+    def quota_bucket_snapshot(self, limit: int = 80) -> list[dict[str, Any]]:
+        ledger = self._get_ledger()
+        if ledger is None:
+            return []
+        try:
+            return ledger.snapshot(limit)
+        except Exception:
+            return []
+
+    def quota_bucket_reset(self, model: str | None = None) -> float | None:
+        """Prochain reset du bucket journalier (timestamp Unix), ou None."""
+        ledger = self._get_ledger()
+        if ledger is None:
+            return None
+        try:
+            bucket = bucket_for(model, getattr(ledger, "bucket_mode", "default"))
+            return ledger.earliest_reset(bucket=bucket)
+        except Exception:
+            return None
+
+    def quota_bucket_exhausted(self, model: str | None = None) -> bool:
+        try:
+            return self.quota_bucket_reset(model) is not None
+        except Exception:
+            return False
+
+    def model_bucket_usable(self, model: str | None, station, *, ip: str | None = None) -> bool:
+        """Le bucket journalier de cette IP autorise-t-il encore ce modèle ?"""
+        try:
+            ok, _ = self._ledger_usable(model, station, ip=ip)
+            return bool(ok)
+        except Exception:
+            return True
+
+    def all_usable_buckets_exhausted(self, model: str | None) -> bool:
+        """Toutes les stations tunnel-usable ont-elles un bucket épuisé ?
+
+        Sert au gate de warmup : inutile d'attendre 45 s un tunnel si le
+        bucket journalier de toutes les IPs déjà routables est épuisé. Une
+        rotation en vol peut certes apporter une IP fraîche, mais elle sera
+        essayée à la requête suivante ; on ne bloque pas celle-ci.
+        """
+        if not model or self._get_ledger() is None:
+            return False
+        try:
+            stations = [
+                st
+                for st in (getattr(self, "_stations", None) or [])
+                if self._station_usable(st, exclude_approaching=False, model=None)
+            ]
+        except Exception:
+            return False
+        if not stations:
+            return False
+        for st in stations:
+            try:
+                if self._ledger_usable(model, st)[0]:
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def quota_bucket_status(self, model: str | None = None) -> dict[str, Any]:
+        ts = self.quota_bucket_reset(model)
+        return {
+            "enabled": bool(getattr(self, "_ledger_enabled", False)) and getattr(self, "_ledger", None) is not None,
+            "exhausted": ts is not None,
+            "earliest_reset_at": ts,
+            "earliest_reset_iso": (
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)) if ts else None
+            ),
+            "buckets": self.quota_bucket_snapshot(40),
+        }
+
     def _note_health_probe(self, station, ok: bool, *, cause: str | None = None) -> None:
         try:
             self._station_health.observe(
@@ -941,6 +1185,7 @@ class FreeIPPool:
             self._quota.note_request(model, station)
         except Exception:
             pass
+        self._ledger_note_request(model, station)
 
     def _rotation_threshold(self, station: VPNManager, model: str | None = None) -> int:
         """Quota-per-IP at which a station should rotate (C3).
@@ -1229,7 +1474,17 @@ class FreeIPPool:
                 st["_test_now"] = float(now)
             return st
 
-    def note_model_ip(self, model: str, station, status: int | None, *, ip: str | None = None) -> None:
+    def note_model_ip(
+        self,
+        model: str,
+        station,
+        status: int | None,
+        *,
+        ip: str | None = None,
+        body=None,
+        error_type: str = "",
+        retry_after: float | None = None,
+    ) -> None:
         """Enregistre un résultat réel pour un couple (modèle, IP).
 
         Règles P0 :
@@ -1237,10 +1492,23 @@ class FreeIPPool:
         * 429 avec 0 succès : mauvaise IP → quarantaine longue (``bad_ip_ttl_s``).
         * 429 après des succès : quota IP → blocage court, la station doit
           tourner ; l'IP ne sera pas rejouée avant ``quota_ip_block_s``.
+
+        [quota-ledger 2026-11-01] Le résultat alimente aussi le bucket
+        journalier ``(IP, jour UTC)`` : un ``FreeUsageLimitError`` bloque
+        l'IP jusqu'à son reset, un 429 transitoire ne la bloque pas.
         """
         mid = str(model or "").strip().lower()
         if not mid or station is None:
             return
+        self._ledger_note_result(
+            mid,
+            station,
+            status,
+            ip=ip,
+            body=body,
+            error_type=error_type,
+            retry_after=retry_after,
+        )
         try:
             now = time.monotonic()
             st = self._model_ip_state(mid, station, ip, now=now)
@@ -1328,6 +1596,35 @@ class FreeIPPool:
 
     def model_ip_bad(self, model: str, station, *, ip: str | None = None) -> bool:
         return self.model_ip_block_remaining(model, station, ip=ip) > 0.0
+
+    def note_model_global_cooldown(self, model: str, seconds: float) -> None:
+        """Pose/étend un cooldown global pour un modèle.
+
+        [fix 2026-11-01] Un `FreeUsageLimitError` upstream porte souvent un
+        `Retry-After` long (heures). L'ancien backoff global ne retenait que
+        60 s : le proxy relançait des rotations/AUTH toutes les minutes alors
+        que l'amont avait explicitement dit « quota épuisé ». On honore le
+        délai annoncé (borné 24 h) pour arrêter le churn, comme le client
+        officiel qui affiche le refus sans tourner en boucle.
+        """
+        mid = str(model or "").strip().lower()
+        if not mid:
+            return
+        try:
+            sec = max(0.0, min(86400.0, float(seconds or 0.0)))
+        except (TypeError, ValueError):
+            return
+        if sec <= 0:
+            return
+        try:
+            until = getattr(self, "_model_global_until", None)
+            if not isinstance(until, dict):
+                until = {}
+                self._model_global_until = until
+            now = time.monotonic()
+            until[mid] = max(float(until.get(mid, 0.0) or 0.0), now + sec)
+        except Exception:
+            pass
 
     def model_global_remaining(self, model: str) -> float:
         """Secondes de backoff modèle global restantes (0 si aucun)."""
@@ -1594,12 +1891,20 @@ class FreeIPPool:
         return max(1, min(n, max(2, n - 2)))
 
     def _degraded_rank(self, station) -> int:
-        """0 = saine, 1 = servable dégradée (dernier recours au tri)."""
+        """0 = saine, 1 = servable dégradée (dernier recours au tri).
+
+        [fix 2026-11-01] ``SUSPECT`` (un probe raté, pas encore en réparation)
+        reste servable mais ne doit pas passer devant une station ``USABLE``.
+        """
         try:
             sid = getattr(station, "_station", None)
             per = self._per.get(sid) if isinstance(sid, int) else None
             if per and per.get("degraded_override"):
                 return 1
+            if isinstance(sid, int) and hasattr(self, "_station_health"):
+                health = self._station_health.get(sid, create=False)
+                if health is not None and health.state == SUSPECT:
+                    return 1
         except Exception:
             pass
         return 0
@@ -1836,6 +2141,10 @@ class FreeIPPool:
             _qok, _qwhy = self._quota.model_usable(model, station, now=_ts)
             if not _qok:
                 return False
+        if model is not None:
+            _lok, _lwhy = self._ledger_usable(model, station)
+            if not _lok:
+                return False
         return True
 
     def _non_routable_reason(self, station, model: str | None = None) -> str | None:
@@ -1921,6 +2230,10 @@ class FreeIPPool:
             _qok, _qwhy = self._quota.model_usable(model, station)
             if not _qok:
                 return f"quota={_qwhy}"
+        if model:
+            _lok, _lwhy = self._ledger_usable(model, station)
+            if not _lok:
+                return f"quota={_lwhy}"
         return None
 
     def usability_report(self, model: str | None = None) -> dict:
@@ -2481,6 +2794,11 @@ class FreeIPPool:
         """
         if not self._vpn.enabled:
             return None, None
+
+        if not model:
+            # Éviter de re-striker une IP dont le bucket journalier est épuisé
+            # même quand l'appelant n'a pas fourni le modèle (retry, hedge).
+            model = getattr(self, "_last_model", None)
 
         await self.ensure_connected()
 
@@ -4511,6 +4829,14 @@ class FreeIPPool:
             _health = self._station_health.get(sid)
             _health_snap = _health.snapshot() if _health is not None else {}
             _model = getattr(self, "_last_model", None) or ""
+            if not _model:
+                # Après un restart, `_last_model` est vide alors que le ledger
+                # connaît déjà les IPs épuisées. Utiliser un modèle ayant reçu
+                # un 429 rend le dashboard véridique (bucket default partagé).
+                try:
+                    _model = next(iter(getattr(self, "_model_429_events", {})), "")
+                except Exception:
+                    _model = ""
             try:
                 _lease = self._quota.lease_for(_model, st) if _model else None
             except Exception:
@@ -4760,6 +5086,7 @@ class FreeIPPool:
             if hasattr(self, "_best_ip")
             else {},
             "quota_leases": self._quota.snapshot(40) if hasattr(self, "_quota") else [],
+            "quota_ledger": self.quota_bucket_status(getattr(self, "_last_model", None)),
             "quota_profile": {
                 "reserve_pct": round(float(getattr(self._quota_profile, "reserve_pct", 0.0)) * 100.0, 1),
                 "rotation_pct": round(float(getattr(self._quota_profile, "rotation_pct", 0.0)) * 100.0, 1),

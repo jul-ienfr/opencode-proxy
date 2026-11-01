@@ -107,6 +107,20 @@ def test_station_contract_rejects_auth_egress_and_stale():
     assert ok is False and reason == "egress-stale"
 
 
+def test_station_contract_serves_suspect_but_not_repairing():
+    """Un seul probe raté ne retire pas la station (SUSPECT servable) ;
+    deux probes ratés passent en REPAIRING et l'excluent."""
+    st = _station()
+    health = StationHealth(station=1)
+    assert health.observe_probe(False, now=100.0) == SUSPECT
+    ok, reason = station_contract(st, health=health, now=100.0)
+    assert ok is True, reason
+    assert health.observe_probe(False, now=101.0) == REPAIRING
+    ok, reason = station_contract(st, health=health, now=101.0)
+    assert ok is False
+    assert reason == "health=repairing"
+
+
 def test_quota_profile_uses_percentages_not_hardcoded_150():
     profile = QuotaProfile.from_config(
         {

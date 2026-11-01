@@ -348,11 +348,19 @@ def station_contract(
     Retourne ``(True, None)`` ou ``(False, raison)``. Les attributs absents
     sont tolérés (doubles de test, endpoints SOCKS5) : le contrat ne doit pas
     inventer une panne à partir d'une absence de donnée.
+
+    [fix 2026-11-01] ``SUSPECT`` reste routable (servable dégradé) : la
+    machine à états documente « un seul probe ne retire jamais une station »,
+    et le passage à ``REPAIRING`` exige déjà deux mauvais probes. L'ancien
+    ``not health.usable`` excluait la station dès le premier probe raté —
+    6 stations connected pouvaient tomber à 1/7 éligible et provoquer les
+    502 « all tunnels failed ». Les états de réparation avérée (``PROBING``,
+    ``REPAIRING``, ``PARKED``, ``DISABLED``) restent, eux, exclus.
     """
     ts = _now(now)
     if bool(getattr(station, "_disabled", False)):
         return False, "disabled"
-    if health is not None and not health.usable:
+    if health is not None and health.state not in (USABLE, SUSPECT):
         return False, f"health={health.state}"
     try:
         status = str(getattr(station, "status", "") or "")

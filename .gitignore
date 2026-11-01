@@ -37,6 +37,8 @@ config.yaml.bak-*
 logs/quota_reset_capture/
 logs/boot.out
 logs/free_pool.json
+logs/quota_ledger.json
+logs/quota_ledger.json.tmp
 logs/live_models.json
 logs/live_models.json.tmp
 config/free_models_probed.json

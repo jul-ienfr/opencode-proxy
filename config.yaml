@@ -30,7 +30,7 @@ routing:
   aliases:
     nimo: mimo
 free_model_map:
-  mimo-v2.5: deepseek-v4-flash-free
+  mimo-v2.5: mimo-v2.6-flash-free
   qwen3.7-max: mimo-v2.6-flash-free
   glm-5.1: mimo-v2.6-flash-free
   kimi-k2.6: mimo-v2.6-flash-free
@@ -107,6 +107,7 @@ ip_rotation:
     tls: 45
   bad_ttl_factor: 2
   bad_ttl_max: 1440
+  boot_gate_wait_s: 45
   boot_stagger_s: 6
   breaker_warmup_grace_s: 60
   cascade_enabled: true
@@ -162,6 +163,9 @@ ip_rotation:
     quota_reserve_pct: 10
     rotation_threshold_pct: 20
     selection_demand: 10
+    ledger_enabled: true
+    ledger_bucket_mode: default
+    ledger_daily_limit: 0
   latency_rotation:
     consecutive_slow: 5
     enabled: false
@@ -199,7 +203,7 @@ ip_rotation:
   ov_auth_station_threshold: 5
   ov_auth_window_s: 1800
   ovpn_endpoint_port: ''
-  ovpn_protocol: tcp
+  ovpn_protocol: udp
   paid_hedge_after_ms: 0
   per_ip_identity: true
   pin_widen_auths: 8
@@ -255,7 +259,8 @@ ip_rotation:
   rotation_stagger: 10
   rotation_storm_cooldown_s: 600
   rotation_wait_timeout: 5
-  server_countries: Germany,Netherlands,France,Sweden,Switzerland
+  server_countries: Japan,Brazil,South Africa,Australia,Singapore,India,South Korea,Mexico,Canada,United
+    Kingdom,Poland,Romania
   server_issue_grace_s: 25
   server_issue_recheck: true
   server_list_refresh_interval_s: 21600

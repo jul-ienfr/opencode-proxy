@@ -50,7 +50,7 @@ def _patch_curl(monkeypatch, resp):
     slot = _FakeSlot(resp)
     pool = _FakeCurlPool(slot)
 
-    async def _fake_pooled(proxy_url, impersonate, fp, egress_ip=None):
+    async def _fake_pooled(proxy_url, impersonate, fp, egress_ip=None, variant=""):
         return pool, slot
 
     monkeypatch.setattr(oc, "_get_pooled_curl_session", _fake_pooled)

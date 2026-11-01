@@ -4,7 +4,7 @@
 Pourquoi ce script existe
 -------------------------
 Depuis le 2026-10-23T23:17:27Z, la jambe gratuite du provider exige la
-signature complète du client officiel : les 10 tools et le prompt système.
+signature complète du client officiel : les 11 tools et le prompt système.
 Un corps réduit est refusé en 403 ``FreeTierError`` (« free tier can only be
 used from within OpenCode »). La copie exacte est donc une dépendance dure,
 et elle doit pouvoir être re-capturée quand le client évolue.
@@ -193,8 +193,8 @@ def main() -> None:
     body = json.loads(rec["body"])
     tools = [t.get("function", {}).get("name") for t in body.get("tools") or []]
     system: dict = next((m for m in body.get("messages") or [] if m.get("role") == "system"), {})
-    if len(tools) < 10:
-        print(f"[capture] ATTENTION : seulement {len(tools)} tools vus (attendu 10)")
+    if len(tools) < 11:
+        print(f"[capture] ATTENTION : seulement {len(tools)} tools vus (attendu 11)")
 
     payload = {
         "_source": "capture intégrale du client officiel opencode",

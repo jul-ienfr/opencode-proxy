@@ -81,40 +81,76 @@ def test_official_headers_differ_per_ip(monkeypatch, tmp_path):
     h19b = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, "86.104.249.192")
     assert "opencode/1.19.3" in h19["User-Agent"]
     assert "opencode/1.18.31" in h18["User-Agent"]
-    # [wire cohérent par version] 1.19.3 → trio, jamais le quartet ;
-    # 1.18.31 → quartet complet, jamais `x-opencode-session-id`. Un combo
-    # croisé n'existe sur aucune version réelle.
+    # [wire exact provider opencode, capture mitm 2026-11-01]
+    # 1.19.3+ → quartet + x-opencode-session-id ; 1.18.31 → quartet sans.
+    # Aucun x-session-affinity/x-session-id sur le provider opencode.
     assert "x-opencode-session-id" in h19
-    assert "x-opencode-client" not in h19
     assert "x-opencode-session-id" not in h18
     for _h in ("x-opencode-client", "x-opencode-project", "x-opencode-request", "x-opencode-session"):
         assert _h in h18, f"{_h} absent du wire 1.18.31 (client incomplet)"
-    assert h19["x-session-affinity"] == h19["x-session-id"] == h19["x-opencode-session-id"]
+        assert _h in h19, f"{_h} absent du wire 1.19.3 (client incomplet)"
+    assert "x-session-affinity" not in h19 and "x-session-id" not in h19
+    assert h19["x-opencode-session"] == h19["x-opencode-session-id"]
     # Même IP = même installation (ses stable), IPs distinctes = ses distincts.
     assert h19b["x-opencode-session-id"] == h19["x-opencode-session-id"]
     assert h18["x-opencode-session"] != h19["x-opencode-session-id"]
 
 
 def test_installation_anchor_is_per_ip(monkeypatch, tmp_path):
-    """Le client reel envoie x-opencode-directory/workspace (chaines des
-    binaires 1.18.31/1.19.3/2.1.4). Chaque IP doit porter SON ancrage local,
-    jamais celui d'une autre machine."""
+    """Le provider `opencode` ne reçoit PAS x-opencode-directory/workspace :
+    la capture live 1.18.31/1.19.3/1.19.5 n'émet que le quartet d'identité.
+    L'ancrage local est réservé aux appels API locaux, pas à l'inférence."""
     monkeypatch.setenv("PER_IP_IDENTITY", "1")
     monkeypatch.setenv("OPENCODE_IDENTITIES_DIR", str(tmp_path / "identities"))
-    seen = {"dir": set(), "ws": set()}
+    seen = {"project": set(), "session": set()}
     for ip in ("186.247.163.125", "187.13.8.129", "86.104.21.99"):
         h = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, ip)
-        d = h.get("x-opencode-directory", "")
-        w = h.get("x-opencode-workspace", "")
-        assert d, f"x-opencode-directory absent pour {ip}"
-        assert w, f"x-opencode-workspace absent pour {ip}"
-        assert d not in seen["dir"], f"repertoire partage entre IPs : {d}"
-        assert w not in seen["ws"], f"workspace partage entre IPs : {w}"
-        seen["dir"].add(d)
-        seen["ws"].add(w)
-    # Hors chemin per-IP (sondes/tests) : aucun ancrage invente.
+        assert "x-opencode-directory" not in h
+        assert "x-opencode-workspace" not in h
+        project = h.get("x-opencode-project", "")
+        session = h.get("x-opencode-session", "")
+        assert project and session, f"identité incomplète pour {ip}"
+        assert project not in seen["project"], f"project partagé entre IPs : {project}"
+        assert session not in seen["session"], f"session partagée entre IPs : {session}"
+        seen["project"].add(project)
+        seen["session"].add(session)
+    # Hors chemin per-IP (sondes/tests) : aucun ancrage inventé.
     h0 = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None)
     assert "x-opencode-directory" not in h0
+    assert "x-opencode-workspace" not in h0
+
+
+def test_proxy_headers_use_exact_1195_generator(monkeypatch, tmp_path):
+    """Le proxy et le générateur partagent la même primitive : headers 1.19.5
+    exacts (quartet + session-id, Bun 1.4.4, zéro header hors client)."""
+    import free.identities as fi
+
+    monkeypatch.setenv("PER_IP_IDENTITY", "1")
+    vault = fi.IdentityVault(base_project="global", forced_client="desktop", forced_version="1.19.5")
+    monkeypatch.setattr(oc, "_ip_vault", lambda: vault)
+    ip = "10.99.0.55"
+    h = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, ip)
+    assert list(h.keys()) == [
+        "Authorization",
+        "Content-Type",
+        "User-Agent",
+        "x-opencode-client",
+        "x-opencode-project",
+        "x-opencode-request",
+        "x-opencode-session",
+        "x-opencode-session-id",
+        "Connection",
+        "Accept",
+        "Host",
+        "Accept-Encoding",
+    ]
+    assert h["User-Agent"] == "opencode/1.19.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4"
+    assert h["x-opencode-client"] == "desktop"
+    assert h["x-opencode-session"] == h["x-opencode-session-id"]
+    assert "x-session-affinity" not in h
+    assert "x-session-id" not in h
+    assert "x-opencode-directory" not in h
+    assert "x-opencode-workspace" not in h
 
 
 def test_each_ip_gets_full_distinct_client(monkeypatch, tmp_path):

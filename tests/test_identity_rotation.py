@@ -82,8 +82,8 @@ def test_rotate_never_raises_on_garbage(tmp_path):
         assert v.rotate_installation(None)["ip"] == "direct"
 
 
-def test_hook_rotates_vault_on_quota_not_on_transient(monkeypatch):
-    """_mark_free_stations_429 : quota → nouvelle installation ; transitoire → rien."""
+def test_hook_marks_bucket_without_rotating_identity(monkeypatch):
+    """_mark_free_stations_429 : quota → bucket IP (pas d'identité) + rotation egress."""
     from test_free_multi_attempt import _Station
 
     import opencode as oc
@@ -119,9 +119,11 @@ def test_hook_rotates_vault_on_quota_not_on_transient(monkeypatch):
     oc._mark_free_stations_429("m", "", stations=[st], body=quota_body)
 
     after = oc._ip_vault().get("9.9.9.9").snapshot()
-    assert after["ses"] != before["ses"], "quota → nouvelle installation, même IP"
-    assert after["generation"] == 1
-    assert pool.quota_calls and pool.quota_calls[0][1] is True, "rotation d'IP toujours armée en parallèle"
+    assert after["ses"] == before["ses"], (
+        "bucket (IP, jour UTC) : changer l'identité sur la même IP ne rend aucun quota"
+    )
+    assert after["generation"] == before["generation"]
+    assert pool.quota_calls and pool.quota_calls[0][1] is True, "rotation d'IP = seul levier"
 
     transient_body = '{"error":{"type":"server_error","message":"Endpoint is unavailable. Please try again later."}}'
     oc._mark_free_stations_429("m", "", stations=[st], body=transient_body)

@@ -34,6 +34,12 @@ from core.errors import (  # noqa: E402
 
 UNAVAILABLE = '{"error":{"type":"server_error","message":"Endpoint is unavailable. Please try again later."}}'
 QUOTA_RATE_LIMIT = '{"error":{"message":"Rate limit exceeded for free tier"}}'
+QUOTA_FREE_USAGE = (
+    '{"type":"error","error":{"type":"FreeUsageLimitError",'
+    '"message":"Free usage limit reached. Free models work in OpenCode '
+    '(https://opencode.ai); subscribe to OpenCode Go to keep going: '
+    'https://opencode.ai/go"}}'
+)
 QUOTA_USAGE = '{"error":{"message":"usage_not_included: your plan does not include this usage"}}'
 QUOTA_INSUFFICIENT = '{"error":{"message":"insufficient_quota: you exceeded your quota"}}'
 
@@ -336,6 +342,28 @@ def test_mark_quota_429_rotates_without_feeding_breaker(monkeypatch):
     assert launched == stations, "chaque quota per-IP doit rotationner sa station"
     assert len(pool._upstream_429_log) == 0, "un quota per-IP n'est pas un signal amont"
     assert pool._upstream_event_active() is False
+
+
+def test_mark_trial_free_limit_marks_ip_bucket_and_rotates(monkeypatch):
+    """Un `FreeUsageLimitError` est un bucket (IP, jour UTC), pas un quota
+    modèle-global : on marque l'IP et on rotationne l'egress (seule façon
+    d'obtenir un bucket frais)."""
+    import opencode as oc
+
+    pool, stations = _iso_pool(2)
+    launched = []
+    pool._launch_rotation = lambda station, forced_pool=None, **kw: launched.append(station)
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    monkeypatch.setattr(oc, "_record_global_429", lambda: None)
+    monkeypatch.setattr(oc, "_note_free_429", lambda model: None)
+    monkeypatch.setattr(oc, "_set_free_cooldown", lambda *a, **k: None)
+    monkeypatch.setattr(oc._cfg_settings, "get_429_action", lambda: "both")
+
+    oc._mark_free_stations_429("m", "7200", stations=[stations[0]], body=QUOTA_FREE_USAGE)
+
+    assert launched == [stations[0]], "un bucket IP épuisé doit rotationner l'egress"
+    assert pool.quota_bucket_exhausted("m") is True
+    assert pool.model_global_remaining("m") <= 0.0, "un seul IP ne doit pas geler le modèle"
 
 
 def test_mark_transient_429_feeds_breaker_without_rotation(monkeypatch):

@@ -586,6 +586,9 @@ if DEBUG:
 # matters most). Handlers are rotation-aware (see dashboard.display).
 attach_module_logger("vpn_manager")
 attach_module_logger("free_ip_pool")
+# Gate de warmup : journalisé même quand DEBUG=false (debug.log), pour
+# diagnostiquer après coup un 503 « vpn_warming » et savoir s'il a attendu.
+attach_module_logger("vpn_gate")
 
 # Request body size limit (from YAML config, default 10 MB)
 MAX_BODY_SIZE = yaml_get("upstream", "max_body_size", 10 * 1024 * 1024)
@@ -3042,8 +3045,32 @@ async def lifespan(app):
 
     async def _start_one(_m):
         async with _boot_sem:
+            # [fix 2026-11-01] start() ne doit jamais pouvoir immobiliser le
+            # fan-out (et donc /readyz) indéfiniment. Après 90 s on rend la
+            # main SANS annuler la tâche : elle peut finir en fond et créer
+            # son watchdog ; l'annuler laisserait la station sans supervision.
+            _boot_start = asyncio.create_task(_m.start())
             try:
-                await _m.start()
+                await asyncio.wait_for(asyncio.shield(_boot_start), timeout=90.0)
+            except TimeoutError:
+                _m._boot_start_task = _boot_start
+
+                def _boot_start_done(_task, _mgr=_m):
+                    try:
+                        _exc = _task.exception()
+                    except Exception:
+                        _exc = None
+                    if _exc is not None:
+                        _debug(
+                            f"  [lifespan] WARN boot station start failed late "
+                            f"(s{getattr(_mgr, '_station', '?')}): {_exc!r}"
+                        )
+
+                _boot_start.add_done_callback(_boot_start_done)
+                _debug(
+                    f"  [lifespan] WARN boot station start timeout 90s "
+                    f"(s{getattr(_m, '_station', '?')}) — poursuite en fond"
+                )
             except Exception as _e:
                 _debug(f"  [lifespan] WARN boot station start raised: {_e!r}")
             await asyncio.sleep(_boot_stagger_s())
@@ -3819,10 +3846,74 @@ async def readyz():
 # requête n'est lu QUE pendant le warmup, et seulement sur les chemins gatés.
 _VPN_GATED_PREFIXES = ("/v1/messages", "/v1/chat/completions", "/anthropic/v1/messages")
 _VPN_GATE_RETRY_AFTER = 5
+_VPN_GATE_POLL_S = 0.25
+_VPN_GATE_DEFAULT_WAIT_S = 45.0
+_VPN_GATE_LOGGER = logging.getLogger("vpn_gate")
+
+
+def _vpn_gate_log(level: int, msg: str, *args) -> None:
+    """Journalise une décision du gate sans polluer debug.log en pytest."""
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return
+    try:
+        _VPN_GATE_LOGGER.log(level, msg, *args)
+    except Exception:
+        pass
+
+
+def _vpn_gate_wait_s() -> float:
+    """Budget pendant lequel une requête free attend son premier tunnel.
+
+    Le gate ne doit plus répondre 503 dès qu'une station est routable : il
+    attend ``ip_rotation.boot_gate_wait_s`` (défaut 45 s, borné 0..300). Une
+    valeur 0 restaure l'ancien comportement (rejet immédiat).
+    """
+    try:
+        raw = (IP_ROTATION or {}).get("boot_gate_wait_s", _VPN_GATE_DEFAULT_WAIT_S)
+        return max(0.0, min(300.0, float(raw)))
+    except (TypeError, ValueError):
+        return _VPN_GATE_DEFAULT_WAIT_S
+
+
+def _vpn_usable_station_count() -> int:
+    """Nombre de stations routables MAINTENANT (0 si état illisible).
+
+    C'est la source de vérité du gate : le boot_fanout « done » ne dit rien
+    sur la disponibilité réelle (il attend toutes les stations + le stagger).
+    Une station déjà connected/degraded avec une IP suffit à servir un free.
+    Fail-open : toute erreur → 0, décision prise par le fallback managers.
+    """
+    try:
+        import shared_state as _ss
+
+        pool = getattr(_ss, "free_ip_pool", None)
+        counter = getattr(pool, "usable_station_count", None)
+        if callable(counter):
+            return max(0, int(counter()))
+        # Fallback (pool pas encore publié / double de test) : lecture directe
+        # des managers. Volontairement conservateur (status + IP), sans quota.
+        count = 0
+        for manager in list(getattr(_ss, "vpn_managers", None) or []):
+            if getattr(manager, "_disabled", False):
+                continue
+            status = str(
+                getattr(manager, "status", None) or getattr(manager, "_status", None) or ""
+            )
+            if status in ("connected", "degraded") and getattr(manager, "current_ip", None):
+                count += 1
+        return count
+    except Exception:
+        return 0
 
 
 def _vpn_warmup_gate_active() -> bool:
-    """True tant que la flotte VPN n'a pas fini de démarrer.
+    """True seulement si une requête free ne peut pas être servie MAINTENANT.
+
+    Conditions cumulatives : VPN activé, flotte en cours de boot, budget
+    ``ready_timeout`` non dépassé, et **zéro station routable**. Dès qu'un
+    tunnel est utilisable, le gate est inerte même si le fan-out continue de
+    démarrer les autres stations — c'était la cause du 503 alors que la flotte
+    répondait déjà.
 
     Fail-open à chaque étape : toute erreur d'introspection → False (le
     middleware laisse passer, jamais de blocage du trafic par un bug de gate).
@@ -3830,7 +3921,7 @@ def _vpn_warmup_gate_active() -> bool:
     try:
         if not IP_ROTATION.get("enabled"):
             return False
-        if BOOT_OPTS.get("no_vpn"):
+        if BOOT_OPTS.get("no_vpn") or IP_ROTATION.get("_fail_closed"):
             return False
         import shared_state as _ss
 
@@ -3842,9 +3933,45 @@ def _vpn_warmup_gate_active() -> bool:
         _rt = float(BOOT_OPTS.get("ready_timeout") or 0.0)
         if _rt > 0 and (time.monotonic() - BOOT_T0) > _rt:
             return False  # budget dépassé → on ne bloque plus, erreur métier normale
-        return True
+        # [fix 2026-11-01] Le vrai critère : un tunnel routable existe déjà ?
+        # Les 7 stations étaient connected ~9 s après le boot, mais le fan-out
+        # (stagger + start de chaque station) continuait → 503 injustifié.
+        return _vpn_usable_station_count() == 0
     except Exception:
         return False
+
+
+async def _vpn_gate_wait(timeout: float) -> None:
+    """Attend qu'un tunnel devienne routable, au plus ``timeout`` secondes.
+
+    La requête free n'est plus rejetée à la première milliseconde du boot :
+    on laisse la station déjà en cours de connexion aboutir. Dès que le gate
+    devient inactif (tunnel trouvé, fan-out terminé ou budget boot dépassé),
+    l'appelant rejoue la requête normalement.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        if not _vpn_warmup_gate_active():
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(_VPN_GATE_POLL_S, remaining))
+
+
+def _vpn_gate_message() -> str:
+    """Message actionnable selon l'état réel (docker down ≠ simple warmup)."""
+    try:
+        import shared_state as _ss
+
+        if getattr(_ss, "docker_ready", None) is False:
+            return (
+                "Docker daemon unavailable — free models need a tunnel. "
+                "Start Docker Desktop, then retry."
+            )
+    except Exception:
+        pass
+    return "VPN fleet still starting — free models need a tunnel. Retry shortly."
 
 
 def _is_free_model_route(model: str) -> bool:
@@ -3874,10 +4001,11 @@ def _is_free_model_route(model: str) -> bool:
 
 def _vpn_gate_payload(path: str, retry: int) -> dict:
     """Corps d'erreur au format du protocole de la route (SDK-compatible)."""
+    message = _vpn_gate_message()
     if path.startswith("/v1/chat/completions"):
         return {
             "error": {
-                "message": ("VPN fleet still starting — free models need a tunnel. Retry shortly."),
+                "message": message,
                 "type": "vpn_warming",
                 "code": "vpn_warming",
             },
@@ -3888,7 +4016,7 @@ def _vpn_gate_payload(path: str, retry: int) -> dict:
         "type": "error",
         "error": {
             "type": "vpn_warming",
-            "message": ("VPN fleet still starting — free models need a tunnel. Retry shortly."),
+            "message": message,
         },
         "degraded": {"vpn": "starting"},
         "retry_after": retry,
@@ -3900,6 +4028,18 @@ class VpnWarmupGateMiddleware:
 
     def __init__(self, app):
         self.app = app
+
+    async def _forward(self, scope, receive, send, body: bytes) -> None:
+        """Rejoue le corps déjà lu puis délègue à l'application."""
+        replayed: dict[str, bool] = {"done": False}
+
+        async def _replay(_msg=None):
+            if not replayed["done"]:
+                replayed["done"] = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self.app(scope, _replay, send)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or not _vpn_warmup_gate_active():
@@ -3930,16 +4070,77 @@ class VpnWarmupGateMiddleware:
             except Exception:
                 model = ""
         if not _is_free_model_route(model):
-            _replayed: dict[str, bool] = {"done": False}
-
-            async def _replay(_msg=None, _b=body, _state=_replayed):
-                if not _state["done"]:
-                    _state["done"] = True
-                    return {"type": "http.request", "body": _b, "more_body": False}
-                return await receive()
-
-            await self.app(scope, _replay, send)
+            await self._forward(scope, receive, send, body)
             return
+
+        # [quota-ledger 2026-11-01] Si toutes les IPs déjà routables ont leur
+        # bucket journalier épuisé, attendre un tunnel ne rendra pas de quota :
+        # on laisse le chemin free rendre le 429 (reset 00:00 UTC) tout de
+        # suite au lieu de bloquer 45 s sur le gate de warmup.
+        try:
+            import shared_state as _ss_bucket
+
+            _pool_bucket = getattr(_ss_bucket, "free_ip_pool", None)
+            if _pool_bucket is not None and hasattr(_pool_bucket, "all_usable_buckets_exhausted"):
+                if _pool_bucket.all_usable_buckets_exhausted(model):
+                    _vpn_gate_log(
+                        logging.INFO,
+                        "[gate] free model %r bucket exhausted — no tunnel wait",
+                        model,
+                    )
+                    await self._forward(scope, receive, send, body)
+                    return
+        except Exception:
+            pass
+
+        # [fix 2026-11-01] Attendre un tunnel routable au lieu de rejeter au
+        # premier milliseconde du boot. Le client n'a pas de retry : un 503
+        # immédiat tue le tour, alors qu'une station était déjà à ~9 s.
+        import shared_state as _ss
+
+        waited_from = time.monotonic()
+        wait_s = _vpn_gate_wait_s()
+        docker_ready = getattr(_ss, "docker_ready", None)
+        if wait_s > 0 and docker_ready is not False:
+            _vpn_gate_log(
+                logging.INFO,
+                "[gate] free model %r waiting up to %.0fs for a usable tunnel "
+                "(boot+%.1fs, usable=%d)",
+                model,
+                wait_s,
+                time.monotonic() - BOOT_T0,
+                _vpn_usable_station_count(),
+            )
+            await _vpn_gate_wait(wait_s)
+            waited = time.monotonic() - waited_from
+            if not _vpn_warmup_gate_active():
+                _vpn_gate_log(
+                    logging.INFO,
+                    "[gate] free model %r released after %.2fs (usable=%d, boot+%.1fs)",
+                    model,
+                    waited,
+                    _vpn_usable_station_count(),
+                    time.monotonic() - BOOT_T0,
+                )
+                await self._forward(scope, receive, send, body)
+                return
+        else:
+            waited = 0.0
+
+        try:
+            fanout_done = bool(getattr(_ss.boot_fanout_task, "done", lambda: True)())
+        except Exception:
+            fanout_done = True
+        _vpn_gate_log(
+            logging.WARNING,
+            "[gate] free model %r rejected after %.1fs — no usable tunnel "
+            "(docker_ready=%r, fanout_done=%s, boot+%.1fs)",
+            model,
+            waited,
+            docker_ready,
+            fanout_done,
+            time.monotonic() - BOOT_T0,
+        )
 
         payload = _json_dumps(_vpn_gate_payload(path, _VPN_GATE_RETRY_AFTER))
         headers = [
@@ -5992,6 +6193,28 @@ _OPENCODE_SIG_ALGS = (
     "rsa_pkcs1_sha512",
     "rsa_pkcs1_sha1",
 )
+# [2026-11-01] TLS 1.19.5 = Bun 1.4.4 (capture tunnel CONNECT, ClientHello
+# en clair) : extension 21 (padding) disparue, courbe 4588 (X25519Kyber768)
+# ajoutée, ed25519 + ecdsa_secp521r1_sha512 dans signature_algorithms.
+_OPENCODE_JA3_1195 = os.getenv(
+    "OPENCODE_JA3_1195",
+    "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171"
+    "-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43,"
+    "4588-29-23-24,0",
+)
+_OPENCODE_SIG_ALGS_1195 = (
+    "ecdsa_secp256r1_sha256",
+    "rsa_pss_rsae_sha256",
+    "rsa_pkcs1_sha256",
+    "ecdsa_secp384r1_sha384",
+    "rsa_pss_rsae_sha384",
+    "rsa_pkcs1_sha384",
+    "rsa_pss_rsae_sha512",
+    "rsa_pkcs1_sha512",
+    "ed25519",
+    "ecdsa_secp521r1_sha512",
+    "rsa_pkcs1_sha1",
+)
 _OPENCODE_TLS_IMPERSONATE = os.getenv("OPENCODE_TLS_IMPERSONATE", "")
 # [wire complet] Pose-t-on les 4 en-têtes de transport dans l'ordre du client ?
 # MESURÉ : le vrai client envoie 12 en-têtes, notre jambe free n'en envoyait
@@ -6039,6 +6262,15 @@ _OPENCODE_HEADER_ORDER = os.getenv(
     "x-opencode-request,x-opencode-session,Connection,Accept,Host,Accept-Encoding,"
     "Content-Length",
 )
+# [2026-11-01] 1.19.0+ ajoute x-opencode-session-id APRÈS x-opencode-session.
+# L'ordre libcurl doit suivre, sinon l'en-tête part après Connection/Host et
+# le wire ne correspond plus au client (13 en-têtes).
+_OPENCODE_HEADER_ORDER_119 = os.getenv(
+    "OPENCODE_FREE_HEADER_ORDER_119",
+    "Authorization,Content-Type,User-Agent,x-opencode-client,x-opencode-project,"
+    "x-opencode-request,x-opencode-session,x-opencode-session-id,Connection,Accept,"
+    "Host,Accept-Encoding,Content-Length",
+)
 _FREE_HEADER_ORDER_ON = os.getenv("OPENCODE_FREE_HEADER_ORDER_ON", "1") not in (
     "0",
     "false",
@@ -6047,11 +6279,13 @@ _FREE_HEADER_ORDER_ON = os.getenv("OPENCODE_FREE_HEADER_ORDER_ON", "1") not in (
 )
 
 
-def _free_fp_override() -> dict:
+def _free_fp_override(version: str = "") -> dict:
     """Params de session curl_cffi pour la face Bun officielle (replay exact).
 
-    Recette validée au captureur contre le vrai client 1.18.31 (ClientHello
-    byte-identique modulo clés éphémères — cf. § ci-dessus) :
+    Recette validée au captureur contre les vrais clients 1.18.31/1.19.0/
+    1.19.3 (Bun 1.3.14) et 1.19.5 (Bun 1.4.4). Le ClientHello 1.19.5 est
+    capturé par tunnel CONNECT : courbe 4588 (X25519Kyber768), plus de
+    padding (ext 21), 11 sigalgs (ed25519 + ecdsa_secp521r1_sha512).
       * ``impersonate="chrome131"`` comme PORTEUR des comportements natifs
         (émission OCSP/SCT) — SANS ses headers navigateur (``default_headers``
         False : sinon sec-ch-ua/Sec-Fetch-*/Accept-Language polluent le wire),
@@ -6069,26 +6303,46 @@ def _free_fp_override() -> dict:
     """
     if _OPENCODE_TLS_IMPERSONATE:
         return {}
+    is_1195 = str(version or "") == "1.19.5"
+    ja3 = _OPENCODE_JA3_1195 if is_1195 else _OPENCODE_JA3
+    sigalgs = _OPENCODE_SIG_ALGS_1195 if is_1195 else _OPENCODE_SIG_ALGS
     fp = {
-        "tls_signature_algorithms": list(_OPENCODE_SIG_ALGS),
+        "tls_signature_algorithms": list(sigalgs),
         "tls_grease": False,
     }
-    if _FREE_HEADER_ORDER_ON and _OPENCODE_HEADER_ORDER:
-        fp["header_order"] = _OPENCODE_HEADER_ORDER
+    if _FREE_HEADER_ORDER_ON:
+        fp["header_order"] = (
+            _OPENCODE_HEADER_ORDER_119
+            if str(version or "") not in ("", "1.18.31")
+            else _OPENCODE_HEADER_ORDER
+        )
     return {
         "impersonate": "chrome131",
-        "ja3": _OPENCODE_JA3,
+        "ja3": ja3,
         "extra_fp": fp,
         "http_version": "v1",
         "default_headers": False,
     }
 
 
-def _get_free_fp_kwargs() -> tuple[str, dict | None]:
-    """(impersonate, fp_override) pour la jambe free — kill-switch inclus."""
+def _get_free_fp_kwargs(version: str = "") -> tuple[str, dict | None]:
+    """(impersonate, fp_override) pour la jambe free — kill-switch inclus.
+
+    ``version`` ajuste l'ordre des en-têtes : 1.18.31 n'a pas
+    x-opencode-session-id (12 en-têtes) ; 1.19.0+ l'insère en 8e position
+    (13 en-têtes). Sans version (sondes/legacy), l'ordre 1.18.31 reste le
+    défaut historique.
+    """
     if _OPENCODE_TLS_IMPERSONATE:
         return _OPENCODE_TLS_IMPERSONATE, None
-    return "", _free_fp_override()
+    fp = _free_fp_override(version)
+    if isinstance(fp, dict) and version and version != "1.18.31":
+        fp = dict(fp)
+        extra = dict(fp.get("extra_fp") or {})
+        if _FREE_HEADER_ORDER_ON and _OPENCODE_HEADER_ORDER_119:
+            extra["header_order"] = _OPENCODE_HEADER_ORDER_119
+        fp["extra_fp"] = extra
+    return "", fp
 
 
 # ── Corps conformes-grille pour la jambe free (gate 2026-09-18, volet body) ──
@@ -6159,10 +6413,10 @@ def _free_shim_tool(name: str, responses: bool) -> dict:
 
 
 def _official_free_payload() -> dict:
-    """Payload officiel figé (capture intégrale du client 1.18.31).
+    """Payload officiel figé (capture intégrale du client 1.19.5).
 
     Le gate gratuit du provider vérifie la signature du client : suite
-    complète des 10 tools + prompt système officiel. Une version réduite
+    complète des 11 tools + prompt système officiel. Une version réduite
     (un seul tool, sans système) est refusée 403/429 — mesuré le 2026-10-25.
     """
     global _OFFICIAL_FREE_PAYLOAD
@@ -6189,12 +6443,13 @@ def _official_free_payload() -> dict:
             if isinstance(t, dict) and isinstance(t.get("function"), dict)
         },
         "system": system,
+        "max_tokens": body.get("max_tokens") or 32000,
         "stream_options": body.get("stream_options") or {"include_usage": True},
     }
     # [2026-10-25] Échec bruyant : une copie absente/corrompue ferait envoyer
     # un corps réduit, donc un 403 sur TOUTE la jambe free. On le dit une fois
     # (le champ /health?detail=full>free_payload>ok le montre aussi).
-    if len(tools) < 10 or not isinstance(system, dict):
+    if len(tools) < 11 or not isinstance(system, dict):
         logging.getLogger(__name__).warning(
             "[free] copie officielle INCOMPLETE (%s) : tools=%d, system=%s — "
             "la jambe free va être refusée en 403. Régénérer avec "
@@ -6934,6 +7189,30 @@ def _truncate_summary_middle(text: str, max_chars: int) -> str:
     return out[:max_chars] if len(out) > max_chars else out
 
 
+def _free_is_title_request(body) -> bool:
+    """Requête de titre du client officiel (petit modèle, sans tools).
+
+    Le client réel envoie un corps dédié de ~2,5 Ko : système « You are a
+    title generator. » + 2 messages, AUCUN outil. Le gate principal (10/11
+    tools + prompt opencode) ne s'applique PAS à cette requête ; lui injecter
+    la grille principale changeait son identité et consommait du quota pour
+    rien. On la laisse passer telle quelle.
+    """
+    try:
+        if not isinstance(body, dict):
+            return False
+        msgs = body.get("messages")
+        if not isinstance(msgs, list) or not msgs:
+            return False
+        first = msgs[0]
+        if not isinstance(first, dict) or first.get("role") != "system":
+            return False
+        text = str(first.get("content") or "")
+        return "You are a title generator" in text or "Generate a brief title" in text
+    except Exception:
+        return False
+
+
 def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = None):
     """Copie d'envoi jambe free : copie officielle + stream (±prompt_cache_key).
 
@@ -6979,6 +7258,10 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     is_resp = "input" in body
     is_chat = "messages" in body
     if not is_resp and not is_chat:
+        return body, False
+    if is_chat and _free_is_title_request(body):
+        # Petit modèle de titre : copie officielle dédiée, jamais la grille
+        # principale (mesuré : 2 477 octets, 0 outil).
         return body, False
     # [2026-10-29] La porte free refuse certains outils (mesuré : subagent_fork)
     # en renvoyant un faux quota. On les retire de la copie d'envoi, sans
@@ -7188,8 +7471,9 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     if need_system:
         # Prompt officiel en tête (obligatoire pour le gate) + consigne qui
         # limite le modèle aux outils réellement déclarés.
-        wire["messages"] = _inject_official_system(wire.get("messages"), _payload["system"])
-    if need_tools and not _signature_ok and _have_official < 5:
+        _note_official = _AVAILABLE_TOOLS_NOTE if (_client_tools or _is_summary) else ""
+        wire["messages"] = _inject_official_system(wire.get("messages"), _payload["system"], note=_note_official)
+    if need_tools and not _signature_ok and _have_official < 5 and (_client_tools or _is_summary):
         # [2026-10-30] Prompt client Hermes = 31 Ko ; le gate free n'a pas le
         # budget. On garde son debut (identite/consignes) et la note finale qui
         # interdit d'appeler les outils officiels de compatibilite.
@@ -7260,6 +7544,13 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
             wire["stream_options"] = copy.deepcopy(_payload["stream_options"])
         forced = True
     if need_order:
+        # [2026-11-01] Le client officiel envoie TOUJOURS max_tokens: 32000
+        # (capture 1.18.31/1.19.0/1.19.3/1.19.5). Un corps générique injecté
+        # sans ce champ avait une forme différente de l'officiel.
+        if "max_tokens" not in wire:
+            _mt_official = _payload.get("max_tokens")
+            if isinstance(_mt_official, int) and _mt_official > 0:
+                wire["max_tokens"] = _mt_official
         wire = _reorder_client_body(wire)
     # [2026-10-31] Le plafond gate s'applique à la COPIE FREE FINALE
     # (system officiel + outils + messages), pas au corps client. L'ancien
@@ -8322,6 +8613,41 @@ def _official_free_headers(
             _conv_session = _conversation_session_id(conversation_key)
     except Exception:
         _conv_session = _free_session_id(egress_ip if _per_ip else None)
+    # [2026-11-01] Wire EXACT du provider `opencode`, mesuré au mitm sur
+    # 1.18.31 / 1.19.3 / 1.19.5 :
+    # Authorization, Content-Type, UA, x-opencode-client, x-opencode-project,
+    # x-opencode-request, x-opencode-session, [x-opencode-session-id], puis
+    # transport. Aucun x-session-affinity/x-session-id/directory/workspace.
+    # 1.18.31 n'émet PAS x-opencode-session-id ; 1.19.3+ l'émet.
+    if _per_ip and _vault_ident is not None:
+        try:
+            out = _vault_ident.official_provider_headers(endpoint or "", conversation_key)
+        except Exception:
+            # Fallback minimal : jamais casser la jambe free sur un vault
+            # incomplet (double de test, identité illisible).
+            out = {
+                "Authorization": "Bearer public",
+                "Content-Type": "application/json",
+                "User-Agent": ua,
+                "x-opencode-client": "desktop",
+                "x-opencode-project": _OPENCODE_PROJECT,
+                "x-opencode-request": _free_request_msg_id(),
+                "x-opencode-session": _conv_session,
+                "x-opencode-session-id": _conv_session,
+            }
+        if _FREE_WIRE_FULL_HEADERS:
+            try:
+                from urllib.parse import urlparse as _urlparse
+
+                _host = _urlparse(endpoint or "").netloc
+            except Exception:
+                _host = ""
+            if _host:
+                out["Connection"] = "keep-alive"
+                out["Accept"] = "*/*"
+                out["Host"] = _host
+                out["Accept-Encoding"] = _OPENCODE_ACCEPT_ENCODING
+        return out
     if _wire_style == "legacy":
         # Wire 1.18.x — conservé pour rollback à chaud.
         if _per_ip and _vault_ident is not None:
@@ -9062,7 +9388,15 @@ async def _do_free_request_curl_cffi(
             _egress_ip = ""
     _egress_ip = (_egress_ip or "").strip() or None
     req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _egress_ip)
-    _free_impersonate, _free_fp = _get_free_fp_kwargs()
+    _ident_version = ""
+    try:
+        if _egress_ip and _per_ip_identity_enabled():
+            _vlt_fp = _ip_vault()
+            if _vlt_fp is not None:
+                _ident_version = str(_vlt_fp.get(_egress_ip).version or "")
+    except Exception:
+        _ident_version = ""
+    _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version)
     # [gate body 2026-09-18] grille tools (bash+read) + stream forcé : un corps
     # non-stream ou sans tools serait 403. Si stream forcé ici, le SSE est
     # collecté plus bas et reconstitué en JSON (contrat non-stream inchangé).
@@ -9089,7 +9423,13 @@ async def _do_free_request_curl_cffi(
     last_exc: Exception | None = None
     for attempt_i, attempt_proxy in enumerate(proxies_to_try):
         is_last = attempt_i == len(proxies_to_try) - 1
-        pool, slot = await _get_pooled_curl_session(attempt_proxy, _free_impersonate, _free_fp, egress_ip=_egress_ip)
+        pool, slot = await _get_pooled_curl_session(
+            attempt_proxy,
+            _free_impersonate,
+            _free_fp,
+            egress_ip=_egress_ip,
+            variant=f"free-{_ident_version}" if _ident_version else "",
+        )
         if endpoint:
             _ep = endpoint
         else:
@@ -11758,7 +12098,8 @@ async def _open_free_stream(
                 # face Bun rejouée, UA par endpoint — même sur les ré-essais.
                 # Session par conversation quand le corps porte un chaînage.
                 req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _egress_ip_s or None)
-                _free_impersonate, _free_fp = _get_free_fp_kwargs()
+                _ident_version = str((_inst_snap or {}).get("version") or "")
+                _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version)
                 # [gate body 2026-09-18] grille tools sur le corps stream.
                 wire_body, _ = _free_wire_body(body, force_stream=True, egress_ip=_egress_ip_s or None)
                 # [P1.1 perf] timeout posé AU NIVEAU DE LA FACTORY
@@ -11771,7 +12112,11 @@ async def _open_free_stream(
                 # read (filet ultime > idle SSE).
                 _debug(f"  [free-stream] creating curl_cffi session proxy={_curl_proxy_url(proxy_url)} (pooled)")
                 pool2, slot2 = await _get_pooled_curl_session(
-                    proxy_url, _free_impersonate, _free_fp, egress_ip=_egress_ip_s or None
+                    proxy_url,
+                    _free_impersonate,
+                    _free_fp,
+                    egress_ip=_egress_ip_s or None,
+                    variant=f"free-{_ident_version}" if _ident_version else "",
                 )
                 # [A1 perf] emprunt SANS verrou pendant le POST : seuls les
                 # headers transitent sous l'emprunt, le corps est consommé
@@ -12375,6 +12720,25 @@ def _free_429_cooldown_seconds(retry_after: str = "", body=None) -> float:
     return _FREE_429_DEFAULT
 
 
+def _free_bucket_retry_after(free_model: str, fallback: str = "") -> str:
+    """Retry-After effectif : reset du bucket IP journalier, sinon fallback.
+
+    Le ledger connaît le prochain minuit UTC des IP épuisées. Il est plus
+    précis que le dernier header vu (surtout si la dernière tentative était
+    un 429 transitoire ou une autre IP). Fail-open : fallback tel quel.
+    """
+    try:
+        pool = _free_ip_pool
+        if pool is not None and hasattr(pool, "quota_bucket_reset"):
+            reset_at = pool.quota_bucket_reset(free_model)
+            if reset_at:
+                secs = int(max(1.0, float(reset_at) - time.time()))
+                return str(secs)
+    except Exception:
+        pass
+    return str(fallback or "")
+
+
 # [PC-5 — audit routabilité 2026-09-08] Le 429 free suit le COMPTE/modèle,
 # pas l'IP (F5) : tant que tout le trafic vise un seul modèle upstream, la
 # diversité des 6 tunnels ne sert à rien. `free_model_spread: true` +
@@ -12542,6 +12906,16 @@ async def _wait_for_fresh_free(models, timeout_s: float = 45.0, poll_s: float = 
         stations = list(getattr(pool, "_stations", None) or []) if pool else []
     except Exception:
         pool, stations = None, []
+    # [quota-ledger 2026-11-01] Toutes les IPs routables ont leur bucket
+    # journalier épuisé : attendre 45 s une rotation qui échoue ne rend pas de
+    # quota et bloque le client. On rend False tout de suite ; la prochaine
+    # requête profitera d'une IP fraîche si une rotation aboutit entre-temps.
+    try:
+        if pool is not None and hasattr(pool, "all_usable_buckets_exhausted"):
+            if models and all(pool.all_usable_buckets_exhausted(m) for m in models):
+                return False
+    except Exception:
+        pass
     # Nudge ciblé : seules les stations mortes pour cette chaîne (les
     # saines gardent leur bonne IP — une rotation leur ferait perdre un
     # bucket vivant + coûterait un AUTH NordVPN pour rien).
@@ -13036,8 +13410,6 @@ def _free_stations_exhausted(free_model: str) -> bool:
     """
     if not _free_ip_pool:
         return True
-    if hasattr(_free_ip_pool, "model_global_remaining") and _free_ip_pool.model_global_remaining(free_model) > 0:
-        return True
     if getattr(_free_ip_pool, "socks5_mode", False):
         # [Axe 3.1] socks5 mode: the docker stations are inert — the usable
         # set is the enabled static proxies. No rotation can land a fresh
@@ -13048,7 +13420,11 @@ def _free_stations_exhausted(free_model: str) -> bool:
                 if not _free_cooldown_active(free_model, ep) and not (
                     hasattr(_free_ip_pool, "model_ip_bad") and _free_ip_pool.model_ip_bad(free_model, ep)
                 ):
-                    return False
+                    if not (
+                        hasattr(_free_ip_pool, "model_bucket_usable")
+                        and not _free_ip_pool.model_bucket_usable(free_model, ep)
+                    ):
+                        return False
         return True
     if not _free_ip_pool._stations:
         return True
@@ -13059,7 +13435,11 @@ def _free_stations_exhausted(free_model: str) -> bool:
             if not _free_cooldown_active(free_model, st) and not (
                 hasattr(_free_ip_pool, "model_ip_bad") and _free_ip_pool.model_ip_bad(free_model, st)
             ):
-                return False
+                if not (
+                    hasattr(_free_ip_pool, "model_bucket_usable")
+                    and not _free_ip_pool.model_bucket_usable(free_model, st)
+                ):
+                    return False
     return True
 
 
@@ -13100,6 +13480,42 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
     if pool is None or not getattr(pool, "enabled", False):
         return None
     try:
+        base = _resolve_free_model(model_id)
+    except Exception:
+        base = None
+    if not base:
+        return None
+    # [quota-ledger 2026-11-01] Toutes les IPs routables sont épuisées : le
+    # reset du ledger est la vérité (minuit UTC), plus précise que le
+    # cooldown modèle-global (garde anti-churn) ou un Retry-After transitoire.
+    # On le vérifie AVANT `_mg` et avant le bypass « rotation en vol ».
+    try:
+        if hasattr(pool, "all_usable_buckets_exhausted") and pool.all_usable_buckets_exhausted(base):
+            _br = pool.quota_bucket_reset(base) if hasattr(pool, "quota_bucket_reset") else None
+            if _br:
+                return max(float(min_wait), float(_br) - time.time())
+    except Exception:
+        pass
+    # Un bucket frais (IP neuve) prime sur le cooldown modèle-global : ce
+    # dernier ne doit pas masquer une station déjà servable.
+    try:
+        if not _free_stations_exhausted(base):
+            return None
+    except Exception:
+        pass
+    # [fix 2026-11-01] Limite modèle globale : à vérifier AVANT la liste des
+    # stations « chaudes » ET avant le bypass « rotation en vol ». Quand tous
+    # les egress sont déjà 429 pour ce modèle, `stations` est vide et une
+    # rotation ne peut rien changer : l'ancien ordre rendait None, ouvrait le
+    # flux SSE puis renvoyait un empty stream au client officiel. On doit
+    # renvoyer un vrai 429 lisible.
+    try:
+        _mg = pool.model_global_remaining(base) if hasattr(pool, "model_global_remaining") else 0.0
+        if _mg > 0:
+            return max(float(min_wait), _mg)
+    except Exception:
+        pass
+    try:
         if getattr(pool, "any_rotation_in_flight", lambda: False)():
             return None
     except Exception:
@@ -13114,20 +13530,6 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
     if not stations:
         return None
     try:
-        base = _resolve_free_model(model_id)
-    except Exception:
-        base = None
-    if not base:
-        return None
-    # [reliability P0] Limite modèle globale : inutile d'ouvrir un flux pour
-    # rejouer les mêmes 429 ; le client reçoit un Retry-After honnête.
-    try:
-        _mg = pool.model_global_remaining(base) if hasattr(pool, "model_global_remaining") else 0.0
-        if _mg > 0:
-            return max(float(min_wait), _mg)
-    except Exception:
-        pass
-    try:
         chain = _free_candidate_chain(model_id, base)
     except Exception:
         chain = [base]
@@ -13135,6 +13537,13 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
     for m in chain:
         for st in stations:
             _ip_block = 0.0
+            try:
+                if hasattr(pool, "model_bucket_usable") and not pool.model_bucket_usable(m, st):
+                    _br = pool.quota_bucket_reset(m) if hasattr(pool, "quota_bucket_reset") else None
+                    waits.append(max(1.0, float(_br) - time.time()) if _br else float(min_wait))
+                    continue
+            except Exception:
+                pass
             try:
                 if hasattr(pool, "model_ip_block_remaining"):
                     _ip_block = pool.model_ip_block_remaining(m, st)
@@ -13228,13 +13637,10 @@ def _mark_free_stations_429(
     # while `body=None` rotated. Same signal -> same decision.
     _body_empty = body is None or (isinstance(body, str) and not body.strip())
     quota_flag = True if _body_empty else _is_free_quota_failure(429, body)
-    # [trial-dead 2026-10-24] Scope du 429 (core.errors.free_quota_scope) :
-    # un `FreeUsageLimitError` (trial per-IP épuisé, MESURÉ en prod, sans
-    # reset annoncé) ne reviendra pas dans 120 s — marteler la clé toutes
-    # les 2 min coûte une RTT amont complète par requête pour rien et
-    # ressemble à du hammering. Cooldown LONG (trial_dead_cooldown_s,
-    # défaut 6 h), rotation inchangée (IP fraîche = bucket frais).
-    # Un Retry-After explicite gagne toujours (consigne amont directe).
+    # [quota-ledger 2026-11-01] `FreeUsageLimitError` = bucket (IP, jour UTC)
+    # avec un Retry-After qui pointe vers 00:00 UTC. On le marque dans le
+    # ledger ; le cooldown station reste borné par le Retry-After (ou 6 h si
+    # absent) pour couvrir la rotation, mais le ledger est la source de vérité.
     _scope = ""
     try:
         if body:
@@ -13246,14 +13652,69 @@ def _mark_free_stations_429(
     if stations is None:
         stations = [_free_attempt_station()]
     pool = _free_ip_pool
-    # [reliability P0] Enregistre le 429 par (modèle, station, IP) AVANT
-    # toute décision : c'est ce qui distingue une IP mauvaise d'un quota.
+    # [quota-ledger 2026-11-01] L'IP de la tentative peut avoir changé si la
+    # station a roté entre le POST et la lecture du 429. On privilégie l'IP
+    # réellement utilisée (ContextVar) pour ne pas marquer la mauvaise.
+    _attempt_ip = ""
+    try:
+        _attempt_ip = str((_current_free_attempt.get() or {}).get("ip") or "").strip()
+    except Exception:
+        _attempt_ip = ""
+    # [quota-ledger 2026-11-01] Le bucket serveur est (IP, jour UTC) :
+    # un `FreeUsageLimitError` marque CETTE IP jusqu'à son reset, pas le
+    # modèle global. Le cooldown modèle-global reste réservé au cas
+    # « plusieurs IP distinctes échouent » (détecté dans note_model_ip).
+    # On transmet le corps et le Retry-After pour que le ledger puisse
+    # poser le bon reset_at.
+    try:
+        _ra_secs = _free_429_cooldown_seconds(retry_after, body if isinstance(body, str) else None)
+    except Exception:
+        _ra_secs = 0.0
+    # Pour le ledger : ne PAS transmettre le défaut 120 s quand l'amont n'a
+    # annoncé aucune durée. Un `FreeUsageLimitError` sans header doit être
+    # calé sur le prochain minuit UTC, pas sur un cooldown court.
+    _ra_for_ledger: float | None = None
+    if (retry_after or "").strip():
+        _ra_for_ledger = _ra_secs
+    elif isinstance(body, str) and body:
+        try:
+            from core.errors import parse_body_retry_seconds as _parse_body_ra
+
+            _ra_for_ledger = _parse_body_ra(body)
+        except Exception:
+            _ra_for_ledger = None
+    _err_type = ""
+    if _scope == "trial-exhausted":
+        _err_type = "FreeUsageLimitError"
+    elif _scope == "rate-limited":
+        _err_type = "RateLimitError"
+    elif _scope == "transient":
+        _err_type = "Transient429"
+    # Corps vide = quota présumé (comportement historique `quota_flag=True`).
+    # Sans corps on ne peut pas distinguer un bucket journalier d'un 429
+    # transitoire ; on prend la lecture conservatrice pour le quota.
+    if not _err_type and _body_empty and quota_flag:
+        _err_type = "FreeUsageLimitError"
     if pool is not None and hasattr(pool, "note_model_ip"):
         for station in stations:
             if station is None:
                 continue
             try:
-                pool.note_model_ip(free_model, station, 429)
+                pool.note_model_ip(
+                    free_model,
+                    station,
+                    429,
+                    ip=_attempt_ip if (len(stations) == 1 and _attempt_ip) else None,
+                    body=body,
+                    error_type=_err_type,
+                    retry_after=_ra_for_ledger,
+                )
+            except TypeError:
+                # Doubles/tests à l'ancienne signature.
+                try:
+                    pool.note_model_ip(free_model, station, 429)
+                except Exception:
+                    pass
             except Exception:
                 pass
         try:
@@ -13262,7 +13723,7 @@ def _mark_free_stations_429(
             _mg = 0.0
         if _mg > 0:
             _log(
-                f"  FREE {free_model!r} 429 sur plusieurs IP — limite modèle globale "
+                f"  FREE {free_model!r} 429 — limite free globale "
                 f"({_mg:.0f}s), rotations suspendues"
             )
             for station in stations:
@@ -13298,32 +13759,12 @@ def _mark_free_stations_429(
             _cd_secs = min(_free_429_cooldown_seconds(retry_after), 30.0)
         if _action_429 != "rotate":
             _set_free_cooldown(free_model, _cd_secs, station, scope=_scope if quota_flag else "transient")
-        # [no-ip-change 2026-10-24] Quota épuisé → changer d'impersonnalisation
-        # SUR PLACE (version/UA/ses_/project neufs, même IP, même tunnel) :
-        # zéro AUTH NordVPN, contrairement à une rotation d'IP. Si le bucket
-        # amont inclut la face client, la prochaine tentative passe sans
-        # changer d'IP. La rotation d'IP ci-dessous reste armée en parallèle
-        # (bucket vraiment per-IP). Jamais de raise : best-effort pur.
-        if quota_flag:
-            try:
-                _rip = ""
-                try:
-                    _rip = str(getattr(station, "current_ip", "") or "").strip()
-                except Exception:
-                    _rip = ""
-                if _rip and _per_ip_identity_enabled():
-                    _vv = _ip_vault()
-                    if _vv is not None and hasattr(_vv, "rotate_installation"):
-                        _new_face = _vv.rotate_installation(_rip) or {}
-                        try:
-                            _sid = getattr(station, "_station", "?")
-                            _log(
-                                f"  [free-identity] {free_model!r} quota ip={_rip} (st{_sid}) → nouvelle installation {(_new_face or {}).get('version')}/{(_new_face or {}).get('client')} gen={(_new_face or {}).get('generation')}"
-                            )
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+        # [quota-ledger 2026-11-01] Le bucket est (IP, jour UTC) : changer
+        # version/UA/ses_/project SUR LA MÊME IP ne rend aucun quota. On ne
+        # rotale donc plus l'installation ici — la seule remédiation est la
+        # rotation d'egress ci-dessous (nouvelle IP = nouveau bucket).
+        # `rotate_installation()` reste disponible pour un changement de
+        # linkage/version explicite, jamais pour échapper à un 429.
         # [fix rotation-storm] rotation SEULEMENT pour un vrai quota (ou body absent).
         # [fix quota-vs-breaker] On appelle AUSSI le pool pour un 429 transitoire
         # (quota=False) : il n'y rotationne pas, mais il alimente le log corrélé
@@ -13797,7 +14238,9 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     except Exception:
                         pass
                     raise FreeQuotaExhausted(
-                        _ra, status=429, body="FreeUsageLimitError: all free candidates trial-dead"
+                        _free_bucket_retry_after(free_model, _ra),
+                        status=429,
+                        body="FreeUsageLimitError: all free candidates trial-dead",
                     )
     except FreeQuotaExhausted:
         raise
@@ -14364,7 +14807,11 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 # dernière cause réelle — jamais de « quota » sans 429 vu.
                 if IP_ROTATION.get("strict_free", False):
                     if _last_free_status == 429:
-                        raise FreeQuotaExhausted(_last_retry_after, status=429, body=_last_body)
+                        raise FreeQuotaExhausted(
+                            _free_bucket_retry_after(free_model, _last_retry_after),
+                            status=429,
+                            body=_last_body,
+                        )
                     if _last_free_status is not None:
                         raise FreeRefusal(
                             status=_last_free_status,
@@ -14653,7 +15100,9 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     _full429 = (getattr(resp, "text", "") or "")[:2000]
                 except Exception:
                     _full429 = body_429
-                raise FreeQuotaExhausted(retry_after, status=429, body=_full429)
+                raise FreeQuotaExhausted(
+                    _free_bucket_retry_after(free_model, retry_after), status=429, body=_full429
+                )
             if _free_exception_fallback_mode() == "direct":
                 return None
             if _free_stations_exhausted(free_model):
@@ -14661,7 +15110,9 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     _full429 = (getattr(resp, "text", "") or "")[:2000]
                 except Exception:
                     _full429 = body_429
-                raise FreeQuotaExhausted(retry_after, status=429, body=_full429)
+                raise FreeQuotaExhausted(
+                    _free_bucket_retry_after(free_model, retry_after), status=429, body=_full429
+                )
         return None
 
     # Other errors → cooldown (60 s) so the next request doesn't retry the
@@ -21682,6 +22133,7 @@ async def api_free_health():
     capacity: dict = {}
     station_health: dict = {}
     quota_leases: list = []
+    quota_ledger: dict = {}
     rotation_planner: dict = {}
     last_selection: dict = {}
     canary: dict = {}
@@ -21697,6 +22149,8 @@ async def api_free_health():
                 station_health = _free_ip_pool._station_health.snapshot()
             if hasattr(_free_ip_pool, "_quota"):
                 quota_leases = _free_ip_pool._quota.snapshot(80)
+            if hasattr(_free_ip_pool, "quota_bucket_status"):
+                quota_ledger = _free_ip_pool.quota_bucket_status(getattr(_free_ip_pool, "_last_model", None))
             if hasattr(_free_ip_pool, "_rotation_planner"):
                 rotation_planner = _free_ip_pool._rotation_planner.snapshot()
             if hasattr(_free_ip_pool, "_best_ip"):
@@ -21716,6 +22170,7 @@ async def api_free_health():
         "capacity": capacity,
         "station_health": station_health,
         "quota_leases": quota_leases,
+        "quota_ledger": quota_ledger,
         "rotation_planner": rotation_planner,
         "last_selection": last_selection,
         "canary": canary,
@@ -21725,6 +22180,7 @@ async def api_free_health():
             "proxy ne suffit pas à conclure. `systemone` = autre protocole "
             "(/v1/systemone), jamais jugé sur le chat. `quotas` = clés "
             "(modèle, IP) en cooldown avec scope et retour estimé. "
+            "`quota_ledger` = buckets (IP, jour UTC) avec reset 00:00 UTC. "
             "`capacity` = stations réellement usable + quota, pas un faux 6/6."
         ),
     }
@@ -25398,6 +25854,20 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
     paid_model = free_model[:-5] if free_model.endswith("-free") else free_model
     proxy_mode = _free_proxy_mode()
     pool = _free_ip_pool
+    # [fix 2026-11-01] Une limite free globale doit être relayée en 429,
+    # JAMAIS transformée en 502 « all tunnels failed (None) » : le client
+    # officiel affiche le vrai refus, et le proxy n'enchaîne pas rotations
+    # ni AUTH pour rien.
+    if pool is not None and hasattr(pool, "model_global_remaining"):
+        try:
+            _mg = float(pool.model_global_remaining(free_model) or 0.0)
+        except Exception:
+            _mg = 0.0
+        if _mg > 0:
+            raise UpstreamError(
+                f"Free usage limit reached for {free_model}. Retry after {int(_mg)}s.",
+                status_code=429,
+            )
     t0 = time.monotonic()
     # forced_pool=None aujourd'hui (pas de _enforce_geo_gate sur systemone —
     # aucun routage géo) ; threadé pour parité future avec la jambe générique.
@@ -25742,6 +26212,19 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
         # catch que UpstreamError). Ordre : ctx C1 (persistance
         # free_status=502 via _FALLBACK_CTX_LAST) → log fallback → cooldown
         # 60 s → moteur latence (pattern L7731-7766, échec silencieux).
+        # [fix 2026-11-01] Si aucun tunnel n'a même été tenté (attempt=None)
+        # parce que tous les couples (modèle, IP) sont en limite free, le vrai
+        # statut est 429 — pas 502 « all tunnels failed (None) ».
+        if _last_tunnel_exc is None:
+            try:
+                _mg_end = float(pool.model_global_remaining(free_model)) if pool is not None else 0.0
+            except Exception:
+                _mg_end = 0.0
+            if _mg_end > 0:
+                raise UpstreamError(
+                    f"Free usage limit reached for {free_model}. Retry after {int(_mg_end)}s.",
+                    status_code=429,
+                )
         _dead_ms = int((time.monotonic() - t0) * 1000)
         try:
             _fallback_ctx_push(req_id, free_model, 502)
@@ -28363,9 +28846,16 @@ class ServerManager:
         import sys
 
         _log("Full restart: replacing process...")
-        # Flush all output before exec
+        # Flush all output before exec. En mode pythonw (GUI Windows),
+        # sys.stdout/sys.stderr peuvent être None : l'ancien flush() nu levait
+        # AttributeError dans le thread de restart, qui mourait silencieusement
+        # et le processus restait sur l'ancien code.
         for stream in (sys.stdout, sys.stderr):
-            stream.flush()
+            try:
+                if stream is not None:
+                    stream.flush()
+            except Exception:
+                pass
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 

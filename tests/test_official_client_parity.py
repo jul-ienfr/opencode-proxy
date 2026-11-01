@@ -102,6 +102,7 @@ OFFICIAL_TOOL_NAMES = {
     "task",
     "todowrite",
     "webfetch",
+    "websearch",
     "write",
 }
 
@@ -352,7 +353,7 @@ async def test_bun_replay_non_stream(official_env, monkeypatch):
     seen = {}
     posts = []
 
-    async def _fake_factory(proxy_url, impersonate, fp_override=None, egress_ip=None):
+    async def _fake_factory(proxy_url, impersonate, fp_override=None, egress_ip=None, variant=""):
         seen["proxy_url"] = proxy_url
         seen["impersonate"] = impersonate
         seen["fp_override"] = fp_override
@@ -564,6 +565,7 @@ def test_free_wire_body_passthrough():
     assert wire["tool_choice"] == "auto"
     assert wire == full or list(wire) == [
         "model",
+        "max_tokens",
         "messages",
         "tools",
         "tool_choice",

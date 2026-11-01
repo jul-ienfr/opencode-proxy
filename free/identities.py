@@ -48,10 +48,104 @@ def _identities_dir() -> str:
     return os.path.join(ROOT, "logs", "identities")
 
 
-# Versions client MESURÉES à 200 sur la gateway (ne jamais inventer une
-# version : le gate a déjà rejeté 1.19.0 et v2/prod — cf. opencode.py).
-KNOWN_CLIENT_VERSIONS = ("1.18.31", "1.19.3")
+# Versions client MESURÉES sur la gateway (captures mitm 2026-11-01).
+# Chaque version porte sa face réseau exacte : UA + suffixe Bun + présence
+# de `x-opencode-session-id`. Le corps (11 tools + système) est identique
+# sur 1.18.31 / 1.19.0 / 1.19.3 / 1.19.5.
+_JA3_BUN_113 = (
+    "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171"
+    "-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43-21,"
+    "29-23-24,0"
+)
+_JA3_BUN_114 = (
+    "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171"
+    "-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43,"
+    "4588-29-23-24,0"
+)
+_SIGALGS_BUN_113 = (
+    "ecdsa_secp256r1_sha256",
+    "rsa_pss_rsae_sha256",
+    "rsa_pkcs1_sha256",
+    "ecdsa_secp384r1_sha384",
+    "rsa_pss_rsae_sha384",
+    "rsa_pkcs1_sha384",
+    "rsa_pss_rsae_sha512",
+    "rsa_pkcs1_sha512",
+    "rsa_pkcs1_sha1",
+)
+_SIGALGS_BUN_114 = (
+    "ecdsa_secp256r1_sha256",
+    "rsa_pss_rsae_sha256",
+    "rsa_pkcs1_sha256",
+    "ecdsa_secp384r1_sha384",
+    "rsa_pss_rsae_sha384",
+    "rsa_pkcs1_sha384",
+    "rsa_pss_rsae_sha512",
+    "rsa_pkcs1_sha512",
+    "ed25519",
+    "ecdsa_secp521r1_sha512",
+    "rsa_pkcs1_sha1",
+)
+VERSION_SPECS: dict[str, dict] = {
+    "1.18.31": {
+        "bun": "runtime/bun/1.3.14",
+        "session_id": False,
+        "verified": True,
+        "ja3": _JA3_BUN_113,
+        "ja3_md5": "d871d02cecbde59abbf8f4806134addf",
+        "sigalgs": _SIGALGS_BUN_113,
+        "tls_grease": False,
+    },
+    "1.18.35": {
+        "bun": "runtime/bun/1.3.14",
+        "session_id": False,
+        "verified": False,
+        "ja3": _JA3_BUN_113,
+        "ja3_md5": "d871d02cecbde59abbf8f4806134addf",
+        "sigalgs": _SIGALGS_BUN_113,
+        "tls_grease": False,
+    },
+    "1.19.0": {
+        "bun": "runtime/bun/1.3.14",
+        "session_id": True,
+        "verified": True,
+        "ja3": _JA3_BUN_113,
+        "ja3_md5": "d871d02cecbde59abbf8f4806134addf",
+        "sigalgs": _SIGALGS_BUN_113,
+        "tls_grease": False,
+    },
+    "1.19.3": {
+        "bun": "runtime/bun/1.3.14",
+        "session_id": True,
+        "verified": True,
+        "ja3": _JA3_BUN_113,
+        "ja3_md5": "d871d02cecbde59abbf8f4806134addf",
+        "sigalgs": _SIGALGS_BUN_113,
+        "tls_grease": False,
+    },
+    "1.19.5": {
+        "bun": "runtime/bun/1.4.4",
+        "session_id": True,
+        "verified": True,
+        "ja3": _JA3_BUN_114,
+        "ja3_md5": "1523504b38f0fae0d881d4b6554aac1b",
+        "sigalgs": _SIGALGS_BUN_114,
+        "tls_grease": False,
+    },
+}
+KNOWN_CLIENT_VERSIONS = tuple(VERSION_SPECS)
+_LEGACY_CLIENT_VERSIONS = ("1.18.31", "1.19.3")
 _BUN_SUFFIX = "runtime/bun/1.3.14"
+_BUN_BY_VERSION = {v: spec["bun"] for v, spec in VERSION_SPECS.items()}
+#: Ordre de rotation des installations (versions vérifiées, la plus récente
+#: d'abord). Le client reste `desktop` (seule valeur observée live sur
+#: `opencode run`) ; `cli`/`app` restent générables explicitement.
+ROTATION_VERSIONS = ("1.19.5", "1.19.3", "1.18.31", "1.19.0")
+SUPPORTED_CLIENTS = ("desktop", "cli", "app")
+#: Seul `desktop` a été observé sur le wire réel (`opencode run` 1.18.31,
+#: 1.19.0, 1.19.3, 1.19.5). `cli`/`app` sont dans l'enum du binaire mais
+#: n'ont pas de capture live : profils explicites uniquement.
+VERIFIED_CLIENTS = ("desktop",)
 # ai-sdk bundle diffère par endpoint (mesuré) : 4.0.23 chat / 4.0.40 responses.
 _AI_CHAT = "ai-sdk/provider-utils/4.0.23"
 _AI_RESP = "ai-sdk/provider-utils/4.0.40"
@@ -59,7 +153,7 @@ _AI_RESP = "ai-sdk/provider-utils/4.0.40"
 # Enum RÉELLE du binaire (`request.ts` : ["app","cli","desktop"] — 1.18.31).
 # "app" n'a jamais été mesuré à 200 sur inference/v1 → pool restreint aux
 # deux valeurs vérifiées live.
-KNOWN_CLIENT_NAMES = ("cli", "desktop")
+KNOWN_CLIENT_NAMES = ("desktop", "cli", "app")
 
 _OC_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _SES_ROTATE_S = 1800.0
@@ -72,56 +166,62 @@ def _stable_int(*parts: str) -> int:
 
 
 def version_for(ip: str) -> str:
-    """Version OpenCode stable pour cette IP (pool mesuré uniquement)."""
+    """Version OpenCode stable pour cette IP (pool historique mesuré)."""
     if not ip:
-        return KNOWN_CLIENT_VERSIONS[0]
-    return KNOWN_CLIENT_VERSIONS[_stable_int("ver", ip) % len(KNOWN_CLIENT_VERSIONS)]
+        return _LEGACY_CLIENT_VERSIONS[0]
+    return _LEGACY_CLIENT_VERSIONS[_stable_int("ver", ip) % len(_LEGACY_CLIENT_VERSIONS)]
 
 
 def _version_for_gen(ip: str, generation: int) -> str:
-    """Variante salée par génération (rotation sans IP) — pool mesuré uniquement."""
+    """Variante salée par génération (rotation sans IP) — pool mesuré."""
     try:
         g = int(generation or 0)
     except Exception:
         g = 0
     if not ip:
-        return KNOWN_CLIENT_VERSIONS[g % len(KNOWN_CLIENT_VERSIONS)]
-    return KNOWN_CLIENT_VERSIONS[(_stable_int("ver", ip) + g) % len(KNOWN_CLIENT_VERSIONS)]
+        return _LEGACY_CLIENT_VERSIONS[g % len(_LEGACY_CLIENT_VERSIONS)]
+    return _LEGACY_CLIENT_VERSIONS[(_stable_int("ver", ip) + g) % len(_LEGACY_CLIENT_VERSIONS)]
 
 
 def client_name_for(ip: str, forced: str = "") -> str:
-    """Nom de client stable pour cette IP (cli/desktop)."""
+    """Nom de client pour cette IP.
+
+    `desktop` est la SEULE valeur observée live sur `opencode run`
+    (1.18.31/1.19.0/1.19.3/1.19.5). `cli`/`app` restent disponibles via un
+    profil explicite (générateur) mais ne sont pas le défaut du vault.
+    """
     if forced in KNOWN_CLIENT_NAMES:
         return forced
-    if not ip:
-        return KNOWN_CLIENT_NAMES[0]
-    return KNOWN_CLIENT_NAMES[_stable_int("client", ip) % len(KNOWN_CLIENT_NAMES)]
+    return "desktop"
 
 
 def _client_for_gen(ip: str, generation: int, forced: str = "") -> str:
-    """Variante salée par génération (rotation sans IP) — pool mesuré uniquement."""
+    """Variante salée par génération (rotation sans IP) — desktop par défaut."""
     if forced in KNOWN_CLIENT_NAMES:
         return forced
-    try:
-        g = int(generation or 0)
-    except Exception:
-        g = 0
-    if not ip:
-        return KNOWN_CLIENT_NAMES[g % len(KNOWN_CLIENT_NAMES)]
-    return KNOWN_CLIENT_NAMES[(_stable_int("client", ip) + g) % len(KNOWN_CLIENT_NAMES)]
+    return "desktop"
 
 
-def project_for(ip: str, base: str) -> str:
-    """Project ID par IP : même machine logique aurait le même projet, deux
-    machines distinctes ont des checkouts distincts. Dérivé déterministe du
-    projet de base (jamais de valeur inventée hors format)."""
+def project_for(ip: str, base: str, generation: int = 0) -> str:
+    """Project ID par IP (et par génération) : deux installations distinctes
+    ont des checkouts distincts. ``generation > 0`` donne un **nouveau**
+    project à la même IP — sinon une rotation d'identité réutilisait le
+    project et le provider pouvait relier les deux installations.
+    """
     base = (base or "").strip()
+    try:
+        gen = int(generation or 0)
+    except Exception:
+        gen = 0
     if not base or base == "global":
-        return "global"
+        if gen <= 0:
+            return "global"
+        return hashlib.sha256(f"global|{ip}|gen{gen}".encode()).hexdigest()[:40]
     if not ip:
         return base
     # base = hash git 40 hex (ou contenu .git/opencode) → dérivé 40 hex.
-    digest = hashlib.sha256(f"{base}|{ip}".encode()).hexdigest()
+    seed = f"{base}|{ip}|gen{gen}" if gen > 0 else f"{base}|{ip}"
+    digest = hashlib.sha256(seed.encode()).hexdigest()
     if len(base) == 40 and all(c in "0123456789abcdefABCDEF" for c in base):
         return digest[:40]
     return digest[: len(base)] if len(base) <= 64 else digest
@@ -131,7 +231,8 @@ def ua_for(ip: str, endpoint: str = "", forced_version: str = "") -> str:
     """User-Agent officiel complet pour cette IP + endpoint."""
     ver = forced_version if forced_version in KNOWN_CLIENT_VERSIONS else version_for(ip)
     ai = _AI_RESP if "/responses" in (endpoint or "") else _AI_CHAT
-    return f"opencode/{ver} {ai} {_BUN_SUFFIX}"
+    bun = _BUN_BY_VERSION.get(ver, _BUN_SUFFIX)
+    return f"opencode/{ver} {ai} {bun}"
 
 
 def _random_base62(n: int = 14) -> str:
@@ -183,10 +284,17 @@ class IpIdentity:
         "_id_state",
         "_lock",
         "_file",
+        "_persist_enabled",
     )
 
     def __init__(
-        self, ip: str, base_project: str = "", forced_client: str = "", forced_version: str = "", generation: int = 0
+        self,
+        ip: str,
+        base_project: str = "",
+        forced_client: str = "",
+        forced_version: str = "",
+        generation: int = 0,
+        persist: bool = True,
     ):
         self.ip = ip or "direct"
         try:
@@ -200,14 +308,20 @@ class IpIdentity:
         else:
             self.version = version_for(self.ip)
         self.client = _client_for_gen(self.ip, self.generation, forced_client)
-        self.project = project_for(self.ip, base_project)
+        self.project = project_for(self.ip, base_project, self.generation)
         self.ses_global: str = ""
         self.ses_ts: float = 0.0
         self.conv: dict[str, str] = {}
         self._id_state = {"last_ms": 0, "counter": 0, "lock": threading.Lock()}
         self._lock = threading.Lock()
+        self._persist_enabled = bool(persist)
         self._file = os.path.join(_identities_dir(), _safe_filename(self.ip) + ".json")
-        if self.generation:
+        if not self._persist_enabled:
+            # Profil généré (CLI/tests) : aucune lecture/écriture disque, IDs
+            # toujours frais.
+            self.ses_global = _mint("ses", "descending", self._id_state)
+            self.ses_ts = time.time()
+        elif self.generation:
             # Rotation sans IP : nouvelle installation — on n'hérite ni de la
             # version figée ni du ses_ (c'est justement ce qu'on change).
             self.ses_global = _mint("ses", "descending", self._id_state)
@@ -265,6 +379,8 @@ class IpIdentity:
         return ""
 
     def _persist(self) -> None:
+        if not getattr(self, "_persist_enabled", True):
+            return
         try:
             os.makedirs(os.path.dirname(self._file), exist_ok=True)
             tmp = self._file + ".tmp"
@@ -333,20 +449,47 @@ class IpIdentity:
 
     def ua(self, endpoint: str = "") -> str:
         ai = _AI_RESP if "/responses" in (endpoint or "") else _AI_CHAT
-        return f"opencode/{self.version} {ai} {_BUN_SUFFIX}"
+        bun = _BUN_BY_VERSION.get(self.version, _BUN_SUFFIX)
+        return f"opencode/{self.version} {ai} {bun}"
+
+    def official_provider_headers(self, endpoint: str = "", conversation_key: str | None = None) -> dict:
+        """Headers EXACTS du provider `opencode` pour cette installation.
+
+        Capture mitm 2026-11-01 (1.18.31 / 1.19.0 / 1.19.3 / 1.19.5) :
+        Authorization, Content-Type, UA, x-opencode-client, x-opencode-project,
+        x-opencode-request, x-opencode-session, [x-opencode-session-id].
+        `x-opencode-session-id` n'existe qu'à partir de 1.19.0.
+        Aucun x-session-affinity / x-session-id / directory / workspace.
+        """
+        ses = self.session_for(conversation_key)
+        msg = self.new_msg()
+        out = {
+            "Authorization": "Bearer public",
+            "Content-Type": "application/json",
+            "User-Agent": self.ua(endpoint),
+            "x-opencode-client": self.client or "desktop",
+            "x-opencode-project": self.project or "global",
+            "x-opencode-request": msg,
+            "x-opencode-session": ses,
+        }
+        if VERSION_SPECS.get(self.version, {}).get("session_id", True):
+            out["x-opencode-session-id"] = ses
+        return out
 
     def session_header_items(self, ses: str) -> list[tuple[str, str]]:
         """Headers d'identité de session pour CETTE version client (ordre wire).
 
-        Mesuré sur binaires réels (chemin custom-provider) :
-        * 1.18.31 → duo `x-session-affinity` + `x-session-id` (capture locale
-          2026-10-24 : jamais de `x-opencode-session-id`) ;
-        * 1.19.3 → trio `x-opencode-session-id` + duo, même valeur
-          (`_research/oc-1.19.3/capture.jsonl`).
-        Même `ses_` sur les 2-3 noms (sticky routing + prefix-cache).
+        * 1.18.31 → quartet provider `opencode` sans `x-opencode-session-id`
+          (capture live 2026-11-01) ;
+        * 1.19.3 → trio historique `x-opencode-session-id` + duo (chemin
+          custom-provider, conservé pour compatibilité) ;
+        * 1.19.5 → quartet provider `opencode` + `x-opencode-session-id`
+          (capture live 2026-11-01).
         """
         if self.version == "1.18.31":
-            return [("x-session-affinity", ses), ("x-session-id", ses)]
+            return [("x-opencode-session", ses)]
+        if self.version == "1.19.5":
+            return [("x-opencode-session", ses), ("x-opencode-session-id", ses)]
         return [
             ("x-opencode-session-id", ses),
             ("x-session-affinity", ses),
@@ -498,7 +641,20 @@ class IdentityVault:
                     remembered = 0
                 gen = max(base_gen, remembered) + 1
                 self._gen[key] = gen
-                ident = IpIdentity(key, self._base_project, self._forced_client, self._forced_version, generation=gen)
+                # [2026-11-01] Nouvelle installation = profil exact alterné
+                # parmi les versions vérifiées (1.19.5 → 1.19.3 → 1.18.31 →
+                # 1.19.0), client `desktop` (seule valeur observée live).
+                # Chaque génération change aussi le project/ses_/msg_.
+                version = self._forced_version or ROTATION_VERSIONS[(gen - 1) % len(ROTATION_VERSIONS)]
+                client = self._forced_client or "desktop"
+                ident = IpIdentity(
+                    key,
+                    self._base_project,
+                    forced_client=client,
+                    forced_version=version,
+                    generation=gen,
+                )
+                ident._persist()
                 self._ids[key] = ident
             try:
                 return ident.snapshot()
