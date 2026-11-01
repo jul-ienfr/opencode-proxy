@@ -250,10 +250,10 @@ def main() -> None:
                 for sid, station in stations.items()
                 if sid in (1, 2, 3, 4) and _needs_chain(station)
             ]
-            wanted = broken if broken else list(SPARES)
+            # One active repair at a time; otherwise keep the spare search.
+            wanted = [min(broken)] if broken else list(SPARES)
 
-            # Stop chains that are no longer needed (recovered station/less
-            # urgent than an active repair).
+            # Stop every chain that is not the current target.
             for sid in list(stations):
                 if sid not in wanted:
                     _stop_chain(sid)
@@ -274,8 +274,6 @@ def main() -> None:
                         path.unlink()
                     except Exception:
                         pass
-                if station in (1, 2, 3, 4):
-                    _disable_station(station)
                 _start_chain(station)
         except Exception as exc:  # noqa: BLE001
             log(f"supervisor error: {type(exc).__name__}: {exc}")
