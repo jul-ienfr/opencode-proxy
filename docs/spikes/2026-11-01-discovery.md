@@ -37,6 +37,33 @@ d’un autre pool, non exposé directement par le catalogue public. La découver
 doit donc être plus large (ou utiliser les observations déjà connues) pour
 retrouver des egress 200.
 
+## Limite majeure découverte
+
+Le catalogue utilisé par gluetun (`/gluetun/servers/nordvpn.json`) contient
+**14 132 entrées** (7 229 uniques côté API publique). Pour l’Albanie :
+
+- 128 entrées (OpenVPN + WireGuard) ;
+- hostnames `al109..` → IPs `186.247.44.x` ;
+- **aucune entrée `87.120.102.x`**.
+
+Or les seuls egress 200 observés (`.53`, `.13`, `.76`) appartiennent au pool
+`87.120.102.x`, qui n’est **pas exposé** dans le catalogue. Il s’agit
+probablement d’un pool NAT de serveurs plus récents, absents du catalogue
+public/gluetun.
+
+Conséquence : le binding par hostname est fiable **pour les serveurs du
+catalogue**, mais il ne permet pas de reproduire un egress NAT inconnu. Pour ces
+derniers, il faut :
+
+1. les garder **stickies** tant que la station reste connectée ;
+2. les marquer `rebindable=false` dans le registre ;
+3. si la station tombe, revenir à une découverte par pays (loterie) ou
+   identifier le hostname via les logs gluetun debug / l’API interne du
+   provider.
+
+C’est un point à intégrer au registre : une IP observée n’est pas forcément
+re-assignable par hostname.
+
 ## Suite
 
 1. Étendre la découverte aux pays/pools qui ont déjà produit des 200.
