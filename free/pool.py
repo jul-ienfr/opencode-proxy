@@ -3381,6 +3381,16 @@ class FreeIPPool:
             raise RotationFailed(f"proxy socks5 {station.pid} n'a pas de rotation docker")
         if station is None:  # pragma: no cover — self._vpn toujours posé
             raise RotationFailed("switch_ip sans station")
+        # [2026-11-01] A Compose-pinned station must never go through the
+        # manager's rotation path: restarting the same hostname returns the
+        # same egress (three attempts × ~20 s, then error) and can leave the
+        # station unusable. Fresh IPs are the fresh-chain's job (Compose
+        # hostname rebind), not a manager restart.
+        if getattr(station, "_pinned_hostname", None):
+            raise RotationFailed(
+                f"station {getattr(station, '_station', '?')} pinned to "
+                f"{station._pinned_hostname} — rotation owned by the fresh-IP chain"
+            )
         new_ip = await station.connect_next()
         if not new_ip:
             # Defensive: connect_next is typed to return str now, but a

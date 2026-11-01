@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 import free.pool as fp
 
 
@@ -92,6 +94,13 @@ def test_duplicate_egress_ip_is_not_routable():
 
     assert pool._station_usable(st2, exclude_approaching=False) is False
     assert pool._station_usable(st1, exclude_approaching=False) is True
+
+
+async def test_switch_ip_refuses_a_pinned_station():
+    pool, st1, _ = _pool()
+    st1._pinned_hostname = "al41.nordvpn.com"
+    with pytest.raises(fp.RotationFailed):
+        await pool.switch_ip(st1)
 
 
 def test_pinned_station_skips_quota_rotation():
