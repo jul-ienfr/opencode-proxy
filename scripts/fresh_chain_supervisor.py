@@ -250,8 +250,19 @@ def main() -> None:
                 for sid, station in stations.items()
                 if sid in (1, 2, 3, 4) and _needs_chain(station)
             ]
-            # One active repair at a time; otherwise keep the spare search.
-            wanted = [min(broken)] if broken else list(SPARES)
+            # One active repair at a time, plus the spare stations so s5/s6
+            # can also find a fresh IP. A 5 s chain delay keeps the NordVPN
+            # AUTH rate safe with three chains.
+            spares = [
+                sid
+                for sid in SPARES
+                if sid not in handled
+                and not (
+                    stations.get(sid, {}).get("model_usable")
+                    and stations.get(sid, {}).get("station_usable")
+                )
+            ]
+            wanted = ([min(broken)] if broken else []) + spares
 
             # Stop every chain that is not the current target.
             for sid in list(stations):

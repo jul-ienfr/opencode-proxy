@@ -343,6 +343,8 @@ async def run(args) -> int:
     for index in range(start, len(candidates)):
         if args.max and tested >= args.max:
             break
+        if tested and args.delay > 0:
+            await asyncio.sleep(args.delay)
         candidate = candidates[index]
         host = str(candidate.get("host") or "")
         country = str(candidate.get("country") or "")
@@ -421,6 +423,7 @@ def main() -> int:
     parser.add_argument("--api-base", default="http://127.0.0.1:4000")
     parser.add_argument("--start", type=int, default=None)
     parser.add_argument("--max", type=int, default=0)
+    parser.add_argument("--delay", type=float, default=5.0)
     parser.add_argument("--candidates", default="")
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
