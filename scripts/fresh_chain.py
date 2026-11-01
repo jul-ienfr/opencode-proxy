@@ -21,6 +21,7 @@ import atexit
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -175,6 +176,27 @@ def build_candidates() -> list[dict]:
     return rows
 
 
+def _clean_station_container(station: int) -> None:
+    """Remove stale/duplicated Compose containers before a rebind.
+
+    Failed `up --force-recreate` can leave hashed-prefix containers
+    (``<id>_opencode-vpn-5``) that make the next compose call fail with
+    "Conflict. The container name ... is already in use".
+    """
+    service = "opencode-vpn" if station == 1 else f"opencode-vpn-{station}"
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}"],
+            capture_output=True,
+            timeout=30,
+        ).stdout
+    except Exception:
+        return
+    for name in out.decode("utf-8", "ignore").splitlines():
+        if service in name:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
+
+
 def _state_path(station: int) -> Path:
     return ROOT / "logs" / f"fresh_chain_state_{int(station)}.json"
 
@@ -299,6 +321,7 @@ async def run(args) -> int:
             state["index"] = index
             save_state(state_path, state)
         log(f"[{index + 1}/{len(candidates)}] bind {host} ({country})")
+        _clean_station_container(args.station)
         bind = await binder.assign(args.station, host, country=country)
         tested += 1
         if not bind.ok:

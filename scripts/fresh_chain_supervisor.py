@@ -43,10 +43,9 @@ def _pid_alive(pid: int) -> bool:
             out = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}"],
                 capture_output=True,
-                text=True,
                 timeout=10,
             ).stdout
-            return str(pid) in out
+            return str(pid).encode() in out
         os.kill(pid, 0)
         return True
     except Exception:
