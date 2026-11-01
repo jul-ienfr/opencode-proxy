@@ -232,6 +232,20 @@ TLS, sans Docker, config `ip_rotation.https_proxies` et
 station Docker n’est routable. La vérification TLS du proxy est désactivée
 (`CurlOpt.PROXY_SSL_VERIFYPEER/VERIFYHOST`), l’origine reste vérifiée.
 
+### OpenVPN : testé, non viable
+
+Test sur `ch296.nordvpn.com` (serveur qui fonctionne en WG) :
+
+```text
+TCP 443 : connexion TCP établie puis "Connection reset" immédiat
+UDP 1194: peer initié puis AUTH_FAILED (credentials refusées)
+```
+
+Le transport OpenVPN n’est donc pas une voie de secours avec les
+credentials actuels. Le binder sait le configurer (`VPN_TYPE=openvpn`,
+`OPENVPN_PROTOCOL=tcp|udp`), mais aucun serveur testé ne passe. WireGuard
+reste le seul transport exploitable.
+
 ## Suite
 
 1. Étendre la découverte aux pays/pools qui ont déjà produit des 200.
