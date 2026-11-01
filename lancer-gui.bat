@@ -35,3 +35,6 @@ echo L'icone apparait dans la barre des taches.
 echo.
 
 start "" pythonw opencode.py --gui
+REM [2026-11-01] Chaine d'IP fraiches: teste les candidats WG (429 -> suivant)
+REM jusqu'au premier 200, puis reactive la station. Logs: logs\fresh_chain_*.log
+start "" pythonw scripts\fresh_chain_supervisor.py

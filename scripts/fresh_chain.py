@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -177,6 +179,31 @@ def _state_path(station: int) -> Path:
     return ROOT / "logs" / f"fresh_chain_state_{int(station)}.json"
 
 
+def _lock_path(station: int) -> Path:
+    return ROOT / "logs" / f"fresh_chain_{int(station)}.lock"
+
+
+def acquire_lock(station: int) -> bool:
+    """One chain per station; a stale lock (crash) expires after one hour."""
+    path = _lock_path(station)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if time.time() - float(data.get("ts") or 0.0) < 3600.0:
+                return False
+        except Exception:
+            pass
+    path.write_text(json.dumps({"pid": os.getpid(), "ts": time.time()}), encoding="utf-8")
+    return True
+
+
+def release_lock(station: int) -> None:
+    try:
+        _lock_path(station).unlink()
+    except Exception:
+        pass
+
+
 def load_state(path: Path) -> dict:
     if path.exists():
         try:
@@ -221,6 +248,11 @@ def mark(api_base: str, ip: str, status: int, retry_after: float, station: int, 
 async def run(args) -> int:
     from free.ip_registry import ComposeHostnameBinder, StationEgress, StationProbe
 
+    if not acquire_lock(args.station):
+        log(f"chain already running for station {args.station} — exit")
+        return 0
+    atexit.register(release_lock, args.station)
+
     state_path = _state_path(args.station)
     state = load_state(state_path)
     if args.candidates and Path(args.candidates).exists():
@@ -241,13 +273,13 @@ async def run(args) -> int:
             print(row["host"], row["country"], row["source"])
         return 0
 
-    egress = StationEgress()
+    egress = StationEgress(urls=("https://api.ipify.org",), timeout_s=5.0)
     probe = StationProbe(egress=egress, timeout_s=60.0)
     binder = ComposeHostnameBinder(
         ROOT,
         override_path=f"logs/compose-hostname-{args.station}.yml",
         profile="multi-station",
-        settle_s=12.0,
+        settle_s=8.0,
         egress=egress,
         recreate_timeout_s=180.0,
     )
