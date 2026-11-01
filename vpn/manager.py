@@ -4890,6 +4890,7 @@ class VPNManager:
             ),
             "ip": self._current_ip,
             "current_host": getattr(self, "_current_host", None),
+            "pinned_hostname": getattr(self, "_pinned_hostname", None),
             "server": self._current_server.get("name") if self._current_server else None,
             "country": self._current_server.get("country") if self._current_server else None,
             "current_country": self._current_country,
