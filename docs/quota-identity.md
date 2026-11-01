@@ -11,9 +11,16 @@ La réponse tient en une phrase :
 
 > En free, le provider ne connaît pas « moi ». Il connaît une **IP d'egress**
 > (IPv6 tronquée au /64). Le quota est un compteur `(ip, interval)` dans
-> `ip_rate_limit`; le reset est **00:00 UTC pour tout le monde**. Les 18 h /
-> 19 h / 24 h observés sont seulement le temps restant jusqu'à minuit UTC au
-> moment du 429, pas une identité ni un reset personnalisé.
+> `ip_rate_limit`. Le reset est **propre à chaque IP** : la mesure live du
+> 2026-11-01 donne des resets entre **00:01 et 00:53 UTC** (pas un minuit
+> unique). Les 18 h / 19 h / 24 h sont le temps restant jusqu'au reset de
+> **cette IP**, pas une identité ni un reset global.
+
+> **Correction 2026-11-01** : le code public `getRetryAfterDay` calcule un
+> minuit UTC unique, mais la production mesurée ne se comporte pas ainsi
+> (resets par IP espacés de ~1 h, stables pour une même IP). Voir
+> [`docs/free-429-investigation.md`](free-429-investigation.md) pour les
+> preuves, le replay exact du client officiel et les tests ASN/modèles.
 
 Tout le reste — Bun, JA3, UA, `x-opencode-project`, `x-opencode-session`,
 `x-opencode-request`, `x-opencode-client`, le corps, les outils — est au mieux
@@ -141,13 +148,17 @@ export function getRetryAfterDay(now: number) {
 ```
 
 `now` est un timestamp Unix en millisecondes. `now % 86_400_000` est le temps
-écoulé depuis **00:00 UTC**. Le `Retry-After` est donc :
+écoulé depuis **00:00 UTC**. Le code public calcule donc :
 
 > **le nombre de secondes restantes jusqu'au prochain minuit UTC.**
 
-Ce n'est ni un rolling window, ni un reset ancré à la première requête, ni un
-reset par utilisateur. C'est une constante globale, la même pour toutes les
-IPs et tous les comptes free.
+Mais la **mesure live 2026-11-01** ne suit pas cette formule à la lettre : sur
+cinq IPs différentes, `date + Retry-After` donne des resets entre **00:01:34**
+et **00:53:10 UTC**, stables pour une même IP. Le code de production a donc
+changé (fenêtre 24 h glissante, offset ou jitter par IP), ou le `Retry-After`
+inclut un décalage par IP. La seule source de vérité est le `Retry-After`
+live ; le ledger stocke `reset_at = now + Retry-After` **sans snap** sur
+minuit. Voir [`docs/free-429-investigation.md`](free-429-investigation.md) §3.
 
 `_isNew` mérite une note : une IP dont le compteur lifetime est inférieur à
 `dailyLimit * 7` est considérée comme « nouvelle » et a droit à **2× la limite
@@ -409,8 +420,8 @@ La règle pratique :
 
 ## 6. Pourquoi 18 h / 19 h / 24 h ?
 
-Parce que le `Retry-After` est un **compte à rebours jusqu'à 00:00 UTC**, pas
-une heure de reset personnelle.
+Le `Retry-After` est le compte à rebours jusqu'au reset **propre à l'IP**. Pour
+une IP dont le reset tombe à minuit UTC, le tableau ci-dessous s'applique :
 
 | Moment du 429 (UTC) | `Retry-After` | Affichage |
 |---|---|---|
@@ -421,25 +432,24 @@ une heure de reset personnelle.
 | 18:00:00 | 21 600 s | 6 h |
 | 23:59:59 | 1 s | 1 s |
 
-Deux utilisateurs qui voient « 19 h » et « 18 h » n'ont pas deux resets
-différents : ils ont simplement atteint la limite à 05:00 et 06:00 UTC. Le
-reset réel est le même instant pour tout le monde : **2026-11-02T00:00:00Z**
-(dans cet exemple).
-
-Si tu observes un « reset » au moment où tu changes d'IP, ce n'est pas un
-reset temporel : c'est un **nouveau bucket** (IP neuve) qui démarre à zéro.
-Le reset journalier de ce bucket reste 00:00 UTC. Deux IPs peuvent donc avoir
-des « resets » apparents différents simplement parce qu'elles ont commencé à
-être utilisées à des heures différentes.
+Mais les resets mesurés le 2026-11-01 ne sont **pas** tous à minuit : cinq IPs
+ont donné des resets entre **00:01:34** et **00:53:10 UTC**. Deux IPs peuvent
+donc afficher « 19 h » et « 18 h » au même moment alors que leurs resets
+diffèrent réellement. Le reset n'est pas un instant global ; c'est un instant
+**par bucket IP**.
 
 Conséquences :
 
-- changer de fuseau horaire, de version, de session ou d'IP ne change pas
-  l'instant de reset ;
-- le seul levier temporel est de **consommer après 00:00 UTC** (le bucket est
-  journalier, pas glissant) ;
-- le `date` de la réponse Cloudflare permet de calculer le reset sans faire
-  confiance à l'horloge locale.
+- le `date` de la réponse + `Retry-After` donne le reset exact de **cette
+  IP** ; il faut le stocker tel quel, sans snap sur minuit ;
+- changer d'IP crée un nouveau bucket avec son propre reset ;
+- si le provider utilise une fenêtre glissante de 24 h, la fenêtre peut être
+  entretenue par d'autres utilisateurs de la même IP partagée ;
+- ne jamais supposer qu'une IP redeviendra disponible à un minuit global.
+
+Voir [`docs/free-429-investigation.md`](free-429-investigation.md) §3 pour la
+table des resets par IP et §7 pour la seule voie free (IP fraîche
+non-datacenter ou compte).
 
 ---
 

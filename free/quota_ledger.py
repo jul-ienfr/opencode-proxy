@@ -302,12 +302,11 @@ class QuotaLedger:
                         ra = 0.0
                     state.retry_after = max(0.0, ra)
                     if ra > 0:
+                        # Le provider peut avoir un reset PAR IP (fenêtre
+                        # glissante / jitter observés 00:01→00:53 UTC). Le
+                        # Retry-After est la seule source de vérité : on ne
+                        # snap plus sur un minuit global.
                         state.reset_at = ts + ra
-                        # Le serveur arrondit à minuit UTC : si le Retry-After
-                        # y correspond à quelques secondes près, on snap.
-                        midnight = next_utc_midnight(ts)
-                        if abs(state.reset_at - midnight) <= 120.0:
-                            state.reset_at = midnight
                     else:
                         state.reset_at = next_utc_midnight(ts)
                 else:
