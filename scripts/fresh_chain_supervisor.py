@@ -156,7 +156,16 @@ def _start_chain(station: int) -> None:
     log_path = ROOT / "logs" / f"fresh_chain_{station}.log"
     handle = open(log_path, "ab")
     proc = subprocess.Popen(
-        [sys.executable, "-X", "utf8", str(ROOT / "scripts" / "fresh_chain.py"), "--station", str(station)],
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            str(ROOT / "scripts" / "fresh_chain.py"),
+            "--station",
+            str(station),
+            "--delay",
+            "8",
+        ],
         cwd=str(ROOT),
         stdout=handle,
         stderr=handle,
@@ -241,30 +250,35 @@ def _persist_pin(station: int, winner: dict) -> None:
 def main() -> None:
     log("supervisor started")
     handled: set[int] = set()
+    repairing: set[int] = set()
     while True:
         try:
             data = _status()
             stations = {int(s.get("station") or 0): s for s in data.get("stations", [])}
+            healthy = {
+                sid
+                for sid, station in stations.items()
+                if station.get("model_usable") and station.get("station_usable")
+            }
+            # A live chain lock means the station is being repaired, even if
+            # its status now says "disabled" (we disable it while rebinding).
+            for sid in range(1, 7):
+                _path, _pid = _lock_state(sid)
+                if _pid and _pid_alive(_pid):
+                    repairing.add(sid)
+            for sid in list(repairing):
+                if sid in healthy:
+                    repairing.discard(sid)
+
             broken = [
                 sid
                 for sid, station in stations.items()
-                if sid in (1, 2, 3, 4) and _needs_chain(station)
+                if sid and sid not in handled and _needs_chain(station)
             ]
-            # One active repair at a time, plus the spare stations so s5/s6
-            # can also find a fresh IP. A 5 s chain delay keeps the NordVPN
-            # AUTH rate safe with three chains.
-            spares = [
-                sid
-                for sid in SPARES
-                if sid not in handled
-                and not (
-                    stations.get(sid, {}).get("model_usable")
-                    and stations.get(sid, {}).get("station_usable")
-                )
-            ]
-            wanted = ([min(broken)] if broken else []) + spares
+            wanted = sorted(set(broken) | repairing)
 
-            # Stop every chain that is not the current target.
+            # Every broken station searches at the same time. Chains that are
+            # no longer wanted (station recovered/winner) are stopped.
             for sid in list(stations):
                 if sid not in wanted:
                     _stop_chain(sid)
@@ -276,9 +290,11 @@ def main() -> None:
                 if winner:
                     _persist_pin(station, winner)
                     handled.add(station)
+                    repairing.discard(station)
                     continue
                 path, pid = _lock_state(station)
                 if pid and _pid_alive(pid):
+                    repairing.add(station)
                     continue
                 if path.exists():
                     try:
@@ -286,6 +302,7 @@ def main() -> None:
                     except Exception:
                         pass
                 _start_chain(station)
+                repairing.add(station)
         except Exception as exc:  # noqa: BLE001
             log(f"supervisor error: {type(exc).__name__}: {exc}")
         time.sleep(INTERVAL_S)

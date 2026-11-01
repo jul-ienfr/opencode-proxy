@@ -124,9 +124,7 @@ ip_rotation:
   country_rotation: false
   credentials_file: vpn_configs/credentials.txt
   custom_ovpn_file: ''
-  disabled_stations:
-  - 5
-  - 6
+  disabled_stations: []
   docker_autostart: true
   docker_autostart_cooldown_s: 600
   docker_compose_file: docker-compose.yml
