@@ -1825,6 +1825,7 @@ class FreeIPPool:
 
     async def acquire_model_slot(self, model: str, station):
         """Acquiert une place de concurrence ; None si timeout (fail-open)."""
+        _t0 = time.monotonic()
         try:
             sem = self._model_slot(model, station)
             try:
@@ -1832,8 +1833,22 @@ class FreeIPPool:
             except (TypeError, ValueError):
                 timeout = 20.0
             await asyncio.wait_for(sem.acquire(), timeout=max(0.1, timeout))
+            _waited = time.monotonic() - _t0
+            if _waited >= 2.0:
+                logger.info(
+                    "[free-ip] model slot wait %.1fs model=%s station=%s",
+                    _waited,
+                    model,
+                    getattr(station, "_station", "?"),
+                )
             return sem
         except TimeoutError:
+            logger.warning(
+                "[free-ip] model slot timeout %.1fs model=%s station=%s — fail-open",
+                time.monotonic() - _t0,
+                model,
+                getattr(station, "_station", "?"),
+            )
             return None
         except Exception:
             return None
