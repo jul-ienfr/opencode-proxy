@@ -22668,6 +22668,14 @@ async def free_quota_mark(request: Request):
                 mgr._egress_state = "tunnel_up_full"
                 mgr._auth_failed = False
                 mgr._desired_connected = True
+                # A real 200 disproves every stale repair failure: the old
+                # rotation error and the repair/park flags must not keep the
+                # station excluded after the tunnel answered.
+                mgr._last_rotation_error = None
+                mgr._last_rotation_failed_at = None
+                mgr._repairing = False
+                mgr._parked_until = 0.0
+                mgr._last_effective_ok_at = time.monotonic()
             except Exception:
                 pass
             try:

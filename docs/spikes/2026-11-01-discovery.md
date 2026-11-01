@@ -99,7 +99,7 @@ Le compose de la station 1 est persisté avec :
 
 et `.env` contient `SERVER_HOSTNAMES_STATION1=al41.nordvpn.com`.
 
-## Trois stations validées
+## Quatre stations validées
 
 Après fusion du catalogue embarqué dans chaque volume gluetun :
 
@@ -108,17 +108,28 @@ Après fusion du catalogue embarqué dans chaque volume gluetun :
 | 1 | `al41.nordvpn.com` | `87.120.102.90` | **200** |
 | 2 | `al75.nordvpn.com` | `87.120.102.77` | **200** |
 | 3 | `al74.nordvpn.com` | `87.120.102.59` | **200** |
+| 4 | `al36.nordvpn.com` | `87.120.102.9` | **200** |
 
-Le proxy voit les trois stations `connected`, `station_usable=true`,
+Le proxy voit les quatre stations `connected`, `station_usable=true`,
 `model_usable=true`, et sert en **200** (DB : `.59`/station 3, `.90`/station 1).
 
-Serveurs du pool testés mais sans egress WG : `al36`, `al37`, `al45`, `al46`,
-`al73`. `al36` reste joignable en HTTPS proxy (`:89`, egress `.14`) mais son
-quota est épuisé (429).
+Serveurs du pool testés mais sans egress WG : `al37`, `al45`, `al46`, `al73`.
+`al36` fonctionne en WireGuard (`al36` était initialement instable, puis a
+produit `.9`) et reste aussi joignable en HTTPS proxy (`:89`, egress `.14`)
+dont le quota est épuisé (429).
 
-Persistance : Compose pin `al41`/`al75`/`al74` pour les stations 1/2/3 via
-`SERVER_HOSTNAMES_STATION1..3`, et `.env` contient les mêmes valeurs. Un
-recreate de station ne perd donc plus le serveur.
+Persistance : Compose pin `al41`/`al75`/`al74`/`al36` pour les stations 1/2/3/4
+via `SERVER_HOSTNAMES_STATION1..4`, et `.env` contient les mêmes valeurs. Un
+recreate de station ne perd donc plus le serveur ; un recreate complet a
+reproduit exactement `.90`, `.77`, `.59` et `.9`.
+
+### Correctif santé station 4
+
+Le 200 de la station 4 était masqué par `health=probing` : `mark_station_ok()`
+nourrissait les bons probes **avant** `repair_succeeded()`, qui remettait
+`good_probes=0` et l'état à `probing`. La station restait donc exclue malgré
+un tunnel sain. L'ordre est désormais réparation → probes → `usable`, et le
+mark 200 efface aussi `last_rotation_error`, `_repairing` et `_parked_until`.
 
 ## Suite
 

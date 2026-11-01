@@ -85,6 +85,26 @@ def test_strict_health_rejects_auth_failed_and_stale_egress():
     assert pool.station_usable(st2) is True
 
 
+def test_mark_station_ok_recovers_a_probing_station():
+    """Un 200 réel doit rendre la station routable immédiatement.
+
+    Régression : ``mark_station_ok`` nourrissait les bons probes AVANT
+    ``repair_succeeded()``, qui remettait ``good_probes=0`` et l'état à
+    ``probing`` — la station restait exclue malgré son tunnel sain.
+    """
+    pool, st1, _ = _pool()
+    health = pool._station_health.get(1)
+    health.repair_succeeded()
+    assert health.state == "probing"
+
+    pool.mark_station_ok(st1)
+
+    assert health.state == "usable"
+    assert health.good_probes >= 2
+    assert pool.station_usable(st1) is True
+    assert pool.model_usable("m", st1)[0] is True
+
+
 def test_suspect_station_remains_usable_but_ranked_degraded():
     """Un probe raté (SUSPECT) ne doit pas faire tomber le pool à 1/7 :
     la station reste servable en dernier recours, derrière les saines."""

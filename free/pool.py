@@ -1191,10 +1191,19 @@ class FreeIPPool:
             good_needed = int(getattr(self._repair_policy, "good_probes", 2) or 2)
         except Exception:
             good_needed = 2
+        # [fix 2026-11-01] `repair_succeeded()` remet la machine à zéro et
+        # repasse en PROBING : il doit donc passer AVANT les bons probes.
+        # L'ancien ordre (probes puis repair_succeeded) laissait la station
+        # collée en `probing` avec `good_probes=0`, donc exclue du routage
+        # alors que son tunnel venait de répondre 200.
+        try:
+            station._last_effective_ok_at = time.monotonic()
+        except Exception:
+            pass
+        self.clear_egress_park(station)
+        self.mark_station_repaired(station)
         for _ in range(max(1, good_needed)):
             self.note_station_probe(station, True, cause=cause)
-        self.mark_station_repaired(station)
-        self.clear_egress_park(station)
         try:
             self._dirty_state = True
             self.save_pool_state()

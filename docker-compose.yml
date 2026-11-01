@@ -405,6 +405,7 @@ services:
       - "127.0.0.1:1083:1083"    # SOCKS5 proxy (loopback only)
     environment:
       <<: *gluetun-multi-env
+      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION4:-al36.nordvpn.com}
       VPN_TYPE: ${VPN_TYPE_STATION4:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION4:-${OPENVPN_PROTOCOL:-udp}}
       OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION4:-${OPENVPN_ENDPOINT_PORT:-}}
