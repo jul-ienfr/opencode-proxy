@@ -1856,6 +1856,14 @@ def register_dashboard(
 
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+    # [fresh-ip-hunter] Reprise au boot si le toggle GUI était activé.
+    try:
+        from free import hunter as _hunter
+
+        _hunter.ensure_started()
+    except Exception:
+        pass
+
     # index.html : le front reconstruit (Vite) vit dans `static/dist/`, l'ancien
     # front reste dans `static/` (repli si `npm run build` n'a jamais tourné, par
     # exemple sur un checkout nu). On sert le premier candidat lisible.

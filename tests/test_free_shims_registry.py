@@ -239,10 +239,11 @@ class TestInjection:
         names = [t["function"]["name"] for t in wire.get("tools") or []]
         assert names == official + ["my_tool"]
 
-    def test_tool_choice_none_quand_le_client_n_a_aucun_outil(self):
-        """Le `read` technique ne doit jamais être appelé par un client de chat."""
+    def test_tool_choice_auto_meme_sans_outil_client(self):
+        """Le gate refuse `none` ; la note système interdit les placeholders."""
         wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})
-        assert wire.get("tool_choice") == "none"
+        assert wire.get("tool_choice") == "auto"
+        assert "No client tools" in wire["messages"][0]["content"]
 
     def test_tool_choice_auto_quand_le_client_a_des_outils(self):
         wire = self._wire(

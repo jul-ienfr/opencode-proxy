@@ -9,6 +9,7 @@
    */
 
   import { apiGet, apiPost } from '$lib/api';
+  import { onMount } from 'svelte';
   import { t } from '$lib/i18n.svelte';
   import { createQuery } from '$lib/query.svelte';
   import { showToast } from '$lib/toast.svelte';
@@ -63,6 +64,16 @@
     rotate?: boolean;
   }
 
+  interface HunterStatus {
+    enabled?: boolean;
+    running?: boolean;
+    pid?: number | null;
+    started_at?: number | null;
+    log_path?: string;
+    last_log?: string[];
+    error?: string;
+  }
+
   interface Country {
     code?: string;
     name?: string;
@@ -95,8 +106,26 @@
     enabled: () => useApi
   });
 
+  const hunterQ = createQuery<HunterStatus>({
+    load: (signal) => apiGet<HunterStatus>('/api/free/hunter', signal),
+    tags: () => ['free_hunter'],
+    initial: {}
+  });
+
   const cfg = $derived(cfgQ.data);
   const proxies = $derived(socksQ.data?.proxies ?? []);
+  const hunter = $derived(hunterQ.data ?? {});
+
+  onMount(() => {
+    const timer = setInterval(() => void hunterQ.refresh(), 5000);
+    return () => clearInterval(timer);
+  });
+
+  async function toggleHunter(next: boolean): Promise<void> {
+    const res = await run('hunter', () => apiPost<HunterStatus>('/api/free/hunter', { enabled: next }));
+    if (res?.error) showToast(res.error, 'error');
+    await hunterQ.refresh(true);
+  }
 
   let busy = $state<string | null>(null);
   let country = $state('');
@@ -681,6 +710,29 @@
   </div>
 </Card>
 
+<Card
+  title="Fresh IP Hunter"
+  hint="Rotation NordVPN lente + test free réel ; s'arrête au premier 200. Désactivable à tout moment."
+>
+  <div class="row">
+    <Toggle
+      checked={!!hunter.enabled}
+      label="Activer le chasseur"
+      disabled={busy === 'hunter'}
+      onchange={toggleHunter}
+    />
+    <span class="muted small">
+      {hunter.running ? `running · pid ${hunter.pid ?? '?'}` : 'stopped'}
+    </span>
+    {#if hunter.enabled && !hunter.running}
+      <span class="muted small">activé mais process arrêté — vérifier le log</span>
+    {/if}
+  </div>
+  {#if hunter.last_log?.length}
+    <pre class="result hunter-log">{hunter.last_log.join('\n')}</pre>
+  {/if}
+</Card>
+
 <style>
   .grid {
     display: grid;
@@ -837,5 +889,9 @@
 
   .mono {
     font-family: var(--font-mono);
+  }
+
+  .hunter-log {
+    max-height: 240px;
   }
 </style>

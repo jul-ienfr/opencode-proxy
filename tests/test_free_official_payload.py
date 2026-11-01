@@ -48,9 +48,11 @@ def test_un_corps_minimal_recoit_la_copie_integrale():
 
     assert forced is True
     assert wire["stream"] is True
-    # Client sans AUCUN outil : grille officielle pour le gate, et tool_choice
-    # "none" pour que le modèle ne l'appelle jamais (le client ne les a pas).
-    assert wire["tool_choice"] == "none"
+    # Client sans AUCUN outil : grille officielle pour le gate. `tool_choice`
+    # reste `auto` (le gate refuse `none`) ; la note « no client tools »
+    # interdit au modèle d'appeler les placeholders.
+    assert wire["tool_choice"] == "auto"
+    assert "No client tools" in wire["messages"][0]["content"]
     assert [t["function"]["name"] for t in wire["tools"]] == OFFICIAL_TOOL_NAMES
     assert wire["messages"][0]["role"] == "system"
     assert SYSTEM_MARKER in wire["messages"][0]["content"]

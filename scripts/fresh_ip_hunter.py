@@ -11,6 +11,7 @@ comme un bucket neuf et l'utilise automatiquement.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,8 +28,8 @@ from free.identities import IpIdentity  # noqa: E402
 BASE = "http://127.0.0.1:4000"
 ENDPOINT = "https://opencode.ai/inference/openai/v1/chat/completions"
 MODEL = "deepseek-v4.1-flash-free"
-INTERVAL_S = 600.0
-MAX_ATTEMPTS = 36
+INTERVAL_S = float(os.getenv("OPENCODE_HUNTER_INTERVAL_S", "600") or 600)
+MAX_ATTEMPTS = max(1, int(os.getenv("OPENCODE_HUNTER_MAX_ATTEMPTS", "36") or 36))
 LOG_PATH = ROOT / "logs" / "fresh_ip_hunter.log"
 
 with open(ROOT / "free" / "official_payload.json", encoding="utf-8") as f:

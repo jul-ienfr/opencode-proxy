@@ -6476,6 +6476,16 @@ _AVAILABLE_TOOLS_NOTE = (
     "invent a tool name."
 )
 
+#: Client sans aucun outil : le gate exige `tool_choice: auto` (il refuse
+#: `none`), mais le modèle ne doit appeler aucun placeholder. La note est
+#: ajoutée au prompt officiel pour que la grille de compatibilité reste
+#: inerte.
+_FREE_NO_TOOLS_NOTE = (
+    "\n\n# No client tools\n"
+    "This request declares no executable client tools. Do not call any tool; "
+    "answer in plain text only."
+)
+
 
 def _inject_official_system(messages, system: dict, note: str = _AVAILABLE_TOOLS_NOTE):
     """Prompt officiel en tête + consigne d'outils en DERNIER message système.
@@ -7470,8 +7480,14 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         wire["tools"] = base
     if need_system:
         # Prompt officiel en tête (obligatoire pour le gate) + consigne qui
-        # limite le modèle aux outils réellement déclarés.
-        _note_official = _AVAILABLE_TOOLS_NOTE if (_client_tools or _is_summary) else ""
+        # limite le modèle aux outils réellement déclarés. Un client sans
+        # aucun outil reçoit une note « ne pas appeler » : le gate exige
+        # `tool_choice: auto`, pas `none`.
+        _note_official = (
+            _AVAILABLE_TOOLS_NOTE
+            if (_client_tools or _is_summary)
+            else _FREE_NO_TOOLS_NOTE
+        )
         wire["messages"] = _inject_official_system(wire.get("messages"), _payload["system"], note=_note_official)
     if need_tools and not _signature_ok and _have_official < 5 and (_client_tools or _is_summary):
         # [2026-10-30] Prompt client Hermes = 31 Ko ; le gate free n'a pas le
@@ -7518,11 +7534,10 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         # la copie officielle, elle, garde son ordre exact.
         wire["tools"] = _sorted_chat_tools(wire.get("tools") or [])
     if need_tc:
-        # Client sans aucun outil : la grille technique ne doit pas être
-        # appelée. Exception : le summary Hermes, dont le gate refuse `none`
-        # (mesuré 2026-10-30) ; la note finale lui interdit explicitement les
-        # outils et lui demande le résumé.
-        wire["tool_choice"] = "auto" if (_is_summary or _client_tools) else "none"
+        # Le gate free refuse `tool_choice: none` (mesuré sur le summary).
+        # On aligne donc toujours sur l'officiel `auto` ; pour un client sans
+        # outil, la note système interdit explicitement tout appel.
+        wire["tool_choice"] = "auto"
     if need_key:
         try:
             # Parité options() : promptCacheKey = sessionID de la conversation
@@ -22378,6 +22393,38 @@ async def free_models():
         "counts": counts,
         "policy": _cfg_settings.get_free_substitution_policy(),
     }
+
+
+@app.get("/api/free/hunter")
+async def free_hunter_status():
+    """Statut du Fresh IP Hunter (process séparé, activable GUI)."""
+    from free import hunter
+
+    return hunter.status()
+
+
+@app.post("/api/free/hunter")
+async def free_hunter_toggle(request: Request):
+    """Active/désactive le Fresh IP Hunter et persiste le choix."""
+    _dash = os.getenv("DASHBOARD_TOKEN", "").strip()
+    if _dash:
+        provided = request.headers.get("X-Dashboard-Token", "")
+        if not provided or not hmac.compare_digest(provided, _dash):
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "unauthorized",
+                    "message": "Valid X-Dashboard-Token header required (DASHBOARD_TOKEN env).",
+                },
+            )
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool((body or {}).get("enabled"))
+    from free import hunter
+
+    return await asyncio.to_thread(hunter.set_enabled, enabled)
 
 
 @app.post("/api/free-discovery/refresh")

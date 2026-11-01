@@ -505,8 +505,9 @@ def test_free_wire_body_chat_appends_shim(official_env):
     assert wire["stream"] is True
     # [2026-10-30] gate re-mesuré : les 10 noms officiels sont exiges.
     assert _chat_names(wire["tools"]) == OFFICIAL_TOOL_NAMES
-    # Client sans outils : la grille technique ne doit pas être appelée.
-    assert wire["tool_choice"] == "none"
+    # Client sans outils : `auto` (le gate refuse `none`) + note no-tools.
+    assert wire["tool_choice"] == "auto"
+    assert "No client tools" in wire["messages"][0]["content"]
     assert wire["messages"][0]["role"] == "system"
     assert "You are opencode, an interactive CLI tool" in wire["messages"][0]["content"]
     assert wire["messages"][-1] == {"role": "user", "content": "hi"}

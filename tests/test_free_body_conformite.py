@@ -98,16 +98,20 @@ def test_tool_choice_auto_added_when_tools_present():
     assert wire["tool_choice"] == "auto"
 
 
-def test_tool_choice_none_quand_le_client_n_a_aucun_outil():
-    """Corps nu : grille officielle pour le gate, mais aucun appel autorisé."""
+def test_tool_choice_auto_meme_sans_outil_client():
+    """Corps nu : grille officielle + `tool_choice: auto` (le gate refuse none).
+
+    La note système « no client tools » interdit les appels de placeholders.
+    """
     wire, _ = oc._free_wire_body(
         {"model": "m", "messages": [{"role": "user", "content": "x"}], "stream": True},
         force_stream=True,
     )
-    assert wire["tool_choice"] == "none"
+    assert wire["tool_choice"] == "auto"
     assert [t["function"]["name"] for t in wire["tools"]] == OFFICIAL_TOOL_NAMES
     systems = [m for m in wire["messages"] if m.get("role") == "system"]
     assert systems and len(systems[0]["content"]) > 20000, "prompt officiel complet"
+    assert "No client tools" in systems[0]["content"]
     assert list(wire) == [k for k in CLIENT_KEY_ORDER if k in wire]
 
 

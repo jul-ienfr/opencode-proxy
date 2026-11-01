@@ -648,6 +648,10 @@ free:
   max_client_tools: 9
   max_summary_chars: 16384
   summary_max_tokens: 4096
+  fresh_ip_hunter:
+    enabled: false
+    interval_s: 600
+    max_attempts: 36
   shims:
     read:
       necessity: required
@@ -916,4 +920,12 @@ models:
   gemini-3.7-flash:
     protocol: gemini
   gemini-3.8-flash:
+    protocol: gemini
+  gemini-3-flash:
+    protocol: gemini
+  gemini-3-pro:
+    protocol: gemini
+  gemini-3.1-pro:
+    protocol: gemini
+  gemini-4-argon-contributor:
     protocol: gemini
