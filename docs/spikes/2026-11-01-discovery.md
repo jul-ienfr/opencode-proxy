@@ -143,9 +143,25 @@ Deux conséquences :
 
 1. une IP « fraîche » peut s’épuiser à l’usage ; le ledger `(IP, reset_at)`
    doit suivre chaque observation ;
-2. redémarrer le **même serveur** peut rendre une autre IP du pool NAT, parfois
-   fraîche. La rotation des stations pinnées est donc utile, et le garde
-   anti-doublon reste indispensable.
+2. redémarrer le **même serveur** peut rendre une autre IP du pool NAT, mais
+   le NAT est par serveur (cf. ci-dessous) : le self-rotation pinned est arrêté
+   au profit de la chaîne, et le garde anti-doublon reste indispensable.
+
+### Le NAT est par serveur, pas par client
+
+Test du 2026-11-01 : une station spare bindée sur les serveurs déjà utilisés
+retrouve **exactement** le même egress que la station active :
+
+```text
+spare → al41 → 87.120.102.87  (déjà s1)
+spare → al75 → 87.120.102.78  (déjà s2)
+spare → al74 → 87.120.102.53  (déjà s3)
+spare → al36 → no-egress
+```
+
+Donc on ne peut pas créer une 5ᵉ/6ᵉ IP en dupliquant un serveur connu. La
+capacité supplémentaire ne peut venir que de **nouveaux serveurs** — c’est le
+rôle de `scripts/fresh_chain.py`, qui change de hostname à chaque candidat.
 
 ### Correctif santé station 4
 

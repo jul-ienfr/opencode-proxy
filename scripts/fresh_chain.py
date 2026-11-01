@@ -241,6 +241,22 @@ def save_state(path: Path, state: dict) -> None:
     os.replace(tmp, path)
 
 
+def _active_egress_ips(api_base: str, exclude_station: int) -> set[str]:
+    """Egress IPs currently used by the serving stations."""
+    try:
+        data = requests.get(api_base + "/api/vpn-status", timeout=20).json()
+    except Exception:
+        return set()
+    out = set()
+    for station in data.get("stations", []):
+        if int(station.get("station") or 0) == int(exclude_station):
+            continue
+        ip = str(station.get("current_ip") or "").strip()
+        if ip:
+            out.add(ip)
+    return out
+
+
 def _ledger_exhausted_ips(api_base: str) -> set[str]:
     try:
         data = requests.get(api_base + "/api/pool-status", timeout=30).json()
@@ -334,6 +350,12 @@ async def run(args) -> int:
             continue
         ip = str(bind.egress_ip or "")
         log(f"  egress {ip}")
+        if ip and ip in _active_egress_ips(args.api_base, args.station):
+            log("  egress already used by a serving station — skip")
+            state["results"].append({"host": host, "country": country, "ip": ip, "status": "duplicate-active"})
+            state["index"] = index + 1
+            save_state(state_path, state)
+            continue
         if ip and ip in exhausted:
             log("  egress already in the 429 ledger — skip probe")
             state["results"].append({"host": host, "country": country, "ip": ip, "status": "ledger-429"})
