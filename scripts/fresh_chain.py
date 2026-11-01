@@ -197,17 +197,19 @@ def _clean_station_container(station: int) -> None:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
 
 
-def _state_path(station: int) -> Path:
-    return ROOT / "logs" / f"fresh_chain_state_{int(station)}.json"
+def _state_path(station: int, transport: str = "wireguard") -> Path:
+    suffix = "" if transport == "wireguard" else f"_{transport}"
+    return ROOT / "logs" / f"fresh_chain_state_{int(station)}{suffix}.json"
 
 
-def _lock_path(station: int) -> Path:
-    return ROOT / "logs" / f"fresh_chain_{int(station)}.lock"
+def _lock_path(station: int, transport: str = "wireguard") -> Path:
+    suffix = "" if transport == "wireguard" else f"_{transport}"
+    return ROOT / "logs" / f"fresh_chain_{int(station)}{suffix}.lock"
 
 
-def acquire_lock(station: int) -> bool:
-    """One chain per station; a stale lock (crash) expires after one hour."""
-    path = _lock_path(station)
+def acquire_lock(station: int, transport: str = "wireguard") -> bool:
+    """One chain per (station, transport); a stale lock expires after one hour."""
+    path = _lock_path(station, transport)
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -219,9 +221,9 @@ def acquire_lock(station: int) -> bool:
     return True
 
 
-def release_lock(station: int) -> None:
+def release_lock(station: int, transport: str = "wireguard") -> None:
     try:
-        _lock_path(station).unlink()
+        _lock_path(station, transport).unlink()
     except Exception:
         pass
 
@@ -288,12 +290,12 @@ def mark(api_base: str, ip: str, status: int, retry_after: float, station: int, 
 async def run(args) -> int:
     from free.ip_registry import ComposeHostnameBinder, StationEgress, StationProbe
 
-    if not acquire_lock(args.station):
-        log(f"chain already running for station {args.station} — exit")
+    if not acquire_lock(args.station, args.transport):
+        log(f"chain already running for station {args.station} transport={args.transport} — exit")
         return 0
-    atexit.register(release_lock, args.station)
+    atexit.register(release_lock, args.station, args.transport)
 
-    state_path = _state_path(args.station)
+    state_path = _state_path(args.station, args.transport)
     state = load_state(state_path)
     if args.candidates and Path(args.candidates).exists():
         candidates = json.loads(Path(args.candidates).read_text(encoding="utf-8"))
@@ -324,6 +326,8 @@ async def run(args) -> int:
         recreate_timeout_s=180.0,
     )
     start = int(args.start if args.start is not None else state.get("index", 0))
+    vpn_type = "openvpn" if args.transport.startswith("openvpn") else None
+    openvpn_protocol = args.transport.split("-", 1)[1] if vpn_type else None
     exhausted = _ledger_exhausted_ips(args.api_base)
     tested = 0
     for index in range(start, len(candidates)):
@@ -340,7 +344,13 @@ async def run(args) -> int:
             save_state(state_path, state)
         log(f"[{index + 1}/{len(candidates)}] bind {host} ({country})")
         _clean_station_container(args.station)
-        bind = await binder.assign(args.station, host, country=country)
+        bind = await binder.assign(
+            args.station,
+            host,
+            country=country,
+            vpn_type=vpn_type,
+            openvpn_protocol=openvpn_protocol,
+        )
         tested += 1
         if not bind.ok:
             log(f"  bind rejected: {bind.error}")
@@ -392,6 +402,11 @@ async def run(args) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--station", type=int, default=5)
+    parser.add_argument(
+        "--transport",
+        default="wireguard",
+        choices=("wireguard", "openvpn-tcp", "openvpn-udp"),
+    )
     parser.add_argument("--model", default="deepseek-v4.1-flash-free")
     parser.add_argument("--api-base", default="http://127.0.0.1:4000")
     parser.add_argument("--start", type=int, default=None)
