@@ -49,23 +49,29 @@ class ComposeHostnameBinder:
     def service_name(self, station: int) -> str:
         return "vpn-gluetun" if int(station) == 1 else f"vpn-gluetun-{int(station)}"
 
-    def override_yaml(self, station: int, hostname: str) -> str:
+    def override_yaml(self, station: int, hostname: str, country: str | None = None) -> str:
         service = self.service_name(station)
-        return (
-            "services:\n"
-            f"  {service}:\n"
-            "    environment:\n"
-            f"      - SERVER_HOSTNAMES={hostname}\n"
-        )
+        lines = [
+            "services:",
+            f"  {service}:",
+            "    environment:",
+            f"      - SERVER_HOSTNAMES={hostname}",
+        ]
+        if country:
+            lines.append(f"      - SERVER_COUNTRIES={country}")
+        return "\n".join(lines) + "\n"
 
-    async def assign(self, station: int, hostname: str) -> BindResult:
+    async def assign(
+        self, station: int, hostname: str, country: str | None = None
+    ) -> BindResult:
         hostname = str(hostname or "").strip()
+        country = str(country or "").strip() or None
         if not hostname:
             return BindResult(False, hostname, error="empty-hostname")
         try:
             self._override_path.parent.mkdir(parents=True, exist_ok=True)
             self._override_path.write_text(
-                self.override_yaml(station, hostname), encoding="utf-8"
+                self.override_yaml(station, hostname, country), encoding="utf-8"
             )
         except Exception as exc:
             return BindResult(False, hostname, error=f"override-write:{type(exc).__name__}")

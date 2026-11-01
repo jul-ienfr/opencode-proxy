@@ -45,6 +45,27 @@ async def test_assign_writes_override_and_recreates(tmp_path):
     assert cwd == str(tmp_path)
 
 
+async def test_assign_writes_a_country_override(tmp_path):
+    runner = FakeRunner()
+
+    async def egress(station: int) -> str:
+        return "146.70.238.51"
+
+    binder = ComposeHostnameBinder(
+        tmp_path,
+        settle_s=0,
+        runner=runner,
+        egress=egress,
+    )
+
+    result = await binder.assign(5, "ae73.nordvpn.com", country="United Arab Emirates")
+
+    assert result.ok
+    override = (tmp_path / "logs" / "compose-hostname.yml").read_text(encoding="utf-8")
+    assert "SERVER_HOSTNAMES=ae73.nordvpn.com" in override
+    assert "SERVER_COUNTRIES=United Arab Emirates" in override
+
+
 async def test_assign_reports_recreate_failure(tmp_path):
     runner = FakeRunner(returncode=1, stderr="boom")
     binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=runner)
