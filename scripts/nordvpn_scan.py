@@ -32,6 +32,7 @@ not applied to a working station.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import ipaddress
 import json
 import subprocess
@@ -50,6 +51,7 @@ from curl_cffi import requests as curl_requests  # noqa: E402
 
 import opencode as oc  # noqa: E402
 from free.identities import IpIdentity  # noqa: E402
+from free.quota_ledger import QuotaLedger  # noqa: E402
 
 ENDPOINT = "https://opencode.ai/inference/openai/v1/chat/completions"
 MODEL = "deepseek-v4.1-flash-free"
@@ -60,10 +62,13 @@ IP_URLS = [
     "https://ipinfo.io/ip",
 ]
 STATE_PATH = ROOT / "logs" / "nordvpn_scan_state.json"
+REGISTRY_PATH = ROOT / "logs" / "nordvpn_scan_ledger.json"
 LOG_PATH = ROOT / "logs" / "nordvpn_scan.log"
 LOCK = threading.Lock()
 #: station -> IP, one IP per station unless --allow-shared-ips is set.
 CLAIMED_IPS: dict[str, int] = {}
+#: Shared 429 registry: (IP, UTC day, bucket) -> retry_after/reset_at.
+LEDGER = QuotaLedger(path=str(REGISTRY_PATH), bucket_mode="default", persist=True)
 
 FALLBACK_COUNTRIES = [
     "Albania",
@@ -419,13 +424,41 @@ def _scan_station(
                     f"{'recreate' if recreate else 'pin'}"
                 )
                 continue
+            with LOCK:
+                owner = CLAIMED_IPS.get(ip)
+            if not allow_shared and owner is not None and owner != station:
+                _log(f"s{station} skip ip={ip} already claimed by s{owner}")
+                continue
+            known_reset = _ledger_reset_iso(ip)
+            if known_reset:
+                _log(f"s{station} skip ip={ip} known 429, reset_at={known_reset}")
+                continue
             status, retry_after, dns = _probe(port, ip, body, imp, fp)
+            reset_at = None
+            if status == 429:
+                try:
+                    _ra = float(retry_after or 0.0)
+                except (TypeError, ValueError):
+                    _ra = 0.0
+                # Shared registry: reset_at = now + Retry-After, exact.
+                LEDGER.note_result(
+                    ip,
+                    MODEL,
+                    429,
+                    error_type="FreeUsageLimitError",
+                    retry_after=_ra,
+                )
+                reset_at = LEDGER.reset_at(ip, MODEL)
+            elif status == 200:
+                LEDGER.note_result(ip, MODEL, 200)
             result = {
                 "station": station,
                 "country": country,
                 "ip": ip,
                 "status": status,
                 "retry_after": retry_after,
+                "reset_at": reset_at,
+                "reset_at_iso": _iso_utc(reset_at),
                 "dns": dns,
                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
@@ -466,7 +499,8 @@ def _scan_station(
             _save_state(state)
             _log(
                 f"s{station} {country!r} ip={ip} free={status} "
-                f"retry_after={retry_after or '-'} dns={dns}"
+                f"retry_after={retry_after or '-'} "
+                f"reset_at={result.get('reset_at_iso') or '-'} dns={dns}"
             )
             if status == 200 and not duplicate:
                 _api(base, "/api/vpn/health-check", {})
@@ -477,6 +511,66 @@ def _scan_station(
         if passes == 0:
             _log(f"s{station} pass={pass_index} complete, continuing (passes=0)")
     _log(f"s{station} finished {attempts} attempts without a 200")
+
+
+def _iso_utc(ts: float | None) -> str | None:
+    if not ts:
+        return None
+    try:
+        return _dt.datetime.fromtimestamp(float(ts), tz=_dt.UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except Exception:
+        return None
+
+
+def _seed_ledger(state: dict) -> None:
+    """Replay the scan history into the shared 429 registry once.
+
+    Each historical 429 carries its own Retry-After; the ledger recomputes
+    ``reset_at = observed_at + Retry-After`` so the reset date/time is exact
+    and survives restarts.
+    """
+    seeded = 0
+    for row in state.get("results", []):
+        ip = str(row.get("ip") or "")
+        if not _valid_ip(ip):
+            continue
+        try:
+            status = int(row.get("status") or 0)
+        except (TypeError, ValueError):
+            continue
+        try:
+            observed = _dt.datetime.strptime(
+                str(row.get("at") or ""), "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=_dt.UTC).timestamp()
+        except Exception:
+            observed = None
+        if status == 429:
+            try:
+                retry_after = float(row.get("retry_after") or 0.0)
+            except (TypeError, ValueError):
+                retry_after = 0.0
+            if retry_after > 0:
+                LEDGER.note_result(
+                    ip,
+                    MODEL,
+                    429,
+                    error_type="FreeUsageLimitError",
+                    retry_after=retry_after,
+                    now=observed,
+                )
+                seeded += 1
+        elif status == 200:
+            LEDGER.note_result(ip, MODEL, 200, now=observed)
+            seeded += 1
+    if seeded:
+        LEDGER.flush()
+        _log(f"shared registry seeded with {seeded} historical results")
+
+
+def _ledger_reset_iso(ip: str) -> str | None:
+    return _iso_utc(LEDGER.reset_at(ip, MODEL))
 
 
 def _normalize_claims(state: dict, allow_shared: bool) -> dict[str, int]:
@@ -537,6 +631,7 @@ def main() -> int:
     imp, fp = oc._get_free_fp_kwargs("1.19.5")
 
     print(f"stations={stations} countries={len(countries)} passes={args.passes}")
+    print(f"registry: {REGISTRY_PATH}")
     print(f"first countries: {countries[:10]}")
     if args.dry_run:
         for station in stations:
@@ -546,6 +641,7 @@ def main() -> int:
     state = _load_state()
     CLAIMED_IPS.clear()
     CLAIMED_IPS.update(_normalize_claims(state, args.allow_shared_ips))
+    _seed_ledger(state)
     _api(base, "/api/vpn/rotation-paused", {"paused": True})
     _api(base, "/api/vpn-config", {"egress_allow_any_country": True})
     _save_state(state)
