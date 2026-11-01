@@ -22578,6 +22578,73 @@ async def free_quota_clear(request: Request):
     return {"ok": True, "cleared": cleared, "ip": ip, "model": model}
 
 
+@app.post("/api/free/quota/mark")
+async def free_quota_mark(request: Request):
+    """Enregistre un résultat de probe (429/200) dans le ledger du pool.
+
+    Utilisé par un scanner externe (``scripts/nordvpn_scan.py``) pour que la
+    sélection de station du proxy voie les IPs déjà épuisées et leur date de
+    reset exacte (``observation + Retry-After``).
+    """
+    _dash = os.getenv("DASHBOARD_TOKEN", "").strip()
+    if _dash:
+        provided = request.headers.get("X-Dashboard-Token", "")
+        if not provided or not hmac.compare_digest(provided, _dash):
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "unauthorized",
+                    "message": "Valid X-Dashboard-Token header required (DASHBOARD_TOKEN env).",
+                },
+            )
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ip = str((body or {}).get("ip") or "").strip()
+    if not ip:
+        return JSONResponse(status_code=400, content={"error": "'ip' requis"})
+    model = str((body or {}).get("model") or "").strip() or None
+    try:
+        status = int((body or {}).get("status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    try:
+        retry_after = float((body or {}).get("retry_after") or 0.0)
+    except (TypeError, ValueError):
+        retry_after = 0.0
+    pool = _free_ip_pool
+    if pool is None or not hasattr(pool, "_get_ledger"):
+        return JSONResponse(status_code=503, content={"error": "free pool unavailable"})
+    ledger = pool._get_ledger()
+    if ledger is None:
+        return JSONResponse(status_code=503, content={"error": "quota ledger unavailable"})
+    try:
+        ledger.note_result(
+            ip,
+            model,
+            status,
+            error_type="FreeUsageLimitError" if status == 429 else "",
+            retry_after=retry_after if status == 429 else None,
+        )
+        reset_at = ledger.reset_at(ip, model)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)[:200]})
+    reset_iso = (
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset_at))
+        if reset_at
+        else None
+    )
+    return {
+        "ok": True,
+        "ip": ip,
+        "model": model,
+        "status": status,
+        "reset_at": reset_at,
+        "reset_at_iso": reset_iso,
+    }
+
+
 @app.post("/api/free-discovery/refresh")
 async def free_discovery_refresh(request: Request):
     """Manual refresh of free discovery (POST /api/free-discovery/refresh).

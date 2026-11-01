@@ -187,7 +187,7 @@ ip_rotation:
     soft_cooldown_sec: 600
     stream_metric: ttfb
     window: 20
-  max_free_attempts: 7
+  max_free_attempts: 6
   max_inflight_per_model_ip: 2
   model_global_429_min_ips: 3
   model_global_429_window_s: 60
@@ -203,7 +203,7 @@ ip_rotation:
   ov_auth_station_threshold: 5
   ov_auth_window_s: 1800
   ovpn_endpoint_port: ''
-  ovpn_protocol: udp
+  ovpn_protocol: tcp
   paid_hedge_after_ms: 0
   per_ip_identity: true
   pin_widen_auths: 8
@@ -276,7 +276,7 @@ ip_rotation:
   state_file_2: logs/vpn_state2.json
   station_bad_ttl_s: 60
   station_connect_retry_interval_s: 300
-  station_count: 7
+  station_count: 6
   station_health:
     max_effective_age_s: 60
     shadow: false

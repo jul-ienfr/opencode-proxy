@@ -448,9 +448,19 @@ def _scan_station(
                     error_type="FreeUsageLimitError",
                     retry_after=_ra,
                 )
+                _api(
+                    base,
+                    "/api/free/quota/mark",
+                    {"ip": ip, "model": MODEL, "status": 429, "retry_after": _ra},
+                )
                 reset_at = LEDGER.reset_at(ip, MODEL)
             elif status == 200:
                 LEDGER.note_result(ip, MODEL, 200)
+                _api(
+                    base,
+                    "/api/free/quota/mark",
+                    {"ip": ip, "model": MODEL, "status": 200},
+                )
             result = {
                 "station": station,
                 "country": country,
