@@ -1702,6 +1702,16 @@ class FreeIPPool:
                     events.popleft()
                 distinct = {str(e[1]) for e in events if now - float(e[0]) <= max(1.0, window)}
                 if len(distinct) >= max(2, min_ips):
+                    # [2026-11-01] Do not impose a model-global cooldown while
+                    # at least one usable station still has a fresh bucket:
+                    # the 429s may all come from exhausted IPs (the fresh-IP
+                    # chain probes many of them), and a global cooldown would
+                    # block the one station that can still serve.
+                    try:
+                        if getattr(self, "_stations", None) and not self.all_usable_buckets_exhausted(mid):
+                            return
+                    except Exception:
+                        pass
                     self._model_global_until[mid] = now + max(1.0, cooldown)
         except Exception:
             return
