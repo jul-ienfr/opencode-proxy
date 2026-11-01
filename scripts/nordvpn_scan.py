@@ -32,6 +32,7 @@ not applied to a working station.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import subprocess
 import sys
@@ -52,9 +53,17 @@ from free.identities import IpIdentity  # noqa: E402
 
 ENDPOINT = "https://opencode.ai/inference/openai/v1/chat/completions"
 MODEL = "deepseek-v4.1-flash-free"
+IP_URLS = [
+    "https://api.ipify.org",
+    "https://icanhazip.com",
+    "https://checkip.amazonaws.com",
+    "https://ipinfo.io/ip",
+]
 STATE_PATH = ROOT / "logs" / "nordvpn_scan_state.json"
 LOG_PATH = ROOT / "logs" / "nordvpn_scan.log"
 LOCK = threading.Lock()
+#: station -> IP, one IP per station unless --allow-shared-ips is set.
+CLAIMED_IPS: dict[str, int] = {}
 
 FALLBACK_COUNTRIES = [
     "Albania",
@@ -186,18 +195,70 @@ def _countries_from_api() -> tuple[list[str], Counter]:
     return list(FALLBACK_COUNTRIES), Counter(dict.fromkeys(FALLBACK_COUNTRIES, 0))
 
 
+def _valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value.strip())
+        return True
+    except ValueError:
+        return False
+
+
 def _egress(port: int, local_dns: bool) -> str:
+    """Probe the public IP through one station with several IP services.
+
+    Remote DNS (socks5h) lets gluetun resolve the hostname; local DNS
+    (socks5) bypasses a broken gluetun resolver.  Every service is tried
+    with both modes; the first valid IP wins.
+    """
     scheme = "socks5" if local_dns else "socks5h"
     proxy = f"{scheme}://127.0.0.1:{port}"
+    proxies = {"http": proxy, "https": proxy}
+    for url in IP_URLS:
+        try:
+            text = curl_requests.get(
+                url,
+                proxies=proxies,
+                timeout=5,
+                impersonate="chrome",
+            ).text.strip()
+        except Exception:
+            continue
+        if _valid_ip(text):
+            return text
+    return ""
+
+
+def _control_egress(station: int) -> str:
+    """Last-resort detection: gluetun's own public-IP endpoint."""
+    container = "opencode-vpn" if station == 1 else f"opencode-vpn-{station}"
+    script = (
+        'wget -q -O - -T 10 --header="X-API-Key: $VPN_CONTROL_API_KEY" '
+        "http://127.0.0.1:8000/v1/publicip/ip"
+    )
     try:
-        return curl_requests.get(
-            "https://api.ipify.org",
-            proxies={"http": proxy, "https": proxy},
-            timeout=12,
-            impersonate="chrome",
-        ).text.strip()
+        proc = subprocess.run(
+            ["docker", "exec", container, "sh", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        data = json.loads((proc.stdout or "{}").strip() or "{}")
+        ip = str(data.get("public_ip") or "").strip()
+        return ip if _valid_ip(ip) else ""
     except Exception:
         return ""
+
+
+def _detect_egress(station: int, port: int) -> tuple[str, str]:
+    """(ip, source): remote DNS → local DNS → control server."""
+    for local_dns, source in ((False, "remote"), (True, "local")):
+        ip = _egress(port, local_dns)
+        if ip:
+            return ip, source
+    ip = _control_egress(station)
+    if ip:
+        return ip, "control"
+    return "", "none"
 
 
 def _probe(port: int, ip: str, body: dict, imp: str, fp: dict | None):
@@ -295,19 +356,15 @@ def _recreate(station: int) -> bool:
         return False
 
 
-def _wait_egress(port: int, previous: str, timeout: float = 45.0) -> str:
+def _wait_egress(station: int, port: int, previous: str, timeout: float = 45.0) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        for local_dns in (False, True):
-            ip = _egress(port, local_dns)
-            if ip and ip != previous:
-                return ip
-        time.sleep(2)
-    for local_dns in (False, True):
-        ip = _egress(port, local_dns)
-        if ip:
+        ip, _source = _detect_egress(station, port)
+        if ip and ip != previous:
             return ip
-    return ""
+        time.sleep(2)
+    ip, _source = _detect_egress(station, port)
+    return ip
 
 
 def _scan_station(
@@ -322,6 +379,7 @@ def _scan_station(
     state: dict,
     max_attempts: int,
     recreate: bool,
+    allow_shared: bool,
 ) -> None:
     key = str(station)
     with LOCK:
@@ -343,18 +401,18 @@ def _scan_station(
                 _log(f"s{station} max attempts {max_attempts} reached")
                 return
             attempts += 1
-            previous = "" if recreate else (_egress(port, False) or _egress(port, True))
+            previous = "" if recreate else _detect_egress(station, port)[0]
             if recreate:
                 _log(f"s{station} pass={pass_index} attempt={attempts} recreate")
                 if not _recreate(station):
                     continue
                 time.sleep(10)
-                ip = _wait_egress(port, "")
+                ip = _wait_egress(station, port, "")
             else:
                 _log(f"s{station} pass={pass_index} attempt={attempts} pin {country!r}")
                 if not _pin(base, station, country):
                     continue
-                ip = _wait_egress(port, previous)
+                ip = _wait_egress(station, port, previous)
             if not ip:
                 _log(
                     f"s{station} {country!r}: no egress after "
@@ -371,18 +429,46 @@ def _scan_station(
                 "dns": dns,
                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
+            duplicate = False
+            owner = None
+            if status == 200:
+                # One distinct IP per station: a duplicate is a shared bucket,
+                # not a second functional station.
+                with LOCK:
+                    owner = CLAIMED_IPS.get(ip)
+                    if not allow_shared and owner is not None and owner != station:
+                        duplicate = True
+                    else:
+                        CLAIMED_IPS[ip] = station
+                if duplicate:
+                    result["duplicate_of"] = owner
+                    _log(
+                        f"s{station} duplicate IP {ip} already claimed by s{owner} "
+                        "— continuing"
+                    )
+                else:
+                    ip2, _src = _detect_egress(station, port)
+                    if ip2 and ip2 != ip:
+                        with LOCK:
+                            if CLAIMED_IPS.get(ip) == station:
+                                CLAIMED_IPS.pop(ip, None)
+                        _log(
+                            f"s{station} IP changed after 200 ({ip} -> {ip2}) "
+                            "— continuing"
+                        )
+                        duplicate = True
             with LOCK:
                 state["results"].append(result)
                 station_state["attempts"] = attempts
                 station_state["last_country"] = country
-                if status == 200:
+                if status == 200 and not duplicate:
                     station_state["winner"] = result
             _save_state(state)
             _log(
                 f"s{station} {country!r} ip={ip} free={status} "
                 f"retry_after={retry_after or '-'} dns={dns}"
             )
-            if status == 200:
+            if status == 200 and not duplicate:
                 _api(base, "/api/vpn/health-check", {})
                 _api(base, "/api/free/quota/clear", {"ip": ip})
                 _api(base, "/api/free/quota/clear", {"model": MODEL})
@@ -391,6 +477,25 @@ def _scan_station(
         if passes == 0:
             _log(f"s{station} pass={pass_index} complete, continuing (passes=0)")
     _log(f"s{station} finished {attempts} attempts without a 200")
+
+
+def _normalize_claims(state: dict, allow_shared: bool) -> dict[str, int]:
+    """Keep one winner per IP; clear duplicate winners so they search again."""
+    winners = []
+    for sid, st in state.get("stations", {}).items():
+        winner = st.get("winner")
+        if isinstance(winner, dict) and winner.get("ip"):
+            winners.append((str(winner.get("at") or ""), int(sid), winner))
+    winners.sort()
+    claimed: dict[str, int] = {}
+    for _at, sid, winner in winners:
+        ip = str(winner["ip"])
+        if not allow_shared and ip in claimed:
+            state["stations"][str(sid)]["winner"] = None
+            _log(f"reset duplicate winner s{sid} ip={ip} (kept by s{claimed[ip]})")
+        else:
+            claimed[ip] = sid
+    return claimed
 
 
 def main() -> int:
@@ -410,6 +515,7 @@ def main() -> int:
     parser.add_argument("--max-attempts", type=int, default=0)
     parser.add_argument("--proxy-url", default="http://127.0.0.1:4000")
     parser.add_argument("--recreate", action="store_true")
+    parser.add_argument("--allow-shared-ips", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -438,6 +544,8 @@ def main() -> int:
         return 0
 
     state = _load_state()
+    CLAIMED_IPS.clear()
+    CLAIMED_IPS.update(_normalize_claims(state, args.allow_shared_ips))
     _api(base, "/api/vpn/rotation-paused", {"paused": True})
     _api(base, "/api/vpn-config", {"egress_allow_any_country": True})
     _save_state(state)
@@ -458,6 +566,7 @@ def main() -> int:
                 state,
                 args.max_attempts,
                 args.recreate,
+                args.allow_shared_ips,
             )
             for station in stations
         ]
