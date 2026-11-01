@@ -924,14 +924,6 @@ models:
     protocol: gemini
   gemini-3.8-flash:
     protocol: gemini
-  gemini-3-flash:
-    protocol: gemini
-  gemini-3-pro:
-    protocol: gemini
-  gemini-3.1-pro:
-    protocol: gemini
-  gemini-4-argon-contributor:
-    protocol: gemini
 ip_registry:
   enabled: false
   db_path: logs/ip_registry.db

@@ -101,6 +101,47 @@ def _enable_station(station: int) -> None:
         log(f"station {station} re-enable failed: {type(exc).__name__}: {exc}")
 
 
+def _disable_station(station: int) -> None:
+    """Add a station to ip_rotation.disabled_stations during a repair chain."""
+    path = ROOT / "config.yaml"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return
+    match = re.search(r"^  disabled_stations:\s*\[([^\]]*)\]\s*$", text, flags=re.MULTILINE)
+    if match:
+        ids = [part.strip() for part in match.group(1).split(",") if part.strip()]
+        if str(station) in ids:
+            return
+        ids.append(str(station))
+        replacement = f"  disabled_stations: [{', '.join(ids)}]"
+        text = text[: match.start()] + replacement + text[match.end() :]
+    else:
+        block = re.search(
+            r"^  disabled_stations:\s*\n((?:  - \d+\s*\n)+)",
+            text,
+            flags=re.MULTILINE,
+        )
+        if block:
+            ids = [
+                line.strip()[2:].strip()
+                for line in block.group(1).splitlines()
+                if line.strip().startswith("- ")
+            ]
+            if str(station) in ids:
+                return
+            ids.append(str(station))
+            replacement = "  disabled_stations: [" + ", ".join(ids) + "]\n"
+            text = text[: block.start()] + replacement + text[block.end() :]
+        else:
+            return
+    try:
+        path.write_text(text, encoding="utf-8", newline="")
+        log(f"station {station} disabled during repair chain")
+    except Exception as exc:
+        log(f"station {station} disable failed: {type(exc).__name__}: {exc}")
+
+
 def _winner(station: int) -> dict | None:
     path = ROOT / "logs" / f"fresh_chain_state_{station}.json"
     try:
@@ -233,6 +274,8 @@ def main() -> None:
                         path.unlink()
                     except Exception:
                         pass
+                if station in (1, 2, 3, 4):
+                    _disable_station(station)
                 _start_chain(station)
         except Exception as exc:  # noqa: BLE001
             log(f"supervisor error: {type(exc).__name__}: {exc}")
