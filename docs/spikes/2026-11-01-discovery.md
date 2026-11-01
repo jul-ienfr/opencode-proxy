@@ -128,6 +128,25 @@ donc changer (fraîche ou déjà épuisée). Chaque egress observé doit être
 enregistré dans le registre, et une rotation pinned reste utile pour chasser
 une IP fraîche.
 
+### L’egress NAT n’est pas fixe
+
+Mesures du 2026-11-01 après usage :
+
+```text
+al41  .90 → 429 (quota consommé)   puis redémarrage → .86 → 429
+al74  .59 → 429
+al75  .77 → 200, puis redémarrage → .75 → 200
+al36  .9  → indisponible, .14 → connexion fermée
+```
+
+Deux conséquences :
+
+1. une IP « fraîche » peut s’épuiser à l’usage ; le ledger `(IP, reset_at)`
+   doit suivre chaque observation ;
+2. redémarrer le **même serveur** peut rendre une autre IP du pool NAT, parfois
+   fraîche. La rotation des stations pinnées est donc utile, et le garde
+   anti-doublon reste indispensable.
+
 ### Correctif santé station 4
 
 Le 200 de la station 4 était masqué par `health=probing` : `mark_station_ok()`
