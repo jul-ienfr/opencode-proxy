@@ -64,6 +64,41 @@ derniers, il faut :
 C’est un point à intégrer au registre : une IP observée n’est pas forcément
 re-assignable par hostname.
 
+## Percée — catalogue embarqué gluetun
+
+Le binaire gluetun (`/gluetun-entrypoint`) embarque un **catalogue NordVPN
+complet** de **17 103 entrées**, dont les anciens serveurs albanais
+`al36..al75` avec leur clé publique WireGuard :
+
+```text
+al41.nordvpn.com  wireguard  87.120.102.83  wgpubkey=0sAxvVg+...
+al75.nordvpn.com  wireguard  87.120.102.67  wgpubkey=0sAxvVg+...
+```
+
+Le manifeste sur disque (`/gluetun/servers/nordvpn.json`, 14 132 entrées) ne
+les contient pas, et c’est lui qui gagne : gluetun rejette
+`SERVER_HOSTNAMES=al41` (« not a valid choice »).
+
+Correctif :
+
+1. `scripts/merge_gluetun_catalog.py` extrait le catalogue embarqué et
+   l’écrit dans `/gluetun/servers/nordvpn.json` (backup inclus).
+2. La station 1 est recréée avec `SERVER_HOSTNAMES=al41.nordvpn.com`.
+3. Egress observé : **87.120.102.90**.
+4. Probe officiel : **200**.
+5. Proxy : **200**, DB `free_model_ip=87.120.102.90`, `station=1`.
+
+Le serveur `al41` est donc **rebindable** : on peut le réassigner par hostname,
+et le pool `87.120.102.x` n’est plus une loterie NAT inconnue.
+
+Le compose de la station 1 est persisté avec :
+
+```yaml
+- SERVER_HOSTNAMES=${SERVER_HOSTNAMES_STATION1:-al41.nordvpn.com}
+```
+
+et `.env` contient `SERVER_HOSTNAMES_STATION1=al41.nordvpn.com`.
+
 ## Suite
 
 1. Étendre la découverte aux pays/pools qui ont déjà produit des 200.

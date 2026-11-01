@@ -769,7 +769,7 @@ Pendant la migration, écrire à la fois dans `quota_ledger.json` et dans
 | Risque | Impact | Mitigation |
 |---|---|---|
 | Gluetun ignore `hostnames` en WG | Binding impossible | Spike phase 2 ; fallback custom WG |
-| Egress NAT absent du catalogue | Un 200 n’est pas reproductible par hostname | `rebindable=false`, sticky, découverte par pays |
+| Egress NAT absent du catalogue | Un 200 n’est pas reproductible par hostname | extraire le catalogue embarqué gluetun (`scripts/merge_gluetun_catalog.py`) ; sinon `rebindable=false` + sticky |
 | Egress NAT ≠ server IP | Registre faux | Toujours stocker l’egress observé ; revérifier |
 | Reset par IP mal modélisé | Retests inutiles | `reset_at = observation + Retry-After` |
 | Scan complet trop long | Blocage | Lazy + classement heuristique |
