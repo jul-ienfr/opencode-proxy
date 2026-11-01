@@ -276,7 +276,11 @@ def main() -> None:
                 for sid, station in stations.items()
                 if sid and sid not in handled and _needs_chain(station)
             ]
-            wanted = sorted(set(broken) | repairing)
+            # The NordVPN account drops every tunnel when several stations
+            # re-authenticate at once. Repair one station at a time; the
+            # others keep serving. The claims catalog prevents duplicate work.
+            target = min(broken) if broken else (min(repairing) if repairing else None)
+            wanted = [target] if target is not None else []
 
             # Every broken station searches at the same time. Chains that are
             # no longer wanted (station recovered/winner) are stopped.
