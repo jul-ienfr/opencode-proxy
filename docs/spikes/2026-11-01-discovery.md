@@ -179,8 +179,18 @@ ch296  WG .93  → 429     (nouveau tunnel testé, manifeste fusionné OK)
 Le port 89 n’est pas actif partout : sur 297 anciens serveurs résolus, seuls
 `al41`, `ie106` et `us11640` ont produit un egress, tous les trois en 429. Un
 scan de 300 serveurs `proxy_ssl` publics (14 pays) n’a produit **aucun** egress
-fonctionnel. La piste HTTPS reste donc un transport possible mais ne fournit
-pas d’IP fraîche à elle seule.
+fonctionnel. Un scan de 120 anciens serveurs WG (Autriche, Tchéquie, Bulgarie,
+Irlande, Israël, Corée, Australie) n’a produit que 3 egress (`cz200`, `kr182`,
+`kr190`), tous en 429. La piste HTTPS reste donc un transport possible mais ne
+fournit pas d’IP fraîche à elle seule.
+
+### 3ᵉ voie implémentée
+
+`HttpsProxyEndpoint` est maintenant disponible dans le pool : proxy CONNECT
+TLS, sans Docker, config `ip_rotation.https_proxies` et
+`https_fallback_enabled` (off par défaut). Il n’est utilisé que si aucune
+station Docker n’est routable. La vérification TLS du proxy est désactivée
+(`CurlOpt.PROXY_SSL_VERIFYPEER/VERIFYHOST`), l’origine reste vérifiée.
 
 ## Suite
 

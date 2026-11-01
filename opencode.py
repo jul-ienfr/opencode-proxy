@@ -1841,6 +1841,19 @@ async def _get_pooled_curl_session(
         sess_kwargs: dict = dict(fp_override)
     else:
         sess_kwargs = {"impersonate": impersonate}
+    # [2026-11-01] Static HTTPS proxy (NordVPN :89): its certificate does not
+    # match the server hostname/IP. Disable *proxy* verification only — the
+    # origin certificate remains verified by libcurl.
+    if proxy_url and proxy_url.startswith("https://"):
+        try:
+            from curl_cffi import CurlOpt
+
+            sess_kwargs["curl_options"] = {
+                CurlOpt.PROXY_SSL_VERIFYPEER: 0,
+                CurlOpt.PROXY_SSL_VERIFYHOST: 0,
+            }
+        except Exception:
+            pass
     slot = await pool.checkout(
         lambda: _curl_requests_mod.AsyncSession(
             proxy=_curl_proxy_url(proxy_url),

@@ -268,6 +268,8 @@ ip_rotation:
   shared_rotation_file: logs/shared_rotation.json
   socks5_auto_rotate: true
   socks5_proxies: []
+  https_proxies: []
+  https_fallback_enabled: false
   socks5_proxy_port: 1080
   socks5_proxy_port_2: 1081
   socks_catchup_s: 90
@@ -938,7 +940,7 @@ ip_registry:
   eligibility:
     error_cooldown_s: 1800
   allocator:
-    mode: "off"
+    mode: 'off'
     max_attempts_per_need: 20
   binder:
     mode: compose_hostname

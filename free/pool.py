@@ -276,6 +276,67 @@ class Socks5Endpoint:
         }
 
 
+class HttpsProxyEndpoint(Socks5Endpoint):
+    """Static HTTPS CONNECT proxy (NordVPN ``:89``), duck-typed as a station.
+
+    The NordVPN proxy certificate does not match the server hostname or its
+    IP (verified 2026-11-01), so the request path must disable *proxy* TLS
+    verification (``CurlOpt.PROXY_SSL_VERIFYPEER`` / ``VERIFYHOST``) or pin a
+    CA. It has no container and no rotation: the pool bad-mark owns recovery.
+    """
+
+    scheme = "https"
+    proxy_tls_verify = False
+
+    def __init__(self, host, port, username=None, password=None, enabled=True, index=0):
+        super().__init__(host, port, username=username, password=password, enabled=enabled, index=index)
+        self.egress_ip: str | None = None
+        self.current_ip = f"https:{self.host}:{self.port}"
+        self.current_server = {"name": f"https:{self.host}:{self.port}", "static": True, "tls": True}
+
+    def refresh_egress(self, timeout: float = 6.0) -> str:
+        """Resolve the real egress IP behind the proxy (best-effort).
+
+        The ledger and distinct-IP guard need the actual IP, not the logical
+        ``https:host:port`` id. Called once, off the event loop, before the
+        first fallback request.
+        """
+        try:
+            import requests
+
+            proxy = self.socks5_url
+            response = requests.get(
+                "https://api.ipify.org",
+                proxies={"http": proxy, "https": proxy},
+                timeout=(3, float(timeout)),
+                verify=False,
+            )
+            ip = str(response.text or "").strip()
+        except Exception:
+            return ""
+        if ip:
+            self.egress_ip = ip
+            self.current_ip = ip
+            self.current_server = {
+                "name": f"https:{self.host}:{self.port}",
+                "static": True,
+                "tls": True,
+                "egress_ip": ip,
+            }
+        return ip
+
+    @property
+    def socks5_url(self) -> str:
+        """https://[user:pass@]host:port — proxy credentials URL-escaped."""
+        if self.username or self.password:
+            user = urllib.parse.quote(self.username or "", safe="")
+            pwd = urllib.parse.quote(self.password or "", safe="")
+            auth = f"{user}:{pwd}@"
+        else:
+            auth = ""
+        return f"https://{auth}{self.host}:{self.port}"
+
+
 # [GUI qualité] Valeurs par défaut des blocs pilotables par config.yaml.
 # Module-level pour que `_seed_quality_cfg` puisse les utiliser même sur une
 # instance reconstruite via `__new__` (tests, hot-reload partiel).
@@ -581,9 +642,12 @@ class FreeIPPool:
         # [Axe 3.1] Static SOCKS5 proxies (socks5 mode — list of curated
         # proxies instead of docker stations; NO docker is ever touched).
         self._socks5_proxies: list = []  # validated config rows {host, port, ...}
-        self._socks5_eps: list = []  # parsed Socks5Endpoint list (negative sids)
+        self._https_proxies: list = []  # static HTTPS CONNECT proxies (NordVPN :89)
+        self._socks5_eps: list = []  # parsed Socks5Endpoint/HttpsProxyEndpoint list
         self._socks5_rr = 0  # round-robin cursor (index into _socks5_eps)
+        self._https_rr = 0  # round-robin cursor for the HTTPS subset
         self._socks5_current: Socks5Endpoint | None = None  # last endpoint used by on_request
+        self._https_fallback_enabled = False  # use HTTPS proxies only when no docker station is usable
         # [Axe 3.1] True (default) = round-robin on every request; False =
         # stick to the current proxy while usable (rotation only via
         # bad-mark or the manual rotate endpoint).
@@ -2690,6 +2754,27 @@ class FreeIPPool:
         when the current one approaches quota)."""
         return self._socks5_next(excluded={ep})
 
+    def _https_enabled_eps(self) -> list:
+        return [ep for ep in self._socks5_enabled_eps() if isinstance(ep, HttpsProxyEndpoint)]
+
+    def _https_next(self, excluded=None) -> HttpsProxyEndpoint | None:
+        """Next usable HTTPS proxy (third path), or None."""
+        eps = self._https_enabled_eps()
+        if not eps:
+            return None
+        excluded = excluded or set()
+        n = len(eps)
+        start = (self._https_rr + 1) % n
+        for i in range(n):
+            idx = (start + i) % n
+            ep = eps[idx]
+            if ep in excluded:
+                continue
+            if self._socks5_usable(ep, exclude_approaching=False):
+                self._https_rr = idx
+                return ep
+        return None
+
     def _socks5_any_other(self, ep) -> bool:
         """True when at least one OTHER enabled proxy is usable (C1 guard
         applied to the static list — never bad-mark the last proxy)."""
@@ -2728,21 +2813,57 @@ class FreeIPPool:
                     "enabled": bool(row.get("enabled", True)),
                 }
             )
+        self._socks5_proxies = new_rows
+        self._rebuild_static_eps()
+
+    def set_https_proxies(self, proxies: list) -> None:
+        """Replace the static HTTPS CONNECT proxies (NordVPN ``:89``).
+
+        Rows use the same shape as ``socks5_proxies`` (host, port, username,
+        password, enabled). They are kept in a separate list so the operator
+        can enable them as a third path without touching the SOCKS5 list.
+        """
+        new_rows = []
+        for row in proxies:
+            host = str(row.get("host") or "").strip()
+            try:
+                port = int(row.get("port"))
+            except (TypeError, ValueError):
+                port = 0
+            if not host or not (1 <= port <= 65535):
+                logger.warning("[free-ip] skipping invalid https proxy %r", row)
+                continue
+            new_rows.append(
+                {
+                    "host": host,
+                    "port": port,
+                    "username": row.get("username"),
+                    "password": row.get("password"),
+                    "enabled": bool(row.get("enabled", True)),
+                }
+            )
+        self._https_proxies = new_rows
+        self._rebuild_static_eps()
+
+    def _rebuild_static_eps(self) -> None:
+        """Rebuild the combined static endpoint list (SOCKS5 + HTTPS)."""
+        rows = [dict(row, scheme="socks5") for row in self._socks5_proxies]
+        rows += [dict(row, scheme="https") for row in self._https_proxies]
         old_by_pid = {}
         for ep in self._socks5_eps:
             old_by_pid[ep.pid] = (ep, self._per.get(ep._station))
         # [audit 2026-10-30] SIDs are index-based: a reorder/insert shifts
-        # every endpoint. Remove ALL old socks5 state first, then reattach
+        # every endpoint. Remove ALL old static state first, then reattach
         # by pid; the old code only pruned removed pids and left duplicate
         # state objects on shifted sids (two proxies sharing a counter).
         for pid, (ep, per) in old_by_pid.items():
             if per is not None:
                 self._per.pop(ep._station, None)
-        self._socks5_proxies = new_rows
         eps = []
-        for i, row in enumerate(new_rows):
+        for i, row in enumerate(rows):
             pid = f"{row['host']}:{row['port']}"
-            ep = Socks5Endpoint(
+            cls = HttpsProxyEndpoint if row.get("scheme") == "https" else Socks5Endpoint
+            ep = cls(
                 row["host"],
                 row["port"],
                 username=row.get("username"),
@@ -2763,6 +2884,8 @@ class FreeIPPool:
                 self._per.pop(_sid, None)
         if self._socks5_rr >= len(eps) or not eps:
             self._socks5_rr = 0
+        if self._https_rr >= len(eps) or not eps:
+            self._https_rr = 0
         if self._socks5_current is not None:
             cur_pid = self._socks5_current.pid
             # [Revue 19/08] Re-resolve only to an ENABLED endpoint: a config
@@ -2931,6 +3054,23 @@ class FreeIPPool:
             per["ip_stats"][ip]["requests"] += 1
             self._socks5_current = ep
             return ep.socks5_url, ep
+
+        if (
+            mode == "vpn"
+            and self._https_fallback_enabled
+            and forced_pool is None
+            and self.usable_station_count(model=model) == 0
+        ):
+            ep = self._https_next(excluded)
+            if ep is not None:
+                if not ep.egress_ip:
+                    try:
+                        await asyncio.to_thread(ep.refresh_egress, 6.0)
+                    except Exception:
+                        pass
+                logger.info("[free-ip] no usable docker station — HTTPS fallback %s", ep.pid)
+                self._socks5_current = ep
+                return ep.socks5_url, ep
 
         if mode == "vpn":
             # [v6 P1-4] pick+increment race — lock <50µs, pas sur ensure_connected
@@ -4520,6 +4660,12 @@ class FreeIPPool:
         # `ip_rotation.socks5_proxies` / `quota_per_ip`, hot-reloadable).
         if "socks5_proxies" in cfg and isinstance(cfg["socks5_proxies"], list):
             self.set_socks5_proxies(cfg["socks5_proxies"])
+        # [2026-11-01] Third path: static NordVPN HTTPS CONNECT proxies
+        # (`https_proxies`). Used only when no docker station is usable.
+        if "https_proxies" in cfg and isinstance(cfg["https_proxies"], list):
+            self.set_https_proxies(cfg["https_proxies"])
+        if "https_fallback_enabled" in cfg:
+            self._https_fallback_enabled = bool(cfg["https_fallback_enabled"])
         # [plan v10 §3.6.2 Lot 3] bloc canonique latency_rotation → moteur
         # (hot-reload, même corps que le dashboard envoie aux managers).
         if "latency_rotation" in cfg:
