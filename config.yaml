@@ -938,10 +938,10 @@ ip_registry:
   eligibility:
     error_cooldown_s: 1800
   allocator:
-    mode: false
+    mode: "off"
     max_attempts_per_need: 20
   binder:
-    mode: observe
+    mode: compose_hostname
   preselect:
     enabled: false
     max_tests_per_hour: 60

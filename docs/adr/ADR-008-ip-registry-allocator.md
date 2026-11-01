@@ -38,18 +38,35 @@ Introduire un **registre d’IP** et un **allocateur** :
 - Un 429 en cours d’utilisation est enregistré (IP, date, Retry-After, reset)
   et libère l’assignation (`reason=runtime_429`).
 
-## Binding serveur — point critique
+## Binding serveur — décision après spike
 
 Trois adaptateurs possibles :
 
 1. `SERVER_HOSTNAMES_STATIONn` + recréation Compose.
-2. `PUT /v1/vpn/settings` avec `countries` + `hostnames` (si gluetun l’accepte
-   en WireGuard).
+2. `PUT /v1/vpn/settings` avec `countries` + `hostnames`.
 3. Config WireGuard custom par serveur.
 
-Un spike Phase 2 doit prouver qu’une station reconnectée 3 fois sur le même
-hostname produit le même egress. Sans cette preuve, le classement est perdu à
-chaque rotation.
+**Spike du 2026-11-01** (station 1, `al110.nordvpn.com`) :
+
+- `SERVER_HOSTNAMES` + recréation Compose, deux fois → **même egress**
+  `186.247.44.61`.
+- `PUT /v1/vpn/settings` avec `countries` + `hostnames` fonctionne pour la
+  première connexion, mais un second `PUT` identique retourne
+  `settings left unchanged` (pas de reconnexion).
+- `PUT /v1/vpn/status` stop/start retourne `rc=8` et bloque la station en
+  `stopping` ; la station a dû être recréée.
+
+Décision :
+
+1. **Binder principal = Compose hostname** (`SERVER_HOSTNAMES_STATIONn` +
+   recréation + vérification de l’egress).
+2. **Control API = fast-path uniquement quand le hostname change**, jamais pour
+   une reconnexion à l’identique.
+3. **Custom WireGuard** = option de secours si un provider ne supporte pas
+   `SERVER_HOSTNAMES`.
+
+Le spike est documenté dans
+`docs/spikes/2026-11-01-server-binding.md`.
 
 ## Conséquences
 

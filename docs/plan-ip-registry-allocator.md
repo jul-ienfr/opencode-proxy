@@ -486,6 +486,12 @@ class StationBinder(Protocol):
    - conteneur `VPN_SERVICE_PROVIDER=custom` ;
    - le plus déterministe, mais demande la génération des configs.
 
+**Décision spike 2026-11-01** : `ComposeHostnameBinder` validé (deux
+recréations sur `al110.nordvpn.com` → même egress `186.247.44.61`).
+`ControlApiBinder` = fast-path uniquement quand le hostname change ; le
+stop/start via control API n’est pas fiable (`rc=8`, station bloquée).
+Voir `docs/spikes/2026-11-01-server-binding.md`.
+
 ### 8.3 Vérification
 
 Après `assign` :
@@ -691,7 +697,7 @@ ip_registry:
   enabled: false          # off | observe | enforce
   shadow_compare: true
 allocator:
-  mode: off               # off | observe | enforce
+  mode: "off"             # off | observe | enforce
 binder:
   mode: compose_hostname  # control_api | compose_hostname | custom_wg
 ```
