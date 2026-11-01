@@ -1620,9 +1620,24 @@ class VPNManager:
         # A pinned station cannot get a new egress by restarting the same
         # host: quota rotations must be skipped (the ledger reset is the
         # remediation, not a doomed restart loop).
-        self._pinned_hostname = (
-            os.getenv(f"SERVER_HOSTNAMES_STATION{self._station}", "") or ""
-        ).strip() or None
+        _pin_key = f"SERVER_HOSTNAMES_STATION{self._station}"
+        _pin = (os.getenv(_pin_key, "") or "").strip()
+        if not _pin:
+            # The proxy process may not have loaded .env (Compose does): read
+            # the repo .env as the authoritative local pin source.
+            try:
+                _env_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    ".env",
+                )
+                with open(_env_path, encoding="utf-8") as _env_file:
+                    for _line in _env_file:
+                        if _line.strip().startswith(_pin_key + "="):
+                            _pin = _line.split("=", 1)[1].strip().strip('"').strip("'")
+                            break
+            except Exception:
+                _pin = ""
+        self._pinned_hostname = _pin or None
         # Callback injecté par FreeIPPool : qualité mesurée par hostname.
         self._host_quality_fn = None
         # [roadmap] dernière charge connue du serveur choisi (pour le score).
