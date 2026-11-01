@@ -815,7 +815,390 @@ Redémarrer le proxy.
 
 ---
 
-## 23. Résumé exécutif
+## 23. Attributs de qualité et SLO
+
+Le plan est conçu autour de cinq axes mesurables. Chaque axe a des cibles
+vérifiables en CI ou en production.
+
+| Axe | Exigence | Mesure | Cible |
+|---|---|---|---|
+| Fiabilité | Aucune double assignation | invariant + index unique partiel | 0 sur 1 M décisions |
+| Fiabilité | Lease orphelin récupéré | `reconcile()` au boot + période | 100 % < 60 s |
+| Fiabilité | Décision d’allocation | needs → succès ou refus explicite | p99 < 5 min |
+| Fiabilité | Crash pendant claim | kill -9 + restart | 0 orphelin |
+| Fiabilité | Stabilité d’une IP assignée | changements non justifiés / jour | < 1 |
+| Performance | Éligibilité 10k IP | requête SQL indexée | p95 < 50 ms |
+| Performance | Décision allocateur | hors réseau | p95 < 100 ms |
+| Performance | Refresh catalogue | 7 232 serveurs | < 60 s |
+| Performance | Empreinte DB | 30 jours d’observations | < 100 Mo |
+| Maintenabilité | Couverture domaine | lignes/branches | ≥ 90 % |
+| Maintenabilité | Couverture adaptateurs | lignes | ≥ 75 % |
+| Maintenabilité | Typage | mypy strict sur le nouveau package | 0 erreur |
+| Maintenabilité | Complexité | par fonction | ≤ 10 |
+| Modularité | Règle de dépendance | imports domaine → infra | 0 |
+| Modularité | Nouveau provider VPN | adaptateur seul | 0 changement domaine |
+| Qualité | Contrats de ports | tests de contrat | 100 % des ports |
+| Qualité | Tests instables | CI sur 20 runs | 0 flaky |
+| Qualité | Mutation score domaine | mutmut (optionnel) | ≥ 70 % |
+
+### Budget d’erreur
+
+- Disponibilité de la décision d’allocation : **99,5 %** par mois.
+- RTO (restauration après crash) : **5 min**.
+- RPO (perte de données max) : **1 min** (WAL SQLite + backup quotidien).
+- Aucune perte d’assignation : la DB est la source de vérité, pas la mémoire.
+
+---
+
+## 24. Principes d’architecture
+
+### 25.1 Hexagonal strict
+
+```text
+domain/        entités, value objects, state machine, règles pures
+ports/         Protocols (interfaces) — aucune dépendance infra
+adapters/      SQLite, NordVPN API, gluetun, curl_cffi, HTTP
+application/   allocator, ranker, services d’orchestration
+api/           FastAPI, dashboard, composition root
+```
+
+**Règle de dépendance** :
+
+```text
+domain  ←  application  ←  api
+   ↑            ↑
+ ports  ←  adapters
+```
+
+- `domain` n’importe jamais `adapters`, `opencode`, `requests`, `sqlite3`.
+- `application` dépend des `ports`, jamais des adapters concrets.
+- Les adapters implémentent les `ports`.
+- Le câblage (DI) est fait uniquement dans `api/bootstrap.py`.
+
+### 25.2 Principes de code
+
+- SOLID, composition over inheritance.
+- Value objects immuables (`@dataclass(frozen=True, slots=True)`).
+- State machine explicite, transitions testées.
+- Pas d’état global mutable ; dépendances injectées.
+- Erreurs typées : `DomainError`, `TransientError`, `PermanentError`,
+  `PolicyError`.
+- Idempotence par `attempt_id` / `lease_id`.
+- Toute écriture DB dans une transaction courte.
+- Aucun appel réseau dans une transaction.
+- Aucun `sleep` bloquant dans le domaine.
+- Typage strict (`from __future__ import annotations`, mypy strict).
+- Logs structurés, jamais de secret.
+
+### 25.3 Feature flags et modes
+
+```text
+ip_registry.enabled = off | observe | enforce
+allocator.mode      = off | observe | enforce
+binder.mode         = compose_hostname | control_api | custom_wg
+```
+
+- `observe` : lit, score, loggue, n’assigne pas.
+- `enforce` : assigne réellement.
+- Canary : une seule station en `enforce`, les autres en `observe`.
+- Rollback : repasser en `off` sans migration destructive.
+
+---
+
+## 25. Contrats des modules
+
+Chaque port est un `Protocol` typé, testé par contrat.
+
+### 26.1 `ServerCatalog`
+
+```python
+class ServerCatalog(Protocol):
+    def snapshot(self) -> CatalogSnapshot: ...
+    async def refresh(self) -> CatalogSnapshot: ...
+```
+
+- `refresh()` est idempotent.
+- En cas d’échec API : conserve le dernier snapshot, retourne `stale=True`.
+- Ne bloque jamais l’allocateur.
+
+### 26.2 `IpRegistry`
+
+```python
+class IpRegistry(Protocol):
+    def eligible(
+        self, *, geo: GeoFilter | None, now: float, limit: int = 50
+    ) -> list[IpCandidate]: ...
+
+    def claim(
+        self, candidate: IpCandidate, station: int, ttl_s: float
+    ) -> Lease | None: ...
+
+    def record(self, lease: Lease, result: ProbeResult) -> None: ...
+    def assign(self, lease: Lease, station: int) -> Assignment: ...
+    def release(self, lease: Lease, reason: str) -> None: ...
+    def reconcile(self, now: float) -> ReconcileReport: ...
+```
+
+Invariants :
+
+- `claim()` est atomique ; retourne `None` si l’IP n’est plus éligible.
+- `record()` met à jour `ip_state` et insère une observation.
+- `assign()` exige un lease valide et un résultat `200`.
+- `release()` remet l’IP dans l’état correct (`candidate`, `exhausted`, `error`).
+- `reconcile()` libère les leases expirés et détecte les assignations orphelines.
+
+### 26.3 `IpRanker`
+
+```python
+class IpRanker(Protocol):
+    def rank(
+        self, candidates: list[IpCandidate], now: float
+    ) -> list[ScoredCandidate]: ...
+```
+
+- Pur, sans I/O, déterministe.
+- Testé par propriétés : ordre stable, score ∈ [0, 100].
+
+### 26.4 `StationBinder`
+
+```python
+class StationBinder(Protocol):
+    async def assign(self, station: int, hostname: str) -> BindResult: ...
+    async def release(self, station: int) -> None: ...
+    async def current(self, station: int) -> str | None: ...
+```
+
+- `assign()` vérifie l’egress réel après connexion.
+- Si l’egress diffère, retourne `BindResult(mismatch=True, egress_ip=...)`.
+- Timeout et erreurs classifiés (`TransientError` / `PermanentError`).
+
+### 26.5 `ProbeClient`
+
+```python
+class ProbeClient(Protocol):
+    async def probe(self, station: int, model: str) -> ProbeResult: ...
+```
+
+- Utilise le corps officiel et l’identité par IP existants.
+- Lit uniquement les headers/status ; ferme le flux.
+- Mesure TTFB et latence totale.
+- Classe : `200`, `429_quota`, `429_transient`, `error`.
+
+### 26.6 `StationHealth`
+
+```python
+class StationHealth(Protocol):
+    def needs_ip(self, station: int, now: float) -> NeedReason | None: ...
+    def is_healthy(self, station: int, now: float) -> bool: ...
+```
+
+- Source unique de vérité pour « la station a-t-elle besoin d’une IP ? ».
+- Un `200` récent et une IP assignée ⇒ pas de besoin.
+
+---
+
+## 26. Modes de défaillance et reprise
+
+| Défaillance | Détection | Reprise |
+|---|---|---|
+| Crash pendant `claim` | lease expiré | `reconcile()` libère |
+| DB verrouillée | `busy_timeout` | retry court, puis erreur transitoire |
+| Binder timeout | timeout | release + candidate suivante |
+| Tunnel qui tombe | probe error | release + cooldown |
+| 429 quota | probe 429 | `exhausted` + `reset_at` |
+| Catalogue API down | refresh error | dernier snapshot + alerte |
+| Deux allocateurs | lease unique | le second claim échoue |
+| Horloge décalée | `reset_at` incohérent | tolérance NTP + log |
+| Disque plein | SQLite error | alerte, arrêt propre, pas de perte |
+| Station désactivée | health | release de l’IP assignée |
+
+### Règle de reprise
+
+1. Au démarrage : `reconcile()` avant toute allocation.
+2. Les leases expirés sont libérés, jamais réutilisés silencieusement.
+3. Les assignations dont la station n’existe plus sont libérées.
+4. Les IP `assigned` absentes du catalogue sont marquées `retired`.
+
+---
+
+## 27. Performance et capacité
+
+### 28.1 Volumétrie
+
+- Catalogue : 7 232 serveurs.
+- `ip_state` : ~7 232 à 20 000 lignes.
+- Observations : ~100 000 / 30 jours (rétention).
+- Stations : 6 (extensible 10).
+- Tests : max 2 concurrents, 60/h en présélection.
+
+### 28.2 SQLite
+
+- `PRAGMA journal_mode=WAL`.
+- `PRAGMA synchronous=NORMAL`.
+- `PRAGMA busy_timeout=5000`.
+- Index couvrants pour `eligible` :
+  `(state, reset_at, error_until, score DESC)`.
+- `EXPLAIN QUERY PLAN` vérifié en CI.
+- Un seul writer ; lectures concurrentes autorisées.
+- Transactions < 10 ms ; pas de réseau dedans.
+
+### 28.3 Budgets
+
+| Opération | Budget |
+|---|---|
+| `eligible()` 10k | < 50 ms p95 |
+| `claim()` | < 10 ms p95 |
+| `assign()` | < 10 ms p95 |
+| Décision allocateur (hors réseau) | < 100 ms p95 |
+| Refresh catalogue | < 60 s |
+| Probe | timeout 60 s |
+| Mémoire catalogue | < 20 Mo |
+
+### 28.4 Anti-charge
+
+- Pas de scan complet si toutes les stations sont saines.
+- Lazy allocation : seuls les besoins déclenchent des tests.
+- Backoff + jitter.
+- Limite globale et par station.
+- Cache des sessions curl_cffi.
+- Fermeture immédiate des flux SSE après headers.
+
+---
+
+## 28. Maintenabilité et qualité d’ingénierie
+
+### 29.1 CI gates
+
+```text
+ruff check .
+mypy free/ip_registry
+pytest tests/ip_registry -q
+pytest --cov=free/ip_registry --cov-fail-under=85
+pytest tests/ip_registry/test_contracts.py
+python scripts/check_schema_migration.py
+```
+
+### 29.2 Pyramide de tests
+
+- 70 % unitaires (domaine, scoring, éligibilité).
+- 20 % intégration (SQLite, faux binder, faux probe).
+- 10 % live opt-in (une station, un serveur).
+
+### 29.3 Standards
+
+- Chaque décision structurante → ADR dans `docs/adr/`.
+- Chaque module → docstring + README court.
+- API → OpenAPI généré.
+- Schéma DB → migrations versionnées (`schema_version`).
+- Changelog mis à jour.
+- Revue de code : checklist ci-dessous.
+
+### 29.4 Checklist de revue
+
+- [ ] Invariants respectés (unicité, reset, freeze).
+- [ ] Erreurs typées et gérées.
+- [ ] Transaction courte, pas d’I/O dedans.
+- [ ] Test unitaire + test de contrat.
+- [ ] Logs structurés, pas de secret.
+- [ ] Métrique ajoutée si nouveau chemin.
+- [ ] Feature flag + rollback.
+- [ ] Documentation/ADR.
+
+### 29.5 Definition of Done (par phase)
+
+- Code mergé, tests verts, couverture ≥ cible.
+- ADR et runbook à jour.
+- Métriques visibles dans le dashboard.
+- Rollback testé.
+- Aucune régression sur les tests existants.
+
+---
+
+## 29. Modularité et extensibilité
+
+### 30.1 Graphe de dépendances
+
+```text
+api ──► application ──► ports ◄── adapters
+                         ▲
+                      domain
+```
+
+- Aucun import croisé entre adapters.
+- Aucun import de `free.pool` dans `domain`.
+- Les adapters sont choisis par configuration (factory).
+
+### 30.2 Ajouter un provider VPN
+
+1. Implémenter `ServerCatalog` (nouvel adapter).
+2. Implémenter `StationBinder` si le provider a sa propre API.
+3. Aucun changement dans `domain`, `allocator`, `ranker`.
+4. Ajouter les tests de contrat.
+
+### 30.3 Ajouter un type de probe
+
+1. Implémenter `ProbeClient`.
+2. Brancher via config.
+3. Tests de contrat.
+
+### 30.4 Stabilité des interfaces
+
+- Ports versionnés (`v1`).
+- Ajout de champ = optionnel avec défaut.
+- Suppression = nouvelle version + dépréciation.
+- API HTTP versionnée (`/api/free/...`).
+
+---
+
+## 30. Sécurité et intégrité des données
+
+- Secrets uniquement en variables d’environnement (`NORDVPN_TOKEN`,
+  credentials) ; jamais dans les logs ni la DB.
+- Requêtes SQL paramétrées ; aucun SQL construit par concaténation.
+- Validation stricte des entrées API (IP, station, modèle).
+- Auth dashboard par token, comparaison constant-time.
+- Rate limit sur les endpoints manuels.
+- Les IP sont des données sensibles : retention 30 jours, accès restreint.
+- Audit des assignations/libérations dans `assignments`.
+- Backup quotidien de `ip_registry.db`, rétention 7 jours.
+- Chiffrement disque recommandé pour la DB.
+
+---
+
+## 31. Gouvernance d’exécution
+
+### 32.1 Jalons go/no-go
+
+| Jalon | Go si | No-go si |
+|---|---|---|
+| M0 | ADR + schéma validés | désaccord sur le binder |
+| M1 | catalogue + score testés | > 50 ms sur 10k |
+| M2 | binder reproductible | egress instable |
+| M3 | canary 200 | double assignation |
+| M4 | 6 stations stables 24 h | churn > 1/jour |
+| M5 | budget tests respecté | 429 > 80 % |
+
+### 32.2 Registre des risques
+
+| Risque | P | I | Mitigation |
+|---|---|---|---|
+| Gluetun ignore hostnames WG | M | Élevé | spike M2, fallback custom WG |
+| Egress NAT imprévisible | M | Élevé | stocker l’egress observé |
+| API NordVPN instable | M | Moyen | cache + alerte |
+| DB concurrente | F | Moyen | WAL + single writer |
+| Perte IP canary | M | Moyen | shadow + rollback |
+| Quota global saturé | É | Élevé | accepter le refus honnête |
+
+### 32.3 Rollback
+
+- `allocator.mode: off` → ancienne sélection.
+- `ip_registry.enabled: false` → aucun impact runtime.
+- DB conservée (pas de migration destructive).
+- Redémarrage du proxy sans perte d’assignation.
+
+---
+
+## 32. Résumé exécutif
 
 Le système cible est un **registre d’IP classées** alimenté par un catalogue
 NordVPN, avec un **allocateur à la demande** qui ne teste que les stations en
