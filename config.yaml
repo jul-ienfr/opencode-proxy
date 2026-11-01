@@ -132,7 +132,7 @@ ip_rotation:
   docker_container_2: opencode-vpn-2
   docker_events: true
   dual_station: false
-  egress_allow_any_country: false
+  egress_allow_any_country: true
   egress_failure_tick_interval: 15.0
   enabled: true
   enforce_vpn_only: true
@@ -214,7 +214,7 @@ ip_rotation:
     enabled: false
     max_attempts: 2
     max_tokens: 4
-  proxy_mode: direct
+  proxy_mode: vpn
   quality_preselection:
     enabled: true
     fast_tps: 55.0
@@ -259,8 +259,8 @@ ip_rotation:
   rotation_stagger: 10
   rotation_storm_cooldown_s: 600
   rotation_wait_timeout: 5
-  server_countries: Japan,Brazil,South Africa,Australia,Singapore,India,South Korea,Mexico,Canada,United
-    Kingdom,Poland,Romania
+  server_countries: Albania,Japan,Brazil,South Africa,Australia,Singapore,India,South
+    Korea,Mexico,Canada,United Kingdom,Poland,Romania
   server_issue_grace_s: 25
   server_issue_recheck: true
   server_list_refresh_interval_s: 21600

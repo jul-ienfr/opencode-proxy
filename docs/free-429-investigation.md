@@ -383,3 +383,44 @@ Résultat après redémarrage :
 Le préflight stream ne consulte plus le ledger VPN en mode direct, et le
 `502 Upstream produced no output` a disparu. `_do_free_direct_request`
 délègue désormais au sender curl_cffi officiel (plus de httpx).
+
+---
+
+## 13. Mode VPN validé sur une IP NordVPN (2026-11-01)
+
+Le mode `proxy_mode: vpn` a été retesté après le correctif direct. Le quota
+est bien **par IP** : toutes les IPs NordVPN ne sont pas équivalentes.
+
+### 13.1 IP trouvée
+
+- Station 1, pays **Albanie**, tunnel WireGuard `87.120.102.67:51820`,
+  egress public **87.120.102.76** (Tirana).
+- Corps officiel exact via le SOCKS5 de la station (`127.0.0.1:1080`) → **200**
+  SSE sur `deepseek-v4.1-flash-free`.
+- Proxy en `proxy_mode: vpn`, station 1 :
+  - non-stream → **200** ;
+  - stream → **200 SSE**, ~40-50 trames, `[DONE]` ;
+  - DB : `free_model_ip=87.120.102.76`, `station=1`.
+
+### 13.2 Ce qui ne marche pas
+
+- 67 serveurs SOCKS5 NordVPN (NL/SE/US) : 3 joignables, tous 429.
+- Albanie station 2 (`186.247.44.134`) : 429.
+- Autres pays/ASN : 429 avec `Retry-After` ~15-16 h.
+- `mimo-v2.6-flash-free` : 429 sur la même IP que deepseek/glm/flint (bucket
+  modèle séparé) ; `deepseek-v4.1-flash-free`, `glm-5.3-flash-free` et
+  `flint-40b-free` → 200.
+
+### 13.3 Procédure / persistance
+
+- Le pin pays est un réglage runtime du control server gluetun. Un **restart
+  du proxy** le conserve (state `current_country`/`current_ip` restauré) ;
+  un **restart du conteneur** peut le perdre.
+- Script de re-pin : `python scripts/nordvpn_free_pin.py --country Albania`.
+  Il sonde d'abord l'egress courant, ne pin que si nécessaire, puis efface
+  le ledger de l'IP/modèle et rafraîchit `current_ip`.
+- Après un pin, `POST /api/free/quota/clear` est indispensable : 27 entrées
+  périmées (anciennes IPs) bloquaient le non-stream en 429 local alors que
+  l'IP fraîche répondait 200.
+- Config : `proxy_mode: vpn`, `egress_allow_any_country: true`,
+  `server_countries` commence par `Albania`.
