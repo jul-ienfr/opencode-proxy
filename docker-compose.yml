@@ -337,6 +337,7 @@ services:
       # choices" and silently break the rotation.
       # Source unique: config.yaml ip_rotation.server_countries (no inline fallback, audit F-H5).
       - SERVER_COUNTRIES=${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}
+      - SERVER_HOSTNAMES=${SERVER_HOSTNAMES_STATION2:-al75.nordvpn.com}
       # [PC-8] pas de UPDATER_PERIOD : source unique = refresh applicatif.
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8889
@@ -383,6 +384,7 @@ services:
       - "127.0.0.1:1082:1082"    # SOCKS5 proxy (loopback only)
     environment:
       <<: *gluetun-multi-env
+      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION3:-al74.nordvpn.com}
       VPN_TYPE: ${VPN_TYPE_STATION3:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION3:-${OPENVPN_PROTOCOL:-udp}}
       OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION3:-${OPENVPN_ENDPOINT_PORT:-}}

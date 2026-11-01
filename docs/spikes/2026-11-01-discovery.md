@@ -99,6 +99,27 @@ Le compose de la station 1 est persisté avec :
 
 et `.env` contient `SERVER_HOSTNAMES_STATION1=al41.nordvpn.com`.
 
+## Trois stations validées
+
+Après fusion du catalogue embarqué dans chaque volume gluetun :
+
+| Station | Serveur | Egress | Free |
+|---|---|---|---|
+| 1 | `al41.nordvpn.com` | `87.120.102.90` | **200** |
+| 2 | `al75.nordvpn.com` | `87.120.102.77` | **200** |
+| 3 | `al74.nordvpn.com` | `87.120.102.59` | **200** |
+
+Le proxy voit les trois stations `connected`, `station_usable=true`,
+`model_usable=true`, et sert en **200** (DB : `.59`/station 3, `.90`/station 1).
+
+Serveurs du pool testés mais sans egress WG : `al36`, `al37`, `al45`, `al46`,
+`al73`. `al36` reste joignable en HTTPS proxy (`:89`, egress `.14`) mais son
+quota est épuisé (429).
+
+Persistance : Compose pin `al41`/`al75`/`al74` pour les stations 1/2/3 via
+`SERVER_HOSTNAMES_STATION1..3`, et `.env` contient les mêmes valeurs. Un
+recreate de station ne perd donc plus le serveur.
+
 ## Suite
 
 1. Étendre la découverte aux pays/pools qui ont déjà produit des 200.

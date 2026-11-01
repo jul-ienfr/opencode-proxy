@@ -28,6 +28,7 @@ from free.ip_registry import (  # noqa: E402
     ComposeHostnameBinder,
     IpRecord,
     IpState,
+    Server,
     SqliteIpRegistry,
     StationEgress,
     StationProbe,
@@ -54,9 +55,16 @@ async def _run(args) -> int:
     if not servers:
         print("catalog empty")
         return 1
-    selected = [s for s in servers if not args.country or s.country == args.country]
-    selected.sort(key=lambda s: (s.load, s.hostname))
-    selected = selected[: max(1, args.limit)]
+    if args.hostnames:
+        selected = [
+            Server(hostname=name.strip(), country=args.country or "Albania")
+            for name in args.hostnames.split(",")
+            if name.strip()
+        ]
+    else:
+        selected = [s for s in servers if not args.country or s.country == args.country]
+        selected.sort(key=lambda s: (s.load, s.hostname))
+        selected = selected[: max(1, args.limit)]
     print(f"catalog={len(servers)} selected={len(selected)} country={args.country or '*'}")
     for server in selected:
         print(f"  {server.hostname:28s} {server.country:20s} load={server.load:g}")
@@ -138,6 +146,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--station", type=int, default=1)
     parser.add_argument("--country", default="Albania")
+    parser.add_argument("--hostnames", default="")
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--model", default="deepseek-v4.1-flash-free")
     parser.add_argument("--db", default="")
