@@ -1172,6 +1172,35 @@ class FreeIPPool:
         except Exception:
             pass
 
+    def mark_station_ok(self, station, *, cause: str = "scan-200") -> None:
+        """A real 200 proves the station is healthy again.
+
+        Clears the rate-limit/timeout bad-mark and feeds enough good probes
+        for ``station_contract`` to return usable. Without this bridge a
+        station found by the external scanner stays ``station-unusable``
+        forever even though its tunnel answers 200.
+        """
+        try:
+            per = self._per_station(station)
+            per["bad_until"] = 0.0
+            per["bad_cause"] = None
+            per["degraded_override"] = False
+        except Exception:
+            pass
+        try:
+            good_needed = int(getattr(self._repair_policy, "good_probes", 2) or 2)
+        except Exception:
+            good_needed = 2
+        for _ in range(max(1, good_needed)):
+            self.note_station_probe(station, True, cause=cause)
+        self.mark_station_repaired(station)
+        self.clear_egress_park(station)
+        try:
+            self._dirty_state = True
+            self.save_pool_state()
+        except Exception:
+            pass
+
     def clear_egress_park(self, station) -> None:
         try:
             item = self._station_health.get(self._station_id(station))

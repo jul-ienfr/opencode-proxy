@@ -22613,6 +22613,10 @@ async def free_quota_mark(request: Request):
         retry_after = float((body or {}).get("retry_after") or 0.0)
     except (TypeError, ValueError):
         retry_after = 0.0
+    try:
+        station_id = int((body or {}).get("station") or 0)
+    except (TypeError, ValueError):
+        station_id = 0
     pool = _free_ip_pool
     if pool is None or not hasattr(pool, "_get_ledger"):
         return JSONResponse(status_code=503, content={"error": "free pool unavailable"})
@@ -22635,13 +22639,58 @@ async def free_quota_mark(request: Request):
         if reset_at
         else None
     )
+    station_usable = None
+    model_usable = None
+    if status == 200 and station_id:
+        # A proven 200 must also clear the station health/bad-mark, otherwise
+        # the pool excludes it forever (the scanner bypasses the pool).
+        mgr = None
+        try:
+            import shared_state as _ss_mark
+
+            mgr = next(
+                (
+                    m
+                    for m in (getattr(_ss_mark, "vpn_managers", None) or [])
+                    if int(getattr(m, "_station", -1)) == station_id
+                ),
+                None,
+            )
+        except Exception:
+            mgr = None
+        if mgr is not None:
+            # The scanner just proved a real 200 through this tunnel. Do NOT
+            # call health_check() here: it can mark/disconnect a tunnel that is
+            # actually up, and the scan already has the authoritative answer.
+            try:
+                mgr._current_ip = ip
+                mgr._status = "connected"
+                mgr._egress_state = "tunnel_up_full"
+                mgr._auth_failed = False
+                mgr._desired_connected = True
+            except Exception:
+                pass
+            try:
+                pool.mark_station_ok(mgr, cause="scan-200")
+            except Exception:
+                pass
+            try:
+                station_usable = bool(pool.station_usable(mgr, model=model))
+                model_usable = (
+                    bool(pool.model_usable(model, mgr)) if model else station_usable
+                )
+            except Exception:
+                pass
     return {
         "ok": True,
         "ip": ip,
         "model": model,
         "status": status,
+        "station": station_id or None,
         "reset_at": reset_at,
         "reset_at_iso": reset_iso,
+        "station_usable": station_usable,
+        "model_usable": model_usable,
     }
 
 

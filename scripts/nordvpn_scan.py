@@ -451,7 +451,13 @@ def _scan_station(
                 _api(
                     base,
                     "/api/free/quota/mark",
-                    {"ip": ip, "model": MODEL, "status": 429, "retry_after": _ra},
+                    {
+                        "ip": ip,
+                        "model": MODEL,
+                        "status": 429,
+                        "retry_after": _ra,
+                        "station": station,
+                    },
                 )
                 reset_at = LEDGER.reset_at(ip, MODEL)
             elif status == 200:
@@ -459,7 +465,12 @@ def _scan_station(
                 _api(
                     base,
                     "/api/free/quota/mark",
-                    {"ip": ip, "model": MODEL, "status": 200},
+                    {
+                        "ip": ip,
+                        "model": MODEL,
+                        "status": 200,
+                        "station": station,
+                    },
                 )
             result = {
                 "station": station,
@@ -583,6 +594,36 @@ def _ledger_reset_iso(ip: str) -> str | None:
     return _iso_utc(LEDGER.reset_at(ip, MODEL))
 
 
+def _clear_stale_winners(base: str, state: dict) -> None:
+    """Drop winners whose station IP changed or whose tunnel is down."""
+    try:
+        data = requests.get(base + "/api/vpn-status", timeout=20).json()
+    except Exception:
+        return
+    by_sid = {
+        int(st.get("station")): st
+        for st in (data.get("stations") or [])
+        if st.get("station") is not None
+    }
+    for sid, station_state in state.get("stations", {}).items():
+        winner = station_state.get("winner")
+        if not isinstance(winner, dict):
+            continue
+        current = by_sid.get(int(sid)) or {}
+        cur_ip = str(current.get("current_ip") or "")
+        vpn_status = str(current.get("vpn_status") or "")
+        if (cur_ip and cur_ip != winner.get("ip")) or vpn_status not in (
+            "connected",
+            "degraded",
+        ):
+            station_state["winner"] = None
+            _log(
+                f"stale winner s{sid} {winner.get('ip')} "
+                f"(current={cur_ip or '?'}, status={vpn_status or '?'}) "
+                "— searching again"
+            )
+
+
 def _normalize_claims(state: dict, allow_shared: bool) -> dict[str, int]:
     """Keep one winner per IP; clear duplicate winners so they search again."""
     winners = []
@@ -649,6 +690,7 @@ def main() -> int:
         return 0
 
     state = _load_state()
+    _clear_stale_winners(base, state)
     CLAIMED_IPS.clear()
     CLAIMED_IPS.update(_normalize_claims(state, args.allow_shared_ips))
     _seed_ledger(state)
