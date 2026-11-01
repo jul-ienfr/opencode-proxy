@@ -85,6 +85,21 @@ def test_strict_health_rejects_auth_failed_and_stale_egress():
     assert pool.station_usable(st2) is True
 
 
+def test_pinned_station_skips_quota_rotation():
+    """A pinned hostname cannot change IP by restarting: no rotation loop."""
+    pool, st1, _ = _pool()
+    calls = []
+    pool._launch_rotation = lambda station, **kw: calls.append(station)
+    st1._pinned_hostname = "al41.nordvpn.com"
+
+    pool.on_quota_exhausted(st1, quota=True)
+
+    assert calls == []
+    st1._pinned_hostname = None
+    pool.on_quota_exhausted(st1, quota=True)
+    assert calls == [st1]
+
+
 def test_recent_health_probe_keeps_an_idle_station_fresh():
     """Une sonde egress réussie vaut preuve: pas de faux `egress-stale`.
 

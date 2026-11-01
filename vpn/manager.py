@@ -1616,6 +1616,13 @@ class VPNManager:
         # Renseigné au pin puis confirmé par les logs gluetun.
         self._current_host: str | None = None
         self._last_host_resolve_at: float = 0.0
+        # [2026-11-01] Compose-pinned hostname (SERVER_HOSTNAMES_STATIONn).
+        # A pinned station cannot get a new egress by restarting the same
+        # host: quota rotations must be skipped (the ledger reset is the
+        # remediation, not a doomed restart loop).
+        self._pinned_hostname = (
+            os.getenv(f"SERVER_HOSTNAMES_STATION{self._station}", "") or ""
+        ).strip() or None
         # Callback injecté par FreeIPPool : qualité mesurée par hostname.
         self._host_quality_fn = None
         # [roadmap] dernière charge connue du serveur choisi (pour le score).
