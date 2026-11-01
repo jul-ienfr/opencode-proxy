@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -256,6 +257,39 @@ def _pin(base: str, station: int, country: str) -> bool:
     return True
 
 
+def _recreate(station: int) -> bool:
+    """Recreate one gluetun container to draw a new server from the env country."""
+    service = "vpn-gluetun" if station == 1 else f"vpn-gluetun-{station}"
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "--profile",
+                "multi-station",
+                "up",
+                "-d",
+                "--force-recreate",
+                "--no-deps",
+                service,
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if proc.returncode != 0:
+            _log(
+                f"s{station} recreate {service} rc={proc.returncode}: "
+                f"{(proc.stderr or proc.stdout or '').strip()[:160]}"
+            )
+            return False
+        return True
+    except Exception as exc:
+        _log(f"s{station} recreate failed: {type(exc).__name__}: {exc}")
+        return False
+
+
 def _wait_egress(port: int, previous: str, timeout: float = 45.0) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -282,6 +316,7 @@ def _scan_station(
     fp: dict | None,
     state: dict,
     max_attempts: int,
+    recreate: bool,
 ) -> None:
     key = str(station)
     with LOCK:
@@ -303,13 +338,23 @@ def _scan_station(
                 _log(f"s{station} max attempts {max_attempts} reached")
                 return
             attempts += 1
-            previous = _egress(port, False) or _egress(port, True)
-            _log(f"s{station} pass={pass_index} attempt={attempts} pin {country!r}")
-            if not _pin(base, station, country):
-                continue
-            ip = _wait_egress(port, previous)
+            previous = "" if recreate else (_egress(port, False) or _egress(port, True))
+            if recreate:
+                _log(f"s{station} pass={pass_index} attempt={attempts} recreate")
+                if not _recreate(station):
+                    continue
+                time.sleep(10)
+                ip = _wait_egress(port, "")
+            else:
+                _log(f"s{station} pass={pass_index} attempt={attempts} pin {country!r}")
+                if not _pin(base, station, country):
+                    continue
+                ip = _wait_egress(port, previous)
             if not ip:
-                _log(f"s{station} {country!r}: no egress after pin")
+                _log(
+                    f"s{station} {country!r}: no egress after "
+                    f"{'recreate' if recreate else 'pin'}"
+                )
                 continue
             status, retry_after, dns = _probe(port, ip, body, imp, fp)
             result = {
@@ -350,6 +395,7 @@ def main() -> int:
     parser.add_argument("--passes", type=int, default=1)
     parser.add_argument("--max-attempts", type=int, default=0)
     parser.add_argument("--proxy-url", default="http://127.0.0.1:4000")
+    parser.add_argument("--recreate", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -397,6 +443,7 @@ def main() -> int:
                 fp,
                 state,
                 args.max_attempts,
+                args.recreate,
             )
             for station in stations
         ]
