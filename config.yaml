@@ -145,6 +145,8 @@ ip_rotation:
     hedge_delay_ms: 1500
     hedge_max_attempts: 1
   free_substitution_policy: homonym
+  https_fallback_enabled: false
+  https_proxies: []
   identity_diversity: true
   identity_max_profiles: 256
   identity_profiles:
@@ -160,12 +162,12 @@ ip_rotation:
   ip_probe_budget: 20.0
   ip_quota:
     enabled: true
+    ledger_bucket_mode: default
+    ledger_daily_limit: 0
+    ledger_enabled: true
     quota_reserve_pct: 10
     rotation_threshold_pct: 20
     selection_demand: 10
-    ledger_enabled: true
-    ledger_bucket_mode: default
-    ledger_daily_limit: 0
   latency_rotation:
     consecutive_slow: 5
     enabled: false
@@ -203,7 +205,7 @@ ip_rotation:
   ov_auth_station_threshold: 5
   ov_auth_window_s: 1800
   ovpn_endpoint_port: ''
-  ovpn_protocol: udp
+  ovpn_protocol: tcp
   paid_hedge_after_ms: 0
   per_ip_identity: true
   pin_widen_auths: 8
@@ -267,9 +269,8 @@ ip_rotation:
   server_provider: nordvpn
   shared_rotation_file: logs/shared_rotation.json
   socks5_auto_rotate: true
+  socks5_fallback_enabled: false
   socks5_proxies: []
-  https_proxies: []
-  https_fallback_enabled: false
   socks5_proxy_port: 1080
   socks5_proxy_port_2: 1081
   socks_catchup_s: 90
@@ -476,6 +477,7 @@ key_pause:
   default_pause: 60
   max_pause: 600
   key_pause_401_sec: 3600
+  key_pause_403_sec: 1800
 database:
   busy_timeout: 5000
   cache_size: 64000
@@ -484,6 +486,7 @@ database:
   commit_batch: 10
   weekly_purge_days: 90
   archive_after_days: 60
+  body_retention_days: 7
 background:
   wal_checkpoint_interval: 3600
   key_pause_cleanup_interval: 30
@@ -491,6 +494,10 @@ background:
   health_cache_ttl: 15
   health_timeout: 5
   custom_routes_check_interval: 5
+  cooldown_sweep_interval: 30
+  free_models_refresh_interval: 3600
+context_guard:
+  warn_body_bytes: 600000
 streaming:
   sse_keepalive_interval: 15
   sse_idle_timeout: 300
@@ -680,6 +687,10 @@ canary:
 free_prewarm:
   enabled: true
   interval_s: 300
+  url: ''
+suspect_tiny_output:
+  input_min: 40000
+  output_max: 100
 observability:
   slo_targets:
     p50_ms: 12000
@@ -691,6 +702,48 @@ observability:
     glm-5.3-flash-free:
       p50_ms: 12000
       p95_ms: 30000
+ip_registry:
+  enabled: true
+  db_path: logs/ip_registry.db
+  catalog_refresh_s: 21600
+  test_timeout_s: 60
+  lease_ttl_s: 300
+  retention_days: 7
+  score:
+    availability_weight: 0.55
+    latency_weight: 0.25
+    freshness_weight: 0.2
+    latency_budget_ms: 8000
+    freshness_ttl_h: 48
+    min_score: 20
+  eligibility:
+    error_cooldown_s: 1800
+  allocator:
+    mode: enforce
+    max_attempts_per_need: 20
+    max_parallel_repairs: 2
+    rebind_limit_per_min: 4
+    winner_cooldown_s: 120
+    winner_grace_s: 20
+    failure_cooldown_s: 60
+    max_candidates_per_chain: 20
+    probe_models:
+    - deepseek-v4.1-flash-free
+    - glm-5.3-flash-free
+    - mimo-v2.6-flash-free
+    global_429_window_s: 1800
+    global_429_threshold: 20
+    global_429_pause_s: 900
+    exhausted_threshold: 40
+    exhausted_pause_s: 1800
+    poll_interval_s: 20
+  binder:
+    mode: compose_hostname
+  sources:
+    manifest: docs/nordvpn_sources.yaml
+    embedded_path: logs/gluetun_nordvpn_embedded.json
+    cache_path: logs/nordvpn_api.json
+    gluetun_manifest_path: logs/gluetun_manifest.json
 models:
   glm-5.2:
     protocol: openai
@@ -922,28 +975,11 @@ models:
     protocol: gemini
   gemini-3.8-flash:
     protocol: gemini
-ip_registry:
-  enabled: false
-  db_path: logs/ip_registry.db
-  catalog_refresh_s: 21600
-  max_test_concurrency: 2
-  test_timeout_s: 60
-  lease_ttl_s: 300
-  retention_days: 7
-  score:
-    availability_weight: 0.55
-    latency_weight: 0.25
-    freshness_weight: 0.2
-    latency_budget_ms: 8000
-    freshness_ttl_h: 48
-    min_score: 20
-  eligibility:
-    error_cooldown_s: 1800
-  allocator:
-    mode: 'off'
-    max_attempts_per_need: 20
-  binder:
-    mode: compose_hostname
-  preselect:
-    enabled: false
-    max_tests_per_hour: 60
+  gemini-3-flash:
+    protocol: gemini
+  gemini-3-pro:
+    protocol: gemini
+  gemini-3.1-pro:
+    protocol: gemini
+  gemini-4-argon-contributor:
+    protocol: gemini

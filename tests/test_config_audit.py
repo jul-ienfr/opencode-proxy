@@ -70,6 +70,21 @@ class TestTheAuditDetectsAFreshDeadKey:
         resultat = audit.auditer()
         assert "ip_rotation.watchdog_intervall" in resultat["dead"]
 
+    def test_ip_registry_uses_strict_leaf_reads(self, tmp_path, monkeypatch):
+        """Une clé `ip_registry.*` sans lecture explicite est morte, même si
+        son nom de feuille apparaît ailleurs dans le code."""
+        import yaml
+
+        config = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+        config["ip_registry"]["dead_key"] = 1
+        faux = tmp_path / "config.yaml"
+        faux.write_text(yaml.safe_dump(config, allow_unicode=True), encoding="utf-8")
+
+        monkeypatch.setattr(audit, "CONFIG", faux)
+        monkeypatch.setattr(audit, "BASELINE", tmp_path / "baseline.json")
+        resultat = audit.auditer()
+        assert "ip_registry.dead_key" in resultat["dead"]
+
     def test_strict_mode_fails_on_a_new_dead_key(self, tmp_path, monkeypatch):
         import yaml
 

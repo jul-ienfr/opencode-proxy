@@ -36,7 +36,14 @@ class NeedReason(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class Server:
-    """One NordVPN server from the catalog (not an observed egress)."""
+    """One NordVPN server from the catalog (not an observed egress).
+
+    ``source_id`` names the registry that supplied the row and ``stale``
+    marks data that did not come from a fresh primary snapshot (fallback
+    source, supplementary static catalog or failed refresh).  Both travel
+    with the row so the SQLite ``servers`` table keeps provenance instead of
+    silently flattening every source into one list.
+    """
 
     hostname: str
     country: str
@@ -44,6 +51,9 @@ class Server:
     city: str | None = None
     load: float = 0.0
     technologies: tuple[str, ...] = ()
+    source_id: str = ""
+    stale: bool = False
+    catalog_fetched_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

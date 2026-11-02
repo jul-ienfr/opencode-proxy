@@ -34,32 +34,17 @@ from free.ip_registry import (  # noqa: E402
     StationNeed,
     StationProbe,
 )
-
-
-def _load_cfg(path: Path) -> dict:
-    try:
-        import yaml
-
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        section = data.get("ip_registry") or {}
-        return section if isinstance(section, dict) else {}
-    except Exception:
-        return {}
+from free.ip_registry.config import load_registry_config  # noqa: E402
 
 
 async def _run(args) -> int:
-    cfg = _load_cfg(Path(args.config))
+    cfg = load_registry_config(args.config or None)
     db_path = Path(args.db or cfg.get("db_path") or "logs/ip_registry.db")
-    score = cfg.get("score") or {}
-    eligibility = cfg.get("eligibility") or {}
     allocator_cfg = cfg.get("allocator") or {}
-    registry = SqliteIpRegistry(
-        str(db_path),
-        error_cooldown_s=float(eligibility.get("error_cooldown_s", 1800) or 1800),
-        min_score=float(score.get("min_score", 20) or 20),
-    )
+    registry = SqliteIpRegistry.from_config(cfg, db_path=db_path)
     try:
         now = time.time()
+        registry.prune_history(float(cfg.get("retention_days", 7) or 7))
         existing = registry.get(args.egress) if args.egress else None
         if args.egress and args.hostname and existing is None:
             registry.upsert_record(
@@ -82,7 +67,10 @@ async def _run(args) -> int:
             return 0 if candidates else 1
         egress = StationEgress()
         binder = ComposeHostnameBinder(ROOT, egress=egress)
-        probe = StationProbe(egress=egress)
+        probe = StationProbe(
+            egress=egress,
+            timeout_s=float(cfg.get("test_timeout_s", 60) or 60),
+        )
         allocator = IpAllocator(
             registry,
             binder,

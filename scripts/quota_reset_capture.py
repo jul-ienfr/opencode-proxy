@@ -149,7 +149,13 @@ def _acquire_lock() -> bool:
             if pid.isdigit():
                 import subprocess
 
-                r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=15)
+                r = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    creationflags=0x08000000 if os.name == "nt" else 0,
+                )
                 if pid in (r.stdout or ""):
                     log(f"veille deja active (pid {pid}) — sortie")
                     return False

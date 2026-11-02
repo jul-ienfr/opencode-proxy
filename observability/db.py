@@ -231,7 +231,8 @@ _SCHEMA_REQUESTS = """
         effort TEXT,
         ttfb_ms INTEGER,
         stop_reason TEXT,
-        aborted INTEGER DEFAULT 0
+        aborted INTEGER DEFAULT 0,
+        server_host TEXT
     )
 """
 
@@ -242,6 +243,8 @@ _REQUESTS_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_account ON requests(account_alias)",
     "CREATE INDEX IF NOT EXISTS idx_ts_model ON requests(timestamp, model)",
     "CREATE INDEX IF NOT EXISTS idx_free_ip ON requests(free_model_ip)",
+    # [présélection IP] rebuild qualité par hostname au boot
+    "CREATE INDEX IF NOT EXISTS idx_requests_server_host_time ON requests(server_host, timestamp)",
     # [P2 perf] filtre historique par modèle original (dropdown dashboard)
     "CREATE INDEX IF NOT EXISTS idx_original_model ON requests(original_model)",
 ]
@@ -276,6 +279,9 @@ _REQUEST_COLUMN_MIGRATIONS = [
     ("ttfb_ms", "NULL"),
     ("stop_reason", "NULL"),
     ("aborted", "0"),
+    # [présélection IP] serveur réellement utilisé : sans lui, la qualité
+    # mesurée (tok/s) ne peut pas être attribuée au hostname rebindable.
+    ("server_host", "NULL"),
 ]
 
 _INSERT_REQUESTS_SQL = """
@@ -284,8 +290,8 @@ _INSERT_REQUESTS_SQL = """
         protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
         request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked,
         geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station, free_status, paid_status,
-        ttfb_ms, stop_reason, aborted)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ttfb_ms, stop_reason, aborted, server_host)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 # Tables cibles acceptées sous forme de tuple taggé ``(table, payload)`` dans
@@ -511,6 +517,7 @@ def init_requests_schema_fast(conn: sqlite3.Connection, *, busy_timeout: int, ca
         ("ttfb_ms", "INTEGER"),
         ("stop_reason", "TEXT"),
         ("aborted", "INTEGER DEFAULT 0"),
+        ("server_host", "TEXT"),
     ):
         try:
             conn.execute(f"ALTER TABLE requests ADD COLUMN {_col} {_ddl}")

@@ -1,0 +1,918 @@
+version: 1
+generated_at: "2026-11-02"
+scope: "Registre des sources de serveurs/IP NordVPN pour opencode-proxy"
+operator_sources:
+  - wg_nord_pages
+  - nordgen_selfhoster
+  - ip_address_list_nordvpn
+  - netify_nordvpn
+
+sources:
+  # ── Sources fournies par l'opérateur ──────────────────────────────────
+  - id: wg_nord_pages
+    name: "NordVPN WireGuard Config Generator (frontend hébergé)"
+    url: "https://wg-nord.pages.dev/"
+    category: mirror
+    kind: catalog_frontend
+    auth: none
+    refresh: realtime
+    status: to_evaluate
+    recorded_at: "2026-11-02"
+    gives:
+      - hostname
+      - station_entry_ip
+      - load
+      - wireguard_public_key
+      - config_files
+    not_gives:
+      - egress_ip
+      - network_ranges
+    upstream: "https://api.nordvpn.com/v1/servers?limit=7000&filters[servers_technologies][identifier]=wireguard_udp"
+    notes: >-
+      Frontend statique. Il interroge l'API officielle via un Worker Cloudflare
+      tiers (proxy.rasimhamidi93717911.workers.dev), pas via une base propre.
+      Il expose aussi /key (échange de token NordVPN contre la clé NordLynx) et
+      /fetch-proxies (liste SOCKS officielle). Le token transite par le Worker
+      tiers : à ne pas utiliser avec un compte réel en production.
+
+  - id: nordgen_selfhoster
+    name: "NordGen — catalogue packé et générateur WireGuard"
+    url: "https://nordgen.selfhoster.win/"
+    category: operator
+    kind: catalog_mirror
+    auth: none
+    refresh: 5m
+    status: to_evaluate
+    recorded_at: "2026-11-02"
+    gives:
+      - hostname
+      - station_entry_ip
+      - load
+      - wireguard_public_key
+      - country_city
+      - server_groups
+    not_gives:
+      - egress_ip
+      - independent_measurements
+    upstream: "https://nordcache.selfhoster.win/api/servers"
+    notes: >-
+      Worker Cloudflare (Hono) + KV. /api/servers renvoie un catalogue packé
+      [publicKeys, countries] de ~93,6 Ko, avec ETag et cache 5 min. Le cron
+      rafraîchit toutes les 5 min depuis nordcache. La provenance de nordcache
+      n'est pas documentée publiquement ; le dépôt NordGen, lui, utilise l'API
+      officielle. Format non standard : nécessite le décodeur du dépôt.
+
+  - id: ip_address_list_nordvpn
+    name: "ip-address-list/nordvpn — proxys HTTPS NordVPN"
+    url: "https://github.com/ip-address-list/nordvpn"
+    category: community
+    kind: proxy_list
+    auth: none
+    refresh: weekly
+    status: to_evaluate
+    recorded_at: "2026-11-02"
+    gives:
+      - proxy_hostname
+      - https_proxy_endpoint_port_89
+    not_gives:
+      - server_ip
+      - wireguard_endpoint
+      - usable_credentials
+    upstream: "https://api.nordvpn.com/v1/servers/recommendations?filters[servers_technologies][identifier]=proxy_ssl"
+    notes: >-
+      GitHub Action hebdomadaire (dimanche 00:00). 14 pays, 100 recommandations
+      par pays. generic/<cc>.txt = hostnames ; foxyproxy/<cc>.txt =
+      ssl://username:password@host:89 avec identifiants factices. Ce ne sont pas
+      des IP de serveurs ni des configs WireGuard.
+
+  - id: netify_nordvpn
+    name: "Netify — réseaux, ASN et couverture NordVPN"
+    url: "https://www.netify.ai/resources/vpns/nordvpn"
+    category: commercial
+    kind: network_ranges
+    auth: paid
+    refresh: unknown
+    status: to_evaluate
+    recorded_at: "2026-11-02"
+    gives:
+      - asn
+      - ipv4_network_ranges
+      - ipv6_network_ranges
+      - country_city_counts
+      - domains
+    not_gives:
+      - per_server_hostnames
+      - per_server_egress_ip
+    notes: >-
+      Page indépendante de renseignement réseau : 57 pays, 102 villes,
+      1 191 plages IPv4 et 119 plages IPv6 (échantillon HTML ; 1 188 + 116
+      supplémentaires). Les données complètes passent par l'API IP / datasets
+      payants. Utile pour qualifier un egress ou vérifier un ASN, pas pour
+      choisir un serveur.
+
+  # ── API et artefacts officiels NordVPN ────────────────────────────────
+  - id: nordvpn_api_servers
+    name: "API NordVPN — catalogue complet"
+    url: "https://api.nordvpn.com/v1/servers?limit=0"
+    category: official
+    kind: catalog
+    auth: none
+    refresh: 6h
+    status: active
+    gives:
+      - hostname
+      - station_entry_ip
+      - ipv6_station
+      - load
+      - status
+      - country
+      - city
+      - technologies
+      - wireguard_public_key
+    not_gives:
+      - egress_ip
+      - measured_throughput
+    used_by:
+      - "free/ip_registry/catalog.py"
+      - "vpn/manager.py"
+      - "scripts/ip_preselection.py"
+    notes: >-
+      Source de vérité du catalogue. ~7 229 serveurs online au 2026-11-02,
+      ~29 Mo pour limit=0. Le champ station/ips est l'IP d'entrée, pas
+      l'egress public.
+
+  - id: nordvpn_api_recommendations
+    name: "API NordVPN — serveurs recommandés"
+    url: "https://api.nordvpn.com/v1/servers/recommendations"
+    category: official
+    kind: catalog
+    auth: none
+    refresh: realtime
+    status: active
+    gives:
+      - hostname
+      - station_entry_ip
+      - load
+      - country_city
+      - technologies
+    not_gives:
+      - egress_ip
+    used_by:
+      - "vpn/manager.py"
+      - "scripts/ip_preselection.py"
+    notes: >-
+      Tri par score interne NordVPN, filtre pays et technologie. Utilisé pour
+      le least-loaded (top-K par load) et le proxy_ssl.
+
+  - id: nordvpn_api_countries
+    name: "API NordVPN — pays"
+    url: "https://api.nordvpn.com/v1/servers/countries"
+    category: official
+    kind: metadata
+    auth: none
+    refresh: 6h
+    status: active
+    gives:
+      - country_id
+      - country_name
+      - country_code
+    not_gives:
+      - server_list
+    used_by:
+      - "vpn/manager.py"
+      - "scripts/ip_preselection.py"
+    notes: "Mapping id pays → nom, nécessaire aux filtres recommendations."
+
+  - id: nordvpn_api_groups
+    name: "API NordVPN — groupes de serveurs"
+    url: "https://api.nordvpn.com/v1/servers/groups"
+    category: official
+    kind: metadata
+    auth: none
+    refresh: 6h
+    status: active
+    gives:
+      - group_id
+      - group_identifier
+      - group_title
+    not_gives:
+      - server_list
+    notes: "Groupes (standard, dedicated_ip, p2p, etc.)."
+
+  - id: nordvpn_api_technologies
+    name: "API NordVPN — technologies"
+    url: "https://api.nordvpn.com/v1/technologies"
+    category: official
+    kind: metadata
+    auth: none
+    refresh: 6h
+    status: active
+    gives:
+      - technology_id
+      - technology_identifier
+      - technology_name
+    not_gives:
+      - server_list
+    notes: >-
+      Endpoint correct : /v1/technologies. /v1/servers/technologies renvoie 403
+      (chemin obsolète).
+
+  - id: nordvpn_api_insights
+    name: "API NordVPN — insights de l'IP appelante"
+    url: "https://api.nordvpn.com/v1/helpers/ips/insights"
+    category: official
+    kind: geolocation
+    auth: none
+    refresh: realtime
+    status: active
+    gives:
+      - public_ip
+      - country
+      - city
+      - isp
+      - isp_asn
+      - protected
+    not_gives:
+      - server_list
+    notes: >-
+      Décrit l'IP publique de l'appelant. Très utile pour vérifier qu'un egress
+      observé appartient bien à NordVPN (ex. isp= NordVPN, isp_asn=136787).
+
+  - id: nordvpn_api_proxy_ssl
+    name: "API NordVPN — proxys HTTPS (proxy_ssl)"
+    url: "https://api.nordvpn.com/v1/servers/recommendations?filters[servers_technologies][identifier]=proxy_ssl&limit=100"
+    category: official
+    kind: proxy_list
+    auth: none
+    refresh: realtime
+    status: active
+    gives:
+      - hostname
+      - station_entry_ip
+      - load
+    not_gives:
+      - credentials
+      - socks_endpoint
+    used_by:
+      - "scripts/ip_preselection.py"
+    notes: "Source de la liste ip-address-list ; port HTTPS 89 côté client."
+
+  - id: nordvpn_api_socks
+    name: "API NordVPN — proxys SOCKS"
+    url: "https://api.nordvpn.com/v1/servers?filters[servers_technologies][identifier]=socks&limit=100"
+    category: official
+    kind: proxy_list
+    auth: none
+    refresh: realtime
+    status: to_evaluate
+    gives:
+      - hostname
+      - station_entry_ip
+      - load
+    not_gives:
+      - credentials
+    notes: >-
+      SOCKS5 sur le port 1080, identifiants du compte requis. Utilisé par
+      wg-nord/fetch-proxies. Vérifier que le port et l'auth sont toujours
+      supportés avant intégration.
+
+  - id: nordvpn_credentials
+    name: "API NordVPN — credentials du compte"
+    url: "https://api.nordvpn.com/v1/users/services/credentials"
+    category: official
+    kind: credentials
+    auth: token
+    refresh: realtime
+    status: active
+    gives:
+      - nordlynx_private_key
+      - username
+      - password
+    not_gives:
+      - server_list
+    notes: >-
+      Nécessite un token NordVPN (Authorization: token:<token>). Ne jamais
+      transiter par un Worker tiers. Utilisé par NordGen/wg-nord pour générer
+      les configs.
+
+  - id: nordvpn_ovpn_archive
+    name: "Archive officielle OpenVPN (tous serveurs)"
+    url: "https://downloads.nordcdn.com/configs/archives/servers/ovpn.zip"
+    category: official
+    kind: config_archive
+    auth: none
+    refresh: daily
+    status: active
+    gives:
+      - hostname
+      - country
+      - openvpn_config
+    not_gives:
+      - egress_ip
+      - load
+    notes: >-
+      Archive ZIP de ~68,7 Mo (Last-Modified 2026-10-30), une config .ovpn par
+      serveur. Excellente source de complétude des hostnames, y compris des
+      serveurs absents de l'API. Variantes : ovpn_tcp.zip (~34,3 Mo),
+      ovpn_udp.zip (~34,4 Mo).
+
+  - id: nordvpn_ovpn_tcp
+    name: "Archive officielle OpenVPN TCP"
+    url: "https://downloads.nordcdn.com/configs/archives/servers/ovpn_tcp.zip"
+    category: official
+    kind: config_archive
+    auth: none
+    refresh: daily
+    status: active
+    gives:
+      - hostname
+      - openvpn_tcp_config
+    not_gives:
+      - egress_ip
+    notes: "Sous-ensemble TCP de l'archive principale."
+
+  - id: nordvpn_ovpn_udp
+    name: "Archive officielle OpenVPN UDP"
+    url: "https://downloads.nordcdn.com/configs/archives/servers/ovpn_udp.zip"
+    category: official
+    kind: config_archive
+    auth: none
+    refresh: daily
+    status: active
+    gives:
+      - hostname
+      - openvpn_udp_config
+    not_gives:
+      - egress_ip
+    notes: "Sous-ensemble UDP de l'archive principale."
+
+  - id: nordvpn_server_locations
+    name: "Page officielle des emplacements de serveurs"
+    url: "https://nordvpn.com/servers/"
+    category: official
+    kind: documentation
+    auth: none
+    refresh: unknown
+    status: reference
+    gives:
+      - country_city_marketing_counts
+    not_gives:
+      - machine_readable_list
+      - ip_addresses
+    notes: "Page marketing (7 400+ serveurs, 118 pays) ; pas de flux exploitable."
+
+  - id: nordvpn_support_server_list
+    name: "Support NordVPN — où trouver la liste des serveurs"
+    url: "https://support.nordvpn.com/hc/en-us/articles/19383127694225-Where-can-I-find-the-NordVPN-server-list"
+    category: official
+    kind: documentation
+    auth: none
+    refresh: static
+    status: reference
+    gives:
+      - procedure
+    not_gives:
+      - machine_readable_list
+    notes: "Documentation officielle, pas de données."
+
+  # ── Sources locales / projet ──────────────────────────────────────────
+  - id: gluetun_embedded_catalog
+    name: "Catalogue NordVPN embarqué dans Gluetun"
+    url: "file:logs/gluetun_nordvpn_embedded.json"
+    category: project
+    kind: catalog
+    auth: none
+    refresh: static
+    status: fallback
+    gives:
+      - hostname
+      - station_entry_ip
+      - wireguard_public_key
+      - country
+      - city
+    not_gives:
+      - load
+      - egress_ip
+    used_by:
+      - "free/ip_registry/catalog.py"
+      - "scripts/merge_gluetun_catalog.py"
+    notes: >-
+      Extrait du binaire /gluetun-entrypoint (17 103 entrées, dont al36..al75).
+      Il contient des serveurs absents du manifeste et de l'API publique, mais
+      peut manquer les serveurs créés après le build de l'image.
+
+  - id: gluetun_manifest
+    name: "Manifeste NordVPN du conteneur Gluetun"
+    url: "container:/gluetun/servers/nordvpn.json"
+    category: project
+    kind: catalog
+    auth: none
+    refresh: static
+    status: active
+    gives:
+      - hostname
+      - station_entry_ip
+      - wireguard_public_key
+      - country
+      - city
+    not_gives:
+      - load
+      - egress_ip
+    used_by:
+      - "scripts/merge_gluetun_catalog.py"
+    notes: >-
+      Téléchargé par Gluetun au démarrage et rafraîchi selon UPDATER_PERIOD
+      (480 h) ; le proxy force un wipe applicatif en cas d'incident. 14 132
+      entrées au 2026-11-01. Le manifeste gagne sur le catalogue embarqué lors
+      du chargement Gluetun.
+
+  - id: gluetun_merge_script
+    name: "Fusion Gluetun + manifeste + API"
+    url: "file:scripts/merge_gluetun_catalog.py"
+    category: project
+    kind: tool
+    auth: none
+    refresh: on_demand
+    status: active
+    gives:
+      - union_catalog
+      - deduplicated_hostnames
+    not_gives:
+      - egress_ip
+    notes: >-
+      Ordre de priorité : API live > manifeste du conteneur > catalogue
+      embarqué. Écrit /gluetun/servers/nordvpn.json et exporte
+      logs/gluetun_nordvpn_embedded.json.
+
+  - id: nordvpn_api_cache
+    name: "Cache brut de l'API NordVPN"
+    url: "file:logs/nordvpn_api.json"
+    category: project
+    kind: catalog_mirror
+    auth: none
+    refresh: on_demand
+    status: fallback
+    gives:
+      - full_api_snapshot
+    not_gives:
+      - egress_ip
+    used_by:
+      - "scripts/fresh_chain.py"
+    notes: >-
+      Snapshot JSON de ~29 Mo (7 229 entrées au 2026-11-02), utilisé par
+      fresh_chain et comme secours hors ligne.
+
+  - id: nordcache_packed
+    name: "NordCache — catalogue packé"
+    url: "https://nordcache.selfhoster.win/api/servers"
+    category: mirror
+    kind: catalog_mirror
+    auth: none
+    refresh: 5m
+    status: fallback
+    gives:
+      - hostname
+      - station_entry_ip
+      - load
+      - wireguard_public_key
+      - country_city
+      - server_groups
+    not_gives:
+      - egress_ip
+      - provenance_documented
+    used_by:
+      - "nordgen_selfhoster"
+    notes: >-
+      Même payload que nordgen (/api/servers), ~93,6 Ko, ETag, cache 5 min.
+      Très bon compromis bande passante si l'API officielle est indisponible,
+      mais format packé et provenance à valider.
+
+  - id: ip_registry_db
+    name: "Registre SQLite des IP observées"
+    url: "file:logs/ip_registry.db"
+    category: project
+    kind: observations
+    auth: none
+    refresh: on_demand
+    status: active
+    gives:
+      - servers_catalog_snapshot
+      - observations
+      - ip_state
+      - assignments
+    not_gives:
+      - server_discovery
+      - egress_ip_without_probe
+    used_by:
+      - "free/ip_registry/sqlite_registry.py"
+      - "scripts/ip_registry_discover.py"
+      - "scripts/ip_registry_canary.py"
+    notes: >-
+      Tables : servers (7 229), observations (7), ip_state (6), assignments (4)
+      au 2026-11-02. Ce n'est pas une source de découverte : c'est la mémoire
+      des egress observés et des assignations.
+
+  # ── Listes communautaires et miroirs ─────────────────────────────────
+  - id: x4bnet_lists_vpn
+    name: "X4BNet — listes d'IP VPN par ASN"
+    url: "https://github.com/X4BNet/lists_vpn"
+    category: community
+    kind: network_ranges
+    auth: none
+    refresh: daily
+    status: active
+    gives:
+      - vpn_ipv4_ranges
+      - vpn_ipv6_ranges
+      - asn_membership
+    not_gives:
+      - hostname
+      - per_server_mapping
+      - load
+    used_by: []
+    notes: >-
+      Inclut AS207137 (PacketHub/NordVPN), AS136787 (TEFINCOM/NordVPN) et
+      AS9009 (M247, opérateur majeur de NordVPN). output/vpn/ipv4.txt contient
+      186.247.44.0/23 (pool albanais). Utile pour classer un egress, avec
+      risque de faux positifs (autres clients M247).
+
+  - id: cloud_ip_ranges_nordvpn
+    name: "Cloud IP Ranges — plages NordVPN"
+    url: "https://cloud-ip-ranges.com/providers/nordvpn"
+    category: community
+    kind: network_ranges
+    auth: none
+    refresh: daily
+    status: to_evaluate
+    gives:
+      - ipv4_cidr_list
+      - ipv6_cidr_list
+      - region
+    not_gives:
+      - hostname
+      - egress_ip
+    notes: >-
+      7 228 CIDR IPv4 au 2026-11-02 (mise à jour quotidienne 04:00). Les
+      valeurs correspondent aux station/entry IP de l'API officielle
+      (7 228 vs 7 229), pas aux egress NAT. Téléchargement :
+      https://cloud-ip-ranges.com/download/nordvpn.txt
+
+  - id: iptoolskit_nordvpn
+    name: "IpToolsKit — informations réseau NordVPN"
+    url: "https://iptoolskit.com/organization/NordVPN"
+    category: community
+    kind: network_ranges
+    auth: none
+    refresh: unknown
+    status: to_evaluate
+    gives:
+      - asn
+      - network_ranges
+      - ip_count
+      - country_city_distribution
+    not_gives:
+      - hostname
+      - per_server_mapping
+    notes: >-
+      Annonce 500 plages, 229 121 IP, AS136787 PacketHub, 33 pays, 81 villes.
+      Agrégation ASN, pas un catalogue de serveurs. Données non datées.
+
+  - id: namakshenas_nordvpn_loc_test
+    name: "NordVPN Servers Stability Test"
+    url: "https://github.com/namakshenas/nordvpn-loc-test"
+    category: community
+    kind: proxy_list
+    auth: none
+    refresh: weekly
+    status: fallback
+    gives:
+      - proxy_hostnames
+    not_gives:
+      - server_ip
+      - load
+      - wireguard
+    notes: >-
+      Mise à jour le vendredi. 7 pays (au, de, fr, nl, sg, uk, us), hostnames
+      recommandés par NordVPN. Dernier commit 2026-11-02. Petit volume.
+
+  - id: sudesh0sudesh_nordvpn_ips
+    name: "NordVPN-IPs — liste historique d'IP"
+    url: "https://github.com/sudesh0sudesh/NordVPN-IPs"
+    category: legacy
+    kind: static_ip_list
+    auth: none
+    refresh: static
+    status: stale
+    gives:
+      - ipv4_addresses
+      - first_last_seen
+    not_gives:
+      - hostname
+      - current_load
+    notes: >-
+      nordvpn_ips.csv (~397 Ko) et nord_subnet.csv (~60 Ko), dernière mise à
+      jour 2025-01-14. Utile comme archive, pas pour la production.
+
+  - id: sandboxfan_vpn_ip
+    name: "VPN_IP — liste statique NordVPN"
+    url: "https://github.com/sandboxfan/VPN_IP"
+    category: legacy
+    kind: static_ip_list
+    auth: none
+    refresh: static
+    status: stale
+    gives:
+      - ipv4_addresses
+    not_gives:
+      - hostname
+      - freshness
+    notes: >-
+      NordVpn_all_servers_ip_list.txt (~83 Ko), dernier push 2023-03-26.
+      Non maintenu.
+
+  - id: leakforge_nordvpn_ips
+    name: "LeakForge — liste quotidienne (legacy)"
+    url: "https://github.com/LeakForge/nordvpn-ips"
+    category: legacy
+    kind: static_ip_list
+    auth: none
+    refresh: static
+    status: stale
+    gives:
+      - ipv4_addresses
+    not_gives:
+      - hostname
+      - current_api
+    notes: >-
+      Script basé sur l'ancien endpoint /server (aujourd'hui 403). CSV
+      2021-12-13, dépôt poussé pour la dernière fois en 2025-09. Obsolète.
+
+  - id: umkus_nordvpn_ips
+    name: "Umkus — liste quotidienne (legacy)"
+    url: "https://github.com/Umkus/nordvpn-ips"
+    category: legacy
+    kind: static_ip_list
+    auth: none
+    refresh: static
+    status: stale
+    gives:
+      - ipv4_addresses
+    not_gives:
+      - hostname
+      - current_api
+    notes: "Dernier push 2021-12-13 ; même générateur que LeakForge. Obsolète."
+
+  # ── Réseau / ASN / classification ────────────────────────────────────
+  - id: ripe_stat_as207137
+    name: "RIPE Stat — préfixes annoncés AS207137"
+    url: "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS207137"
+    category: network
+    kind: network_ranges
+    auth: none
+    refresh: realtime
+    status: active
+    gives:
+      - announced_prefixes
+      - asn
+    not_gives:
+      - hostname
+      - server_role
+    notes: "API JSON fiable pour les préfixes BGP d'un ASN NordVPN."
+
+  - id: peeringdb_as207137
+    name: "PeeringDB — AS207137"
+    url: "https://www.peeringdb.com/api/net?asn=207137"
+    category: network
+    kind: metadata
+    auth: none
+    refresh: realtime
+    status: active
+    gives:
+      - asn
+      - organization
+      - prefix_counts
+      - ix_count
+    not_gives:
+      - per_server_mapping
+    notes: "Métadonnées réseau et peering, pas de liste de serveurs."
+
+  - id: bgp_tools_as136787
+    name: "BGP.Tools — AS136787"
+    url: "https://bgp.tools/as/136787"
+    category: network
+    kind: network_ranges
+    auth: none
+    refresh: realtime
+    status: to_evaluate
+    gives:
+      - announced_prefixes
+      - asn
+      - bgp_visibility
+    not_gives:
+      - hostname
+    notes: "HTML riche ; GET fonctionne, HEAD renvoie 403. Pas d'API JSON simple."
+
+  - id: ipinfo_as136787
+    name: "IPinfo — AS136787"
+    url: "https://ipinfo.io/AS136787"
+    category: network
+    kind: network_ranges
+    auth: none
+    refresh: realtime
+    status: to_evaluate
+    gives:
+      - asn
+      - announced_prefixes
+      - country
+    not_gives:
+      - hostname
+    notes: "Page HTML gratuite ; l'API JSON peut nécessiter un token selon l'usage."
+
+  - id: iplocate_asn_db
+    name: "IPLocate — base IP → ASN"
+    url: "https://github.com/iplocate/ip-address-databases"
+    category: network
+    kind: dataset
+    auth: license
+    refresh: daily
+    status: to_evaluate
+    gives:
+      - ip_to_asn_mapping
+      - prefix_data
+    not_gives:
+      - vpn_provider_label
+    notes: >-
+      Base utilisée par X4BNet pour construire ses listes. Permet de classer
+      localement un egress par ASN sans dépendre d'un service tiers.
+
+  - id: team_cymru_whois
+    name: "Team Cymru — mapping IP → ASN"
+    url: "https://team-cymru.com/community-services/ip-asn-mapping/"
+    category: network
+    kind: dataset
+    auth: none
+    refresh: realtime
+    status: to_evaluate
+    gives:
+      - ip_to_asn
+      - asn_name
+    not_gives:
+      - vpn_provider_label
+    notes: "Whois/DNS-based, utile pour un lookup ponctuel d'egress."
+
+  - id: maxmind_geolite2_asn
+    name: "MaxMind GeoLite2 ASN"
+    url: "https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/"
+    category: network
+    kind: dataset
+    auth: license
+    refresh: monthly
+    status: to_evaluate
+    gives:
+      - ip_to_asn
+      - ip_to_country
+    not_gives:
+      - vpn_provider_label
+    notes: "Base locale gratuite sous licence ; classification ASN/pays."
+
+  # ── Commercial ───────────────────────────────────────────────────────
+  - id: ipapi_is_vpn_db
+    name: "ipapi.is — base VPN / egress"
+    url: "https://ipapi.is/vpn-detection.html"
+    category: commercial
+    kind: network_ranges
+    auth: paid
+    refresh: regular
+    status: to_evaluate
+    gives:
+      - vpn_exit_nodes
+      - vpn_ranges
+      - provider_label
+    not_gives:
+      - per_server_hostname
+    notes: >-
+      Base CSV/MMDB et API, inclut NordVPN. La meilleure option payante pour
+      qualifier un egress indépendamment de l'API NordVPN.
+
+  - id: ipasis_vpn_directory
+    name: "IPASIS — annuaire ASN des VPN"
+    url: "https://ipasis.com/directory/vpn-providers"
+    category: commercial
+    kind: network_ranges
+    auth: paid
+    refresh: regular
+    status: to_evaluate
+    gives:
+      - asn
+      - provider_mapping
+      - detection_api
+    not_gives:
+      - per_server_mapping
+    notes: >-
+      Approche ASN (M247 AS9009, etc.). Utile pour la détection, moins précis
+      pour l'attribution d'un serveur.
+
+  - id: abstractapi_vpn_checker
+    name: "AbstractAPI — VPN checker"
+    url: "https://www.abstractapi.com/guides/vpn-checker/nord-vpn-ip-lookup"
+    category: commercial
+    kind: network_ranges
+    auth: paid
+    refresh: realtime
+    status: to_evaluate
+    gives:
+      - vpn_detection
+      - ip_intelligence
+    not_gives:
+      - server_list
+    notes: "API de détection, pas un catalogue de serveurs."
+
+  # ── Outils / documentation (pas des sources de données) ─────────────
+  - id: mustafachyi_nordgen_repo
+    name: "NordGen — dépôt de référence"
+    url: "https://github.com/mustafachyi/NordVPN-WireGuard-Config-Generator"
+    category: tool
+    kind: tool
+    auth: none
+    refresh: on_demand
+    status: reference
+    gives:
+      - decoder_packed_catalog
+      - cli_generator
+      - worker_implementation
+    not_gives:
+      - independent_server_data
+    notes: >-
+      Contient le Worker nordgen, le frontend Vue, la CLI Python et les tests.
+      Utile pour décoder /api/servers et comprendre le format packé.
+
+  - id: wg_nord_cli
+    name: "wg-nord — CLI Rust"
+    url: "https://github.com/n-thumann/wg-nord"
+    category: tool
+    kind: tool
+    auth: token
+    refresh: on_demand
+    status: reference
+    gives:
+      - wireguard_config_generation
+    not_gives:
+      - independent_server_data
+    notes: "Génère une config à partir d'un hostname et d'un token NordVPN."
+
+  - id: nord_python_lib
+    name: "nord — client Python"
+    url: "https://nord.readthedocs.io/en/latest/reference/api.html"
+    category: tool
+    kind: tool
+    auth: token
+    refresh: on_demand
+    status: reference
+    gives:
+      - api_client
+    not_gives:
+      - independent_server_data
+    notes: "Client de l'API NordVPN, utile comme référence de schéma."
+
+  - id: sleeplessbeastie_api
+    name: "Guide API NordVPN (2019)"
+    url: "https://sleeplessbeastie.eu/2019/02/18/how-to-use-public-nordvpn-api/"
+    category: legacy
+    kind: documentation
+    auth: none
+    refresh: static
+    status: reference
+    gives:
+      - legacy_api_examples
+    not_gives:
+      - current_endpoints
+    notes: >-
+      Documente l'ancien /server (aujourd'hui 403). Utile pour l'historique,
+      pas pour l'implémentation actuelle.
+
+hierarchy:
+  catalog_primary: nordvpn_api_servers
+  catalog_fallbacks:
+    - nordcache_packed
+    - gluetun_manifest
+    - gluetun_embedded_catalog
+    - nordvpn_api_cache
+  hostname_completeness:
+    - nordvpn_ovpn_archive
+    - gluetun_embedded_catalog
+  https_proxy:
+    - nordvpn_api_proxy_ssl
+    - ip_address_list_nordvpn
+  socks5_proxy:
+    - nordvpn_api_socks
+  network_classification:
+    - x4bnet_lists_vpn
+    - netify_nordvpn
+    - cloud_ip_ranges_nordvpn
+    - iptoolskit_nordvpn
+    - ipapi_is_vpn_db
+    - iplocate_asn_db
+  egress_truth: "observed_only"
+  egress_sources:
+    - ip_registry_db
+    - nordvpn_api_insights

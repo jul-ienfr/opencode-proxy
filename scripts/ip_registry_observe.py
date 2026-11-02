@@ -20,27 +20,20 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from free.ip_registry.catalog import NordVpnCatalog  # noqa: E402
+from free.ip_registry.config import load_registry_config  # noqa: E402
 from free.ip_registry.sqlite_registry import SqliteIpRegistry  # noqa: E402
 
 
-def _load_cfg(path: Path) -> dict:
-    try:
-        import yaml
-
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        section = data.get("ip_registry") or {}
-        return section if isinstance(section, dict) else {}
-    except Exception as exc:
-        print(f"config load failed: {type(exc).__name__}: {exc}")
-        return {}
-
-
 async def _run(args) -> int:
-    cfg = _load_cfg(Path(args.config))
+    cfg = load_registry_config(args.config or None)
     db_path = Path(args.db or cfg.get("db_path") or "logs/ip_registry.db")
-    catalog = NordVpnCatalog(ttl_s=float(cfg.get("catalog_refresh_s", 21600) or 21600))
+    catalog = NordVpnCatalog.from_config(cfg)
     servers = await catalog.refresh()
     print(f"catalog: {len(servers)} online servers")
+    print(
+        f"source: {catalog.source_id or '-'} stale={catalog.stale} "
+        f"etag={catalog.etag or '-'}"
+    )
     if catalog.last_error:
         print(f"catalog error: {catalog.last_error}")
     if args.dry_run:
@@ -48,21 +41,30 @@ async def _run(args) -> int:
             print(f"  {server.hostname} {server.country} load={server.load:g}")
         return 0 if servers else 1
 
-    score = cfg.get("score") or {}
-    eligibility = cfg.get("eligibility") or {}
-    registry = SqliteIpRegistry(
-        str(db_path),
-        error_cooldown_s=float(eligibility.get("error_cooldown_s", 1800) or 1800),
-        min_score=float(score.get("min_score", 20) or 20),
-    )
+    registry = SqliteIpRegistry.from_config(cfg, db_path=db_path)
     try:
-        count = registry.sync_catalog(servers)
+        resolution = catalog.last_resolution
+        if resolution is not None:
+            count = registry.sync_snapshot(resolution, authoritative=True)
+        else:
+            count = registry.sync_catalog(
+                servers,
+                source_id=catalog.source_id or "nordvpn_api_servers",
+                stale=catalog.stale,
+                catalog_fetched_at=catalog.catalog_fetched_at,
+            )
+        pruned = registry.prune_history(
+            float(cfg.get("retention_days", 7) or 7)
+        )
         rows = registry._conn.execute(
             "SELECT state, COUNT(*) AS n FROM ip_state GROUP BY state ORDER BY state"
         ).fetchall()
         print(f"synced: {count} servers into {db_path}")
+        print("sources:", registry.catalog_source_counts() or "empty")
         print("ip_state:", {row["state"]: row["n"] for row in rows} or "empty")
         print(f"eligible: {len(registry.eligible(now=None, limit=1000))}")
+        if pruned["observations"] or pruned["assignments"]:
+            print(f"pruned: {pruned}")
     finally:
         registry.close()
     return 0

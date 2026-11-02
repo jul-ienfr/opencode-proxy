@@ -19,6 +19,7 @@ def test_schema_is_created(tmp_path):
             )
         }
         assert {"schema_meta", "servers", "observations", "ip_state", "assignments"} <= tables
+        assert "catalog_snapshots" in tables
         indexes = {
             row["name"]
             for row in conn.execute(
@@ -27,7 +28,54 @@ def test_schema_is_created(tmp_path):
         }
         assert "idx_state_eligible" in indexes
         assert "idx_one_assigned_per_station" in indexes
+        assert "idx_servers_source" in indexes
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(servers)")
+        }
+        assert {"source_id", "stale", "catalog_fetched_at"} <= columns
         assert schema_version(conn) == SCHEMA_VERSION
+    finally:
+        conn.close()
+
+
+def test_v1_database_migrates_in_place(tmp_path):
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO schema_meta(key, value) VALUES('schema_version', '1');
+        CREATE TABLE servers (
+            hostname TEXT PRIMARY KEY,
+            server_ip TEXT,
+            country TEXT NOT NULL,
+            city TEXT,
+            load REAL NOT NULL DEFAULT 0,
+            technologies TEXT NOT NULL DEFAULT '[]',
+            first_seen_at REAL NOT NULL,
+            last_seen_at REAL NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO servers(
+            hostname, server_ip, country, city, load, technologies,
+            first_seen_at, last_seen_at, active
+        ) VALUES('al110.nordvpn.com', '186.247.44.61', 'Albania', 'Tirana', 12.0,
+                 '["WireGuard"]', 1000.0, 1000.0, 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    conn = ensure_schema(path)
+    try:
+        assert schema_version(conn) == SCHEMA_VERSION
+        row = conn.execute(
+            "SELECT hostname, source_id, stale, catalog_fetched_at FROM servers"
+        ).fetchone()
+        assert row["hostname"] == "al110.nordvpn.com"
+        assert row["source_id"] == "nordvpn_api_servers"
+        assert row["stale"] == 0
+        assert row["catalog_fetched_at"] is None
     finally:
         conn.close()
 

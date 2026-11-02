@@ -156,6 +156,7 @@ def stop() -> dict:
                         ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
                         capture_output=True,
                         check=False,
+                        creationflags=0x08000000 if os.name == "nt" else 0,
                     )
                 else:
                     os.kill(int(pid), 15)

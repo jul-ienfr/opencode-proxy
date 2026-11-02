@@ -1,0 +1,278 @@
+{
+  "generated_at": "2026-11-02T09:10:44.646542+00:00",
+  "hours": 72,
+  "thresholds": {
+    "fast_tps": 50.0,
+    "slow_tps": 20.0,
+    "max_load": 80,
+    "min_samples": 3
+  },
+  "api": {
+    "servers": 50,
+    "load": {
+      "min": 9,
+      "median": 12.0,
+      "max": 18
+    }
+  },
+  "db": {
+    "ips": 795,
+    "hosts": 0,
+    "requests": 10783
+  },
+  "matching": {
+    "hostname": 0,
+    "ip_legacy": 0,
+    "candidates": 50
+  },
+  "tiers": {
+    "A": 0,
+    "B": 50,
+    "C": 0
+  },
+  "top_ips": [
+    {
+      "ip": "186.247.78.59",
+      "n": 15,
+      "tps": 152.494,
+      "ttfb": 2571.222222222222,
+      "last": "2026-10-31T09:46:59Z"
+    },
+    {
+      "ip": "186.247.161.23",
+      "n": 1,
+      "tps": 116.829,
+      "ttfb": 937.0,
+      "last": "2026-10-30T22:32:58Z"
+    },
+    {
+      "ip": "186.247.161.235",
+      "n": 6,
+      "tps": 113.167,
+      "ttfb": null,
+      "last": "2026-10-30T15:37:02Z"
+    },
+    {
+      "ip": "91.132.138.230",
+      "n": 63,
+      "tps": 100.912,
+      "ttfb": 1449.5762711864406,
+      "last": "2026-10-30T21:16:21Z"
+    },
+    {
+      "ip": "186.247.76.84",
+      "n": 22,
+      "tps": 92.744,
+      "ttfb": null,
+      "last": "2026-10-30T11:22:19Z"
+    },
+    {
+      "ip": "187.15.171.89",
+      "n": 2,
+      "tps": 91.981,
+      "ttfb": 3241.5,
+      "last": "2026-10-31T17:09:29Z"
+    },
+    {
+      "ip": "187.15.110.249",
+      "n": 3,
+      "tps": 87.296,
+      "ttfb": 2630.0,
+      "last": "2026-10-31T09:47:09Z"
+    },
+    {
+      "ip": "186.247.77.98",
+      "n": 2,
+      "tps": 86.672,
+      "ttfb": 1101.5,
+      "last": "2026-10-30T21:18:09Z"
+    },
+    {
+      "ip": "212.23.215.145",
+      "n": 5,
+      "tps": 84.441,
+      "ttfb": 2745.75,
+      "last": "2026-10-31T08:08:53Z"
+    },
+    {
+      "ip": "86.104.22.222",
+      "n": 26,
+      "tps": 81.102,
+      "ttfb": 2294.230769230769,
+      "last": "2026-10-31T09:52:11Z"
+    }
+  ],
+  "top_candidates": [
+    {
+      "host": "al162.nordvpn.com",
+      "country": "Albania",
+      "load": 9,
+      "entry_ip": "187.15.131.102",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al110.nordvpn.com",
+      "country": "Albania",
+      "load": 10,
+      "entry_ip": "186.247.44.2",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al141.nordvpn.com",
+      "country": "Albania",
+      "load": 10,
+      "entry_ip": "187.15.130.35",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al156.nordvpn.com",
+      "country": "Albania",
+      "load": 10,
+      "entry_ip": "187.15.131.41",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al157.nordvpn.com",
+      "country": "Albania",
+      "load": 10,
+      "entry_ip": "187.15.131.51",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al171.nordvpn.com",
+      "country": "Albania",
+      "load": 10,
+      "entry_ip": "187.15.131.199",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al111.nordvpn.com",
+      "country": "Albania",
+      "load": 11,
+      "entry_ip": "186.247.44.3",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al118.nordvpn.com",
+      "country": "Albania",
+      "load": 11,
+      "entry_ip": "186.247.44.10",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al127.nordvpn.com",
+      "country": "Albania",
+      "load": 11,
+      "entry_ip": "186.247.44.19",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al128.nordvpn.com",
+      "country": "Albania",
+      "load": 11,
+      "entry_ip": "186.247.44.20",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al132.nordvpn.com",
+      "country": "Albania",
+      "load": 11,
+      "entry_ip": "186.247.44.24",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al137.nordvpn.com",
+      "country": "Albania",
+      "load": 11,
+      "entry_ip": "187.15.130.31",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al142.nordvpn.com",
+      "country": "Albania",
+      "load": 11,
+      "entry_ip": "187.15.130.36",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al147.nordvpn.com",
+      "country": "Albania",
+      "load": 11,
+      "entry_ip": "187.15.130.145",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al152.nordvpn.com",
+      "country": "Albania",
+      "load": 11,
+      "entry_ip": "187.15.131.1",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    }
+  ],
+  "notes": [
+    "0 hostname dans l'historique : server_host n'existe que depuis ce correctif ; l'attribution démarrera au prochain redémarrage du proxy. Les anciennes lignes ne sont pas reconstructibles de façon fiable.",
+    "L'IP 'station' de l'API est l'IP d'entrée, jamais l'egress : la jointure IP est un repli legacy explicitement non fiable.",
+    "ip_registry.enabled=false : l'allocateur runtime n'est pas branché.",
+    "nordcache_packed est déclaré sans décodeur : la résolution rapporte no-adapter:nordcache_packed si ce fallback est nécessaire."
+  ]
+}

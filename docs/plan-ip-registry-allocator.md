@@ -142,10 +142,18 @@ CREATE TABLE servers (
   technologies    TEXT,             -- JSON: ["wireguard","openvpn","socks"]
   first_seen_at   REAL NOT NULL,
   last_seen_at    REAL NOT NULL,
-  active          INTEGER NOT NULL DEFAULT 1
+  active          INTEGER NOT NULL DEFAULT 1,
+  source_id       TEXT NOT NULL DEFAULT 'nordvpn_api_servers',
+  stale           INTEGER NOT NULL DEFAULT 0,
+  catalog_fetched_at REAL
 );
 CREATE INDEX idx_servers_country ON servers(country, active);
+CREATE INDEX idx_servers_source  ON servers(source_id, active);
 ```
+
+Chaque refresh est journalisé dans `catalog_snapshots(source_id, fetched_at,
+etag, stale, server_count, error)` : un fallback est visible, jamais silencieux.
+Les migrations sont versionnées (`SCHEMA_VERSION = 2`) et idempotentes.
 
 #### Table `observations` (historique des tests)
 
@@ -237,6 +245,10 @@ Règles :
 ## 5. Catalogue NordVPN
 
 ### 5.1 Import
+
+> Registre des sources et hiérarchie de repli : voir
+> [`docs/nordvpn-sources.md`](nordvpn-sources.md) et
+> [`docs/nordvpn_sources.yaml`](nordvpn_sources.yaml).
 
 - Source : `GET https://api.nordvpn.com/v1/servers?limit=0`.
 - Filtre : `status=online`.

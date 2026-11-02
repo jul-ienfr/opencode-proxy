@@ -1,0 +1,173 @@
+{
+  "generated_at": "2026-11-02T09:51:19.586852+00:00",
+  "hours": 1,
+  "thresholds": {
+    "fast_tps": 50.0,
+    "slow_tps": 20.0,
+    "max_load": 80,
+    "min_samples": 3
+  },
+  "api": {
+    "servers": 50,
+    "load": {
+      "min": 9,
+      "median": 12.0,
+      "max": 16
+    }
+  },
+  "api_errors": [],
+  "db": {
+    "ips": 3,
+    "hosts": 2,
+    "requests": 19
+  },
+  "matching": {
+    "hostname": 1,
+    "ip_legacy": 0,
+    "candidates": 50
+  },
+  "tiers": {
+    "A": 0,
+    "B": 50,
+    "C": 0
+  },
+  "top_ips": [
+    {
+      "ip": "87.120.102.68",
+      "n": 7,
+      "tps": 13.021,
+      "ttfb": null,
+      "last": "2026-11-02T09:06:04Z"
+    },
+    {
+      "ip": "87.120.102.40",
+      "n": 11,
+      "tps": 8.62,
+      "ttfb": 3273.5,
+      "last": "2026-11-02T09:50:56Z"
+    },
+    {
+      "ip": "187.15.131.186",
+      "n": 1,
+      "tps": 0.437,
+      "ttfb": null,
+      "last": "2026-11-02T09:50:35Z"
+    }
+  ],
+  "top_candidates": [
+    {
+      "host": "al123.nordvpn.com",
+      "country": "Albania",
+      "load": 9,
+      "entry_ip": "186.247.44.15",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al173.nordvpn.com",
+      "country": "Albania",
+      "load": 9,
+      "entry_ip": "187.15.131.219",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al120.nordvpn.com",
+      "country": "Albania",
+      "load": 10,
+      "entry_ip": "186.247.44.12",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al129.nordvpn.com",
+      "country": "Albania",
+      "load": 10,
+      "entry_ip": "186.247.44.21",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al131.nordvpn.com",
+      "country": "Albania",
+      "load": 10,
+      "entry_ip": "186.247.44.23",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al144.nordvpn.com",
+      "country": "Albania",
+      "load": 10,
+      "entry_ip": "187.15.130.142",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al154.nordvpn.com",
+      "country": "Albania",
+      "load": 10,
+      "entry_ip": "187.15.131.21",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al167.nordvpn.com",
+      "country": "Albania",
+      "load": 10,
+      "entry_ip": "187.15.131.159",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al115.nordvpn.com",
+      "country": "Albania",
+      "load": 11,
+      "entry_ip": "186.247.44.7",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    },
+    {
+      "host": "al119.nordvpn.com",
+      "country": "Albania",
+      "load": 11,
+      "entry_ip": "186.247.44.11",
+      "tier": "B",
+      "quality_source": null,
+      "n": 0,
+      "tps": null,
+      "ttfb": null
+    }
+  ],
+  "notes": [
+    "ip_registry.enabled=false : l'allocateur runtime n'est pas branché.",
+    "nordcache_packed est déclaré sans décodeur : la résolution rapporte no-adapter:nordcache_packed si ce fallback est nécessaire."
+  ]
+}

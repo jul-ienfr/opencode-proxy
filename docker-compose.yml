@@ -232,9 +232,11 @@ services:
       # choices" and silently break the rotation.
       # Source unique: config.yaml ip_rotation.server_countries (no inline fallback, audit F-H5).
       - SERVER_COUNTRIES=${SERVER_COUNTRIES_STATION1:-${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}}
-      # [2026-11-01] Serveur épinglé validé 200 dans le pool 87.120.102.x.
-      # Le binder Compose peut écraser cette valeur par override.
-      - SERVER_HOSTNAMES=${SERVER_HOSTNAMES_STATION1:-al41.nordvpn.com}
+      # [fix 2026-11-01] No hard-coded default: a dead pinned server
+      # blocked the station forever (no re-pick, healthcheck restart loop).
+      # Empty = gluetun chooses a server inside SERVER_COUNTRIES. The
+      # fresh-chain binder can still pin a specific host via .env.
+      - SERVER_HOSTNAMES=${SERVER_HOSTNAMES_STATION1:-}
       # [PC-8] pas de UPDATER_PERIOD : source unique = refresh applicatif.
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8888
@@ -337,7 +339,8 @@ services:
       # choices" and silently break the rotation.
       # Source unique: config.yaml ip_rotation.server_countries (no inline fallback, audit F-H5).
       - SERVER_COUNTRIES=${SERVER_COUNTRIES_STATION2:-${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}}
-      - SERVER_HOSTNAMES=${SERVER_HOSTNAMES_STATION2:-al75.nordvpn.com}
+      # [fix 2026-11-01] Same as station 1: no dead-server default.
+      - SERVER_HOSTNAMES=${SERVER_HOSTNAMES_STATION2:-}
       # [PC-8] pas de UPDATER_PERIOD : source unique = refresh applicatif.
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8889
@@ -384,7 +387,8 @@ services:
       - "127.0.0.1:1082:1082"    # SOCKS5 proxy (loopback only)
     environment:
       <<: *gluetun-multi-env
-      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION3:-al74.nordvpn.com}
+      # [fix 2026-11-01] No dead-server default; empty = gluetun picks.
+      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION3:-}
       SERVER_COUNTRIES: ${SERVER_COUNTRIES_STATION3:-${SERVER_COUNTRIES}}
       VPN_TYPE: ${VPN_TYPE_STATION3:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION3:-${OPENVPN_PROTOCOL:-udp}}
@@ -406,7 +410,8 @@ services:
       - "127.0.0.1:1083:1083"    # SOCKS5 proxy (loopback only)
     environment:
       <<: *gluetun-multi-env
-      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION4:-al36.nordvpn.com}
+      # [fix 2026-11-01] al36 was a known dead pin and blocked the station.
+      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION4:-}
       SERVER_COUNTRIES: ${SERVER_COUNTRIES_STATION4:-${SERVER_COUNTRIES}}
       VPN_TYPE: ${VPN_TYPE_STATION4:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION4:-${OPENVPN_PROTOCOL:-udp}}

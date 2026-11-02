@@ -76,32 +76,35 @@ def test_classify_never_matches_vpn_errors():
 
 
 class _RC:
-    def __init__(self, rc=1):
+    def __init__(self, rc=1, stdout=""):
         self.returncode = rc
-        self.stdout = ""
+        self.stdout = stdout
         self.stderr = "error during connect"
 
 
 def _patch_docker_dead(monkeypatch):
-    """Simule un daemon mort : `docker ps` échoue, Popen réussit."""
-    calls = {"probe": 0, "launch": 0}
+    """Simule un daemon mort : `docker ps` échoue, le CLI Desktop démarre."""
+    calls = {"probe": 0, "launch": 0, "popen": 0}
 
     def fake_run(cmd, **kw):
         if list(cmd[:2]) == ["docker", "ps"]:
             calls["probe"] += 1
-        elif list(cmd[:1]) in (["cmd"], ["docker"]):
-            # Seules voies de lancement Desktop : `cmd /c start` (fallback)
-            # ou un éventuel `docker ...` hors sonde. Le bruit de fond
-            # (curl d'update-check au import dashboard, etc.) est ignoré.
+            return _RC(1)
+        if list(cmd[:2]) == ["docker", "desktop"]:
+            calls["launch"] += 1
+            return _RC(0)
+        if list(cmd[:1]) == ["cmd"]:
             calls["launch"] += 1
         return _RC(1)
 
     def fake_popen(*a, **k):
         calls["launch"] += 1
+        calls["popen"] += 1
         return object()
 
     monkeypatch.setattr(vm.subprocess, "run", fake_run)
     monkeypatch.setattr(vm.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm, "_disable_docker_desktop_ui_on_startup", lambda: None)
     return calls
 
 
@@ -118,6 +121,32 @@ async def test_cooldown_limits_relaunch(monkeypatch):
     assert await vm.ensure_docker_running(timeout=4) is False
     assert calls["launch"] == 2
     assert vm.docker_daemon_status()["reachable"] is False
+
+
+async def test_running_desktop_is_never_relaunched(monkeypatch):
+    """Desktop déjà ouvert + CLI indisponible : ne PAS relancer l'exe (il
+    ramènerait le dashboard au premier plan à chaque tick du watchdog)."""
+    calls = {"popen": 0}
+
+    def fake_run(cmd, **kw):
+        if list(cmd[:2]) == ["docker", "ps"]:
+            return _RC(1)
+        if list(cmd[:2]) == ["docker", "desktop"]:
+            return _RC(1)
+        if list(cmd[:1]) == ["tasklist"]:
+            return _RC(0, "Docker Desktop.exe 1234 Console 1 10 000")
+        return _RC(1)
+
+    def fake_popen(*a, **k):
+        calls["popen"] += 1
+        return object()
+
+    monkeypatch.setattr(vm.subprocess, "run", fake_run)
+    monkeypatch.setattr(vm.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm, "_disable_docker_desktop_ui_on_startup", lambda: None)
+
+    assert await vm.ensure_docker_running(timeout=4) is False
+    assert calls["popen"] == 0
 
 
 async def test_request_cooldown_disabled_noop():

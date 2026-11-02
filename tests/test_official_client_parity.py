@@ -371,6 +371,14 @@ async def test_bun_replay_non_stream(official_env, monkeypatch):
         },
     )
     monkeypatch.setattr(oc, "_ensure_curl_cffi", lambda: True)
+    # Hermetic identity: never inherit a cached direct egress whose vault
+    # entry may carry another UA version (order-dependent full-suite failure).
+    monkeypatch.setattr(oc, "_free_proxy_mode", lambda: "direct")
+
+    async def _no_direct_ip():
+        return ""
+
+    monkeypatch.setattr(oc, "_free_direct_egress_ip", _no_direct_ip)
 
     body = {"model": "mimo-v2.5-free", "messages": [{"role": "user", "content": "hi"}]}
     resp = await oc._do_free_request_curl_cffi(

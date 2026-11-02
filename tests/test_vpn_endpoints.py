@@ -91,11 +91,19 @@ class _FakePool:
     def __init__(self, rows=None):
         self._socks5_proxies = list(rows or [])
         self._socks5_auto_rotate = True
+        self._socks5_fallback_enabled = False
+        self._https_proxies = []
+        self._https_fallback_enabled = False
         self.set_calls = []
+        self.https_set_calls = []
 
     def set_socks5_proxies(self, rows):
         self._socks5_proxies = [dict(r) for r in rows]
         self.set_calls.append([dict(r) for r in rows])
+
+    def set_https_proxies(self, rows):
+        self._https_proxies = [dict(r) for r in rows]
+        self.https_set_calls.append([dict(r) for r in rows])
 
     def rotate_socks5_now(self):
         return SimpleNamespace(pid="nxt.example.com")
@@ -319,21 +327,153 @@ def test_socks5_rotate_manual_returns_next(ctx):
     assert persisted == [], "manual rotate never persists"
 
 
+def test_persist_vpn_config_writes_proxy_fallback_keys(tmp_path, monkeypatch):
+    """The dedicated toggle endpoints call the real writer; the key_map must
+    include the proxy keys or the GUI silently forgets them after restart."""
+    import copy
+
+    import yaml
+
+    import config.settings as cs
+
+    before = copy.deepcopy(cs._yaml_data.get("ip_rotation", {}))
+    target = tmp_path / "config.yaml"
+    target.write_text("ip_rotation:\n  enabled: true\n", encoding="utf-8")
+    monkeypatch.setattr(api, "__CONFIG_YAML_PATH", str(target))
+    monkeypatch.setattr(api, "_config_yaml_known_mtime", 0.0)
+    try:
+        err = api._persist_vpn_config(
+            {
+                "socks5_fallback_enabled": True,
+                "https_fallback_enabled": True,
+                "socks5_proxies": [{"host": "socks.example.com", "port": 1080}],
+                "https_proxies": [{"host": "https.example.com", "port": 89}],
+            }
+        )
+        assert err is None
+        on_disk = yaml.safe_load(target.read_text(encoding="utf-8"))["ip_rotation"]
+        assert on_disk["socks5_fallback_enabled"] is True
+        assert on_disk["https_fallback_enabled"] is True
+        assert on_disk["socks5_proxies"][0]["port"] == 1080
+        assert on_disk["https_proxies"][0]["port"] == 89
+    finally:
+        # The writer intentionally syncs config.settings._yaml_data in place;
+        # restore it or a later save_yaml_config() would leak these fixtures
+        # into the real config.yaml.
+        cs._yaml_data["ip_rotation"].clear()
+        cs._yaml_data["ip_rotation"].update(before)
+
+
+def test_socks5_fallback_toggle_persists_and_updates_pool(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    with TestClient(fast) as client:
+        assert client.get("/api/vpn/socks5").json()["fallback"] is False
+    resp = _post(fast, "/api/vpn/socks5/fallback", {"enabled": True})
+    assert resp == {"ok": True, "enabled": True}
+    assert persisted == [{"socks5_fallback_enabled": True}]
+    assert pool._socks5_fallback_enabled is True
+    with TestClient(fast) as client:
+        assert client.get("/api/vpn/socks5").json()["fallback"] is True
+
+
 # ── POST /api/vpn/socks5/test (probe) ─────────────────────────────
 
 
-def test_socks5_test_delegates_to_probe(ctx, monkeypatch):
+def test_socks5_test_delegates_to_probe_with_stored_credentials(ctx, monkeypatch):
     fast, s1, s2, pool, cfg, persisted = ctx
     calls = []
 
-    async def _fake_probe(host, port):
-        calls.append((host, port))
+    async def _fake_probe(host, port, username=None, password=None):
+        calls.append((host, port, username, password))
         return {"ok": True, "ip": "5.5.5.5", "opencode_ok": True, "latency_ms": 12.3}
 
     monkeypatch.setattr(api, "_socks5_probe", _fake_probe)
     resp = _post(fast, "/api/vpn/socks5/test", {"host": "p1.example.com", "port": 1080})
     assert resp == {"ok": True, "ip": "5.5.5.5", "opencode_ok": True, "latency_ms": 12.3}
-    assert calls == [("p1.example.com", 1080)]
+    # NordVPN SOCKS5 requires auth: the stored row supplies it server-side.
+    assert calls == [("p1.example.com", 1080, "u1", "s3cr3t")]
+
+
+# ?? HTTPS CONNECT proxies (NordVPN :89) ????????????????????????????
+
+
+def test_https_get_empty(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    with TestClient(fast) as client:
+        resp = client.get("/api/vpn/https-proxies").json()
+    assert resp == {"enabled": False, "proxies": []}
+
+
+def test_https_add_persists_and_masks_password(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    resp = _post(
+        fast,
+        "/api/vpn/https-proxies",
+        {"host": "uk765.nordvpn.com", "username": "u", "password": "pw"},
+    )
+    assert resp["ok"] is True
+    assert resp["proxies"] == [
+        {"host": "uk765.nordvpn.com", "port": 89, "enabled": True, "has_password": True}
+    ]
+    assert "password" not in resp["proxies"][0]
+    assert persisted[-1]["https_proxies"][0]["port"] == 89
+    assert pool._https_proxies[0]["password"] == "pw"
+    assert pool.https_set_calls
+
+
+def test_https_add_invalid_port_is_error(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    resp = _post(fast, "/api/vpn/https-proxies", {"host": "x", "port": 70000})
+    assert "port hors bornes" in resp["error"]
+    assert persisted == []
+    assert pool._https_proxies == []
+
+
+def test_https_remove_and_toggle_bounds(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    pool._https_proxies = [
+        {"host": "a.example.com", "port": 89, "enabled": True, "username": None, "password": None}
+    ]
+    resp = _post(fast, "/api/vpn/https-proxies/toggle", {"index": 0, "enabled": False})
+    assert resp == {"ok": True}
+    assert pool._https_proxies[0]["enabled"] is False
+    resp = _post(fast, "/api/vpn/https-proxies/remove", {"index": 0})
+    assert resp["ok"] is True and resp["proxies"] == []
+    resp = _post(fast, "/api/vpn/https-proxies/remove", {"index": 99})
+    assert "hors bornes" in resp["error"]
+
+
+def test_https_fallback_toggle_persists_and_updates_pool(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    resp = _post(fast, "/api/vpn/https-proxies/fallback", {"enabled": True})
+    assert resp == {"ok": True, "enabled": True}
+    assert persisted == [{"https_fallback_enabled": True}]
+    assert pool._https_fallback_enabled is True
+    with TestClient(fast) as client:
+        assert client.get("/api/vpn/https-proxies").json()["enabled"] is True
+
+
+def test_https_test_delegates_to_probe_with_stored_credentials(ctx, monkeypatch):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    pool._https_proxies = [
+        {
+            "host": "uk765.nordvpn.com",
+            "port": 89,
+            "enabled": True,
+            "username": "u",
+            "password": "pw",
+        }
+    ]
+    calls = []
+
+    async def _fake_probe(host, port, username=None, password=None):
+        calls.append((host, port, username, password))
+        return {"ok": True, "ip": "6.6.6.6", "opencode_ok": True, "latency_ms": 9.0}
+
+    monkeypatch.setattr(api, "_https_probe", _fake_probe)
+    resp = _post(fast, "/api/vpn/https-proxies/test", {"host": "uk765.nordvpn.com", "port": 89})
+    assert resp["ip"] == "6.6.6.6"
+    assert calls == [("uk765.nordvpn.com", 89, "u", "pw")]
 
 
 # ── GET nordvpn-available / nordvpn-status ────────────────────────

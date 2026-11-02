@@ -201,7 +201,8 @@ EXPECTED_REQUEST_COLUMNS = {
     "station",
     "free_status",
     "paid_status",
-}  # 34 colonnes : 14 de base + 20 migrations + station
+    "server_host",
+}  # 35 colonnes : 14 de base + 21 migrations + station
 
 EXPECTED_FREE_USAGE_COLUMNS = {
     "id",
@@ -236,11 +237,11 @@ def test_db_schema_columns_frozen():
 
 
 def test_db_insert_sql_placeholder_count():
-    """L'INSERT requests DOIT avoir 32 placeholders (tuple 32 colonnes)."""
+    """L'INSERT requests DOIT avoir 36 placeholders (tuple 36 colonnes)."""
     from app.db import _INSERT_REQUESTS_SQL
 
-    assert _INSERT_REQUESTS_SQL.count("?") == 35, (
-        f"INSERT requests: {_INSERT_REQUESTS_SQL.count('?')} placeholders ≠ 32"
+    assert _INSERT_REQUESTS_SQL.count("?") == 36, (
+        f"INSERT requests: {_INSERT_REQUESTS_SQL.count('?')} placeholders ≠ 36"
     )
 
 

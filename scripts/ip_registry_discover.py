@@ -33,24 +33,14 @@ from free.ip_registry import (  # noqa: E402
     StationEgress,
     StationProbe,
 )
-
-
-def _cfg() -> dict:
-    try:
-        import yaml
-
-        data = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8")) or {}
-        section = data.get("ip_registry") or {}
-        return section if isinstance(section, dict) else {}
-    except Exception:
-        return {}
+from free.ip_registry.config import load_registry_config  # noqa: E402
 
 
 async def _run(args) -> int:
     from free.ip_registry.catalog import NordVpnCatalog
 
-    cfg = _cfg()
-    catalog = NordVpnCatalog(ttl_s=float(cfg.get("catalog_refresh_s", 21600) or 21600))
+    cfg = load_registry_config()
+    catalog = NordVpnCatalog.from_config(cfg)
     servers = await catalog.refresh()
     if not servers:
         print("catalog empty")
@@ -72,17 +62,26 @@ async def _run(args) -> int:
         return 0
 
     db_path = Path(args.db or cfg.get("db_path") or "logs/ip_registry.db")
-    score = cfg.get("score") or {}
-    eligibility = cfg.get("eligibility") or {}
-    registry = SqliteIpRegistry(
-        str(db_path),
-        error_cooldown_s=float(eligibility.get("error_cooldown_s", 1800) or 1800),
-        min_score=float(score.get("min_score", 20) or 20),
-    )
+    registry = SqliteIpRegistry.from_config(cfg, db_path=db_path)
     egress = StationEgress()
     binder = ComposeHostnameBinder(ROOT, egress=egress)
-    probe = StationProbe(egress=egress)
+    probe = StationProbe(
+        egress=egress,
+        timeout_s=float(cfg.get("test_timeout_s", 60) or 60),
+    )
     try:
+        resolution = catalog.last_resolution
+        if resolution is not None:
+            synced = registry.sync_snapshot(resolution, authoritative=True)
+            print(
+                f"catalog synced: {synced} servers "
+                f"source={resolution.source_id} stale={resolution.stale}"
+            )
+        pruned = registry.prune_history(
+            float(cfg.get("retention_days", 7) or 7)
+        )
+        if pruned["observations"] or pruned["assignments"]:
+            print(f"pruned: {pruned}")
         for server in selected:
             now = time.time()
             print(f"\n=== {server.hostname} ===", flush=True)

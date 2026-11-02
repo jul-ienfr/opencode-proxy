@@ -348,11 +348,22 @@ def save_yaml_config():
 
 
 def yaml_get(section: str, key: str = None, default=None):
-    """Read a value from the YAML config. Returns default if missing."""
+    """Read a value from the YAML config. Returns default if missing.
+
+    ``key`` may be dotted (``"score.min_score"``) for typed sub-sections whose
+    leaves must be explicit — the config audit can then verify every leaf.
+    """
     section_data = _yaml_data.get(section, {})
     if key is None:
         return section_data if isinstance(section_data, dict) else (section_data or default)
     if isinstance(section_data, dict):
+        if "." in str(key):
+            node = section_data
+            for part in str(key).split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return node
         return section_data.get(key, default)
     return default
 

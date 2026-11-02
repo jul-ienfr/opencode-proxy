@@ -74,7 +74,9 @@ class CatalogClaims:
                 rows.append((host, country, priority))
         with self._conn:
             self._conn.executemany(
-                "INSERT OR IGNORE INTO catalog(hostname, country, priority) VALUES (?, ?, ?)",
+                "INSERT INTO catalog(hostname, country, priority) VALUES (?, ?, ?) "
+                "ON CONFLICT(hostname) DO UPDATE SET "
+                "country=excluded.country, priority=excluded.priority",
                 rows,
             )
         return len(rows)

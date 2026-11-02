@@ -72,6 +72,16 @@ Vérifié sur le wire proxy :
 - profil 1.19.5 → JA3-MD5 `1523504b…` identique au client officiel ;
 - profil 1.19.3 → JA3-MD5 `d871d02c…` identique au client officiel.
 
+## Utilisation par la probe
+
+`StationProbe` (`free/ip_registry/adapters/probe.py`) appelle
+`generate_profile()` avec une version **déterministe par egress IP** parmi
+`1.19.5, 1.19.3, 1.18.31, 1.19.0`. Le profil fournit les en-têtes et les IDs ;
+`opencode._get_free_fp_kwargs(version)` fournit le TLS/JA3/Bun/header_order
+apparié. Une même IP garde son profil ; deux stations peuvent donc ressembler
+à deux installations officielles différentes, sans identité aléatoire par
+requête.
+
 ## Générer des profils
 
 ```bash
@@ -104,7 +114,10 @@ Le proxy et le générateur partagent **la même primitive** :
 `IpIdentity.official_provider_headers()`.
 
 - `opencode._official_free_headers()` l'appelle pour chaque IP d'egress ;
-- `free/identity_generator.py` l'appelle pour les profils générés ;
+- `free.identities.version_for()` choisit désormais parmi les quatre versions
+  mesurées (`1.19.5/1.19.3/1.18.31/1.19.0`), plus seulement les deux legacy ;
+- `StationProbe` appelle `generate_profile()` avec une version déterministe
+  par egress IP et préfère la version persistée du vault pour cette IP ;
 - `_get_free_fp_kwargs(version)` ajuste l'ordre libcurl (12 en-têtes 1.18.x,
   13 en-têtes 1.19+) ;
 - `free/official_payload.json` fournit le corps 1.19.5 (11 outils, système

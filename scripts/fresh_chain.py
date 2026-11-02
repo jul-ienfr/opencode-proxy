@@ -31,6 +31,9 @@ import requests
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+from config.settings import yaml_get  # noqa: E402
+
 API_URL = "https://api.nordvpn.com/v1/servers?limit=0"
 STATE = ROOT / "logs" / "fresh_chain_state.json"
 CANDIDATES_CACHE = ROOT / "logs" / "fresh_chain_candidates.json"
@@ -92,14 +95,83 @@ def _active_hosts() -> set[str]:
     return hosts
 
 
-def _is_wireguard(item: dict) -> bool:
+def _has_technology(item: dict, identifier: str) -> bool:
     return any(
-        isinstance(t, dict) and t.get("identifier") == "wireguard_udp"
+        isinstance(t, dict) and t.get("identifier") == identifier
         for t in (item.get("technologies") or [])
     )
 
 
-def build_candidates() -> list[dict]:
+def _matches_transport(item: dict, transport: str) -> bool:
+    if transport == "openvpn-tcp":
+        return _has_technology(item, "openvpn_tcp")
+    if transport == "openvpn-udp":
+        return _has_technology(item, "openvpn_udp")
+    return _has_technology(item, "wireguard_udp")
+
+
+def _embedded_matches_transport(item: dict, transport: str) -> bool:
+    vpn = str(item.get("vpn") or "").strip().lower()
+    if transport.startswith("openvpn"):
+        return vpn == "openvpn"
+    return vpn == "wireguard"
+
+
+def _is_wireguard(item: dict) -> bool:
+    return _matches_transport(item, "wireguard")
+
+
+def _host_quality() -> dict[str, dict]:
+    """Measured quality per hostname from ``requests`` (7 days).
+
+    This is the only performance truth: the API ``load`` is an aggregate
+    prior, not a speed measurement.
+    """
+
+    db = ROOT / "logs" / "requests.db"
+    if not db.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return {}
+    try:
+        columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(requests)")}
+        if "server_host" not in columns:
+            return {}
+        cutoff = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7 * 86400)
+        )
+        rows = conn.execute(
+            """
+            SELECT server_host AS host,
+                   COUNT(*) AS n,
+                   AVG(tokens_output * 1000.0 / NULLIF(duration_ms, 0)) AS tps,
+                   MAX(timestamp) AS last
+            FROM requests
+            WHERE timestamp >= ?
+              AND server_host IS NOT NULL AND server_host != ''
+              AND success = 1
+              AND tokens_output > 0
+              AND duration_ms > 0
+            GROUP BY server_host
+            """,
+            (cutoff,),
+        ).fetchall()
+        return {
+            str(r["host"]): {
+                "n": int(r["n"]),
+                "tps": float(r["tps"] or 0.0),
+                "last": str(r["last"] or ""),
+            }
+            for r in rows
+        }
+    finally:
+        conn.close()
+
+
+def build_candidates(transport: str = "wireguard") -> list[dict]:
     api = _fetch_api()
     embedded = []
     if EMBEDDED.exists():
@@ -111,6 +183,17 @@ def build_candidates() -> list[dict]:
 
     active = _active_hosts()
     seen: set[str] = set()
+    quality = _host_quality()
+    has_200 = set(_registry_hosts())
+    qcfg = yaml_get("ip_rotation", "quality_preselection", {}) or {}
+    try:
+        fast_tps = float((qcfg or {}).get("fast_tps", 50.0))
+    except (TypeError, ValueError):
+        fast_tps = 50.0
+    try:
+        slow_tps = float((qcfg or {}).get("slow_tps", 20.0))
+    except (TypeError, ValueError):
+        slow_tps = 20.0
 
     def add(rows: list[dict], item: dict, source: str) -> None:
         host = str(item.get("hostname") or "").strip()
@@ -123,25 +206,54 @@ def build_candidates() -> list[dict]:
                 country = str(((loc.get("country") or {}) if isinstance(loc.get("country"), dict) else {}).get("name") or "")
         if not country:
             return
+        try:
+            load = int(item.get("load") or 100)
+        except (TypeError, ValueError):
+            load = 100
+        ips = [
+            str((entry.get("ip") or {}).get("ip") or "")
+            for entry in (item.get("ips") or [])
+            if isinstance(entry, dict)
+        ]
+        ips = [ip for ip in ips if ip]
+        entry_ip = str(item.get("station") or (ips[0] if ips else ""))
         seen.add(host)
-        rows.append({"host": host, "country": country, "source": source})
+        rows.append(
+            {
+                "host": host,
+                "country": country,
+                "source": source,
+                "load": load,
+                "ip": entry_ip,
+                "ips": ips,
+            }
+        )
 
     rows: list[dict] = []
-
-    # 1. Hostnames already seen with a 200 in the registry.
     api_by_host = {
         str(item.get("hostname") or ""): item
         for item in api
         if isinstance(item, dict)
     }
-    for host in _registry_hosts():
-        item = api_by_host.get(host) or {"hostname": host, "country": "Albania"}
-        add(rows, item, "registry-200")
 
-    # 2. Active public API WG servers, one per /24, newest first.
+    # 1. Every old 200 hostname that supports the transport.
+    for host in _registry_hosts():
+        item = api_by_host.get(host)
+        if item is not None and not _matches_transport(item, transport):
+            continue
+        if item is None and transport != "wireguard":
+            continue
+        add(rows, item or {"hostname": host, "country": "Albania"}, "registry-200")
+
+    # 2. Embedded catalog (may contain servers omitted by the public API).
+    for item in embedded:
+        if _embedded_matches_transport(item, transport):
+            add(rows, item, "embedded")
+
+    # 3. Public API candidates.
     public = []
     for item in api:
-        if item.get("status") != "online" or not _is_wireguard(item):
+        if item.get("status") != "online" or not _matches_transport(item, transport):
             continue
         station_ip = str(item.get("station") or "")
         loc = (item.get("locations") or [{}])[0]
@@ -149,7 +261,7 @@ def build_candidates() -> list[dict]:
         if not station_ip or not country:
             continue
         public.append((str(item.get("created_at") or ""), station_ip, item))
-    public.sort(reverse=True)
+
     seen_net: set[str] = set()
     for _, station_ip, item in public:
         net = ".".join(station_ip.split(".")[:3])
@@ -157,44 +269,67 @@ def build_candidates() -> list[dict]:
             continue
         seen_net.add(net)
         add(rows, item, "public-1-per-24")
-
-    # 3. Old Albanian WG hosts (embedded-only) not currently active.
-    for item in embedded:
-        host = str(item.get("hostname") or "")
-        if item.get("vpn") == "wireguard" and item.get("country") == "Albania" and host.startswith("al"):
-            add(rows, item, "albania-legacy")
-
-    # 4. Remaining embedded WireGuard hosts.
-    for item in embedded:
-        if item.get("vpn") == "wireguard":
-            add(rows, item, "embedded-rest")
-
-    # 5. Remaining public servers (multiple per /24).
     for _, _, item in public:
         add(rows, item, "public-rest")
 
+    def _candidate_key(row: dict) -> tuple:
+        host = row["host"]
+        load = int(row.get("load") or 100)
+        q = quality.get(host)
+        if q and int(q.get("n") or 0) >= 3:
+            tps = float(q.get("tps") or 0.0)
+            if tps >= fast_tps:
+                return (0, -tps, load, host)
+            if tps >= slow_tps:
+                return (1, -tps, load, host)
+            return (4, -tps, load, host)
+        if host in has_200:
+            return (2, 0.0, load, host)
+        return (3, 0.0, load, host)
+
+    rows.sort(key=_candidate_key)
+    top = ", ".join(
+        f"{row['host']}({row['source']})" for row in rows[:3]
+    )
+    log(
+        f"candidate quality: {len(quality)} measured, {len(has_200)} known-200; "
+        f"top={top or '-'}"
+    )
     return rows
 
 
+def station_container_names(names, station: int) -> list[str]:
+    """Return the containers owned by ``station`` (exact match only).
+
+    Compose can leave hashed-prefix containers (``<id>_opencode-vpn-5``)
+    after a failed ``up --force-recreate``; those must be removed before the
+    next bind. A substring match is NOT safe here: station 1's service is
+    ``opencode-vpn`` and would also match ``opencode-vpn-2`` … ``-10``,
+    deleting the whole serving fleet on every chain iteration.
+    """
+    service = "opencode-vpn" if int(station) == 1 else f"opencode-vpn-{int(station)}"
+    return [name for name in names if name == service or name.endswith("_" + service)]
+
+
 def _clean_station_container(station: int) -> None:
-    """Remove stale/duplicated Compose containers before a rebind.
+    """Remove stale/duplicated Compose containers for THIS station only.
 
     Failed `up --force-recreate` can leave hashed-prefix containers
     (``<id>_opencode-vpn-5``) that make the next compose call fail with
     "Conflict. The container name ... is already in use".
     """
-    service = "opencode-vpn" if station == 1 else f"opencode-vpn-{station}"
     try:
         out = subprocess.run(
             ["docker", "ps", "-a", "--format", "{{.Names}}"],
             capture_output=True,
             timeout=30,
+            creationflags=_NO_WINDOW,
         ).stdout
     except Exception:
         return
-    for name in out.decode("utf-8", "ignore").splitlines():
-        if service in name:
-            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
+    names = out.decode("utf-8", "ignore").splitlines()
+    for name in station_container_names(names, station):
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60, creationflags=_NO_WINDOW)
 
 
 def _state_path(station: int, transport: str = "wireguard") -> Path:
@@ -297,6 +432,64 @@ def mark(
         pass
 
 
+def _record_registry_winner(
+    station: int,
+    host: str,
+    country: str,
+    ip: str,
+    latency_ms: float | None,
+) -> None:
+    """Persist the tested winner in the shared IP registry (test-then-keep).
+
+    The catalog claims DB says who tested what; this makes the assignment
+    authoritative for the allocator/dashboard: one station, one egress.
+    """
+
+    if not ip:
+        return
+    try:
+        from free.ip_registry import SqliteIpRegistry
+        from free.ip_registry.config import load_registry_config
+
+        registry = SqliteIpRegistry.from_config(load_registry_config())
+        try:
+            record = registry.assign_observed(
+                egress_ip=ip,
+                hostname=host,
+                country=country,
+                station=int(station),
+                latency_ms=latency_ms,
+                tested_at=time.time(),
+            )
+            if record is not None:
+                log(f"registry: station {station} keeps {ip} ({host})")
+            else:
+                log(f"registry: station {station} could not claim {ip} (owned elsewhere)")
+        finally:
+            registry.close()
+    except Exception as exc:  # noqa: BLE001 - the chain must continue
+        log(f"registry assignment failed: {type(exc).__name__}: {exc}")
+
+
+async def _probe_with_fallbacks(probe, station: int, primary: str, fallbacks: list[str]):
+    """Try the primary free model, then the other buckets before condemning IP.
+
+    A 429 is keyed by (model, IP bucket): an egress rejected on deepseek can
+    still answer 200 on glm/mimo. One 200 is enough to keep the IP.
+    """
+
+    result = await probe.probe(station, primary)
+    if result.status == 200:
+        return result, primary
+    for model in fallbacks:
+        if not model or model == primary:
+            continue
+        alt = await probe.probe(station, model)
+        if alt.status == 200:
+            return alt, model
+    return result, primary
+
+
 async def _run_claims(args, candidates, binder, probe, state_path, state) -> int:
     """Parallel-safe chain: one shared catalog, exclusive hostname claims."""
     from free.catalog_claims import CatalogClaims
@@ -309,7 +502,8 @@ async def _run_claims(args, candidates, binder, probe, state_path, state) -> int
         seeded = claims.seed(candidates)
         log(
             f"claims mode: catalog={seeded} db={args.claims_db} "
-            f"rebind_limit={args.rebind_limit}/min station={args.station}"
+            f"rebind_limit={args.rebind_limit}/min station={args.station} "
+            f"first={[str(c.get('host')) for c in candidates[:3]]}"
         )
         tested = 0
         while True:
@@ -343,22 +537,44 @@ async def _run_claims(args, candidates, binder, probe, state_path, state) -> int
                 claims.record(host, args.station, "duplicate", ip=ip)
                 await asyncio.sleep(args.delay)
                 continue
-            result = await probe.probe(args.station, args.model)
-            log(f"  free status={result.status} ra={result.retry_after_s}")
+            result, model_used = await _probe_with_fallbacks(
+                probe, args.station, args.model, args.probe_models
+            )
+            log(
+                f"  free status={result.status} ra={result.retry_after_s} "
+                f"model={model_used}"
+            )
             row = {
                 "host": host,
                 "country": country,
                 "ip": ip,
                 "status": result.status,
                 "retry_after": result.retry_after_s,
+                "model": model_used,
             }
             state["results"] = (state.get("results") or [])[-499:] + [row]
             if result.status == 200:
                 claims.record(host, args.station, "ok", ip=ip)
-                mark(args.api_base, ip, 200, 0.0, args.station, args.model, hostname=host)
-                state["winner"] = {"host": host, "country": country, "ip": ip}
+                mark(
+                    args.api_base,
+                    ip,
+                    200,
+                    0.0,
+                    args.station,
+                    model_used,
+                    hostname=host,
+                )
+                _record_registry_winner(
+                    args.station, host, country, ip, getattr(result, "latency_ms", None)
+                )
+                state["winner"] = {
+                    "host": host,
+                    "country": country,
+                    "ip": ip,
+                    "model": model_used,
+                }
                 save_state(state_path, state)
-                log(f"WINNER station={args.station} host={host} egress={ip}")
+                log(f"WINNER station={args.station} host={host} egress={ip} model={model_used}")
                 return 0
             if result.status == 429:
                 claims.record(
@@ -368,7 +584,14 @@ async def _run_claims(args, candidates, binder, probe, state_path, state) -> int
                     ip=ip,
                     retry_after=result.retry_after_s,
                 )
-                mark(args.api_base, ip, 429, result.retry_after_s, args.station, args.model)
+                mark(
+                    args.api_base,
+                    ip,
+                    429,
+                    result.retry_after_s,
+                    args.station,
+                    model_used,
+                )
             else:
                 claims.record(
                     host,
@@ -393,14 +616,21 @@ async def run(args) -> int:
 
     state_path = _state_path(args.station, args.transport)
     state = load_state(state_path)
+    candidates_cache = CANDIDATES_CACHE.with_name(
+        f"fresh_chain_candidates_{args.transport}.json"
+    )
     if args.candidates and Path(args.candidates).exists():
         candidates = json.loads(Path(args.candidates).read_text(encoding="utf-8"))
-    elif CANDIDATES_CACHE.exists() and not args.refresh:
-        candidates = json.loads(CANDIDATES_CACHE.read_text(encoding="utf-8"))
+    elif (
+        candidates_cache.exists()
+        and not args.refresh
+        and time.time() - candidates_cache.stat().st_mtime < 1800.0
+    ):
+        candidates = json.loads(candidates_cache.read_text(encoding="utf-8"))
     else:
         log("building candidate list")
-        candidates = build_candidates()
-        CANDIDATES_CACHE.write_text(json.dumps(candidates), encoding="utf-8")
+        candidates = build_candidates(args.transport)
+        candidates_cache.write_text(json.dumps(candidates), encoding="utf-8")
     if not candidates:
         log("no candidates")
         return 1
@@ -411,19 +641,29 @@ async def run(args) -> int:
             print(row["host"], row["country"], row["source"])
         return 0
 
-    egress = StationEgress(urls=("https://api.ipify.org",), timeout_s=5.0)
+    # Multiple independent egress services + a longer tunnel settle: a single
+    # 5 s ipify attempt after 8 s declared many healthy WireGuard servers
+    # "no-egress" and burned the candidate catalog.
+    egress = StationEgress(timeout_s=8.0)
     probe = StationProbe(egress=egress, timeout_s=60.0)
     binder = ComposeHostnameBinder(
         ROOT,
         override_path=f"logs/compose-hostname-{args.station}.yml",
         profile="multi-station",
-        settle_s=8.0,
+        settle_s=12.0,
+        egress_wait_s=20.0,
+        egress_poll_s=3.0,
         egress=egress,
         recreate_timeout_s=180.0,
     )
     start = int(args.start if args.start is not None else state.get("index", 0))
     vpn_type = "openvpn" if args.transport.startswith("openvpn") else None
     openvpn_protocol = args.transport.split("-", 1)[1] if vpn_type else None
+    args.probe_models = [
+        part.strip()
+        for part in str(getattr(args, "models", "") or "").split(",")
+        if part.strip() and part.strip() != args.model
+    ]
     exhausted = _ledger_exhausted_ips(args.api_base)
     tested = 0
     if args.claims:
@@ -472,8 +712,13 @@ async def run(args) -> int:
             state["index"] = index + 1
             save_state(state_path, state)
             continue
-        result = await probe.probe(args.station, args.model)
-        log(f"  free status={result.status} ra={result.retry_after_s}")
+        result, model_used = await _probe_with_fallbacks(
+            probe, args.station, args.model, args.probe_models
+        )
+        log(
+            f"  free status={result.status} ra={result.retry_after_s} "
+            f"model={model_used}"
+        )
         state["results"].append(
             {
                 "host": host,
@@ -481,15 +726,32 @@ async def run(args) -> int:
                 "ip": ip,
                 "status": result.status,
                 "retry_after": result.retry_after_s,
+                "model": model_used,
             }
         )
         state["index"] = index + 1
         save_state(state_path, state)
         if result.status == 200:
-            mark(args.api_base, ip, 200, 0.0, args.station, args.model, hostname=host)
-            state["winner"] = {"host": host, "country": country, "ip": ip}
+            mark(
+                args.api_base,
+                ip,
+                200,
+                0.0,
+                args.station,
+                model_used,
+                hostname=host,
+            )
+            _record_registry_winner(
+                args.station, host, country, ip, getattr(result, "latency_ms", None)
+            )
+            state["winner"] = {
+                "host": host,
+                "country": country,
+                "ip": ip,
+                "model": model_used,
+            }
             save_state(state_path, state)
-            log(f"WINNER station={args.station} host={host} egress={ip}")
+            log(f"WINNER station={args.station} host={host} egress={ip} model={model_used}")
             return 0
         if result.status == 429:
             mark(args.api_base, ip, 429, result.retry_after_s, args.station, args.model)
@@ -508,6 +770,11 @@ def main() -> int:
         choices=("wireguard", "openvpn-tcp", "openvpn-udp"),
     )
     parser.add_argument("--model", default="deepseek-v4.1-flash-free")
+    parser.add_argument(
+        "--models",
+        default="",
+        help="modèles de repli, séparés par des virgules (buckets distincts)",
+    )
     parser.add_argument("--api-base", default="http://127.0.0.1:4000")
     parser.add_argument("--start", type=int, default=None)
     parser.add_argument("--max", type=int, default=0)

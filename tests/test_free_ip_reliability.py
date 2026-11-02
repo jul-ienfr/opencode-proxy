@@ -84,7 +84,9 @@ def test_note_model_global_cooldown_honors_long_retry_and_never_shortens(monkeyp
     pool = _pool(monkeypatch)
     pool.note_model_global_cooldown("m", 7200)
     rem = pool.model_global_remaining("m")
-    assert 7190 < rem <= 7200
+    # tolérances d'horloge : monotonic() + 7200 relu peut dépasser 7200 de
+    # quelques nanosecondes selon la plateforme.
+    assert 7190 < rem <= 7201
     # Un second 429 plus court ne doit jamais raccourcir le délai annoncé.
     pool.note_model_global_cooldown("m", 10)
     assert pool.model_global_remaining("m") > 7190

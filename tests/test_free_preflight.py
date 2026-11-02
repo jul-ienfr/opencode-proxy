@@ -55,6 +55,13 @@ def _clean(monkeypatch):
 def _pool(monkeypatch, **kw):
     p = _Pool(**kw)
     monkeypatch.setattr(oc, "_free_ip_pool", p)
+    # The preflight only runs on the VPN leg. Without a manager the helper
+    # reports "direct" and every strict-free test would (correctly) bail out.
+    monkeypatch.setattr(
+        oc,
+        "_vpn_manager",
+        type("_Vpn", (), {"proxy_mode": "vpn", "enabled": True})(),
+    )
     return p
 
 

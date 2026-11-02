@@ -4,24 +4,34 @@ The catalog is a read-only snapshot of the provider's server list.  It never
 writes to the registry: the registry stores egress observations and server
 bindings separately.
 
-The public API omits older servers that gluetun still embeds (for example the
-Albanian ``al36..al75`` pool).  ``extra_path`` optionally points at that
-embedded catalog so discovery can see and rank those servers too.
+Resolution is delegated to :class:`~free.ip_registry.sources.SourceRegistry`:
+the official API is the primary source, then the manifest fallbacks, while
+the embedded gluetun catalog only *completes* hostnames the API omits.  Every
+row keeps its ``source_id`` and ``stale`` flag so a fallback is never silent.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from .domain import Server
+from .sources.adapters import DEFAULT_API_URL
+from .sources.base import CatalogResolution
+from .sources.manifest import DEFAULT_MANIFEST_PATH
+from .sources.parsers import parse_gluetun_payload, parse_official_payload
+from .sources.registry import (
+    DEFAULT_CACHE_PATH,
+    DEFAULT_EMBEDDED_PATH,
+    DEFAULT_GLUETUN_MANIFEST_PATH,
+    SourceRegistry,
+    build_default_registry,
+)
 
-DEFAULT_URL = "https://api.nordvpn.com/v1/servers?limit=0"
-DEFAULT_EXTRA_PATH = Path(__file__).resolve().parents[2] / "logs" / "gluetun_nordvpn_embedded.json"
+DEFAULT_URL = DEFAULT_API_URL
+DEFAULT_EXTRA_PATH = DEFAULT_EMBEDDED_PATH
 
 
 class NordVpnCatalog:
@@ -35,15 +45,56 @@ class NordVpnCatalog:
         fetch: Callable[[], Any] | None = None,
         clock: Callable[[], float] = time.time,
         extra_path: str | Path | None = DEFAULT_EXTRA_PATH,
+        cache_path: str | Path | None = DEFAULT_CACHE_PATH,
+        gluetun_manifest_path: str | Path | None = DEFAULT_GLUETUN_MANIFEST_PATH,
+        manifest_path: str | Path | None = DEFAULT_MANIFEST_PATH,
+        sources: SourceRegistry | None = None,
     ) -> None:
-        self._url = url
         self._ttl_s = max(0.0, float(ttl_s))
-        self._fetch = fetch or self._http_fetch
         self._clock = clock
-        self._extra_path = Path(extra_path) if extra_path else None
+        self._sources = sources or build_default_registry(
+            manifest_path=manifest_path,
+            url=url,
+            fetch=fetch,
+            extra_path=extra_path,
+            cache_path=cache_path,
+            gluetun_manifest_path=gluetun_manifest_path,
+        )
         self._servers: tuple[Server, ...] = ()
         self._last_refresh: float | None = None
         self._last_error: str | None = None
+        self._last_resolution: CatalogResolution | None = None
+        self._last_refresh_failed = False
+
+    @classmethod
+    def from_config(
+        cls,
+        section: dict[str, Any],
+        *,
+        clock: Callable[[], float] = time.time,
+    ) -> NordVpnCatalog:
+        """Build a catalog from the ``ip_registry`` config section."""
+
+        raw_sources = section.get("sources") if isinstance(section, dict) else None
+        sources = raw_sources if isinstance(raw_sources, dict) else {}
+        root = Path(__file__).resolve().parents[2]
+
+        def _path(key: str, default: Path) -> Path:
+            value = sources.get(key)
+            path = Path(value) if value else default
+            return path if path.is_absolute() else root / path
+
+        return cls(
+            ttl_s=float(section.get("catalog_refresh_s", 21600) or 21600),
+            clock=clock,
+            manifest_path=_path("manifest", DEFAULT_MANIFEST_PATH),
+            extra_path=_path("embedded_path", DEFAULT_EXTRA_PATH),
+            cache_path=_path("cache_path", DEFAULT_CACHE_PATH),
+            gluetun_manifest_path=_path(
+                "gluetun_manifest_path", DEFAULT_GLUETUN_MANIFEST_PATH
+            ),
+        )
+
 
     def snapshot(self) -> tuple[Server, ...]:
         return self._servers
@@ -56,130 +107,65 @@ class NordVpnCatalog:
     def last_error(self) -> str | None:
         return self._last_error
 
+    @property
+    def last_resolution(self) -> CatalogResolution | None:
+        return self._last_resolution
+
+    @property
+    def source_id(self) -> str | None:
+        return self._last_resolution.source_id if self._last_resolution else None
+
+    @property
+    def catalog_fetched_at(self) -> float | None:
+        return self._last_resolution.fetched_at if self._last_resolution else None
+
+    @property
+    def etag(self) -> str | None:
+        return self._last_resolution.etag if self._last_resolution else None
+
+    @property
+    def stale(self) -> bool:
+        """True when the served snapshot is not a fresh primary resolution."""
+
+        if self._last_resolution is None:
+            return True
+        return bool(self._last_refresh_failed or self._last_resolution.stale)
+
     def is_stale(self, now: float | None = None) -> bool:
         if self._last_refresh is None:
+            return True
+        if self._last_refresh_failed:
             return True
         return (now if now is not None else self._clock()) - self._last_refresh >= self._ttl_s
 
     async def refresh(self) -> tuple[Server, ...]:
-        errors: list[str] = []
-        api_servers: list[Server] = []
-        try:
-            raw = await asyncio.to_thread(self._fetch)
-            api_servers = self._parse(raw)
-        except Exception as exc:
-            errors.append(f"{type(exc).__name__}: {exc}")
-
-        extra_servers: list[Server] = []
-        if self._extra_path is not None and self._extra_path.exists():
-            try:
-                extra_servers = await asyncio.to_thread(self._read_extra)
-            except Exception as exc:
-                errors.append(f"extra:{type(exc).__name__}: {exc}")
-
-        servers = self._merge(api_servers, extra_servers)
-        if servers:
-            self._servers = tuple(servers)
+        resolution = await self._sources.resolve()
+        if resolution.servers:
+            self._servers = resolution.servers
             self._last_refresh = self._clock()
-            self._last_error = "; ".join(errors) or None
-        elif errors:
-            self._last_error = "; ".join(errors)
+            self._last_resolution = resolution
+            self._last_refresh_failed = False
+            self._last_error = "; ".join(resolution.errors) or None
+        else:
+            self._last_refresh_failed = True
+            if resolution.errors:
+                self._last_error = "; ".join(resolution.errors)
         return self._servers
 
-    def _http_fetch(self) -> Any:
-        import requests
-
-        response = requests.get(self._url, timeout=120)
-        response.raise_for_status()
-        return response.json()
-
-    def _read_extra(self) -> list[Server]:
-        with open(self._extra_path, encoding="utf-8") as handle:
-            raw = json.load(handle)
-        if isinstance(raw, dict):
-            raw = raw.get("servers") or []
-        return self._parse_gluetun(raw)
+    # ── backwards-compatible pure parsers ────────────────────────────────
 
     @staticmethod
     def _parse(raw: Any) -> list[Server]:
-        if not isinstance(raw, list):
-            return []
-        servers: list[Server] = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("status") or "") != "online":
-                continue
-            hostname = str(item.get("hostname") or "").strip()
-            locations = item.get("locations") or []
-            country = ""
-            city = None
-            if isinstance(locations, list) and locations:
-                loc = locations[0] if isinstance(locations[0], dict) else {}
-                country_obj = loc.get("country") or {}
-                country = str((country_obj or {}).get("name") or "").strip()
-                city_obj = loc.get("city") or {}
-                city = str((city_obj or {}).get("name") or "").strip() or None
-            if not hostname or not country:
-                continue
-            technologies = tuple(
-                str((tech or {}).get("name") or "").strip()
-                for tech in (item.get("technologies") or [])
-                if isinstance(tech, dict) and str((tech or {}).get("name") or "").strip()
-            )
-            try:
-                load = float(item.get("load") or 0.0)
-            except (TypeError, ValueError):
-                load = 0.0
-            servers.append(
-                Server(
-                    hostname=hostname,
-                    country=country,
-                    server_ip=str(item.get("station") or "").strip() or None,
-                    city=city,
-                    load=max(0.0, load),
-                    technologies=technologies,
-                )
-            )
-        return servers
+        return parse_official_payload(raw)
 
     @staticmethod
     def _parse_gluetun(raw: Any) -> list[Server]:
-        """Parse gluetun's embedded catalog format (``vpn``/``ips``/``wgpubkey``)."""
-        if isinstance(raw, dict):
-            raw = raw.get("servers") or []
-        if not isinstance(raw, list):
-            return []
-        servers: list[Server] = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("vpn") or "").strip().lower() != "wireguard":
-                continue
-            hostname = str(item.get("hostname") or "").strip()
-            country = str(item.get("country") or "").strip()
-            if not hostname or not country:
-                continue
-            ips = item.get("ips") or []
-            server_ip = None
-            if isinstance(ips, list) and ips:
-                server_ip = str(ips[0] or "").strip() or None
-            city = str(item.get("city") or "").strip() or None
-            servers.append(
-                Server(
-                    hostname=hostname,
-                    country=country,
-                    server_ip=server_ip,
-                    city=city,
-                    load=0.0,
-                    technologies=("WireGuard",),
-                )
-            )
-        return servers
+        return parse_gluetun_payload(raw)
 
     @staticmethod
     def _merge(api_servers: list[Server], extra_servers: list[Server]) -> list[Server]:
         """Merge embedded servers under the API snapshot (API wins on duplicates)."""
+
         merged: dict[str, Server] = {}
         for server in extra_servers:
             merged.setdefault(server.hostname, server)

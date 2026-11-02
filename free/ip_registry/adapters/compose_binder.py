@@ -13,11 +13,14 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from ..domain import BindResult
+
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
 class ComposeHostnameBinder:
@@ -32,6 +35,8 @@ class ComposeHostnameBinder:
         profile: str = "multi-station",
         recreate_timeout_s: float = 180.0,
         settle_s: float = 10.0,
+        egress_wait_s: float = 0.0,
+        egress_poll_s: float = 2.0,
         runner: Callable[[list[str], str], subprocess.CompletedProcess] | None = None,
         egress: Callable[[int], Awaitable[str]] | None = None,
         clock: Callable[[], float] = time.time,
@@ -42,12 +47,30 @@ class ComposeHostnameBinder:
         self._profile = profile
         self._recreate_timeout_s = max(1.0, float(recreate_timeout_s))
         self._settle_s = max(0.0, float(settle_s))
+        self._egress_wait_s = max(0.0, float(egress_wait_s))
+        self._egress_poll_s = max(0.1, float(egress_poll_s))
         self._runner = runner or self._run
         self._egress = egress
         self._clock = clock
 
     def service_name(self, station: int) -> str:
         return "vpn-gluetun" if int(station) == 1 else f"vpn-gluetun-{int(station)}"
+
+    def override_path_for(self, station: int) -> Path:
+        """One override file per station: parallel chains must never race.
+
+        A shared ``compose-hostname.yml`` made two stations overwrite each
+        other's hostname between `docker compose` reads; the result was
+        cross-binding and mass ``no-egress`` failures.
+        """
+
+        station = int(station)
+        stem = self._override_path.stem
+        if stem.endswith(f"-{station}") or stem.endswith(f"_{station}"):
+            return self._override_path
+        return self._override_path.with_name(
+            f"{stem}-{station}{self._override_path.suffix}"
+        )
 
     def override_yaml(
         self,
@@ -86,8 +109,9 @@ class ComposeHostnameBinder:
         if not hostname:
             return BindResult(False, hostname, error="empty-hostname")
         try:
-            self._override_path.parent.mkdir(parents=True, exist_ok=True)
-            self._override_path.write_text(
+            override_path = self.override_path_for(station)
+            override_path.parent.mkdir(parents=True, exist_ok=True)
+            override_path.write_text(
                 self.override_yaml(
                     station, hostname, country, vpn_type, openvpn_protocol
                 ),
@@ -103,7 +127,7 @@ class ComposeHostnameBinder:
             "-f",
             self._compose_file,
             "-f",
-            str(self._override_path),
+            str(override_path),
             "up",
             "-d",
             "--force-recreate",
@@ -123,14 +147,23 @@ class ComposeHostnameBinder:
             await asyncio.sleep(self._settle_s)
         if self._egress is None:
             return BindResult(True, hostname)
-        try:
-            egress_ip = await self._egress(station)
-        except Exception as exc:
-            return BindResult(False, hostname, error=f"egress:{type(exc).__name__}")
-        egress_ip = str(egress_ip or "").strip()
-        if not egress_ip:
-            return BindResult(False, hostname, error="no-egress")
-        return BindResult(True, hostname, egress_ip=egress_ip)
+        deadline = time.monotonic() + self._egress_wait_s
+        last_error = "no-egress"
+        while True:
+            try:
+                egress_ip = await self._egress(station)
+                last_error = "no-egress"
+            except Exception as exc:
+                egress_ip = ""
+                last_error = f"egress:{type(exc).__name__}"
+            egress_ip = str(egress_ip or "").strip()
+            if egress_ip:
+                return BindResult(True, hostname, egress_ip=egress_ip)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(self._egress_poll_s, remaining))
+        return BindResult(False, hostname, error=last_error)
 
     async def release(self, station: int) -> None:
         return None
@@ -153,4 +186,5 @@ class ComposeHostnameBinder:
             capture_output=True,
             text=True,
             timeout=self._recreate_timeout_s,
+            creationflags=_NO_WINDOW,
         )

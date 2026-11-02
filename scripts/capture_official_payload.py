@@ -31,6 +31,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -208,6 +209,11 @@ def main() -> None:
             "Toute réduction est refusée 403/429."
         ),
         "_request_headers": rec["headers"],
+        # Byte-exact capture: the probe must replay this raw body (compact
+        # UTF-8 JSON), never a re-indented serialization.
+        "_body_raw": rec["body"],
+        "_body_len": rec["body_len"],
+        "_body_sha256": hashlib.sha256(rec["body"].encode("utf-8")).hexdigest(),
         "body": body,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

@@ -20,7 +20,9 @@ from .domain import (
 )
 from .eligibility import EligibilityDecision, check_eligibility
 from .scoring import ScoreWeights, score_record
+from .sources import SourceManifest, SourceRegistry, SourceSnapshot
 from .sqlite_registry import SqliteIpRegistry
+from .status import registry_status
 
 __all__ = [
     "AllocationOutcome",
@@ -39,11 +41,15 @@ __all__ = [
     "RuntimeResult",
     "ScoreWeights",
     "Server",
+    "SourceManifest",
+    "SourceRegistry",
+    "SourceSnapshot",
     "SqliteIpRegistry",
     "StationEgress",
     "StationNeed",
     "StationProbe",
     "can_transition",
     "check_eligibility",
+    "registry_status",
     "score_record",
 ]

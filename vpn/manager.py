@@ -194,6 +194,95 @@ def _note_daemon_reachable(ok: bool) -> None:
         pass
 
 
+def _docker_desktop_process_running() -> bool:
+    """True when Docker Desktop.exe is already alive.
+
+    Launching the GUI executable a second time does not start a new process:
+    the running backend treats it as a "show dashboard" signal and brings the
+    window to the foreground. That is the popup we must avoid.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Docker Desktop.exe", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return "docker desktop.exe" in (r.stdout or "").lower()
+    except Exception:
+        return False
+
+
+def _disable_docker_desktop_ui_on_startup() -> None:
+    """Keep the Docker dashboard closed when we auto-start Desktop.
+
+    ``OpenUIOnStartupDisabled`` is the settings-store key Docker Desktop
+    itself uses for "Open Docker Dashboard at startup". Best effort: an
+    unreadable/absent settings file must never break the autostart.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        path = os.path.join(os.path.expandvars(r"%APPDATA%"), "Docker", "settings-store.json")
+        if not os.path.exists(path):
+            return
+        data: dict = {}
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            data = loaded
+        if data.get("OpenUIOnStartupDisabled") is True:
+            return
+        data["OpenUIOnStartupDisabled"] = True
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _start_docker_desktop(exe: str | None) -> bool:
+    """Start Docker Desktop without opening its dashboard window.
+
+    The ``docker desktop start`` CLI brings the engine up silently. The GUI
+    executable is only a fallback for installs without that CLI, and only
+    when Desktop is not already running (otherwise it just pops the window).
+    """
+    _disable_docker_desktop_ui_on_startup()
+    try:
+        r = subprocess.run(
+            ["docker", "desktop", "start", "--detach"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    if _docker_desktop_process_running():
+        return True
+    if not exe:
+        return False
+    try:
+        subprocess.Popen(
+            [exe],
+            creationflags=CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception as e:
+        logging.getLogger("vpn_manager").warning("[docker] failed to launch Desktop %s: %s", exe, e)
+        return False
+
+
 async def _docker_autostart_worker(reason: str, timeout: int) -> None:
     """Corps de la relance background (flag in_progress garantie par l'appelant)."""
     global _DOCKER_LAUNCH_IN_PROGRESS
@@ -292,7 +381,6 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
                 pass
         _note_daemon_reachable(False)
         return False
-    # [v10 §14.3.13] latch posé uniquement après un Popen RÉUSSI (voir plus bas)
     # Common install paths
     candidates = [
         r"C:\Program Files\Docker\Docker\Docker Desktop.exe",
@@ -308,45 +396,23 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
                 break
         except Exception:
             continue
-    if not exe:
-        # Fallback: try `start` via shell (may be on PATH)
-        try:
-            await asyncio.to_thread(
-                subprocess.run,
-                ["cmd", "/c", "start", "", "Docker Desktop"],
-                capture_output=True,
-                timeout=10,
-                creationflags=CREATE_NO_WINDOW,
-            )
-        except Exception:
-            pass
-        # `start` shell : tentative effectuée aussi → horodatage pour le
-        # cooldown (évite de spammer une machine sans Docker installé).
+    # CLI first (silent engine start); GUI only as a last resort, and never
+    # while Desktop already runs (a second GUI launch pops its dashboard).
+    launched = await asyncio.to_thread(_start_docker_desktop, exe)
+    if not launched:
+        logging.getLogger("vpn_manager").warning(
+            "[docker] failed to launch Desktop %s", exe or "Docker Desktop"
+        )
         try:
             _DOCKER_LAST_LAUNCH_AT = time.monotonic()
         except Exception:
             pass
-    else:
-        try:
-            # Use Popen to not block; Desktop will daemonize
-            subprocess.Popen(
-                [exe],
-                creationflags=CREATE_NO_WINDOW,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as e:
-            # [plan v10 §14.3.13] l'horodatage ne se pose qu'après un lancement
-            # EFFECTIF : sinon un Popen raté verrouillait toute relance
-            # jusqu'au restart ([docker-autostart 2026-10-07] : cooldown
-            # temporel au lieu du latch one-shot).
-            logging.getLogger("vpn_manager").warning("[docker] failed to launch Desktop %s: %s", exe, e)
-            _note_daemon_reachable(False)
-            return False
-        try:
-            _DOCKER_LAST_LAUNCH_AT = time.monotonic()
-        except Exception:
-            pass
+        _note_daemon_reachable(False)
+        return False
+    try:
+        _DOCKER_LAST_LAUNCH_AT = time.monotonic()
+    except Exception:
+        pass
     # Wait for daemon to become reachable
     for _ in range(timeout // 2):
         await asyncio.sleep(2)
@@ -1639,6 +1705,11 @@ class VPNManager:
             except Exception:
                 _pin = ""
         self._pinned_hostname = _pin or None
+        # [fix 2026-11-01] Rate-limit for dropping a dead compose pin
+        # (SERVER_HOSTNAMES_STATIONn). Without it, a dead server made the
+        # station restart forever: no country rotation + same pinned host =
+        # no path to a fresh server.
+        self._last_pin_escape_at: float | None = None
         # Callback injecté par FreeIPPool : qualité mesurée par hostname.
         self._host_quality_fn = None
         # [roadmap] dernière charge connue du serveur choisi (pour le score).
@@ -2175,6 +2246,17 @@ class VPNManager:
             await _auth_gate(self._docker_container)
             try:
                 await self._compose_up()
+            finally:
+                # [fix 2026-11-01] The slot covers the AUTH handshake, not
+                # the health poll. Holding it through `_wait_healthy` (up to
+                # 120 s) starved the other stations at boot: with 2 slots
+                # and 6 stations, stations 3-6 waited minutes before their
+                # compose even started and the watchdog cancelled them
+                # ("startup connect bloqué > 180s"). Same contract as the
+                # rotation path (_ensure_container releases right after the
+                # docker primitive).
+                _auth_connect_done()
+            try:
                 started_at = await self._wait_healthy(timeout=120)
                 if started_at is None:
                     raise RuntimeError("gluetun non sain dans les 120s")
@@ -2231,8 +2313,6 @@ class VPNManager:
                 self._backoff.record_failure()
                 logger.error("[vpn] connect failed: %s", e)
                 raise
-            finally:
-                _auth_connect_done()
 
     def _check_rotation_storm(self) -> None:
         """[plan 30/08 Lot A4] Anti-churn : fenêtre glissante 1 h des
@@ -5196,6 +5276,38 @@ class VPNManager:
                 except RuntimeError:
                     pass  # loop already closed at shutdown — nothing to wake
 
+    def _read_live_compose_pin(self, station: int) -> tuple[str, str, bool, bool]:
+        """Read the supervisor-written pin from `.env` before every compose.
+
+        The allocator writes ``SERVER_HOSTNAMES_STATIONn`` in `.env`, but the
+        proxy process inherited the boot-time value in ``os.environ``; compose
+        children give the parent env precedence, so a manager recreate could
+        silently revert to the old hostname (and a different NAT egress).
+        `.env` is the authoritative local pin source here, with os.environ as
+        the fallback when the key is absent.
+        """
+        host_key = f"SERVER_HOSTNAMES_STATION{int(station)}"
+        country_key = f"SERVER_COUNTRIES_STATION{int(station)}"
+        host = country = None
+        env_path = os.path.join(os.path.dirname(self._compose_file_path()), ".env")
+        try:
+            with open(env_path, encoding="utf-8") as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if line.startswith(host_key + "="):
+                        host = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    elif line.startswith(country_key + "="):
+                        country = line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+        host_present = host is not None
+        country_present = country is not None
+        if host is None:
+            host = (os.getenv(host_key, "") or "").strip()
+        if country is None:
+            country = (os.getenv(country_key, "") or "").strip()
+        return host or "", country or "", host_present, country_present
+
     def _compose_env(self, *, stations: list | None = None, stack: str | None = None) -> dict:
         """Explicit environment for `docker compose` children.
 
@@ -5220,6 +5332,18 @@ class VPNManager:
             stack = self._stack_effective or "openvpn"
         for s in stations or [self._station]:
             env[f"VPN_TYPE_STATION{s}"] = stack
+            # The allocator may have rewritten the pin in .env after this
+            # process booted; carry it explicitly so a stale parent env can
+            # never send the recreate back to the previous hostname.
+            _host, _country, _host_present, _country_present = (
+                self._read_live_compose_pin(s)
+            )
+            if _host or _host_present:
+                env[f"SERVER_HOSTNAMES_STATION{s}"] = _host
+                if s == self._station:
+                    self._pinned_hostname = _host or None
+            if _country or _country_present:
+                env[f"SERVER_COUNTRIES_STATION{s}"] = _country
             if stack == "openvpn":
                 _proto = getattr(self, "_ovpn_protocol_effective", "udp")
                 if _proto not in ("udp", "tcp"):
@@ -6298,6 +6422,92 @@ class VPNManager:
             # lui aussi : l'ancien code ne le comptait pas dans le budget.
             self._note_watchdog_restart()
             await self._docker_restart()
+
+    def _compose_pin_key(self) -> str:
+        return f"SERVER_HOSTNAMES_STATION{self._station}"
+
+    def _clear_compose_pin_file(self) -> None:
+        """Persist ``SERVER_HOSTNAMES_STATIONn=`` next to the compose file.
+
+        The proxy process env is updated by the caller; the file is what
+        the next boot reads (compose interpolation). Best-effort: a read-only
+        checkout must never block the runtime recovery.
+        """
+        env_path = os.path.join(os.path.dirname(self._compose_file_path()), ".env")
+        try:
+            with open(env_path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            return
+        key = self._compose_pin_key()
+        changed = False
+        out: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(key + "="):
+                if stripped != key + "=":
+                    line = key + "="
+                    changed = True
+            out.append(line)
+        if not changed:
+            return
+        tmp = env_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="") as fh:
+                fh.write("\n".join(out) + "\n")
+            os.replace(tmp, env_path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    async def _escape_dead_compose_pin(self, reason: str = "egress dead") -> bool:
+        """Drop a dead compose-pinned server and recreate on the same country.
+
+        A station pinned through ``SERVER_HOSTNAMES_STATIONn`` and running
+        with ``country_rotation: false`` has no recovery path when that
+        server dies: every restart reconnects to the same host and the
+        gluetun healthcheck loop never ends. After one failed recovery
+        cycle the watchdog calls this to blank the pin (process env + .env),
+        then recreates so gluetun picks a live server inside
+        ``SERVER_COUNTRIES``. Rate-limited so a genuinely broken country
+        does not churn compose every tick.
+        """
+        pin = str(getattr(self, "_pinned_hostname", "") or "").strip()
+        if not pin:
+            return False
+        now = self._now_fn()
+        if self._last_pin_escape_at is not None and now - self._last_pin_escape_at < 1800.0:
+            return False
+        self._last_pin_escape_at = now
+        logger.warning(
+            "[vpn] s%s compose pin %s dead (%s) — clearing pin, gluetun will re-pick in %s",
+            self._station,
+            pin,
+            reason,
+            self._server_countries or "the configured country",
+        )
+        try:
+            os.environ[self._compose_pin_key()] = ""
+        except Exception:
+            pass
+        try:
+            self._clear_compose_pin_file()
+        except Exception as e:
+            logger.debug("[vpn] s%s pin clear persist failed: %s", self._station, e)
+        self._pinned_hostname = None
+        self._watchdog_last_action = "pin-escape"
+        try:
+            self._note_watchdog_restart()
+        except Exception:
+            pass
+        await _auth_gate()
+        try:
+            await self._compose_up(force_recreate=True)
+        finally:
+            _auth_connect_done()
+        return True
 
     async def _refresh_server_list(self) -> None:
         """[force-update] Wipe gluetun's cached provider server list so the
@@ -10098,6 +10308,25 @@ class VPNManager:
                         self._watchdog_backoff.record_success()
                         self._set_status(VPNState.CONNECTED)
                         return
+                    # [fix 2026-11-01] A dead compose pin is unrecoverable
+                    # while country rotation is off: restart/compose keep
+                    # reconnecting the same server. After one failed heal,
+                    # blank the pin so gluetun re-picks inside the country.
+                    if (
+                        self._watchdog_backoff.consecutive_failures >= 1
+                        and not self._auth_failed
+                        and not self._country_rotation
+                        and str(getattr(self, "_pinned_hostname", "") or "").strip()
+                    ):
+                        try:
+                            if await self._escape_dead_compose_pin(kind):
+                                return
+                        except Exception as e:
+                            logger.warning(
+                                "[vpn-watchdog] s%s pin escape failed: %s",
+                                self._station,
+                                e,
+                            )
                     try:
                         if self._server_issue or self._auth_failed:
                             # AUTH_FAILED OV = quasi toujours liste de serveurs

@@ -97,13 +97,14 @@ async def test_save_request_enqueues_raw_row(monkeypatch):
     assert raw.tools_used == ["read", "read", "grep"], "dédup effectué au writer, pas au caller"
 
     row = oc._materialize_db_row(raw)
-    assert len(row) == 35  # [audit 2026-10-30] + ttfb_ms/stop_reason/aborted
+    assert len(row) == 36  # + server_host (présélection IP)
     assert row[0] == "req-d1"
     assert row[16] == json.dumps([{"name": "read"}])
     assert row[17] == json.dumps(["read", "grep"]), "tools_used dédupliqué"
     assert '"model"' in row[18] and "glm-5.1" in row[18]
     assert len(row[18]) <= oc.MAX_BODY_STORAGE + 64  # truncate appliqué
     assert row[30] is None and row[31] is None, "pas de fallback → NULL corrélés"
+    assert row[35] is None, "pas de station → server_host NULL"
 
 
 @pytest.mark.asyncio
@@ -116,7 +117,7 @@ async def test_materialized_row_redacts_secrets():
     }
     raw = oc._DbRowRaw(
         ("id",) * 16,
-        (None,) * 15,  # [audit 2026-10-30] tail 12 -> 15 (+ ttfb_ms/stop_reason/aborted)
+        (None,) * 16,  # tail 16 : + ttfb_ms/stop_reason/aborted/server_host
         request_body=body,
         response_body=None,
         tools=None,
@@ -138,7 +139,7 @@ def test_redact_fast_path_ignores_embedded_sk_dash():
 @pytest.mark.asyncio
 async def test_batch_writer_accepts_raw_rows_end_to_end(monkeypatch, tmp_path):
     """Garde-fou régression : _db_execute_batch_sync insère VRAIMENT une
-    _DbRowRaw matérialisée dans SQLite (35 colonnes) — pas l'objet brut."""
+    _DbRowRaw matérialisée dans SQLite (36 colonnes) — pas l'objet brut."""
     import sqlite3
 
     conn = sqlite3.connect(":memory:")
@@ -155,7 +156,8 @@ async def test_batch_writer_accepts_raw_rows_end_to_end(monkeypatch, tmp_path):
             geo_country TEXT, geo_blocked TEXT, geo_direct_country TEXT,
             geo_direct_ip TEXT, geo_via_vpn TEXT, geo_allowed TEXT, station TEXT,
             free_status INTEGER, paid_status INTEGER,
-            ttfb_ms INTEGER, stop_reason TEXT, aborted INTEGER DEFAULT 0
+            ttfb_ms INTEGER, stop_reason TEXT, aborted INTEGER DEFAULT 0,
+            server_host TEXT
         )
         """
     )
@@ -308,7 +310,8 @@ async def test_mixed_batch_requests_and_free_usage(monkeypatch):
             geo_country TEXT, geo_blocked TEXT, geo_direct_country TEXT,
             geo_direct_ip TEXT, geo_via_vpn TEXT, geo_allowed TEXT, station TEXT,
             free_status INTEGER, paid_status INTEGER,
-            ttfb_ms INTEGER, stop_reason TEXT, aborted INTEGER DEFAULT 0
+            ttfb_ms INTEGER, stop_reason TEXT, aborted INTEGER DEFAULT 0,
+            server_host TEXT
         )
         """
     )
@@ -317,7 +320,7 @@ async def test_mixed_batch_requests_and_free_usage(monkeypatch):
 
     raw_req = oc._DbRowRaw(
         ("id-mix", "2026-08-26T10:00:00Z", "glm-5.1") + (None,) * 13,
-        (None,) * 15,  # [audit 2026-10-30] tail 12 -> 15 (+ ttfb_ms/stop_reason/aborted)
+        (None,) * 16,  # tail 16 : + ttfb_ms/stop_reason/aborted/server_host
         request_body=None,
         response_body=None,
         tools=None,

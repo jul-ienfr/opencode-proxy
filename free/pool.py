@@ -233,6 +233,7 @@ class Socks5Endpoint:
         self.username = username
         self.password = password
         self.enabled = bool(enabled)
+        self.egress_ip: str | None = None
         self._station = -1 - int(index)  # negative — never a docker station
         self.pid = f"{self.host}:{self.port}"
         self._quota_per_ip = 0  # filled by set_socks5_proxies / update_config
@@ -264,6 +265,38 @@ class Socks5Endpoint:
 
     def arm_egress_watchdog(self) -> None:
         pass  # no docker watchdog — the pool bad-mark owns recovery
+
+    def refresh_egress(self, timeout: float = 6.0) -> str:
+        """Resolve the real egress IP behind this SOCKS5 proxy.
+
+        The quota ledger and the distinct-IP guard must key on the IP the
+        upstream sees, not on the logical ``socks5:host:port`` id. Best-effort:
+        an unreachable proxy returns "" and the pool bad-marks it on the first
+        failed request.
+        """
+        try:
+            from curl_cffi import requests as curl_requests
+
+            proxy = self.socks5_url
+            if proxy.startswith("socks5://"):
+                proxy = "socks5h://" + proxy[len("socks5://") :]
+            response = curl_requests.get(
+                "https://api.ipify.org",
+                proxies={"http": proxy, "https": proxy},
+                timeout=float(timeout),
+            )
+            ip = str(getattr(response, "text", "") or "").strip()
+        except Exception:
+            return ""
+        if ip:
+            self.egress_ip = ip
+            self.current_ip = ip
+            self.current_server = {
+                "name": f"socks5:{self.host}:{self.port}",
+                "static": True,
+                "egress_ip": ip,
+            }
+        return ip
 
     def get_status(self) -> dict:
         return {
@@ -302,16 +335,20 @@ class HttpsProxyEndpoint(Socks5Endpoint):
         first fallback request.
         """
         try:
-            import requests
+            from curl_cffi import requests as curl_requests
+            from curl_cffi.const import CurlOpt
 
             proxy = self.socks5_url
-            response = requests.get(
+            response = curl_requests.get(
                 "https://api.ipify.org",
                 proxies={"http": proxy, "https": proxy},
-                timeout=(3, float(timeout)),
-                verify=False,
+                timeout=float(timeout),
+                curl_options={
+                    CurlOpt.PROXY_SSL_VERIFYPEER: 0,
+                    CurlOpt.PROXY_SSL_VERIFYHOST: 0,
+                },
             )
-            ip = str(response.text or "").strip()
+            ip = str(getattr(response, "text", "") or "").strip()
         except Exception:
             return ""
         if ip:
@@ -646,7 +683,9 @@ class FreeIPPool:
         self._socks5_eps: list = []  # parsed Socks5Endpoint/HttpsProxyEndpoint list
         self._socks5_rr = 0  # round-robin cursor (index into _socks5_eps)
         self._https_rr = 0  # round-robin cursor for the HTTPS subset
+        self._socks5_fallback_rr = 0  # cursor for the SOCKS5-only fallback subset
         self._socks5_current: Socks5Endpoint | None = None  # last endpoint used by on_request
+        self._socks5_fallback_enabled = False  # SOCKS5 fallback when no docker station is usable
         self._https_fallback_enabled = False  # use HTTPS proxies only when no docker station is usable
         # [Axe 3.1] True (default) = round-robin on every request; False =
         # stick to the current proxy while usable (rotation only via
@@ -926,6 +965,25 @@ class FreeIPPool:
         """
         count = 0
         for station in list(getattr(self, "_stations", None) or []):
+            try:
+                if self._station_usable(station, exclude_approaching=False, model=model):
+                    count += 1
+            except Exception:
+                continue
+        return count
+
+    def usable_station_count_excluding(
+        self, excluded=None, *, model: str | None = None
+    ) -> int:
+        """Comme ``usable_station_count`` mais ignore les endpoints déjà
+        trial-dead pour ce modèle. Le fallback proxy ne doit pas attendre
+        qu'une station *physiquement* utilisable soit aussi *utile* pour la
+        requête courante."""
+        excluded = excluded or set()
+        count = 0
+        for station in list(getattr(self, "_stations", None) or []):
+            if station in excluded:
+                continue
             try:
                 if self._station_usable(station, exclude_approaching=False, model=model):
                     count += 1
@@ -2793,6 +2851,33 @@ class FreeIPPool:
         when the current one approaches quota)."""
         return self._socks5_next(excluded={ep})
 
+    def _socks5_fallback_next(self, excluded=None) -> Socks5Endpoint | None:
+        """Next usable SOCKS5-only endpoint for the vpn-mode fallback tier.
+
+        Explicitly excludes ``HttpsProxyEndpoint`` (a subclass): the HTTPS
+        tier has its own selector and its own config flag, and keeping the
+        two ordered avoids surprising protocol switches.
+        """
+        eps = [
+            ep
+            for ep in self._socks5_enabled_eps()
+            if not isinstance(ep, HttpsProxyEndpoint)
+        ]
+        if not eps:
+            return None
+        excluded = excluded or set()
+        n = len(eps)
+        start = (self._socks5_fallback_rr + 1) % n
+        for i in range(n):
+            idx = (start + i) % n
+            ep = eps[idx]
+            if ep in excluded:
+                continue
+            if self._socks5_usable(ep, exclude_approaching=False):
+                self._socks5_fallback_rr = idx
+                return ep
+        return None
+
     def _https_enabled_eps(self) -> list:
         return [ep for ep in self._socks5_enabled_eps() if isinstance(ep, HttpsProxyEndpoint)]
 
@@ -3096,9 +3181,28 @@ class FreeIPPool:
 
         if (
             mode == "vpn"
+            and self._socks5_fallback_enabled
+            and forced_pool is None
+            and self.usable_station_count_excluding(excluded, model=model) == 0
+        ):
+            ep = self._socks5_fallback_next(excluded)
+            if ep is not None:
+                if not ep.egress_ip:
+                    try:
+                        await asyncio.to_thread(ep.refresh_egress, 6.0)
+                    except Exception:
+                        pass
+                logger.info(
+                    "[free-ip] no usable docker station - SOCKS5 fallback %s", ep.pid
+                )
+                self._socks5_current = ep
+                return ep.socks5_url, ep
+
+        if (
+            mode == "vpn"
             and self._https_fallback_enabled
             and forced_pool is None
-            and self.usable_station_count(model=model) == 0
+            and self.usable_station_count_excluding(excluded, model=model) == 0
         ):
             ep = self._https_next(excluded)
             if ep is not None:
@@ -4726,6 +4830,8 @@ class FreeIPPool:
         # (`https_proxies`). Used only when no docker station is usable.
         if "https_proxies" in cfg and isinstance(cfg["https_proxies"], list):
             self.set_https_proxies(cfg["https_proxies"])
+        if "socks5_fallback_enabled" in cfg:
+            self._socks5_fallback_enabled = bool(cfg["socks5_fallback_enabled"])
         if "https_fallback_enabled" in cfg:
             self._https_fallback_enabled = bool(cfg["https_fallback_enabled"])
         # [plan v10 §3.6.2 Lot 3] bloc canonique latency_rotation → moteur

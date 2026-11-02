@@ -1,7 +1,9 @@
 """SQLite schema and connection helpers for the IP registry.
 
-Phase 0/1 foundation: schema, pragmas, idempotent initialization.  The
-repository implementation (claim/assign/release) lives in a later phase.
+Schema v2 adds catalog provenance to ``servers`` (``source_id``, ``stale``,
+``catalog_fetched_at``) and a ``catalog_snapshots`` journal.  Migration is
+idempotent: existing v1 databases keep their rows and gain the columns in
+place, with no destructive rebuild.
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -19,15 +21,18 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 );
 
 CREATE TABLE IF NOT EXISTS servers (
-    hostname       TEXT PRIMARY KEY,
-    server_ip      TEXT,
-    country        TEXT NOT NULL,
-    city           TEXT,
-    load           REAL NOT NULL DEFAULT 0,
-    technologies   TEXT NOT NULL DEFAULT '[]',
-    first_seen_at  REAL NOT NULL,
-    last_seen_at   REAL NOT NULL,
-    active         INTEGER NOT NULL DEFAULT 1
+    hostname           TEXT PRIMARY KEY,
+    server_ip          TEXT,
+    country            TEXT NOT NULL,
+    city               TEXT,
+    load               REAL NOT NULL DEFAULT 0,
+    technologies       TEXT NOT NULL DEFAULT '[]',
+    first_seen_at      REAL NOT NULL,
+    last_seen_at       REAL NOT NULL,
+    active             INTEGER NOT NULL DEFAULT 1,
+    source_id          TEXT NOT NULL DEFAULT 'nordvpn_api_servers',
+    stale              INTEGER NOT NULL DEFAULT 0,
+    catalog_fetched_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_servers_country
     ON servers(country, active);
@@ -100,6 +105,30 @@ CREATE INDEX IF NOT EXISTS idx_assign_station
     ON assignments(station, assigned_at DESC);
 """
 
+# Applied after the ALTER TABLE migration so an old ``servers`` table never
+# blocks index creation.
+EXTRA_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS catalog_snapshots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id    TEXT NOT NULL,
+    fetched_at   REAL NOT NULL,
+    etag         TEXT,
+    stale        INTEGER NOT NULL DEFAULT 0,
+    server_count INTEGER NOT NULL DEFAULT 0,
+    error        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_snapshots_time
+    ON catalog_snapshots(fetched_at DESC);
+CREATE INDEX IF NOT EXISTS idx_servers_source
+    ON servers(source_id, active);
+"""
+
+_PROVENANCE_COLUMNS = {
+    "source_id": "TEXT NOT NULL DEFAULT 'nordvpn_api_servers'",
+    "stale": "INTEGER NOT NULL DEFAULT 0",
+    "catalog_fetched_at": "REAL",
+}
+
 
 def connect(path: str | Path) -> sqlite3.Connection:
     """Open a WAL SQLite connection with sane pragmas.
@@ -121,14 +150,30 @@ def connect(path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-def init_schema(conn: sqlite3.Connection) -> None:
-    """Create all tables/indexes and record the schema version (idempotent)."""
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
 
-    conn.executescript(SCHEMA_SQL)
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing database to ``SCHEMA_VERSION`` without data loss."""
+
+    columns = _table_columns(conn, "servers")
+    for name, sql_type in _PROVENANCE_COLUMNS.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE servers ADD COLUMN {name} {sql_type}")
+    conn.executescript(EXTRA_SCHEMA_SQL)
     conn.execute(
-        "INSERT OR IGNORE INTO schema_meta(key, value) VALUES('schema_version', ?)",
+        "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (str(SCHEMA_VERSION),),
     )
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    """Create all tables/indexes, migrate, and record the schema version."""
+
+    conn.executescript(SCHEMA_SQL)
+    migrate(conn)
     conn.commit()
 
 

@@ -691,6 +691,18 @@ async def _db_migrate_bg() -> None:
                 return _app_db.migrate_and_canary(_conn)
 
         _naive_ts_count = await asyncio.to_thread(_run)
+        # [présélection IP] Reconstruire la qualité hostname depuis l'historique
+        # SQLite : sans cela, chaque redémarrage repart à froid et la
+        # présélection retombe sur le `load` API malgré des milliers de mesures.
+        try:
+            from free.quality import get_quality_registry
+
+            _rebuilt = await asyncio.to_thread(
+                get_quality_registry().rebuild_from_requests, _db_path, hours=168
+            )
+            _debug(f"  [quality] rebuilt {_rebuilt} (station, ip, host) entries from requests")
+        except Exception as _qexc:
+            _debug(f"  [quality] rebuild skipped: {type(_qexc).__name__}: {_qexc}")
         # [30] Canary: mixed naive/UTC timestamps break ORDER BY timestamp
         # DESC (BINARY collation) — warning différé, jamais sur le boot.
         if _naive_ts_count:
@@ -1088,6 +1100,79 @@ async def _db_writer_loop():
             await asyncio.sleep(0.1)
 
 
+_HOST_ATTR_MODULE = None
+
+
+def _host_attribution_module():
+    global _HOST_ATTR_MODULE
+    if _HOST_ATTR_MODULE is None:
+        # Import paresseux : `free/__init__` importe le pool/rotation, qui ne
+        # doivent pas être chargés avant la fin de l'import d'opencode.
+        from free import host_attribution
+
+        _HOST_ATTR_MODULE = host_attribution
+    return _HOST_ATTR_MODULE
+
+
+def _reset_host_attribution() -> None:
+    _host_attribution_module().reset()
+
+
+def _note_host_attribution(server_host: str | None) -> None:
+    _host_attribution_module().note(server_host)
+
+
+def _host_attribution_snapshot() -> dict[str, float | int]:
+    return _host_attribution_module().snapshot()
+
+
+def _attribute_server_host(
+    server_host: str | None,
+    station,
+    free_model_ip: str | None,
+) -> str | None:
+    """Resolve the serving hostname from the most reliable available source.
+
+    Priority: explicit value (stream path) → manager ``_current_host`` →
+    last measured quality for the same ``(station, egress)``.  Attribution
+    must never fall back to the API entry IP: it is not the egress.
+    """
+
+    if server_host:
+        return str(server_host)
+    if not station:
+        return None
+    try:
+        sid = int(getattr(station, "_station", station) or 0)
+    except Exception:
+        sid = 0
+    if sid <= 0:
+        return None
+    try:
+        for manager in getattr(_free_ip_pool, "_stations", None) or []:
+            if int(getattr(manager, "_station", -1)) != sid:
+                continue
+            host = (
+                getattr(manager, "_current_host", None)
+                or getattr(manager, "current_host", None)
+                or None
+            )
+            if host:
+                return str(host)
+    except Exception:
+        pass
+    if free_model_ip:
+        try:
+            from free.quality import get_quality_registry
+
+            item = get_quality_registry()._items.get((sid, str(free_model_ip)))
+            if item is not None and item.server_host:
+                return str(item.server_host)
+        except Exception:
+            pass
+    return None
+
+
 async def _save_request(
     req_id,
     model,
@@ -1126,6 +1211,7 @@ async def _save_request(
     ttfb_ms=None,
     stop_reason=None,
     aborted=False,
+    server_host=None,
 ):
     # [D1 perf] plus de sérialisation inline : tools_json / truncate / redact
     # sont exécutés dans le thread writer (_materialize_db_row). Estimation
@@ -1166,7 +1252,12 @@ async def _save_request(
                 station = int(getattr(_pool_st, "_station", 0) or 0) or None
         except Exception:
             pass
-    # [30] UTC everywhere — Z suffix
+    # [présélection IP] Hostname du serveur qui a réellement servi : explicite
+    # (stream), manager, ou dernière qualité mesurée pour (station, egress).
+    server_host = _attribute_server_host(server_host, station, free_model_ip)
+    if free_model_ip and station:
+        _note_host_attribution(server_host)
+    # [30] UTC everywhere - Z suffix
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     timestamp = _normalize_timestamp_utc(timestamp)
     # Geo direct extra — pull from ContextVar set by _enforce_geo_gate
@@ -1249,6 +1340,7 @@ async def _save_request(
         ttfb_ms,
         stop_reason,
         1 if aborted else 0,
+        server_host,
     )
     item = _DbRowRaw(
         head,
@@ -6119,7 +6211,14 @@ def _official_project_id() -> str:
 
     def _git(*args: str) -> str:
         try:
-            r = _sp.run(["git", *args], capture_output=True, text=True, timeout=5, check=False)
+            r = _sp.run(
+                ["git", *args],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                creationflags=0x08000000 if os.name == "nt" else 0,
+            )
             return r.stdout.strip() if r.returncode == 0 else ""
         except Exception:
             return ""
@@ -16081,6 +16180,7 @@ async def _save_and_log_request(
     stop_reason=None,
     aborted=False,
     station_override=None,
+    server_host=None,
 ):
     """Log success and save to DB (success=False si tour agent vide suspect)."""
     # [suspect_tiny_output P0] Un tour « énorme input + micro output + aucun
@@ -16153,6 +16253,7 @@ async def _save_and_log_request(
             stop_reason=stop_reason,
             aborted=aborted,
             station=station_override,
+            server_host=server_host,
         )
     except Exception as e:
         _debug(f"  ✗ save_request failed: {type(e).__name__}: {e}")
@@ -19823,6 +19924,10 @@ async def messages(request: Request):
                     aborted=_stream_truncated,
                     free_model_ip=_free_done_ip or None,
                     station_override=getattr(_free_done_station, "_station", None),
+                    server_host=(
+                        getattr(_free_done_station, "_current_host", None)
+                        or getattr(_free_done_station, "current_host", None)
+                    ),
                 )
 
         # For streaming: if free model exists, pass empty headers (free models don't need auth)

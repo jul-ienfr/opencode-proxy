@@ -89,7 +89,7 @@ def generate_profile(
         base_project=project_base,
         forced_client=client,
         forced_version=version,
-        generation=max(1, int(generation or 1)),
+        generation=max(0, int(generation or 0)),
         persist=False,
     )
     headers = ident.official_provider_headers(endpoint, None)

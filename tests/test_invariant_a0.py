@@ -464,6 +464,46 @@ class _FakeStreamResp:
         pass
 
 
+class _FakeCurlPostResp(_FakeStreamResp):
+    pass
+
+
+class _FakeCurlSess:
+    """curl_cffi session double used by the direct free path."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _FakeCurlPostResp()
+
+
+class _FakeCurlPool:
+    async def checkin(self, slot):
+        pass
+
+
+class _FakeCurlSlot:
+    def __init__(self, sess):
+        self.sess = sess
+
+
+def _install_direct_curl(monkeypatch):
+    """Route the direct free path to an offline curl_cffi session double."""
+    sess = _FakeCurlSess()
+
+    async def _fake_get(*args, **kwargs):
+        return _FakeCurlPool(), _FakeCurlSlot(sess)
+
+    async def _fake_ip():
+        return "1.2.3.4"
+
+    monkeypatch.setattr(oc, "_get_pooled_curl_session", _fake_get)
+    monkeypatch.setattr(oc, "_free_direct_egress_ip", _fake_ip)
+    return sess
+
+
 class _FakeCurlSession:
     """curl_cffi AsyncSession double: records constructor kwargs, posts offline.
 
@@ -488,8 +528,8 @@ class _FakeCurlSession:
 class _FakeHttpxClient:
     """httpx.AsyncClient double: records stream() calls, yields offline.
 
-    `calls` is a per-instance list of (method, url, kwargs) — the direct
-    fallback branch's `_client.stream(...)` is captured there.
+    Kept for the paid-path tests in this module; the free direct path now
+    goes through curl_cffi (``_install_direct_curl``).
     """
 
     def __init__(self):
@@ -513,6 +553,9 @@ async def test_open_free_stream_count_false_reuses_stored_station(free_env, monk
     pool = _StubPoolNeverCount()
     pool.active_station = _StubIdentityMgr({"impersonate": "edge101", "user_agent": None, "extra_headers": {}})
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    # This test describes the TUNNEL retry path; without a manager the helper
+    # reports "direct" and the retry would never enter it.
+    monkeypatch.setattr(oc, "_free_proxy_mode", lambda: "vpn")
     # The stored station is an int sentinel here; the real helper would
     # dereference .current_ip on it — stub it (the IP is already in the
     # ContextVar, the retry must not touch live state anyway).
@@ -558,14 +601,19 @@ async def test_open_free_stream_count_false_reuses_stored_station(free_env, monk
     # via default_headers=False) + ja3/sigalgs/H1 du client
     # (cf. test_official_client_parity.py).
     assert sess.get("impersonate") == "chrome131", sess
-    assert sess.get("ja3") == oc._OPENCODE_JA3
-    assert sess.get("extra_fp") == {
-        "tls_signature_algorithms": list(oc._OPENCODE_SIG_ALGS),
-        "tls_grease": False,
-        # [ordre exact] header_order place Connection en 8e position comme
-        # le client (libcurl la mettrait en dernier). Cf. sonde AK.
-        "header_order": oc._OPENCODE_HEADER_ORDER,
-    }
+    # The vault now rotates the full official pool (1.18.31/1.19.0/1.19.3/
+    # 1.19.5): accept either measured Bun family, never a browser preset.
+    assert sess.get("ja3") in (oc._OPENCODE_JA3, oc._OPENCODE_JA3_1195)
+    extra = sess.get("extra_fp") or {}
+    assert extra.get("tls_signature_algorithms") in (
+        list(oc._OPENCODE_SIG_ALGS),
+        list(oc._OPENCODE_SIG_ALGS_1195),
+    )
+    assert extra.get("tls_grease") is False
+    assert extra.get("header_order") in (
+        oc._OPENCODE_HEADER_ORDER,
+        oc._OPENCODE_HEADER_ORDER_119,
+    )
     assert sess.get("http_version") == "v1"
     assert sess.get("default_headers") is False
     assert sess["proxy"] == "socks5h://127.0.0.1:1080"
@@ -577,9 +625,8 @@ async def test_open_free_stream_count_false_empty_attempt_direct_fallback(free_e
     fallback: still no on_request(), and the ContextVar is re-set with
     station None so the next retry also goes direct."""
     _StubPoolNeverCount.calls = 0
-    fake_client = _FakeHttpxClient()
+    fake_sess = _install_direct_curl(monkeypatch)
     monkeypatch.setattr(oc, "_free_ip_pool", _StubPoolNeverCount())
-    monkeypatch.setattr(oc, "_client", fake_client)
     # [2026-10-25] Ce test décrit le repli DIRECT : il doit donc forcer
     # proxy_mode=direct. Sans cela, il passait seul mais échouait dans la
     # suite dès qu'un autre test avait initialisé un VPN manager (proxy_mode
@@ -600,9 +647,8 @@ async def test_open_free_stream_count_false_empty_attempt_direct_fallback(free_e
         oc._current_free_attempt.set({})
 
     assert _StubPoolNeverCount.calls == 0
-    assert len(fake_client.calls) == 1
-    method, url, kwargs = fake_client.calls[0]
-    assert method == "POST"
+    assert len(fake_sess.calls) == 1
+    url, kwargs = fake_sess.calls[0]
     assert url == oc.API_BASE_FREE
     # [gate 2026-09-17] Direct path stamped the official identity (invariant A.0)
     # [2026-10-25] L'UA dépend de l'identité par IP (vault) : 1.18.31 et 1.19.3
@@ -635,6 +681,8 @@ async def test_open_free_stream_fresh_station_switches_station(free_env, monkeyp
     pool = _StubPoolDisconnectRetry()
     pool.active_station = None
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    # disconnect-retry is a VPN-leg behaviour; force it (no live manager).
+    monkeypatch.setattr(oc, "_free_proxy_mode", lambda: "vpn")
     monkeypatch.setattr(oc, "_free_usage_ip", lambda station=None: "9.9.9.9")
     monkeypatch.setattr("curl_cffi.requests.AsyncSession", _FakeCurlSession)
 
@@ -686,12 +734,12 @@ async def test_open_free_stream_fresh_station_direct_fallback_preserves_station(
     re-striking it."""
     _StubPoolDisconnectRetry.calls_to_request = 0
     _StubPoolDisconnectRetry.calls_to_disconnect = []
-    fake_client = _FakeHttpxClient()
+    fake_sess = _install_direct_curl(monkeypatch)
 
     pool = _StubPoolDisconnectRetry()
     pool._return_disconnect = (None, None)  # no station usable right now
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
-    monkeypatch.setattr(oc, "_client", fake_client)
+    monkeypatch.setattr(oc, "_free_proxy_mode", lambda: "vpn")
 
     oc._current_free_attempt.set(
         {"proxy_url": "socks5://127.0.0.1:1080", "station": 1, "identity": "", "ip": "9.9.9.9"}
@@ -714,7 +762,7 @@ async def test_open_free_stream_fresh_station_direct_fallback_preserves_station(
 
     assert _StubPoolDisconnectRetry.calls_to_request == 0
     assert _StubPoolDisconnectRetry.calls_to_disconnect == [1]
-    assert len(fake_client.calls) == 1  # direct httpx fallback ran
+    assert len(fake_sess.calls) == 1  # direct curl_cffi fallback ran
     # The failed station is preserved, not wiped: the next retry can still
     # switch away from it (on_disconnect_retry(excluded=1)).
     assert attempt.get("station") == 1

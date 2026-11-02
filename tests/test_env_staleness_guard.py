@@ -121,6 +121,40 @@ class TestComposeEnv:
         env = m._compose_env(stations=[1, 2, 3])
         assert {env[f"VPN_TYPE_STATION{s}"] for s in (1, 2, 3)} == {"wireguard"}
 
+    def test_env_pin_overrides_a_stale_parent_value(self, tmp_path, monkeypatch):
+        """The allocator writes the winner pin in .env; a manager recreate must
+        not silently fall back to the boot-time parent env (different NAT IP)."""
+        _compose(tmp_path, monkeypatch)
+        (tmp_path / ".env").write_text(
+            "SERVER_HOSTNAMES_STATION3=al116.nordvpn.com\n"
+            "SERVER_COUNTRIES_STATION3=Albania\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SERVER_HOSTNAMES_STATION3", "old.nordvpn.com")
+        monkeypatch.setenv("SERVER_COUNTRIES_STATION3", "Germany")
+        cfg, _ = _cfg_with(tmp_path)
+        m = _EnvRecFake(cfg, station=3, tmp_path=tmp_path)
+
+        env = m._compose_env()
+
+        assert env["SERVER_HOSTNAMES_STATION3"] == "al116.nordvpn.com"
+        assert env["SERVER_COUNTRIES_STATION3"] == "Albania"
+        assert m._pinned_hostname == "al116.nordvpn.com"
+
+    def test_empty_env_pin_clears_a_stale_parent_value(self, tmp_path, monkeypatch):
+        _compose(tmp_path, monkeypatch)
+        (tmp_path / ".env").write_text(
+            "SERVER_HOSTNAMES_STATION3=\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("SERVER_HOSTNAMES_STATION3", "old.nordvpn.com")
+        cfg, _ = _cfg_with(tmp_path)
+        m = _EnvRecFake(cfg, station=3, tmp_path=tmp_path)
+
+        env = m._compose_env()
+
+        assert env["SERVER_HOSTNAMES_STATION3"] == ""
+        assert m._pinned_hostname is None
+
     def test_explicit_stack_override_wins(self, tmp_path):
         """During a flip, _apply_stack passes the TARGET stack — the child
         must recreate in the requested mode even if the parent env / the

@@ -1,0 +1,411 @@
+/* =====================================================================
+   Design tokens — source unique de vérité pour l'ensemble du dashboard.
+
+   Règle : AUCUNE couleur, espacement, rayon ou ombre écrit en dur dans
+   un composant. Tout passe par une variable ici. C'est ce qui remplace la
+   feuille `static/styles.css` (1 141 lignes) et ses ~103 usages de
+   variables jamais définies (`--text-muted`, `--warning`, ...).
+
+   Les anciennes variables non définies sont désormais DÉFINIES :
+     --bg-primary    -> --bg
+     --bg-secondary  -> --surface-2
+     --bg-tertiary   -> --surface-3
+     --text-muted    -> --text-dim
+     --warning       -> --warn
+     --error         -> --danger
+     --primary       -> --accent
+   ===================================================================== */
+
+:root {
+  /* --- Surfaces -------------------------------------------------- */
+  --bg: #12151f;
+  --surface: #1a1e2b;
+  --surface-2: #212636;
+  --surface-3: #2a3042;
+  --surface-inset: #0d1017;
+
+  /* --- Texte ----------------------------------------------------- */
+  --text: #e6e9f0;
+  --text-dim: #9aa3b5;
+  --text-faint: #6b7488;
+  --text-heading: #f2f4f8;
+
+  /* --- Bordures -------------------------------------------------- */
+  --border: #2c3244;
+  --border-strong: #3a4258;
+
+  /* --- Accent / états -------------------------------------------- */
+  --accent: #4fc3f7;
+  --accent-hover: #6fd0fa;
+  --accent-contrast: #04121c;
+  --danger: #ef5350;
+  --danger-hover: #f16a67;
+  --danger-bg: rgba(239, 83, 80, 0.12);
+  --warn: #ffb74d;
+  --warn-bg: rgba(255, 183, 77, 0.12);
+  --success: #66bb6a;
+  --success-bg: rgba(102, 187, 106, 0.12);
+  --info: #4fc3f7;
+  --info-bg: rgba(79, 195, 247, 0.12);
+
+  /* --- Palette graphiques ---------------------------------------- */
+  --chart-1: #4fc3f7;
+  --chart-2: #ff8a65;
+  --chart-3: #81c784;
+  --chart-4: #ba68c8;
+  --chart-5: #ffd54f;
+  --chart-6: #f06292;
+  --chart-7: #4dd0e1;
+  --chart-8: #aed581;
+
+  /* --- Ombres / overlay ------------------------------------------ */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --overlay: rgba(0, 0, 0, 0.6);
+
+  /* --- Espacement (échelle 4px) ---------------------------------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  /* --- Rayons ---------------------------------------------------- */
+  --radius-sm: 4px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --radius-full: 999px;
+
+  /* --- Typographie ----------------------------------------------- */
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica,
+    Arial, sans-serif;
+  --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-base: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 24px;
+
+  /* --- z-index --------------------------------------------------- */
+  --z-sticky: 10;
+  --z-dropdown: 50;
+  --z-modal: 100;
+  --z-toast: 200;
+
+  color-scheme: dark;
+}
+
+/* --- Thème clair : seules les couleurs changent ------------------- */
+:root[data-theme='light'] {
+  --bg: #f4f6fa;
+  --surface: #ffffff;
+  --surface-2: #f7f9fc;
+  --surface-3: #eceff5;
+  --surface-inset: #eef1f6;
+
+  --text: #1c2430;
+  --text-dim: #5a6472;
+  --text-faint: #838d9c;
+  --text-heading: #10161f;
+
+  --border: #dde3ec;
+  --border-strong: #c7d0dd;
+
+  --accent: #0a7bc4;
+  --accent-hover: #0a68a6;
+  --accent-contrast: #ffffff;
+  --danger: #cf3b38;
+  --danger-hover: #b63230;
+  --danger-bg: rgba(207, 59, 56, 0.1);
+  --warn: #b5730a;
+  --warn-bg: rgba(181, 115, 10, 0.12);
+  --success: #22883b;
+  --success-bg: rgba(34, 136, 59, 0.12);
+  --info: #0a7bc4;
+  --info-bg: rgba(10, 123, 196, 0.1);
+
+  --chart-1: #0a7bc4;
+  --chart-2: #d9642f;
+  --chart-3: #2f9e44;
+  --chart-4: #8e44ad;
+  --chart-5: #c08a00;
+  --chart-6: #d6336c;
+  --chart-7: #12a5b8;
+  --chart-8: #6a9b00;
+
+  --shadow-sm: 0 1px 2px rgba(16, 22, 31, 0.06);
+  --shadow-md: 0 4px 12px rgba(16, 22, 31, 0.1);
+  --shadow-lg: 0 12px 32px rgba(16, 22, 31, 0.16);
+  --overlay: rgba(16, 22, 31, 0.4);
+
+  color-scheme: light;
+}
+
+/* =====================================================================
+   Base
+   ===================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  font-family: var(--font);
+  font-size: var(--fs-base);
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  color: var(--text-heading);
+  font-weight: 600;
+}
+
+h1 {
+  font-size: var(--fs-2xl);
+}
+h2 {
+  font-size: var(--fs-xl);
+}
+h3 {
+  font-size: var(--fs-lg);
+}
+h4 {
+  font-size: var(--fs-base);
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--font-mono);
+}
+
+hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: var(--sp-4) 0;
+}
+
+/* Accessibilité : anneau de focus visible et cohérent partout. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Respect de la préférence système de mouvement réduit. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Utilitaires partagés (limités — la logique visuelle vit dans les tokens) */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* =====================================================================
+   Contrôles partagés (boutons, champs, badges, tableaux).
+
+   Posés en global volontairement : un seul endroit pour l'apparence d'un
+   bouton ou d'un champ. Chaque composant n'apporte que sa mise en page
+   (styles scopés), jamais l'apparence des contrôles eux-mêmes.
+   ===================================================================== */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: 7px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-md);
+  font-weight: 500;
+  line-height: 1.3;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--surface-3);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+}
+.btn--primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.btn--danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+.btn--danger:hover:not(:disabled) {
+  background: var(--danger-hover);
+}
+
+.btn--ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-dim);
+}
+.btn--ghost:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.btn--sm {
+  padding: 4px 9px;
+  font-size: var(--fs-sm);
+}
+
+.btn--icon {
+  padding: 6px;
+  width: 30px;
+  height: 30px;
+}
+
+/* --- Champs de saisie ---------------------------------------------- */
+
+.input,
+.select {
+  padding: 7px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-inset);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-md);
+  min-width: 0;
+  width: 100%;
+}
+
+.input:focus,
+.select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.input::placeholder {
+  color: var(--text-faint);
+}
+
+.input:disabled,
+.select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.input--inline {
+  width: auto;
+}
+
+.select {
+  cursor: pointer;
+}
+
+/* Squelettes pour chargement (remplace les lignes « Loading… ») */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--surface-2) 25%,
+    var(--surface-3) 37%,
+    var(--surface-2) 63%
+  );
+  background-size: 400% 100%;
+  animation: skeleton 1.3s ease infinite;
+  border-radius: var(--radius-sm);
+  height: 1em;
+}
+
+@keyframes skeleton {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+
+/* Pied de page : horodatage de la dernière donnée reçue + suppression de
+   l'historique (fonctionnalité de l'ancienne interface, reprise à l'identique). */
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  padding: var(--sp-3) var(--sp-6);
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}
+
+.footer-time {
+  font-variant-numeric: tabular-nums;
+}

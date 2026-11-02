@@ -1,8 +1,10 @@
 """Sonde active légère par station — alimente `free.quality`.
 
 Contrat : un GET statique via le SOCKS5 de la station, jamais l'endpoint
-d'inférence, donc zéro quota. La sonde ne décide pas de la santé du tunnel :
-elle fournit une mesure de latence et un signal de vivacité.
+d'inférence, donc zéro quota. Le GET utilise le replay TLS/headers officiel
+(1.19.5) pour ne pas être refusé sur la seule signature réseau. La sonde ne
+décide pas de la santé du tunnel : elle fournit une mesure de latence et un
+signal de vivacité.
 """
 
 from __future__ import annotations
@@ -40,19 +42,45 @@ async def probe_station(station: Any, *, url: str | None = None, timeout: float 
     if not proxy:
         return {"ok": False, "ms": None, "station": sid, "ip": ip, "error": "no_proxy"}
     started = time.perf_counter()
-    try:
-        import httpx
 
-        async with httpx.AsyncClient(timeout=max(1.0, float(timeout)), proxy=proxy) as client:
-            resp = await asyncio.wait_for(client.get(target), timeout=max(1.0, float(timeout)))
+    def _get() -> Any:
+        from curl_cffi import requests as curl_requests
+
+        proxy_url = str(proxy)
+        if proxy_url.startswith("socks5://"):
+            proxy_url = "socks5h://" + proxy_url[len("socks5://") :]
+        kwargs: dict[str, Any] = {
+            "proxies": {"http": proxy_url, "https": proxy_url},
+            "timeout": max(1.0, float(timeout)),
+        }
+        # Same Bun/TLS replay as the inference leg: a plain httpx GET is
+        # fingerprinted and can fail for the wrong reason. The static
+        # robots.txt target keeps this probe at zero inference quota.
+        try:
+            import opencode as oc
+
+            impersonate, fp = oc._get_free_fp_kwargs("1.19.5")
+            if impersonate:
+                kwargs["impersonate"] = impersonate
+            if fp:
+                kwargs.update(fp)
+        except Exception:
+            pass
+        return curl_requests.get(target, **kwargs)
+
+    try:
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(_get), timeout=max(1.0, float(timeout))
+        )
         ms = (time.perf_counter() - started) * 1000.0
-        ok = 200 <= int(getattr(resp, "status_code", 0)) < 400
+        status = int(getattr(resp, "status_code", 0) or 0)
+        ok = 200 <= status < 400
         return {
             "ok": ok,
             "ms": round(ms, 1),
             "station": sid,
             "ip": ip,
-            "error": None if ok else f"http_{getattr(resp, 'status_code', '?')}",
+            "error": None if ok else f"http_{status or '?'}",
         }
     except Exception as e:
         return {

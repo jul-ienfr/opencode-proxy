@@ -14,9 +14,12 @@ tokens de sortie, tok/s, quarantaine slow lane).
 from __future__ import annotations
 
 import math
+import sqlite3
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from datetime import UTC
+from datetime import datetime as _dt
 from typing import Any
 
 _MAX_ENTRIES = 300
@@ -30,6 +33,13 @@ def _yaml_get(section: str, key: str, default: Any = None) -> Any:
         return yaml_get(section, key, default)
     except Exception:
         return default
+
+
+def _parse_request_timestamp(value: Any) -> float:
+    try:
+        return _dt.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
 
 
 @dataclass
@@ -377,6 +387,99 @@ class QualityRegistry:
     def __init__(self, cfg: QualityConfig | None = None) -> None:
         self.cfg = cfg or QualityConfig.from_yaml()
         self._items: OrderedDict[tuple[int, str], IpQuality] = OrderedDict()
+
+    def rebuild_from_requests(
+        self,
+        db_path: str,
+        *,
+        hours: int = 168,
+    ) -> int:
+        """Recharger la qualité hostname depuis l'historique SQLite.
+
+        Sans ce rebuild, chaque redémarrage repart à froid : la présélection
+        retombe sur le `load` API pendant des heures alors que la base contient
+        déjà des milliers de mesures. Seules les lignes avec ``server_host``
+        sont utilisées — l'IP d'entrée de l'API ne permet pas l'attribution.
+        """
+
+        since = _dt.now(UTC).timestamp() - max(1, int(hours)) * 3600.0
+        cutoff = _dt.fromtimestamp(since, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+            con.row_factory = sqlite3.Row
+        except Exception:
+            return 0
+        try:
+            columns = {str(row["name"]) for row in con.execute("PRAGMA table_info(requests)")}
+            if "server_host" not in columns or "free_model_ip" not in columns:
+                return 0
+            rows = con.execute(
+                """
+                SELECT station AS sid,
+                       free_model_ip AS ip,
+                       server_host,
+                       COUNT(*) AS n,
+                       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS ok,
+                       SUM(CASE WHEN success = 1 AND tokens_output > 0
+                                 AND duration_ms > 0 THEN 1 ELSE 0 END) AS tps_n,
+                       AVG(CASE WHEN success = 1 AND tokens_output > 0
+                                 AND duration_ms > 0
+                                THEN tokens_output * 1000.0 / duration_ms END) AS tps,
+                       SUM(CASE WHEN success = 1 AND ttfb_ms IS NOT NULL
+                                THEN 1 ELSE 0 END) AS ttfb_n,
+                       AVG(CASE WHEN success = 1 AND ttfb_ms IS NOT NULL
+                                THEN ttfb_ms END) AS ttfb,
+                       AVG(CASE WHEN success = 1 AND duration_ms > 0
+                                THEN duration_ms END) AS dur,
+                       MAX(timestamp) AS last
+                FROM requests
+                WHERE timestamp >= ?
+                  AND station IS NOT NULL
+                  AND free_model_ip IS NOT NULL AND free_model_ip != ''
+                  AND server_host IS NOT NULL AND server_host != ''
+                GROUP BY station, free_model_ip, server_host
+                ORDER BY last ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+        except Exception:
+            return 0
+        finally:
+            con.close()
+
+        rebuilt: OrderedDict[tuple[int, str], IpQuality] = OrderedDict()
+        for row in rows:
+            try:
+                sid = int(row["sid"])
+                ip = str(row["ip"] or "").strip()
+                host = str(row["server_host"] or "").strip()
+            except Exception:
+                continue
+            if sid <= 0 or not ip or not host:
+                continue
+            item = IpQuality(sid=sid, ip=ip, server_host=host)
+            item.success = int(row["ok"] or 0)
+            item.errors = max(0, int(row["n"] or 0) - item.success)
+            item.tps_n = int(row["tps_n"] or 0)
+            item.tps_ewma = (
+                float(row["tps"]) if row["tps"] is not None and item.tps_n > 0 else None
+            )
+            item.ttfb_n = int(row["ttfb_n"] or 0)
+            item.ewma_ms = (
+                float(row["ttfb"])
+                if row["ttfb"] is not None and item.ttfb_n > 0
+                else None
+            )
+            item.total_ewma_ms = (
+                float(row["dur"]) if row["dur"] is not None else None
+            )
+            item.last_ok_at = _parse_request_timestamp(row["last"])
+            rebuilt[(sid, ip)] = item
+
+        while len(rebuilt) > _MAX_ENTRIES:
+            rebuilt.popitem(last=False)
+        self._items = rebuilt
+        return len(rebuilt)
 
     def get(self, sid: int, ip: str) -> IpQuality:
         key = (int(sid), str(ip or "unknown"))

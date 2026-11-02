@@ -62,6 +62,12 @@
   interface Socks5State {
     proxies?: Socks5Proxy[];
     rotate?: boolean;
+    fallback?: boolean;
+  }
+
+  interface HttpsProxyState {
+    proxies?: Socks5Proxy[];
+    enabled?: boolean;
   }
 
   interface HunterStatus {
@@ -99,6 +105,12 @@
     initial: {}
   });
 
+  const httpsQ = createQuery<HttpsProxyState>({
+    load: (signal) => apiGet<HttpsProxyState>('/api/vpn/https-proxies', signal),
+    tags: () => ['vpn'],
+    initial: {}
+  });
+
   const countriesQ = createQuery<{ countries?: Country[] }>({
     load: (signal) => apiGet<{ countries?: Country[] }>('/api/vpn/countries', signal),
     tags: () => ['vpn'],
@@ -114,6 +126,7 @@
 
   const cfg = $derived(cfgQ.data);
   const proxies = $derived(socksQ.data?.proxies ?? []);
+  const httpsProxies = $derived(httpsQ.data?.proxies ?? []);
   const hunter = $derived(hunterQ.data ?? {});
 
   onMount(() => {
@@ -139,6 +152,12 @@
   let port = $state(1080);
   let username = $state('');
   let password = $state('');
+
+  // Formulaire HTTPS CONNECT (NordVPN :89)
+  let httpsHost = $state('');
+  let httpsPort = $state(89);
+  let httpsUser = $state('');
+  let httpsPass = $state('');
 
   async function run(field: string, fn: () => Promise<unknown>): Promise<ToolResult | null> {
     if (busy) return null;
@@ -241,6 +260,13 @@
     });
   }
 
+  function setSocksFallback(value: boolean): void {
+    void run('socks-fallback', async () => {
+      await apiPost('/api/vpn/socks5/fallback', { enabled: value });
+      await socksQ.refresh(true);
+    });
+  }
+
   function addProxy(): void {
     void run('add-proxy', async () => {
       if (!host) {
@@ -276,6 +302,73 @@
       const res = await apiPost<{ error?: string }>('/api/vpn/socks5/toggle', { index, enabled });
       if (res?.error) throw new Error(res.error);
       await socksQ.refresh(true);
+      return res;
+    });
+  }
+
+  function setHttpsFallback(value: boolean): void {
+    void run('https-fallback', async () => {
+      await apiPost('/api/vpn/https-proxies/fallback', { enabled: value });
+      await httpsQ.refresh(true);
+    });
+  }
+
+  function addHttpsProxy(): void {
+    void run('add-https', async () => {
+      if (!httpsHost) {
+        showToast(t('free_models.socks5_host'), 'warning');
+        return null;
+      }
+      const res = await apiPost<{ error?: string }>('/api/vpn/https-proxies', {
+        host: httpsHost,
+        port: Number(httpsPort) || 89,
+        username: httpsUser || null,
+        password: httpsPass || null
+      });
+      if (res?.error) throw new Error(res.error);
+      httpsHost = '';
+      httpsUser = '';
+      httpsPass = '';
+      await httpsQ.refresh(true);
+      return res;
+    });
+  }
+
+  function removeHttpsProxy(index: number): void {
+    void run('remove-https', async () => {
+      const res = await apiPost<{ error?: string }>('/api/vpn/https-proxies/remove', { index });
+      if (res?.error) throw new Error(res.error);
+      await httpsQ.refresh(true);
+      return res;
+    });
+  }
+
+  function toggleHttpsProxy(index: number, enabled: boolean): void {
+    void run('toggle-https', async () => {
+      const res = await apiPost<{ error?: string }>('/api/vpn/https-proxies/toggle', {
+        index,
+        enabled
+      });
+      if (res?.error) throw new Error(res.error);
+      await httpsQ.refresh(true);
+      return res;
+    });
+  }
+
+  function testHttpsProxy(index: number, p: Socks5Proxy): void {
+    void run('test-https', async () => {
+      const key = `https://${p.host}:${p.port}`;
+      testResults = { ...testResults, [key]: '?' };
+      const res = await apiPost<{ ok?: boolean; ip?: string; latency_ms?: number; error?: string }>(
+        '/api/vpn/https-proxies/test',
+        { host: p.host, port: p.port }
+      );
+      testResults = {
+        ...testResults,
+        [key]: res.error
+          ? t('vpn.test_fail', { err: res.error })
+          : t('vpn.test_ok', { ip: res.ip ?? '?', ms: res.latency_ms ?? 0 })
+      };
       return res;
     });
   }
@@ -640,6 +733,77 @@
   </div>
 </Card>
 
+<Card title={t('free_models.https_title')} hint={t('free_models.https_hint')}>
+  <div class="row">
+    <Toggle
+      checked={httpsQ.data?.enabled === true}
+      label={t('free_models.https_fallback')}
+      disabled={busy === 'https-fallback'}
+      onchange={setHttpsFallback}
+    />
+  </div>
+
+  <div class="proxy-list">
+    {#if httpsProxies.length === 0}
+      <p class="muted small">{t('vpn.no_https_proxies')}</p>
+    {:else}
+      {#each httpsProxies as p, i (i)}
+        <div class="proxy" class:off={!p.enabled}>
+          <span class="mono proxy-addr">{p.host}:{p.port}</span>
+          <span class="muted small">{p.enabled ? t('vpn.on') : t('vpn.off')}</span>
+          {#if testResults[`https://${p.host}:${p.port}`]}
+            <span class="muted small">{testResults[`https://${p.host}:${p.port}`]}</span>
+          {/if}
+          <div class="proxy-actions">
+            <input
+              type="checkbox"
+              checked={!!p.enabled}
+              aria-label={t('vpn.proxy_enabled')}
+              onchange={(e) => toggleHttpsProxy(i, e.currentTarget.checked)}
+            />
+            <button
+              class="btn btn--sm"
+              disabled={busy === 'test-https'}
+              onclick={() => testHttpsProxy(i, p)}
+            >
+              {t('vpn.test')}
+            </button>
+            <button
+              class="btn btn--danger btn--sm"
+              disabled={busy === 'remove-https'}
+              onclick={() => removeHttpsProxy(i)}
+            >
+              {t('vpn.remove')}
+            </button>
+          </div>
+        </div>
+      {/each}
+    {/if}
+  </div>
+
+  <div class="add-form">
+    <label class="field-inline">
+      <span class="label">{t('free_models.socks5_host')}</span>
+      <input class="input input--host" type="text" placeholder="uk765.nordvpn.com" bind:value={httpsHost} />
+    </label>
+    <label class="field-inline">
+      <span class="label">{t('free_models.socks5_port')}</span>
+      <input class="input input--port" type="number" placeholder="89" bind:value={httpsPort} />
+    </label>
+    <label class="field-inline">
+      <span class="label">{t('free_models.socks5_user')}</span>
+      <input class="input input--opt" type="text" bind:value={httpsUser} />
+    </label>
+    <label class="field-inline">
+      <span class="label">{t('free_models.socks5_pass')}</span>
+      <input class="input input--opt" type="password" bind:value={httpsPass} />
+    </label>
+    <button class="btn btn--primary" disabled={busy === 'add-https'} onclick={addHttpsProxy}>
+      {t('free_models.https_add')}
+    </button>
+  </div>
+</Card>
+
 <Card title={t('free_models.socks5_title')} hint={t('free_models.socks5_hint')}>
   <div class="row">
     <Toggle
@@ -647,6 +811,12 @@
       label={t('free_models.socks5_rotation')}
       disabled={busy === 'rotate'}
       onchange={setRotate}
+    />
+    <Toggle
+      checked={socksQ.data?.fallback === true}
+      label={t('free_models.socks5_fallback')}
+      disabled={busy === 'socks-fallback'}
+      onchange={setSocksFallback}
     />
   </div>
 

@@ -433,6 +433,7 @@ class TestForcedPoolRotation:
         station = MagicMock()
         station._station = 1
         station._current_country = "Germany"
+        station._pinned_hostname = None
 
         # forced_pool: 3 countries, NO Estonia
         fp = {"Germany", "France", "United States"}

@@ -44,7 +44,7 @@ class _StubStation:
         proxy_mode="vpn",
         status="connected",
         quota_per_ip=15,
-        ip="1.1.1.1",
+        ip=None,
         server_name="se-1",
     ):
         self._station = sid
@@ -52,7 +52,9 @@ class _StubStation:
         self.proxy_mode = proxy_mode
         self.status = status
         self._quota_per_ip = quota_per_ip
-        self.current_ip = ip
+        # Distinct egress per station: the pool's distinct-IP invariant
+        # refuses two stations sharing one IP (the higher sid yields).
+        self.current_ip = ip or f"10.0.0.{sid}"
         self.current_server = {"name": server_name}
         self.socks5_url = f"socks5://127.0.0.1:1{sid}080"
         self._last_rotation_error = None

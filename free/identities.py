@@ -134,7 +134,6 @@ VERSION_SPECS: dict[str, dict] = {
     },
 }
 KNOWN_CLIENT_VERSIONS = tuple(VERSION_SPECS)
-_LEGACY_CLIENT_VERSIONS = ("1.18.31", "1.19.3")
 _BUN_SUFFIX = "runtime/bun/1.3.14"
 _BUN_BY_VERSION = {v: spec["bun"] for v, spec in VERSION_SPECS.items()}
 #: Ordre de rotation des installations (versions vérifiées, la plus récente
@@ -166,10 +165,14 @@ def _stable_int(*parts: str) -> int:
 
 
 def version_for(ip: str) -> str:
-    """Version OpenCode stable pour cette IP (pool historique mesuré)."""
+    """Version OpenCode stable pour cette IP (pool complet mesuré).
+
+    Le pool couvre 1.18.31, 1.19.0, 1.19.3 et 1.19.5 ; le choix reste
+    déterministe par IP pour qu'une installation garde son profil.
+    """
     if not ip:
-        return _LEGACY_CLIENT_VERSIONS[0]
-    return _LEGACY_CLIENT_VERSIONS[_stable_int("ver", ip) % len(_LEGACY_CLIENT_VERSIONS)]
+        return ROTATION_VERSIONS[0]
+    return ROTATION_VERSIONS[_stable_int("ver", ip) % len(ROTATION_VERSIONS)]
 
 
 def _version_for_gen(ip: str, generation: int) -> str:
@@ -179,8 +182,8 @@ def _version_for_gen(ip: str, generation: int) -> str:
     except Exception:
         g = 0
     if not ip:
-        return _LEGACY_CLIENT_VERSIONS[g % len(_LEGACY_CLIENT_VERSIONS)]
-    return _LEGACY_CLIENT_VERSIONS[(_stable_int("ver", ip) + g) % len(_LEGACY_CLIENT_VERSIONS)]
+        return ROTATION_VERSIONS[g % len(ROTATION_VERSIONS)]
+    return ROTATION_VERSIONS[(_stable_int("ver", ip) + g) % len(ROTATION_VERSIONS)]
 
 
 def client_name_for(ip: str, forced: str = "") -> str:

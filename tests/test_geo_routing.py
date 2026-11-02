@@ -542,6 +542,7 @@ class TestEstoniaNonRegression:
         station = MagicMock()
         station._station = 1
         station._current_country = "Germany"
+        station._pinned_hostname = None
 
         # forced_pool excludes Estonia
         fp = {"Germany", "France", "United States"}

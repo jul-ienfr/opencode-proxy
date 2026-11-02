@@ -213,14 +213,29 @@ class StationHealth:
             self.good_probes = 0
             self.bad_probes = 0
 
+    def _is_egress_park(self) -> bool:
+        """True when the park reason is a connectivity failure, not auth.
+
+        [fix 2026-11-01] The egress recovery deadline parks with
+        ``cause="deadline 240s"`` (repair policy) while ``last_error`` is
+        ``"egress"``. Testing only ``cause.startswith("egress")`` left a
+        proven-healthy station parked for 30 min. Auth parks stay
+        protected: an explicit auth/credential cause always wins.
+        """
+        cause = str(self.cause or "").lower()
+        if "auth" in cause or "credential" in cause:
+            return False
+        for value in (cause, str(self.last_error or "").lower()):
+            if "egress" in value or "deadline" in value:
+                return True
+        return False
+
     def clear_egress_park(self, now: float | None = None) -> bool:
         """Lève un park egress quand un vrai egress est revenu.
 
-        Un park auth/credentials n'est jamais levé par cette voie : seul un
-        ``cause`` commençant par ``egress`` est concerné.
+        Un park auth/credentials n'est jamais levé par cette voie.
         """
-        cause = str(self.cause or "")
-        if self.state != PARKED or not cause.startswith("egress"):
+        if self.state != PARKED or not self._is_egress_park():
             return False
         self.parked_until = 0.0
         self.next_retry_at = 0.0

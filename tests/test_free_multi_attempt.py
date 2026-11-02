@@ -44,7 +44,6 @@ no DB write (free-usage logging no-op'd).
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
 
 import pytest
 
@@ -95,10 +94,12 @@ def assert_no_paid_artifacts(label, headers, body=""):
     # seul singleton global (les fakes utilisent des IPs/Hash qui tombent
     # sur l'autre version).
     try:
-        from free.identities import KNOWN_CLIENT_VERSIONS as _KCV
+        from free.identities import VERSION_SPECS as _VS
 
-        _ok_uas = {f"opencode/{_v} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14" for _v in _KCV} | {
-            f"opencode/{_v} ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14" for _v in _KCV
+        _ok_uas = {
+            f"opencode/{_v} ai-sdk/provider-utils/{_ai} {_spec['bun']}"
+            for _v, _spec in _VS.items()
+            for _ai in ("4.0.23", "4.0.40")
         }
     except Exception:
         _ok_uas = set()
@@ -962,26 +963,11 @@ async def test_stream_tunnel_failure_raises_free_tunnel_failure(free_vpn_env, fr
     assert attempt.get("station") is a
 
 
-# ── (d') stream CM: direct_fallback=True → legacy direct httpx ─────────────
-class _FakeHttpxClient:
-    """httpx.AsyncClient double: records stream() calls, yields offline."""
-
-    def __init__(self):
-        self.calls = []
-
-    @asynccontextmanager
-    async def stream(self, method, url, **kwargs):
-        self.calls.append((method, url, kwargs))
-        yield _FakeStreamResp()
-
-    async def aclose(self):
-        pass
-
-
+# ── (d') stream CM: direct_fallback=True → direct curl_cffi fallback ───────
 @pytest.mark.asyncio
 async def test_stream_direct_mode_legacy_direct_fallback(free_vpn_env, free_cfg, monkeypatch):
     """direct mode (legacy stream): a tunnel exception falls through to the
-    direct httpx fallback — NO _FreeTunnelFailure. Invariant A.0 holds on
+    direct curl_cffi fallback — NO _FreeTunnelFailure. Invariant A.0 holds on
     the direct request, and the failed station is preserved in the
     ContextVar (a later disconnect retry can still switch away from it)."""
     monkeypatch.setitem(oc.IP_ROTATION, "enforce_vpn_only", False)
@@ -990,9 +976,37 @@ async def test_stream_direct_mode_legacy_direct_fallback(free_vpn_env, free_cfg,
     pool.active_station = a
     pool.proxy_url = a.socks5_url
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
-    monkeypatch.setattr("curl_cffi.requests.AsyncSession", _FakeCurlSessionRaise)
-    fake_client = _FakeHttpxClient()
-    monkeypatch.setattr(oc, "_client", fake_client)
+
+    class _RaisingSess:
+        async def post(self, *args, **kwargs):
+            raise RuntimeError("SOCKS5 tunnel dead")
+
+    class _OkSess:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return _FakeStreamResp()
+
+    class _FakePool:
+        async def checkin(self, slot):
+            pass
+
+    class _Slot:
+        def __init__(self, sess):
+            self.sess = sess
+
+    ok_sess = _OkSess()
+
+    async def _fake_get(proxy_url=None, *args, **kwargs):
+        return _FakePool(), _Slot(_RaisingSess() if proxy_url else ok_sess)
+
+    monkeypatch.setattr(oc, "_get_pooled_curl_session", _fake_get)
+    async def _fake_ip():
+        return "1.2.3.4"
+
+    monkeypatch.setattr(oc, "_free_direct_egress_ip", _fake_ip)
 
     body = {"model": FREE_MODEL, "messages": [{"role": "user", "content": "hello"}]}
     async with oc._open_free_stream(
@@ -1000,9 +1014,8 @@ async def test_stream_direct_mode_legacy_direct_fallback(free_vpn_env, free_cfg,
     ) as resp:
         assert resp.status_code == 200
 
-    assert len(fake_client.calls) == 1, "legacy direct httpx fallback ran"
-    method, url, kwargs = fake_client.calls[0]
-    assert method == "POST" and url == oc.API_BASE_FREE
+    assert len(ok_sess.calls) == 1, "legacy direct curl_cffi fallback ran"
+    _args, kwargs = ok_sess.calls[0]
     assert_no_paid_artifacts("stream direct fallback", kwargs["headers"])
     attempt = oc._current_free_attempt.get() or {}
     assert attempt.get("station") is a, "failed station preserved for exclusion"

@@ -89,6 +89,48 @@ if _fix_mkdir_0700_enumeration():
 
 
 @pytest.fixture(autouse=True)
+def _reset_free_runtime_globals():
+    """[P0.6] Aucun état free ne fuit d'un test à l'autre.
+
+    Les globals ``_vpn_manager``, ``_free_ip_pool`` et le ContextVar
+    ``_current_free_attempt`` sont modifiés par de nombreux tests ; sans reset,
+    le résultat dépend de l'ordre (incidents UA vaultée / préflight direct).
+    On ne touche qu'aux modules déjà importés : les tests de lazy import
+    restent valides.
+    """
+
+    import sys
+
+    module = sys.modules.get("opencode")
+
+    def _reset() -> None:
+        if module is None:
+            return
+        for name, value in (
+            ("_vpn_manager", None),
+            ("_free_ip_pool", None),
+        ):
+            try:
+                setattr(module, name, value)
+            except Exception:
+                pass
+        try:
+            module._current_free_attempt.set({})
+        except Exception:
+            pass
+
+    _reset()
+    yield
+    _reset()
+    try:
+        import free.identities as _identities
+
+        _identities._VAULT = None
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
 def _reset_disable_mapping():
     """Ensure DISABLE_MAPPING is False during tests unless explicitly set."""
     os.environ.pop("DISABLE_MAPPING", None)

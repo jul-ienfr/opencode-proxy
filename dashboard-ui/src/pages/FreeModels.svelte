@@ -16,6 +16,7 @@
   import Card from '$lib/components/Card.svelte';
   import Empty from '$lib/components/Empty.svelte';
   import VpnStatus from './vpn/VpnStatus.svelte';
+  import AllocatorStatus from './vpn/AllocatorStatus.svelte';
   import VpnRouting from './vpn/VpnRouting.svelte';
   import VpnServers from './vpn/VpnServers.svelte';
   import VpnAdvanced from './vpn/VpnAdvanced.svelte';
@@ -139,6 +140,8 @@
 </Card>
 
 <VpnStatus />
+
+<AllocatorStatus />
 <VpnRouting />
 <VpnServers />
 <VpnAdvanced />

@@ -11,8 +11,11 @@ import sqlite3
 import threading
 import time
 import uuid
+from ast import literal_eval
 from collections.abc import Callable, Iterable
 from dataclasses import replace
+from pathlib import Path
+from typing import Any
 
 from free.quota_ledger import next_utc_midnight
 
@@ -54,6 +57,41 @@ class SqliteIpRegistry:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._lock = threading.RLock()
 
+    @classmethod
+    def from_config(
+        cls,
+        section: dict[str, Any],
+        *,
+        db_path: str | Path | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> SqliteIpRegistry:
+        """Build a registry from the ``ip_registry`` config section.
+
+        Every documented scoring knob is applied here; reading them from an
+        ad-hoc dict in each script is how config keys silently become dead.
+        """
+
+        path = str(db_path or section.get("db_path") or "logs/ip_registry.db")
+        raw_score = section.get("score")
+        score = raw_score if isinstance(raw_score, dict) else {}
+        raw_eligibility = section.get("eligibility")
+        eligibility = raw_eligibility if isinstance(raw_eligibility, dict) else {}
+        weights = ScoreWeights(
+            availability=float(score.get("availability_weight", 0.55)),
+            latency=float(score.get("latency_weight", 0.25)),
+            freshness=float(score.get("freshness_weight", 0.20)),
+            latency_budget_ms=float(score.get("latency_budget_ms", 8000.0)),
+            freshness_ttl_h=float(score.get("freshness_ttl_h", 48.0)),
+            min_score=float(score.get("min_score", 20.0)),
+        )
+        return cls(
+            path,
+            error_cooldown_s=float(eligibility.get("error_cooldown_s", 1800.0)),
+            min_score=weights.min_score,
+            weights=weights,
+            clock=clock,
+        )
+
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     def close(self) -> None:
@@ -74,19 +112,44 @@ class SqliteIpRegistry:
 
     # ── catalog ───────────────────────────────────────────────────────────
 
-    def sync_catalog(self, servers: Iterable[Server], now: float | None = None) -> int:
+    def sync_catalog(
+        self,
+        servers: Iterable[Server],
+        now: float | None = None,
+        *,
+        source_id: str = "nordvpn_api_servers",
+        stale: bool = False,
+        catalog_fetched_at: float | None = None,
+        deactivate_missing: bool = False,
+    ) -> int:
+        """Upsert servers and keep their catalog provenance.
+
+        ``deactivate_missing`` is only safe for an authoritative, complete and
+        fresh snapshot: a partial fallback must never retire rows it simply
+        did not contain.
+        """
+
         ts = now if now is not None else self._clock()
         count = 0
+        seen: set[str] = set()
         with self._lock:
             try:
                 self._begin()
                 for server in servers:
+                    row_source = str(server.source_id or source_id)
+                    row_stale = 1 if (server.stale or stale) else 0
+                    row_fetched = (
+                        server.catalog_fetched_at
+                        if server.catalog_fetched_at is not None
+                        else catalog_fetched_at
+                    )
                     self._conn.execute(
                         """
                         INSERT INTO servers(
                             hostname, server_ip, country, city, load,
-                            technologies, first_seen_at, last_seen_at, active
-                        ) VALUES(?,?,?,?,?,?,?,?,1)
+                            technologies, first_seen_at, last_seen_at, active,
+                            source_id, stale, catalog_fetched_at
+                        ) VALUES(?,?,?,?,?,?,?,?,1,?,?,?)
                         ON CONFLICT(hostname) DO UPDATE SET
                             server_ip=excluded.server_ip,
                             country=excluded.country,
@@ -94,7 +157,10 @@ class SqliteIpRegistry:
                             load=excluded.load,
                             technologies=excluded.technologies,
                             last_seen_at=excluded.last_seen_at,
-                            active=1
+                            active=1,
+                            source_id=excluded.source_id,
+                            stale=excluded.stale,
+                            catalog_fetched_at=excluded.catalog_fetched_at
                         """,
                         (
                             server.hostname,
@@ -105,14 +171,155 @@ class SqliteIpRegistry:
                             repr(list(server.technologies)),
                             ts,
                             ts,
+                            row_source,
+                            row_stale,
+                            row_fetched,
                         ),
                     )
+                    seen.add(server.hostname)
                     count += 1
+                if deactivate_missing and seen:
+                    self._deactivate_missing(seen, ts)
                 self._commit()
             except Exception:
                 self._rollback()
                 raise
         return count
+
+    def _deactivate_missing(self, seen: set[str], ts: float) -> None:
+        rows = self._conn.execute(
+            "SELECT hostname FROM servers WHERE active=1"
+        ).fetchall()
+        missing = [str(row["hostname"]) for row in rows if str(row["hostname"]) not in seen]
+        for start in range(0, len(missing), 500):
+            chunk = missing[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            self._conn.execute(
+                f"UPDATE servers SET active=0, last_seen_at=? "
+                f"WHERE hostname IN ({placeholders})",
+                (ts, *chunk),
+            )
+
+    def record_catalog_snapshot(self, snapshot: Any, now: float | None = None) -> int:
+        """Append one row to the catalog journal (source, ETag, counts)."""
+
+        ts = now if now is not None else self._clock()
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO catalog_snapshots(
+                    source_id, fetched_at, etag, stale, server_count, error
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (
+                    str(snapshot.source_id),
+                    float(snapshot.fetched_at or ts),
+                    snapshot.etag,
+                    1 if snapshot.stale else 0,
+                    len(snapshot.servers),
+                    snapshot.error,
+                ),
+            )
+            self._conn.commit()
+            return int(cursor.lastrowid or 0)
+
+    def sync_snapshot(
+        self,
+        snapshot: Any,
+        *,
+        authoritative: bool = False,
+        now: float | None = None,
+    ) -> int:
+        """Journal a snapshot and upsert its servers with provenance."""
+
+        ts = now if now is not None else self._clock()
+        self.record_catalog_snapshot(snapshot, now=ts)
+        return self.sync_catalog(
+            snapshot.servers,
+            now=ts,
+            source_id=str(snapshot.source_id),
+            stale=bool(snapshot.stale),
+            catalog_fetched_at=float(snapshot.fetched_at or ts),
+            deactivate_missing=bool(
+                authoritative and snapshot.complete and not snapshot.stale
+            ),
+        )
+
+    def server(self, hostname: str) -> Server | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM servers WHERE hostname=?", (hostname,)
+            ).fetchone()
+        return self._server_from_row(row) if row else None
+
+    def list_servers(
+        self,
+        *,
+        source_id: str | None = None,
+        active: bool | None = None,
+        stale: bool | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Server]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if source_id:
+            clauses.append("source_id=?")
+            params.append(source_id)
+        if active is not None:
+            clauses.append("active=?")
+            params.append(1 if active else 0)
+        if stale is not None:
+            clauses.append("stale=?")
+            params.append(1 if stale else 0)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.extend([max(1, int(limit)), max(0, int(offset))])
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM servers {where} ORDER BY hostname LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        return [self._server_from_row(row) for row in rows]
+
+    def catalog_source_counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT source_id, COUNT(*) AS n FROM servers "
+                "WHERE active=1 GROUP BY source_id ORDER BY source_id"
+            ).fetchall()
+        return {str(row["source_id"]): int(row["n"]) for row in rows}
+
+    def recent_catalog_snapshots(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM catalog_snapshots ORDER BY id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def prune_history(
+        self,
+        retention_days: float = 7.0,
+        now: float | None = None,
+    ) -> dict[str, int]:
+        """Delete observations and closed assignments older than retention."""
+
+        ts = now if now is not None else self._clock()
+        cutoff = ts - max(0.0, float(retention_days)) * 86400.0
+        with self._lock:
+            observations = self._conn.execute(
+                "DELETE FROM observations WHERE tested_at < ?", (cutoff,)
+            )
+            assignments = self._conn.execute(
+                "DELETE FROM assignments "
+                "WHERE released_at IS NOT NULL AND released_at < ?",
+                (cutoff,),
+            )
+            self._conn.commit()
+        return {
+            "observations": int(observations.rowcount or 0),
+            "assignments": int(assignments.rowcount or 0),
+        }
 
     # ── records ───────────────────────────────────────────────────────────
 
@@ -179,6 +386,127 @@ class SqliteIpRegistry:
                 "SELECT * FROM ip_state WHERE egress_ip=?", (egress_ip,)
             ).fetchone()
         return self._record_from_row(row) if row else None
+
+    def assigned_for_station(self, station: int) -> IpRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM ip_state WHERE assigned_station=? AND state='assigned' "
+                "ORDER BY assigned_at DESC LIMIT 1",
+                (int(station),),
+            ).fetchone()
+        return self._record_from_row(row) if row else None
+
+    def release_station(
+        self,
+        station: int,
+        reason: str = "replaced",
+        now: float | None = None,
+    ) -> int:
+        """Release every IP currently assigned to ``station`` (idempotent)."""
+
+        ts = now if now is not None else self._clock()
+        count = 0
+        with self._lock:
+            try:
+                self._begin()
+                rows = self._conn.execute(
+                    "SELECT * FROM ip_state WHERE assigned_station=? AND state='assigned'",
+                    (int(station),),
+                ).fetchall()
+                for row in rows:
+                    record = self._record_from_row(row)
+                    next_state, error_until = self._released_state(record, ts, reason)
+                    self._conn.execute(
+                        """
+                        UPDATE ip_state SET
+                            state=?, error_until=?, assigned_station=NULL,
+                            assigned_at=NULL, lease_id=NULL, lease_expires_at=NULL,
+                            updated_at=?
+                        WHERE egress_ip=?
+                        """,
+                        (next_state.value, error_until, ts, record.egress_ip),
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE assignments SET released_at=?, reason=?, result=?
+                        WHERE egress_ip=? AND station=? AND released_at IS NULL
+                        """,
+                        (
+                            ts,
+                            reason,
+                            str(record.last_status or ""),
+                            record.egress_ip,
+                            int(station),
+                        ),
+                    )
+                    count += 1
+                self._commit()
+            except Exception:
+                self._rollback()
+                raise
+        return count
+
+    def assign_observed(
+        self,
+        *,
+        egress_ip: str,
+        hostname: str,
+        country: str,
+        station: int,
+        latency_ms: float | None = None,
+        tested_at: float | None = None,
+    ) -> IpRecord | None:
+        """Test-then-keep: persist a real 200 and freeze the IP on the station.
+
+        Used by the station allocator after a successful official probe.  The
+        previous IP of the station is released first; an IP assigned to
+        another station is never stolen.
+        """
+
+        ts = tested_at if tested_at is not None else self._clock()
+        existing = self.get(egress_ip)
+        if existing is not None and existing.assigned_station not in (None, int(station)):
+            return None
+        if existing is not None and existing.assigned_station == int(station):
+            if existing.state is IpState.ASSIGNED:
+                return existing
+        if existing is None:
+            self.upsert_record(
+                IpRecord(
+                    egress_ip=egress_ip,
+                    hostname=hostname,
+                    country=country,
+                    state=IpState.FRESH,
+                ),
+                now=ts,
+            )
+        else:
+            # A fresh 200 proves the IP works now: clear an old 429/error
+            # cooldown before claiming it.
+            self.upsert_record(
+                replace(
+                    existing,
+                    hostname=hostname,
+                    country=country,
+                    state=IpState.FRESH,
+                    reset_at=None,
+                    error_until=None,
+                    assigned_station=None,
+                    assigned_at=None,
+                    lease_id=None,
+                    lease_expires_at=None,
+                ),
+                now=ts,
+            )
+        self.release_station(station, "replaced", now=ts)
+        lease = self.claim(egress_ip, int(station), 300.0, ts)
+        if lease is None:
+            return None
+        self.record(
+            lease,
+            ProbeResult(status=200, tested_at=ts, latency_ms=latency_ms),
+        )
+        return self.assign(lease, now=ts)
 
     def list_records(
         self,
@@ -658,6 +986,29 @@ class SqliteIpRegistry:
         if record.error_until is not None and now < record.error_until:
             return IpState.ERROR, record.error_until
         return IpState.CANDIDATE, record.error_until
+
+    @staticmethod
+    def _server_from_row(row: sqlite3.Row) -> Server:
+        raw_technologies = row["technologies"] if "technologies" in row.keys() else "[]"
+        try:
+            technologies = tuple(str(value) for value in literal_eval(str(raw_technologies or "[]")))
+        except (ValueError, SyntaxError, TypeError):
+            technologies = ()
+        return Server(
+            hostname=str(row["hostname"]),
+            country=str(row["country"]),
+            server_ip=str(row["server_ip"]) if row["server_ip"] is not None else None,
+            city=str(row["city"]) if row["city"] is not None else None,
+            load=float(row["load"] or 0.0),
+            technologies=technologies,
+            source_id=str(row["source_id"] or ""),
+            stale=bool(row["stale"]),
+            catalog_fetched_at=(
+                float(row["catalog_fetched_at"])
+                if row["catalog_fetched_at"] is not None
+                else None
+            ),
+        )
 
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> IpRecord:

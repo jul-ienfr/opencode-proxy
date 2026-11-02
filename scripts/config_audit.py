@@ -73,8 +73,41 @@ CARTES_PAR_IDENTIFIANT = {
     "state_file_2",
 }
 
+# Sections dont CHAQUE feuille doit être lue explicitement (`yaml_get` avec
+# clé pointée). Le nom-de-feuille-permissif est interdit : une clé inerte dans
+# ces sections est un mensonge (incident `server_host`/`ip_registry.*`).
+STRICT_SECTIONS = {"ip_registry"}
+
+# Secrets lus depuis l'environnement/credentials.env, volontairement absents
+# du config.yaml suivi (scrub au chargement). Ne pas les compter « missing ».
+SECRET_KEYS = {"ip_rotation.control_api_key"}
+
 # Fichiers à ignorer dans la recherche d'usage.
-EXCLUS = ("_research", "tests", "Lib", "node_modules", ".git", "site-packages")
+EXCLUS = (
+    "_research",
+    "tests",
+    "Lib",
+    "node_modules",
+    ".git",
+    "site-packages",
+    ".audit-wt",
+    ".audit-logs-wt",
+    ".kilo",
+)
+
+
+def _est_dynamique(cle: str) -> bool:
+    """Vraie pour une clé sous une section/map d'identifiants.
+
+    Ces clés sont volontairement absentes de l'aplatissement (`CARTES_PAR_
+    IDENTIFIANT`), donc les compter comme « lues mais absentes » serait un
+    faux positif.
+    """
+
+    parties = cle.split(".")
+    if parties and parties[0] in SECTIONS_DYNAMIQUES:
+        return True
+    return any(partie in CARTES_PAR_IDENTIFIANT for partie in parties)
 
 
 def _fichiers_python() -> list[Path]:
@@ -151,6 +184,14 @@ def _litteraux_yaml_get() -> set[str]:
             premier = noeud.args[0]
             if isinstance(premier, ast.Constant) and isinstance(premier.value, str):
                 cles.add(premier.value)
+                # `yaml_get("ip_registry", "score.min_score")` : la feuille
+                # complète permet l'audit strict des sous-sections typées.
+                if (
+                    len(noeud.args) > 1
+                    and isinstance(noeud.args[1], ast.Constant)
+                    and isinstance(noeud.args[1].value, str)
+                ):
+                    cles.add(f"{premier.value}.{noeud.args[1].value}")
     _CLES_LUES_CACHE = cles
     return cles
 
@@ -196,6 +237,14 @@ def auditer(chemin: Path | None = None) -> dict[str, Any]:
 
     mortes: list[str] = []
     for cle in aplaties:
+        section = cle.split(".", 1)[0]
+        if section in STRICT_SECTIONS:
+            # Strict : seule une lecture explicite de la feuille complète
+            # compte. Le nom-de-feuille trouvé n'importe où dans le code ne
+            # suffit pas (il masquait les clés mortes de `ip_registry`).
+            if cle not in lues_exactement:
+                mortes.append(cle)
+            continue
         feuille = cle.rsplit(".", 1)[-1]
         # « utilisée » = son nom apparaît quelque part dans le code, ou elle est
         # lue via yaml_get sous sa forme complète. Volontairement permissif :
@@ -211,7 +260,13 @@ def auditer(chemin: Path | None = None) -> dict[str, Any]:
         for cle in lues_exactement
         # une clé sans point est une SECTION entière (`yaml_get("server")`) :
         # légitime, ce n'est pas un réglage manquant.
-        if "." in cle and cle not in aplaties
+        if "." in cle
+        and cle not in aplaties
+        and cle not in SECRET_KEYS
+        and not _est_dynamique(cle)
+        # une clé qui est un SOUS-ARBRE (`upstream.timeout`) est lue comme
+        # section entière, pas comme feuille : légitime.
+        and not any(k.startswith(cle + ".") for k in aplaties)
     )
     resultat: dict[str, object] = {
         "total_cles": len(aplaties),

@@ -132,9 +132,14 @@ async def test_paid_stream_path_goes_through_helper(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_free_direct_fallback_goes_through_helper(monkeypatch):
-    """use_free=True with no VPN pool (direct free fallback) must call the
-    helper too — the 21:22:13 route (mimo-v2.5 → deepseek-v4-flash) is a free
-    model and takes exactly this branch."""
+    """use_free=True with no VPN pool (direct free fallback) streams through
+    the official curl_cffi face, not the shared httpx client.
+
+    [2026-11-01] The direct free leg deliberately moved off httpx: the gate
+    rejects the httpx fingerprint (empty stream/403), so the request must use
+    the pooled curl_cffi session with the official identity. This test pins
+    that contract offline.
+    """
     monkeypatch.setattr(oc, "_debug", lambda *a, **k: None)
     monkeypatch.setattr(oc, "_free_ip_pool", None)
     monkeypatch.setattr(
@@ -143,15 +148,40 @@ async def test_free_direct_fallback_goes_through_helper(monkeypatch):
         lambda station=None: {"impersonate": "chrome131", "user_agent": None, "extra_headers": {}},
     )
     monkeypatch.setattr(oc, "_free_usage_ip", lambda station=None: "1.2.3.4")
-    closed = _ClosedClient()
-    monkeypatch.setattr(oc, "_client", closed)
-    spy_calls = []
 
-    def _spy_ensure():
-        spy_calls.append(1)
-        return _FakeHttpxClient()
+    class _Resp:
+        status_code = 200
+        headers: dict = {}
 
-    monkeypatch.setattr(oc, "_ensure_http_client", _spy_ensure)
+        async def aclose(self):
+            pass
+
+    class _Sess:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return _Resp()
+
+    class _Pool:
+        async def checkin(self, slot):
+            pass
+
+    class _Slot:
+        def __init__(self, sess):
+            self.sess = sess
+
+    sess = _Sess()
+
+    async def _fake_get(*args, **kwargs):
+        return _Pool(), _Slot(sess)
+
+    async def _fake_ip():
+        return "1.2.3.4"
+
+    monkeypatch.setattr(oc, "_get_pooled_curl_session", _fake_get)
+    monkeypatch.setattr(oc, "_free_direct_egress_ip", _fake_ip)
 
     body = {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]}
     async with oc._open_free_stream(
@@ -162,7 +192,8 @@ async def test_free_direct_fallback_goes_through_helper(monkeypatch):
     ) as resp:
         assert resp.status_code == 200
 
-    assert spy_calls, "free fallback must consult _ensure_http_client()"
+    assert len(sess.calls) == 1, "direct free path must use the official curl_cffi session"
+    assert sess.calls[0][1]["headers"].get("Authorization") == "Bearer public"
 
 
 @pytest.mark.asyncio

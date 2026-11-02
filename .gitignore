@@ -136,7 +136,7 @@ logs/config-*.json
 # installés par erreur dans scripts/ + bottle.py vendored (dépendance de
 # pywebview, pas du proxy). Non versionnés ET exclus de la gate locale
 # (scripts/gate.ps1 : ruff/mypy scannent le dépôt).
-Lib/
+/Lib/
 scripts/*.exe
 scripts/bottle.py
 scripts/pywin32_postinstall.py

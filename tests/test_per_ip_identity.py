@@ -65,22 +65,35 @@ def test_vault_version_client_in_measured_pool(tmp_path, monkeypatch):
         assert ident.client in ("cli", "desktop")
         assert ident.project == "global" or len(ident.project) >= 8
         assert "opencode/%s" % ident.version in ident.ua()
-    # distribution : les 2 versions et 2 clients sont représentés sur 20 IPs
+    # distribution : le pool complet de versions est représenté sur 20 IPs
     ips = [f"10.9.9.{i}" for i in range(20)]
     assert {v.get(i).version for i in ips} <= set(KNOWN_CLIENT_VERSIONS)
     assert len({v.get(i).version for i in ips}) >= 1
 
 
+def test_version_for_covers_the_full_official_pool():
+    from free.identities import ROTATION_VERSIONS, version_for
+
+    versions = {version_for(f"10.10.{i}.1") for i in range(200)}
+    assert set(ROTATION_VERSIONS) <= versions
+
+
 def test_official_headers_differ_per_ip(monkeypatch, tmp_path):
     monkeypatch.setenv("PER_IP_IDENTITY", "1")
     monkeypatch.setenv("OPENCODE_IDENTITIES_DIR", str(tmp_path / "identities"))
-    # 86.104.249.192 → 1.19.3 (trio), 186.247.163.125 → 1.18.31 (quartet) :
-    # distribution mesurée du vault (cf. test_vault_version_client...).
-    h19 = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, "86.104.249.192")
-    h18 = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, "186.247.163.125")
-    h19b = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, "86.104.249.192")
-    assert "opencode/1.19.3" in h19["User-Agent"]
-    assert "opencode/1.18.31" in h18["User-Agent"]
+    from free.identities import VERSION_SPECS, version_for
+
+    ips = [f"10.9.9.{i}" for i in range(100)]
+    ip_18 = next(i for i in ips if not VERSION_SPECS[version_for(i)]["session_id"])
+    ip_19 = next(i for i in ips if VERSION_SPECS[version_for(i)]["session_id"])
+    v18, v19 = version_for(ip_18), version_for(ip_19)
+
+    h19 = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, ip_19)
+    h18 = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, ip_18)
+    h19b = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions", None, ip_19)
+    assert f"opencode/{v19}" in h19["User-Agent"]
+    assert f"opencode/{v18}" in h18["User-Agent"]
+    assert v18 != v19
     # [wire exact provider opencode, capture mitm 2026-11-01]
     # 1.19.3+ → quartet + x-opencode-session-id ; 1.18.31 → quartet sans.
     # Aucun x-session-affinity/x-session-id sur le provider opencode.

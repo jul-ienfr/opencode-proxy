@@ -3,6 +3,7 @@
 > 29/10/2026. Recherche live : API NordVPN, API de contrôle gluetun, DB de production
 > (`logs/requests.db`, 72 h), code du proxy. Outil de rapport :
 > `scripts/ip_preselection.py`. Aucun changement de comportement dans ce document.
+> Registre des sources et hiérarchie de repli : [`docs/nordvpn-sources.md`](nordvpn-sources.md).
 
 ## 1. Réponse courte
 
@@ -337,3 +338,42 @@ mesures. Vérifié en live : s1 `fr957`, s2 `ch485`, s5 `de1618`, s6 `de1217`.
 (l'opérateur l'active dans la GUI), sonde désactivée. La rotation qualité reste
 indépendante de `latency_rotation.enabled` : elle possède son propre cooldown
 par station (600 s) et son plafond horaire.
+
+## 10. Attribution hostname en base (2026-11-02)
+
+La phase 0 est **réellement branchée** depuis le 2026-11-02 : `requests` porte
+`server_host TEXT` (migration idempotente dans `observability/db.py`), rempli
+par `_save_request` depuis le manager de la station ou explicitement par le
+chemin stream. `scripts/ip_preselection.py` joint désormais la qualité sur
+`server_host` en priorité ; l'IP d'entrée de l'API n'est plus utilisée que
+comme repli étiqueté « legacy, non fiable ».
+
+Limite : les lignes antérieures n'ont pas d'attribution et ne peuvent pas être
+reconstruites. Le rapport du 2026-11-02 (72 h) montrait **0 hostname sur 811 IP
+et 11 059 requêtes** ; l'attribution démarrera au prochain redémarrage. Voir
+[`AUDIT_PRESELECTION_QUOTA_2026-11-02.md`](AUDIT_PRESELECTION_QUOTA_2026-11-02.md).
+
+### 10.1 Preuves reproductibles
+
+Le rapport accepte `--json` et `--output` (UTF-8) :
+
+```bash
+python scripts/ip_preselection.py --hours 72 --top 15 \
+  --output docs/evidence/ip-preselection-2026-11-02-72h.json
+```
+
+Les fichiers `docs/evidence/ip-preselection-2026-11-02-{24h,72h,168h}.json`
+contiennent `generated_at`, seuils, compteurs API/DB, appariements, tiers,
+top IP et notes. Reproduction du 2026-11-02T09:10Z : 24 h = 26 IP / 1 974
+requêtes ; 72 h = 795 IP / 10 783 requêtes ; 168 h = 1 269 IP / 46 883
+requêtes ; **0 hostname** dans les trois fenêtres. La différence avec le
+rapport initial (811 / 11 059) vient de la fenêtre glissante, pas d'une
+régression.
+
+Annotations :
+
+- `ip_registry.enabled=false` : l'allocateur runtime n'est pas branché.
+- `nordcache_packed` : déclaré sans décodeur ; la résolution rapporte
+  `no-adapter:nordcache_packed` si ce fallback est requis.
+- `server_host` : les anciennes lignes restent non attribuables ; ne pas
+  joindre l'IP d'entrée API à l'egress.

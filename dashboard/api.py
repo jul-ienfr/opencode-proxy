@@ -982,6 +982,9 @@ def _persist_vpn_config(updates: dict):
                 # NordVPN country API, custom .ovpn file) — all persisted config.
                 "socks5_proxies": "socks5_proxies",
                 "socks5_auto_rotate": "socks5_auto_rotate",
+                "socks5_fallback_enabled": "socks5_fallback_enabled",
+                "https_proxies": "https_proxies",
+                "https_fallback_enabled": "https_fallback_enabled",
                 "use_nordvpn_api": "use_nordvpn_api",
                 "custom_ovpn_file": "custom_ovpn_file",
                 # warm-avalanche
@@ -1516,6 +1519,105 @@ def _apply_socks5_rows(rows: list) -> dict | None:
     return None
 
 
+def _https_payload(pool) -> list:
+    """HTTPS CONNECT proxy rows for the GUI. Passwords never leave the
+    server; the browser only learns whether one is set."""
+    rows = getattr(pool, "_https_proxies", None) or []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        out.append(
+            {
+                "host": r.get("host", ""),
+                "port": r.get("port", 0),
+                "enabled": bool(r.get("enabled", True)),
+                "has_password": bool(r.get("password")),
+            }
+        )
+    return out
+
+
+def _apply_https_rows(rows: list) -> dict | None:
+    """Validate + persist the HTTPS proxy list, then push it to the pool."""
+    cleaned = []
+    for i, r in enumerate(rows or []):
+        if not isinstance(r, dict):
+            return {"error": f"ligne {i}: entrée invalide"}
+        host = str(r.get("host", "") or "").strip()
+        if not host:
+            return {"error": f"ligne {i}: host manquant"}
+        try:
+            port = int(r.get("port") or 0)
+        except (TypeError, ValueError):
+            return {"error": f"ligne {i}: port invalide"}
+        if not (1 <= port <= 65535):
+            return {"error": f"ligne {i}: port hors bornes (1-65535)"}
+        cleaned.append(
+            {
+                "host": host,
+                "port": port,
+                "enabled": bool(r.get("enabled", True)),
+                "username": str(r.get("username") or "").strip() or None,
+                "password": str(r.get("password") or "").strip() or None,
+            }
+        )
+    err = _persist_vpn_config({"https_proxies": cleaned})
+    if not err:
+        pool = _dashboard_pool()
+        if pool is not None and hasattr(pool, "set_https_proxies"):
+            try:
+                pool.set_https_proxies(cleaned)
+            except Exception as e:
+                _debug(f"  [vpn] https pool update failed: {e}")
+    return None
+
+
+def _https_fallback_state() -> bool:
+    """``https_fallback_enabled`` — config mirror first, pool second."""
+    try:
+        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+        if "https_fallback_enabled" in cfg:
+            return bool(cfg["https_fallback_enabled"])
+        pool = _dashboard_pool()
+        if pool is not None and hasattr(pool, "_https_fallback_enabled"):
+            return bool(pool._https_fallback_enabled)
+    except Exception:
+        pass
+    return False
+
+
+def _stored_proxy_credentials(pool, attr: str, host: str, port: int) -> tuple:
+    """Look up a stored static proxy's credentials by host:port so the test
+    button never has to resend (or expose) the password."""
+    for row in getattr(pool, attr, None) or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("host") or "") != str(host or ""):
+            continue
+        try:
+            if int(row.get("port") or 0) != int(port):
+                continue
+        except (TypeError, ValueError):
+            continue
+        return row.get("username"), row.get("password")
+    return None, None
+
+
+def _socks5_fallback_state() -> bool:
+    """``socks5_fallback_enabled`` — config mirror first, pool second."""
+    try:
+        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+        if "socks5_fallback_enabled" in cfg:
+            return bool(cfg["socks5_fallback_enabled"])
+        pool = _dashboard_pool()
+        if pool is not None and hasattr(pool, "_socks5_fallback_enabled"):
+            return bool(pool._socks5_fallback_enabled)
+    except Exception:
+        pass
+    return False
+
+
 def _socks5_auto_rotate_state() -> bool:
     """Current auto-rotate toggle — config mirror first, pool second."""
     try:
@@ -1532,78 +1634,13 @@ def _socks5_auto_rotate_state() -> bool:
     return True
 
 
-def _read_exact(sock, n: int) -> bytes:
-    """Read exactly n bytes or raise (used for the SOCKS5 reply framing)."""
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("fermeture de la connexion pendant la réponse SOCKS5")
-        buf += chunk
-    return buf
+async def _socks5_probe(host: str, port: int, username=None, password=None) -> dict:
+    """Test a static SOCKS5 proxy with the official Bun/TLS replay.
 
-
-def _socks5_raw_get(proxy_host: str, proxy_port: int, target: str, timeout: float = 8.0) -> tuple:
-    """Full HTTP(S) GET through a SOCKS5 proxy using raw sockets + ssl (no
-    socks-extras dependency). Returns (status, body, elapsed_seconds);
-    raises on connectivity failure. The CONNECT handshake doubles as the
-    proxy liveness probe."""
-    import ipaddress
-    import ssl
-    from urllib.parse import urlsplit
-
-    u = urlsplit(target)
-    host, port = u.hostname or "", u.port or 443
-    started = time.monotonic()
-    sock = socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout)
-    try:
-        sock.settimeout(timeout)
-        sock.sendall(b"\x05\x01\x00")  # version 5, 1 method, no-auth
-        ver, nmeth = _read_exact(sock, 2)
-        if ver != 5 or nmeth != 0:
-            raise ConnectionError(f"proxy SOCKS5 a refusé le handshake ({ver}/{nmeth})")
-        try:
-            ipaddress.ip_address(host)
-            atyp, addr = 0x01, socket.inet_aton(host)
-        except ValueError:
-            atyp, hb = 0x03, host.encode()  # hostname ATYP
-            addr = bytes([len(hb)]) + hb
-        sock.sendall(b"\x05\x01\x00" + bytes([atyp]) + addr + int(port).to_bytes(2, "big"))
-        rep = _read_exact(sock, 4)
-        if rep[1] != 0:
-            raise ConnectionError(f"CONNECT SOCKS5 refusé (code {rep[1]})")
-        atyp = rep[3]
-        if atyp == 0x01:
-            _read_exact(sock, 6)  # IPv4 addr + port
-        elif atyp == 0x04:
-            _read_exact(sock, 18)  # IPv6 addr + port
-        elif atyp == 0x03:
-            ln = _read_exact(sock, 1)[0]
-            _read_exact(sock, ln + 2)  # hostname + port
-        else:
-            raise ConnectionError(f"réponse SOCKS5 atyp={atyp}")
-        path = u.path or "/"
-        if u.query:
-            path += "?" + u.query
-        req = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: opencode-proxy/1.0\r\nConnection: close\r\n\r\n"
-        with ssl.create_default_context().wrap_socket(sock, server_hostname=host) as tls:
-            tls.sendall(req.encode())
-            data = b""
-            while True:
-                chunk = tls.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
-    finally:
-        sock.close()
-    head, _, body = data.partition(b"\r\n\r\n")
-    status = int(head.split(b" ", 2)[1])
-    return status, body.decode("utf-8", "replace"), time.monotonic() - started
-
-
-async def _socks5_probe(host: str, port: int) -> dict:
-    """Test a static SOCKS5 proxy: egress IP + latency + opencode.ai
-    reachability through it (contracts: static/app.js socks5/test)."""
+    The probe uses the same curl_cffi fingerprint as the inference leg
+    (instead of a generic httpx/raw TLS client) so Cloudflare cannot reject
+    a valid proxy on the TLS signature alone.
+    """
     host = (host or "").strip()
     try:
         port = int(port)
@@ -1613,14 +1650,111 @@ async def _socks5_probe(host: str, port: int) -> dict:
         return {"ok": False, "error": "host manquant"}
 
     def _run():
-        status, body, elapsed = _socks5_raw_get(host, port, "https://api.ipify.org/")
-        ip = body.strip()
+        from curl_cffi import requests as curl_requests
+
+        proxy = _proxy_url("socks5h", host, port, username, password)
+        kwargs = _apply_official_fp(
+            {
+                "proxies": {"http": proxy, "https": proxy},
+                "timeout": 12,
+                "verify": True,
+            }
+        )
+        started = time.monotonic()
+        r = curl_requests.get("https://api.ipify.org/", **kwargs)
+        elapsed = time.monotonic() - started
+        ip = str(getattr(r, "text", "") or "").strip()
+        ok = 200 <= int(getattr(r, "status_code", 0) or 0) < 400
         try:
-            s2, _, _ = _socks5_raw_get(host, port, "https://opencode.ai/")
-            oc_ok = 200 <= s2 < 400
+            r2 = curl_requests.get("https://opencode.ai/", **kwargs)
+            oc_ok = 200 <= int(getattr(r2, "status_code", 0) or 0) < 400
         except Exception:
             oc_ok = False
-        return ip, (200 <= status < 400), elapsed, oc_ok
+        return ip, ok, elapsed, oc_ok
+
+    try:
+        ip, ok, elapsed, oc_ok = await asyncio.to_thread(_run)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": ok, "ip": ip, "opencode_ok": oc_ok, "latency_ms": round(elapsed * 1000, 1)}
+
+
+def _proxy_url(
+    scheme: str,
+    host: str,
+    port: int,
+    username: str | None,
+    password: str | None,
+) -> str:
+    """Build a proxy URL with URL-escaped credentials."""
+    from urllib.parse import quote
+
+    if username or password:
+        user = quote(username or "", safe="")
+        pwd = quote(password or "", safe="")
+        auth = f"{user}:{pwd}@"
+    else:
+        auth = ""
+    return f"{scheme}://{auth}{host}:{port}"
+
+
+def _apply_official_fp(kwargs: dict) -> dict:
+    """Apply the measured OpenCode Bun/TLS replay to a curl_cffi call."""
+    try:
+        import opencode as oc
+
+        impersonate, fp = oc._get_free_fp_kwargs("1.19.5")
+        if impersonate:
+            kwargs["impersonate"] = impersonate
+        if fp:
+            kwargs.update(fp)
+    except Exception:
+        pass
+    return kwargs
+
+
+async def _https_probe(host: str, port: int, username=None, password=None) -> dict:
+    """Probe one NordVPN HTTPS CONNECT proxy (``host:89``).
+
+    The proxy leg is TLS but NordVPN's certificate does not match the proxy
+    hostname, so proxy verification is disabled via curl options while the
+    target (api.ipify.org) stays verified. curl handles the nested TLS.
+    """
+    host = (host or "").strip()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "port invalide"}
+    if not host:
+        return {"ok": False, "error": "host manquant"}
+
+    def _run():
+        from curl_cffi import requests as curl_requests
+        from curl_cffi.const import CurlOpt
+
+        proxy = _proxy_url("https", host, port, username, password)
+        kwargs = _apply_official_fp(
+            {
+                "proxies": {"http": proxy, "https": proxy},
+                "timeout": 12,
+                "verify": True,
+                "curl_options": {
+                    CurlOpt.PROXY_SSL_VERIFYPEER: 0,
+                    CurlOpt.PROXY_SSL_VERIFYHOST: 0,
+                },
+            }
+        )
+        started = time.monotonic()
+        r = curl_requests.get("https://api.ipify.org/", **kwargs)
+        elapsed = time.monotonic() - started
+        ip = str(getattr(r, "text", "") or "").strip()
+        ok = 200 <= int(getattr(r, "status_code", 0) or 0) < 400
+        try:
+            r2 = curl_requests.get("https://opencode.ai/", **kwargs)
+            oc_ok = 200 <= int(getattr(r2, "status_code", 0) or 0) < 400
+        except Exception:
+            oc_ok = False
+        return ip, ok, elapsed, oc_ok
 
     try:
         ip, ok, elapsed, oc_ok = await asyncio.to_thread(_run)
@@ -3732,6 +3866,41 @@ def register_dashboard(
                 pass
         return data
 
+    @app.get("/api/free/allocator/status")
+    async def get_allocator_status(request: Request):
+        """[allocator] Chaînes actives, winners, claims et assignations."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        from free.ip_registry.status import registry_status
+
+        status = await asyncio.to_thread(registry_status)
+        return {
+            "generated_at": status.get("generated_at"),
+            "enabled": status.get("enabled"),
+            "allocator": status.get("allocator"),
+            "db": {
+                "assignments_open": status.get("db", {}).get("assignments_open", 0),
+                "open_assignments": status.get("db", {}).get("open_assignments", []),
+                "ip_state": status.get("db", {}).get("ip_state", {}),
+            },
+        }
+
+    @app.get("/api/free/ip-registry/status")
+    async def get_ip_registry_status(request: Request):
+        """[P0.3] Provenance et état du registre catalogue/IP.
+
+        Lecture seule : fonctionne aussi quand `ip_registry.enabled=false` ou
+        quand la DB n'existe pas encore. Expose les sources sans adaptateur
+        (`no-adapter`) et la couverture d'attribution hostname du runtime.
+        """
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        from free.ip_registry.status import registry_status
+
+        return await asyncio.to_thread(registry_status)
+
     @app.get("/api/pool-status")
     async def get_pool_status():
         """[v10] État du pool d'IPs free (stations, quotas, healthy/routable).
@@ -4788,10 +4957,14 @@ def register_dashboard(
 
     @app.get("/api/vpn/socks5")
     async def get_vpn_socks5():
-        """Static SOCKS5 proxy list for the GUI (app.js socks5 GET →
-        ``{proxies, rotate}``; proxies never carry passwords)."""
+        """Static SOCKS5 uplink list for the GUI (``{proxies, rotate,
+        fallback}``; proxies never carry passwords)."""
         pool = _dashboard_pool()
-        return {"proxies": _socks5_payload(pool), "rotate": _socks5_auto_rotate_state()}
+        return {
+            "proxies": _socks5_payload(pool),
+            "rotate": _socks5_auto_rotate_state(),
+            "fallback": _socks5_fallback_state(),
+        }
 
     @app.post("/api/vpn/socks5")
     async def add_vpn_socks5(request: Request):
@@ -4861,12 +5034,17 @@ def register_dashboard(
     @app.post("/api/vpn/socks5/test")
     async def test_vpn_socks5(request: Request):
         """Probe one proxy (``{host, port}``) → ``{ok, ip, opencode_ok,
-        latency_ms, error}`` (raw SOCKS5 + ssl through ``_socks5_probe``)."""
+        latency_ms, error}`` (raw SOCKS5 + ssl through ``_socks5_probe``).
+        Stored credentials are used when the row is in the list."""
         err = _check_dashboard_token(request)
         if err:
             return err
         body = await request.json()
-        return await _socks5_probe(body.get("host", ""), body.get("port", 0))
+        host = body.get("host", "")
+        port = body.get("port", 0)
+        pool = _dashboard_pool()
+        username, password = _stored_proxy_credentials(pool, "_socks5_proxies", host, port)
+        return await _socks5_probe(host, port, username=username, password=password)
 
     @app.post("/api/vpn/socks5/rotate")
     async def rotate_vpn_socks5(request: Request):
@@ -4896,6 +5074,127 @@ def register_dashboard(
             "ok": nxt is not None,
             "next": getattr(nxt, "pid", None) if nxt is not None else None,
         }
+
+    @app.post("/api/vpn/socks5/fallback")
+    async def set_vpn_socks5_fallback(request: Request):
+        """Arm/disarm ``ip_rotation.socks5_fallback_enabled``.
+
+        Armed means: when no docker station is usable in ``vpn`` mode, the
+        pool may serve through a configured SOCKS5 uplink before trying the
+        HTTPS tier."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        enabled = bool(body.get("enabled"))
+        _persist_vpn_config({"socks5_fallback_enabled": enabled})
+        pool = _dashboard_pool()
+        if pool is not None and hasattr(pool, "_socks5_fallback_enabled"):
+            pool._socks5_fallback_enabled = enabled
+        return {"ok": True, "enabled": enabled}
+
+    @app.get("/api/vpn/https-proxies")
+    async def get_vpn_https_proxies():
+        """HTTPS CONNECT fallback list + whether the fallback is armed."""
+        pool = _dashboard_pool()
+        return {
+            "enabled": _https_fallback_state(),
+            "proxies": _https_payload(pool),
+        }
+
+    @app.post("/api/vpn/https-proxies")
+    async def add_vpn_https_proxy(request: Request):
+        """Append a static HTTPS CONNECT proxy (NordVPN ``:89``)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        pool = _dashboard_pool()
+        try:
+            port = int(body.get("port") or 89)
+        except (TypeError, ValueError):
+            return {"error": f"port invalide: {body.get('port')!r}"}
+        rows = list(getattr(pool, "_https_proxies", None) or [])
+        rows.append(
+            {
+                "host": str(body.get("host", "") or ""),
+                "port": port,
+                "enabled": True,
+                "username": body.get("username"),
+                "password": body.get("password"),
+            }
+        )
+        err = _apply_https_rows(rows)
+        if err:
+            return err
+        return {"ok": True, "proxies": _https_payload(pool)}
+
+    @app.post("/api/vpn/https-proxies/remove")
+    async def remove_vpn_https_proxy(request: Request):
+        """Remove the HTTPS proxy at ``{index}``."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        pool = _dashboard_pool()
+        rows = list(getattr(pool, "_https_proxies", None) or [])
+        idx = _as_index(body.get("index"))
+        if not (0 <= idx < len(rows)):
+            return {"error": f"proxy index hors bornes: {idx!r}"}
+        del rows[idx]
+        err = _apply_https_rows(rows)
+        if err:
+            return err
+        return {"ok": True, "proxies": _https_payload(pool)}
+
+    @app.post("/api/vpn/https-proxies/toggle")
+    async def toggle_vpn_https_proxy(request: Request):
+        """Enable/disable the HTTPS proxy at ``{index, enabled}``."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        pool = _dashboard_pool()
+        rows = list(getattr(pool, "_https_proxies", None) or [])
+        idx = _as_index(body.get("index"))
+        if not (0 <= idx < len(rows)):
+            return {"error": f"proxy index hors bornes: {idx!r}"}
+        rows[idx] = dict(rows[idx])
+        rows[idx]["enabled"] = bool(body.get("enabled", True))
+        err = _apply_https_rows(rows)
+        if err:
+            return err
+        return {"ok": True}
+
+    @app.post("/api/vpn/https-proxies/fallback")
+    async def set_vpn_https_fallback(request: Request):
+        """Arm/disarm ``ip_rotation.https_fallback_enabled``.
+
+        Armed means: when no docker station is usable in ``vpn`` mode, the
+        pool may serve through a configured HTTPS CONNECT proxy."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        enabled = bool(body.get("enabled"))
+        _persist_vpn_config({"https_fallback_enabled": enabled})
+        pool = _dashboard_pool()
+        if pool is not None and hasattr(pool, "_https_fallback_enabled"):
+            pool._https_fallback_enabled = enabled
+        return {"ok": True, "enabled": enabled}
+
+    @app.post("/api/vpn/https-proxies/test")
+    async def test_vpn_https_proxy(request: Request):
+        """Probe one HTTPS CONNECT proxy (stored credentials by host:port)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        host = body.get("host", "")
+        port = body.get("port", 0)
+        pool = _dashboard_pool()
+        username, password = _stored_proxy_credentials(pool, "_https_proxies", host, port)
+        return await _https_probe(host, port, username=username, password=password)
 
     @app.post("/api/vpn/proxy-mode")
     async def set_vpn_proxy_mode(request: Request):
