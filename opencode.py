@@ -2690,11 +2690,18 @@ async def _apply_station_count(new_n: int) -> None:
         shared_state.vpn_manager_2 = managers[1] if len(managers) >= 2 else None
         # [plan v2 auto-sync] derive AFTER set_stations+watcher, persist LAST
         # Strict: shared_state → pool.set_stations → watcher → derive → persist
-        try:
-            _eff = effective_free_max_attempts()
-            IP_ROTATION["max_free_attempts"] = _eff
-        except Exception:
-            _eff = max(1, min(int(IP_ROTATION.get("max_free_attempts", 2) or 2), 5))
+        _auto = bool(IP_ROTATION.get("auto_max_free_attempts", True))
+        if _auto:
+            try:
+                _eff = effective_free_max_attempts()
+                IP_ROTATION["max_free_attempts"] = _eff
+            except Exception:
+                _eff = max(1, min(int(IP_ROTATION.get("max_free_attempts", 2) or 2), 5))
+                IP_ROTATION["max_free_attempts"] = _eff
+        else:
+            # Mode manuel : persist le choix opérateur (1–3), pas le budget
+            # effectif élargi par strict_free.
+            _eff = max(1, min(3, int(IP_ROTATION.get("max_free_attempts", 2) or 2)))
             IP_ROTATION["max_free_attempts"] = _eff
         from dashboard.api import _persist_vpn_config
 
@@ -3485,10 +3492,20 @@ async def lifespan(app):
     # [plan v2 auto-sync] boot derive — mirrors _apply_station_count strict order
     # shared_state → pool.set_stations already done; watcher started; now derive
     try:
-        _eff_boot = effective_free_max_attempts()
-        IP_ROTATION["max_free_attempts"] = _eff_boot
+        _auto_boot = bool(IP_ROTATION.get("auto_max_free_attempts", True))
+        if _auto_boot:
+            _eff_boot = effective_free_max_attempts()
+            IP_ROTATION["max_free_attempts"] = _eff_boot
+        else:
+            # Mode manuel : ne jamais écraser la valeur persistée par le
+            # budget effectif (strict_free peut élargir à N sans changer le
+            # choix opérateur). Sinon le select GUI perd sa sélection.
+            IP_ROTATION["max_free_attempts"] = max(
+                1, min(3, int(IP_ROTATION.get("max_free_attempts", 2) or 2))
+            )
         _debug(
-            f"  [lifespan] effective_max boot derived={_eff_boot} (auto={IP_ROTATION.get('auto_max_free_attempts', True)})"
+            f"  [lifespan] effective_max boot derived={effective_free_max_attempts()} "
+            f"(auto={_auto_boot}, manual={IP_ROTATION.get('max_free_attempts')})"
         )
     except Exception as _e:
         _debug(f"  [lifespan] effective_max boot derive failed: {_e}")

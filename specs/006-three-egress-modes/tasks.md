@@ -58,6 +58,10 @@
   `diag.routing.free_attempts` expose `auto/manual/effective`.
 - [x] **T-016** Persistance au redémarrage : mode WARP, langue FR et auto
   (effectif 7 avec 7 endpoints) vérifiés après restart proxy.
+- [x] **T-017** Mode manuel persistant : `max_free_attempts=3` n'est plus
+  écrasé par le budget effectif `strict_free=7` au boot ni lors du changement
+  de `station_count`. Vérifié après restart : `auto=false, max=3,
+  effective=7`.
 
 ## Suivi
 

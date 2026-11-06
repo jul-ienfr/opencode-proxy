@@ -203,6 +203,9 @@ actions ne sont pas présentées comme actives.
   une valeur sélectionnée : `Auto (selon stations)` ou une valeur manuelle
   effective 1–3, y compris si `config.yaml` contient une ancienne valeur hors
   bornes.
+- **FR-022** En mode manuel, `max_free_attempts` NE DOIT PAS être écrasé par le
+  budget effectif (élargi par `strict_free`) au démarrage ou lors d'un
+  changement de `station_count` ; la valeur opérateur 1–3 doit persister.
 
 ### Key Entities
 
@@ -242,6 +245,8 @@ actions ne sont pas présentées comme actives.
   localStorage et redémarrage du proxy.
 - **SC-009** Le paramètre d'essais gratuits est lisible, sélectionné et
   effectif : `auto` → 7 essais avec 7 endpoints ; manuel 1–3.
+- **SC-010** Un mode manuel `3` reste `3` après redémarrage, même si
+  `strict_free` porte le budget effectif à 7.
 
 ## Assumptions
 
