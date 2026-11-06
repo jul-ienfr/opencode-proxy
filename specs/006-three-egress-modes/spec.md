@@ -194,6 +194,15 @@ actions ne sont pas présentées comme actives.
 - **FR-018** Les tests DOIVENT couvrir les trois modes, le partage des
   paramètres, l'isolation des réglages spécifiques, la capacité et la
   persistance.
+- **FR-019** En mode SOCKS5, la capacité et le statut DOIVENT compter les
+  endpoints WARP réels et le quota par modèle, pas les stations Docker vides.
+- **FR-020** La langue choisie DOIT persister côté navigateur et côté serveur,
+  et être reprise au démarrage/redémarrage même si le stockage local est absent
+  (autre origine `localhost`/`127.0.0.1`, stockage vidé).
+- **FR-021** Le sélecteur « Essais gratuits / requête » DOIT toujours afficher
+  une valeur sélectionnée : `Auto (selon stations)` ou une valeur manuelle
+  effective 1–3, y compris si `config.yaml` contient une ancienne valeur hors
+  bornes.
 
 ### Key Entities
 
@@ -227,6 +236,12 @@ actions ne sont pas présentées comme actives.
   WARP ; les réglages WARP-only ne sont ni visibles ni appliqués en NordVPN.
 - **SC-006** Les suites existantes restent vertes et les nouveaux tests
   couvrent les trois modes et le partage des paramètres.
+- **SC-007** En mode WARP, `/health` et `/api/vpn-status` exposent la capacité
+  réelle (7/7) et le quota par modèle, sans faux « 0/1 ».
+- **SC-008** La langue française reste active après rechargement, vidage du
+  localStorage et redémarrage du proxy.
+- **SC-009** Le paramètre d'essais gratuits est lisible, sélectionné et
+  effectif : `auto` → 7 essais avec 7 endpoints ; manuel 1–3.
 
 ## Assumptions
 

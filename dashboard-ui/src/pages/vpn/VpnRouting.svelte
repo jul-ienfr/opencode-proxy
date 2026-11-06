@@ -69,6 +69,11 @@
   const parallel = $derived(cfg?.free_parallel ?? {});
   const retry = $derived(retryQ.data ?? {});
   const proxyMode = $derived(String(cfg?.proxy_mode ?? 'vpn'));
+  // L'API clampe le mode manuel à [1, 3] ; afficher la valeur effective évite
+  // un select vide quand config.yaml contient une ancienne valeur (ex. 7).
+  const manualAttempts = $derived(
+    String(Math.max(1, Math.min(3, Number(cfg?.max_free_attempts ?? 2) || 2)))
+  );
 
   let stationCount = $state('1');
   let cooldown = $state('60');
@@ -272,7 +277,7 @@
       <span class="label">{t('vpn.free_attempts')}</span>
       <select
         class="select row-control row-control--wide"
-        value={cfg?.auto_max_free_attempts === false ? String(cfg.max_free_attempts ?? 2) : 'auto'}
+        value={cfg?.auto_max_free_attempts === false ? manualAttempts : 'auto'}
         onchange={(e) =>
           patch(
             'attempts',

@@ -23183,6 +23183,11 @@ async def api_free_egress_diag():
             "post_rotation_probe": dict(
                 getattr(pool, "_post_rotation_probe", {}) or {}
             ),
+            "free_attempts": {
+                "auto": bool(IP_ROTATION.get("auto_max_free_attempts", True)),
+                "manual": int(IP_ROTATION.get("max_free_attempts", 2) or 2),
+                "effective": int(effective_free_max_attempts()),
+            },
             "timeout_guard": {
                 "distinct_pairs": timeout_pairs,
                 "window_s": float(getattr(pool, "_socks5_timeout_window_s", 60.0) or 60.0),

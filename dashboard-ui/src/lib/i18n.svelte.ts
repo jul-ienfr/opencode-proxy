@@ -62,6 +62,32 @@ export async function setLocale(next: Locale): Promise<void> {
   }
 }
 
+/**
+ * Reprise de la langue serveur quand le navigateur n'a pas de préférence
+ * locale (autre origine localhost/127.0.0.1, stockage vidé, nouvel appareil).
+ * La préférence locale reste prioritaire.
+ */
+export async function syncLocaleFromServer(): Promise<void> {
+  if (readStored()) return;
+  try {
+    const response = await fetch('/api/config', { headers: { Accept: 'application/json' } });
+    if (!response.ok) return;
+    const data = await response.json();
+    const server = String((data as { lang?: unknown }).lang ?? '');
+    if (!LOCALES.includes(server as Locale)) return;
+    if ((server as Locale) === lang.current) return;
+    lang.current = server as Locale;
+    applyDocument();
+    try {
+      localStorage.setItem(STORAGE_KEY, server);
+    } catch {
+      // stockage indisponible
+    }
+  } catch {
+    // serveur indisponible : garder la langue locale
+  }
+}
+
 /** Traduit `key` dans la langue courante, avec repli sur `en` puis la clé. */
 export function t(key: string, params?: Record<string, string | number>): string {
   const table = LOCALE[lang.current] || LOCALE.en;
@@ -76,3 +102,5 @@ export function t(key: string, params?: Record<string, string | number>): string
 
 // Applique la langue dès le chargement du module.
 applyDocument();
+// Puis tente la préférence serveur si aucune préférence locale n'existe.
+void syncLocaleFromServer();

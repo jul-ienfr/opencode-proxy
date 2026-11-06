@@ -50,6 +50,14 @@
   - Direct actif → section commune + mention « non applicable », aucune
     section NordVPN/WARP.
 - [x] **T-013** `pytest -k "not docker"` : exit 0.
+- [x] **T-014** Langue persistante : localStorage + `PROXY_LANG` serveur ;
+  fallback `/api/config` au chargement si le stockage local est absent.
+  Vérifié après rechargement, vidage du localStorage et redémarrage proxy.
+- [x] **T-015** Sélecteur « Essais gratuits / requête » : options `auto` et
+  1–3 ; valeur manuelle clampée à 1–3 pour ne jamais afficher un select vide.
+  `diag.routing.free_attempts` expose `auto/manual/effective`.
+- [x] **T-016** Persistance au redémarrage : mode WARP, langue FR et auto
+  (effectif 7 avec 7 endpoints) vérifiés après restart proxy.
 
 ## Suivi
 
