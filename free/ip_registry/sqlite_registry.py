@@ -546,6 +546,7 @@ class SqliteIpRegistry:
         placeholders = ",".join("?" for _ in _ELIGIBLE_STATES)
         clauses = [
             f"state IN ({placeholders})",
+            "hostname <> ''",
             "(reset_at IS NULL OR reset_at <= ?)",
             "(error_until IS NULL OR error_until <= ?)",
             "assigned_station IS NULL",

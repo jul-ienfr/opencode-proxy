@@ -76,10 +76,10 @@ class RotationPlanner:
     def should_rotate(self, lease: IpQuotaLease) -> bool:
         if lease.state in (DRAINING, EXHAUSTED):
             return True
-        if lease.recent_429 >= 3:
-            return True
-        threshold = self.profile.rotation_headroom_for(lease.model)
-        return lease.headroom <= threshold
+        # A 429 must not trigger a rotation here: the ledger already marks the
+        # IP and the station allocator owns the egress repair. Rotating on
+        # every 429 (3 recent) burned the fresh-IP inventory in minutes.
+        return False
 
     def plan(
         self,

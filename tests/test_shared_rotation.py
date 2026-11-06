@@ -21,6 +21,7 @@ class is pure sync — mutate + persist in one call, no await.
 """
 
 import json
+import sqlite3
 import time
 
 from shared_rotation import SharedRotationState
@@ -192,12 +193,44 @@ class TestPersistence:
         s = SharedRotationState({"shared_rotation_file": str(path)})
         assert s.recent_ips() == []  # bad file → empty state, no raise
 
-    def test_atomic_write_no_tmp_left(self, tmp_path):
+    def test_registry_write_no_json_left(self, tmp_path):
         s = _state(tmp_path)
         s.record_ip("5.6.7.8", 1)
+        assert not (tmp_path / "shared_rotation.json").exists()
         assert not (tmp_path / "shared_rotation.json.tmp").exists()
-        raw = json.loads((tmp_path / "shared_rotation.json").read_text())
-        assert raw["ip_events"][0]["ip"] == "5.6.7.8"
+        conn = sqlite3.connect(tmp_path / "registry.db")
+        try:
+            raw = conn.execute(
+                "SELECT value FROM chain_state WHERE namespace='shared_rotation'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert raw is not None
+        assert json.loads(raw[0])["ip_events"][0]["ip"] == "5.6.7.8"
+
+    def test_legacy_json_is_imported_once(self, tmp_path):
+        path = tmp_path / "shared_rotation.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "ip_events": [
+                        {
+                            "ip": "7.7.7.7",
+                            "station": 1,
+                            "time": time.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                            ),
+                        }
+                    ],
+                    "cursor": 4,
+                }
+            )
+        )
+        s = SharedRotationState({"shared_rotation_file": str(path)})
+        assert s.recent_ips() == ["7.7.7.7"]
+        assert s._cursor == 4
+        assert not path.exists()
+        assert (tmp_path / "shared_rotation.json.migrated").exists()
 
 
 # ── config hot-reload ────────────────────────────────────────────

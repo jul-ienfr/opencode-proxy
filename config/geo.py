@@ -109,7 +109,10 @@ def normalize_geo_list(countries, server_set: set, normalize_fn=_vpn_normalize_c
             dropped.append(c)
             continue
         norm = normalize_fn(c)
-        if norm not in server_set:
+        # [T021] An empty server_countries means "any country": there is no
+        # fixed universe to intersect against, so the allowlist is accepted
+        # as-is instead of being emptied.
+        if server_set and norm not in server_set:
             log.warning(
                 "[geo] country %r → %r not in server_countries — dropping (intersection check)",
                 c,
@@ -222,11 +225,13 @@ def resolve_geo(
     if not has_allowed and not has_blocked:
         return _cached(set(server_set) if server_set else set(), mode, require_vpn, "ok")
     if allowed_set and blocked_set:
-        effective = (allowed_set - blocked_set) & server_set
+        effective = allowed_set - blocked_set
+        if server_set:
+            effective &= server_set
     elif allowed_set:
-        effective = allowed_set & server_set
+        effective = allowed_set & server_set if server_set else allowed_set
     elif blocked_set:
-        effective = server_set - blocked_set
+        effective = server_set - blocked_set if server_set else set()
     else:
         # Both normalized empty after WARN drops
         if has_allowed:

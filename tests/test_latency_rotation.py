@@ -299,10 +299,13 @@ def test_key_pause_401_constant_shared():
 # ── v6 : offset stride pays ──────────────────────────────────────────────
 
 
-def test_country_offset_stride_changes_draw():
+def test_country_offset_stride_changes_draw(tmp_path):
     from shared_rotation import SharedRotationState
 
-    cfg_base = {"recent_ip_window": 20, "shared_rotation_file": "logs/_sr_stride_test.json"}
+    cfg_base = {
+        "recent_ip_window": 20,
+        "shared_rotation_file": str(tmp_path / "shared_rotation.json"),
+    }
 
     sr_legacy = SharedRotationState({**cfg_base, "country_offset_stride": 0})
     sr_strided = SharedRotationState({**cfg_base, "country_offset_stride": 17})
@@ -316,9 +319,3 @@ def test_country_offset_stride_changes_draw():
     sr_a = SharedRotationState({**cfg_base, "country_offset_stride": 0})
     sr_b = SharedRotationState({**cfg_base, "country_offset_stride": 17})
     assert sr_a.next_country(1, 14, 29) == sr_b.next_country(1, 14, 29)
-
-    import os
-
-    for f in ("logs/_sr_stride_test.json",):
-        if os.path.exists(f):
-            os.remove(f)

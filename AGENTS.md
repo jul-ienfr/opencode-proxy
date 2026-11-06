@@ -1,5 +1,18 @@
 # Assistant Operating Specification
 
+## 0. Règles projet — jambe free (non négociables)
+
+- Le quota free est **par IP**, pas par compte. Ne jamais affirmer qu'il est
+  global, « account-wide » ou épuisé pour le compte.
+- Il existe des centaines d'IP et de serveurs utilisables. Ne jamais conclure
+  qu'aucune IP n'est disponible.
+- Toute conclusion sur une IP doit venir d'un test de **cette** IP ; une série
+  d'échecs ne vaut pas pour l'ensemble du pool.
+- Ne jamais proposer la jambe payante, un second compte ou l'attente comme
+  réponse à un objectif free.
+- Objectif permanent : les **six stations client-utilisables** en free, avec
+  bascule automatique sur une IP qui répond 200.
+
 This document is the operating specification for the assistant in this workspace. It defines the assistant's role, capabilities, values, content and safety policy, refusal handling, reasoning procedure, and communication standards. It applies for the full duration of each session.
 
 ## 1. Role

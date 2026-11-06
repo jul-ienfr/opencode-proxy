@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -181,6 +182,14 @@ class QuotaLedger:
     max_entries: int = 8192
     persist: bool = True
     save_interval_s: float = 2.0
+    # [2026-11-06] Plafond optionnel du blocage effectif après un 429 quota.
+    # Le ``Retry-After`` upstream est la distance au prochain 00:00 UTC, pas
+    # la vraie recovery : afree-proxy a mesuré RA=20 h 46 et un 200 sur la
+    # même IP 18 minutes plus tard. On garde la valeur brute dans
+    # ``retry_after`` pour l'observabilité, et ``reset_at`` peut être plafonné
+    # pour que l'IP redevienne candidate et soit re-testée. 0 = pas de
+    # plafond (contrat historique : le ledger garde la vérité serveur).
+    max_block_s: float = 0.0
     clock: Callable[[], float] = time.time
     _items: dict[tuple[str, str, str], BucketState] = field(default_factory=dict, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
@@ -190,6 +199,11 @@ class QuotaLedger:
 
     def __post_init__(self) -> None:
         self._path = str(self.path or DEFAULT_PATH)
+        self._sqlite = self._path.lower().endswith(
+            (".db", ".sqlite", ".sqlite3")
+        )
+        if self._sqlite:
+            self._ensure_sqlite()
         # Les tests qui construisent un pool ne doivent pas écrire dans le
         # ledger de production. Un test de persistance passe un chemin
         # explicite (ou persist=True + path=tmp) et garde l'écriture.
@@ -304,9 +318,17 @@ class QuotaLedger:
                     if ra > 0:
                         # Le provider peut avoir un reset PAR IP (fenêtre
                         # glissante / jitter observés 00:01→00:53 UTC). Le
-                        # Retry-After est la seule source de vérité : on ne
-                        # snap plus sur un minuit global.
-                        state.reset_at = ts + ra
+                        # Retry-After reste la source brute, mais il vaut
+                        # « jusqu'à 00:00 UTC » : on plafonne le blocage
+                        # effectif (cf. ``max_block_s``) pour re-tester l'IP
+                        # au lieu de la parquer ~19 h sur une valeur qui n'est
+                        # pas la vraie recovery.
+                        try:
+                            _cap = float(self.max_block_s or 0.0)
+                        except (TypeError, ValueError):
+                            _cap = 0.0
+                        _effective = min(ra, _cap) if _cap > 0 else ra
+                        state.reset_at = ts + _effective
                     else:
                         state.reset_at = next_utc_midnight(ts)
                 else:
@@ -411,8 +433,63 @@ class QuotaLedger:
 
     # ── persistance ────────────────────────────────────────────────────────
 
+    def _ensure_sqlite(self) -> None:
+        try:
+            from rotation.infrastructure.db.migrate import (
+                apply_schema,
+                connect,
+            )
+
+            conn = connect(self._path)
+            try:
+                apply_schema(conn)
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+    def _load_sqlite(self) -> None:
+        try:
+            conn = sqlite3.connect(self._path, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT ip, day, bucket, used, successes, failures, "
+                    "last_status, last_error, reset_at, source, "
+                    "first_seen_at, last_seen_at FROM quota_buckets"
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            return
+        now = self._now(None)
+        for row in rows:
+            status = int(row["last_status"] or 0)
+            reset_at = float(row["reset_at"] or 0.0)
+            state = BucketState(
+                ip=server_ip_key(row["ip"]),
+                day=str(row["day"]),
+                bucket=str(row["bucket"] or "default"),
+                requests=max(0, int(row["used"] or 0)),
+                successes=max(0, int(row["successes"] or 0)),
+                failures=max(0, int(row["failures"] or 0)),
+                last_status=max(0, status),
+                last_error=str(row["last_error"] or ""),
+                reset_at=max(0.0, reset_at),
+                exhausted=status == 429 and reset_at > now,
+                first_seen=max(0.0, float(row["first_seen_at"] or 0.0)),
+                last_seen=max(0.0, float(row["last_seen_at"] or 0.0)),
+                source=str(row["source"] or "observed"),
+            )
+            self._items[(state.ip, state.day, state.bucket)] = state
+        self._enforce_cap_locked()
+        self._prune_locked(now)
+
     def _load(self) -> None:
         if not self.persist:
+            return
+        if self._sqlite:
+            self._load_sqlite()
             return
         try:
             with open(self._path, encoding="utf-8") as f:
@@ -450,8 +527,65 @@ class QuotaLedger:
             self._prune_locked(ts)
             return before - len(self._items)
 
+    def _save_sqlite(self) -> None:
+        with self._lock:
+            states = list(self._items.values())
+            saved_at = self._now(None)
+        try:
+            conn = sqlite3.connect(self._path, timeout=10.0)
+            try:
+                for state in states:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO egress_ips("
+                        "ip, first_seen_at, last_seen_at, state"
+                        ") VALUES(?,?,?,'fresh')",
+                        (
+                            state.ip,
+                            state.first_seen or saved_at,
+                            state.last_seen or saved_at,
+                        ),
+                    )
+                    conn.execute(
+                        "INSERT INTO quota_buckets("
+                        "ip, model, day, bucket, used, successes, failures, "
+                        "last_status, last_error, reset_at, source, "
+                        "first_seen_at, last_seen_at"
+                        ") VALUES(?,'default',?,?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(ip, model, day, bucket) DO UPDATE SET "
+                        "used=excluded.used, successes=excluded.successes, "
+                        "failures=excluded.failures, "
+                        "last_status=excluded.last_status, "
+                        "last_error=excluded.last_error, "
+                        "reset_at=excluded.reset_at, source=excluded.source, "
+                        "last_seen_at=excluded.last_seen_at",
+                        (
+                            state.ip,
+                            state.day,
+                            state.bucket,
+                            int(state.requests),
+                            int(state.successes),
+                            int(state.failures),
+                            int(state.last_status),
+                            state.last_error,
+                            state.reset_at or None,
+                            state.source,
+                            state.first_seen or saved_at,
+                            state.last_seen or saved_at,
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            self._last_save = saved_at
+            self._dirty = False
+        except Exception:
+            return
+
     def _save(self) -> None:
         if not self.persist:
+            return
+        if self._sqlite:
+            self._save_sqlite()
             return
         with self._lock:
             payload = {

@@ -57,6 +57,30 @@ def _pool():
     return fp.FreeIPPool(st1, st2), st1, st2
 
 
+def test_shadow_selector_logs_but_keeps_legacy_routing(monkeypatch):
+    cfg = _cfg(station_health={"strict": True, "max_effective_age_s": 60, "shadow": True})
+    st1 = _RelStation(1, "1.1.1.1", config=cfg)
+    st2 = _RelStation(2, "2.2.2.2", config=cfg)
+    pool = fp.FreeIPPool(st1, st2)
+    pool._shadow_selector = True
+    # The legacy failover path keeps station 1; the shadow selector prefers 2.
+    pool._per_station(st2)["request_count"] = 0
+    pool._per_station(st1)["request_count"] = 5
+
+    class Pick:
+        station = st2
+
+        def snapshot(self):
+            return {"station": 2, "reason": "shadow"}
+
+    monkeypatch.setattr(
+        pool._best_ip, "rank", lambda stations, model: [Pick()]
+    )
+    assert pool._best_station(model="m") is st1
+    assert pool._last_selection is not None
+    assert pool._last_selection.snapshot()["station"] == 2
+
+
 def test_dynamic_rotation_threshold_uses_profile_and_percent():
     pool, st1, _ = _pool()
     # profil 20, réserve 2, seuil de headroom 4 => rotation à 16 requêtes.
@@ -245,6 +269,36 @@ def test_duplicate_ip_is_degraded_and_one_station_is_drained():
     assert len(pool._draining_stations) == 1
     # La station conservée n'est pas dans le drain.
     assert 1 not in pool._draining_stations and 2 in pool._draining_stations
+
+
+def test_duplicate_rotation_is_not_blocked_by_another_rotation():
+    """A queued rotation for another station must not starve the duplicate fix."""
+
+    cfg = _cfg(rotation_planner={"enabled": True, "spare_station": 0})
+    st1 = _RelStation(1, "same-ip", config=cfg)
+    st2 = _RelStation(2, "same-ip", config=cfg)
+    st3 = _RelStation(3, "other-ip", config=cfg)
+    pool = fp.FreeIPPool(st1, st2)
+    pool.set_stations([st1, st2, st3])
+    pool._pending.add(3)  # another station is already queued
+    launched = []
+    pool._launch_rotation = lambda station, **kw: launched.append(station)  # type: ignore[method-assign]
+    pool._plan_proactive_rotation("m")
+    assert len(launched) == 1
+    assert launched[0] is st2
+
+
+def test_disabled_rotation_planner_never_rotates_proactively():
+    cfg = _cfg(rotation_planner={"enabled": False, "spare_station": 0})
+    st1 = _RelStation(1, "same-ip", config=cfg)
+    st2 = _RelStation(2, "same-ip", config=cfg)
+    pool = fp.FreeIPPool(st1, st2)
+    launched = []
+    pool._launch_rotation = lambda station, **kw: launched.append(station)  # type: ignore[method-assign]
+    pool._last_model = "m"
+    pool._plan_proactive_rotation("m")
+    assert launched == []
+    assert pool._draining_stations == set()
 
 
 def test_spare_is_not_warm_if_it_shares_an_active_ip():

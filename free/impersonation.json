@@ -1,0 +1,60 @@
+{
+  "version": "2.2.5",
+  "captured_at": "2026-11-04T11:04:54Z",
+  "endpoint": "/v1/chat/completions",
+  "authorization_scheme": "Bearer",
+  "authorization_value": "public",
+  "client": "cli",
+  "project": "a24ad984335289d5bb037e290b55f7fb5e04ce6b",
+  "user_agent": "opencode/latest/2.2.5/cli",
+  "headers": [
+    "accept",
+    "accept-encoding",
+    "authorization",
+    "b3",
+    "connection",
+    "content-length",
+    "content-type",
+    "host",
+    "traceparent",
+    "user-agent",
+    "x-opencode-client",
+    "x-opencode-project",
+    "x-opencode-session",
+    "x-opencode-session-id",
+    "x-session-affinity",
+    "x-session-id"
+  ],
+  "header_count": 16,
+  "body_keys": [
+    "max_completion_tokens",
+    "messages",
+    "model",
+    "stream",
+    "stream_options",
+    "tools"
+  ],
+  "tools_count": 13,
+  "tool_names": [
+    "edit",
+    "experimental_image_generate",
+    "glob",
+    "grep",
+    "question",
+    "read",
+    "shell",
+    "skill",
+    "subagent",
+    "webfetch",
+    "websearch",
+    "write",
+    "execute"
+  ],
+  "max_completion_tokens": 32000,
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "body_bytes": 43285,
+  "body_sha256": "520d7090892cf65078d24f353b3b94674a7d1497b5ff29ba7e32ee37149c0f0f"
+}

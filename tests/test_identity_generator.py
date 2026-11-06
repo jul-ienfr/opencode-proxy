@@ -19,27 +19,21 @@ def _profile(version: str, client: str = "desktop", generation: int = 1):
 
 
 def test_generated_headers_match_each_version_capture():
-    expectations = {
-        "1.18.31": ("opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", False),
-        "1.19.0": ("opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", True),
-        "1.19.3": ("opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", True),
-        "1.19.5": ("opencode/1.19.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4", True),
-    }
-    for version, (ua, session_id) in expectations.items():
+    expectations = ("1.18.31", "1.19.0", "1.19.3", "1.19.5")
+    for version in expectations:
         p = _profile(version)
         h = p["headers"]
         assert h["Authorization"] == "Bearer public"
         assert h["Content-Type"] == "application/json"
-        assert h["User-Agent"] == ua
-        assert h["x-opencode-client"] == "desktop"
+        # 2.2.5 spec is the current official wire for every template.
+        assert h["User-Agent"] == "opencode/latest/2.2.5/cli"
+        assert h["x-opencode-client"] == "cli"
         assert h["x-opencode-project"] == p["project"]
-        assert h["x-opencode-request"] == h["x-opencode-request"]
+        assert "x-opencode-request" not in h
         assert h["x-opencode-session"] == p["session"]
-        assert ("x-opencode-session-id" in h) is session_id
-        if session_id:
-            assert h["x-opencode-session-id"] == p["session"]
-        assert "x-session-affinity" not in h
-        assert "x-session-id" not in h
+        assert h["x-opencode-session-id"] == p["session"]
+        assert h["x-session-affinity"] == p["session"]
+        assert h["x-session-id"] == p["session"]
         assert "x-opencode-directory" not in h
         assert "x-opencode-workspace" not in h
 
@@ -75,10 +69,28 @@ def test_proxy_fp_selector_uses_version_specific_ja3():
     assert fp_old["ja3"] == oc._OPENCODE_JA3
     assert fp_1193["ja3"] == oc._OPENCODE_JA3
     assert fp_1195["ja3"] == oc._OPENCODE_JA3_1195
-    assert fp_old["extra_fp"]["header_order"] == oc._OPENCODE_HEADER_ORDER
-    assert fp_1193["extra_fp"]["header_order"] == oc._OPENCODE_HEADER_ORDER_119
+    assert fp_old["extra_fp"]["header_order"] == oc._OPENCODE_HEADER_ORDER_118
+    assert fp_1193["extra_fp"]["header_order"] == oc._OPENCODE_HEADER_ORDER_119_LEGACY
     assert fp_1195["extra_fp"]["header_order"] == oc._OPENCODE_HEADER_ORDER_119
     assert fp_1195["extra_fp"]["tls_signature_algorithms"] == list(oc._OPENCODE_SIG_ALGS_1195)
+
+
+def test_proxy_fp_selector_uses_225_order_when_tracing_present():
+    headers = {
+        "Authorization": "Bearer public",
+        "b3": "trace-span-1-parent",
+        "traceparent": "00-trace-span-01",
+        "x-session-affinity": "ses_x",
+        "x-opencode-session": "ses_x",
+    }
+    _, fp = oc._get_free_fp_kwargs("1.19.5", headers)
+    assert fp["extra_fp"]["header_order"] == oc._OPENCODE_HEADER_ORDER_225
+    _, fp_225 = oc._get_free_fp_kwargs("2.2.5", headers)
+    assert fp_225["ja3"] == oc._OPENCODE_JA3_1195
+    assert fp_225["extra_fp"]["header_order"] == oc._OPENCODE_HEADER_ORDER_225
+    # Sans tracing, le wire 1.19.x garde son ordre historique.
+    _, fp_no_trace = oc._get_free_fp_kwargs("1.19.5")
+    assert fp_no_trace["extra_fp"]["header_order"] == oc._OPENCODE_HEADER_ORDER_119
 
 
 def test_generated_header_order_matches_client():
@@ -89,9 +101,12 @@ def test_generated_header_order_matches_client():
         "User-Agent",
         "x-opencode-client",
         "x-opencode-project",
-        "x-opencode-request",
         "x-opencode-session",
         "x-opencode-session-id",
+        "b3",
+        "traceparent",
+        "x-session-affinity",
+        "x-session-id",
         "Connection",
         "Accept",
         "Host",
@@ -99,24 +114,26 @@ def test_generated_header_order_matches_client():
     ]
 
 
-def test_generated_body_profile_is_the_11_tool_official_copy():
+def test_generated_body_profile_is_the_13_tool_official_copy():
     p = _profile("1.19.5")
     body = p["body"]
-    assert body["tools_count"] == 11
+    assert body["tools_count"] == 13
     assert body["tools"] == [
-        "bash",
         "edit",
+        "experimental_image_generate",
         "glob",
         "grep",
+        "question",
         "read",
+        "shell",
         "skill",
-        "task",
-        "todowrite",
+        "subagent",
         "webfetch",
         "websearch",
         "write",
+        "execute",
     ]
-    assert body["system_chars"] == 21604
+    assert body["system_chars"] == 26993
 
 
 def test_generator_alternates_versions_and_clients_with_distinct_ids():
@@ -139,7 +156,7 @@ def test_generator_alternates_versions_and_clients_with_distinct_ids():
     assert [p["client"] for p in profiles] == ["desktop", "cli"] * 4
     assert len({p["project"] for p in profiles}) == 8
     assert len({p["session"] for p in profiles}) == 8
-    assert len({p["headers"]["x-opencode-request"] for p in profiles}) == 8
+    assert len({p["headers"]["x-opencode-session"] for p in profiles}) == 8
     assert profiles[0]["verified"] is True
     assert profiles[1]["verified"] is False  # cli non capturé live
 

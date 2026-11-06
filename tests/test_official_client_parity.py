@@ -76,6 +76,8 @@ SES_RE = re.compile(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}")
 #: [ALIGNEMENT 2026-10-20] Wire OFFICIEL (client 1.19.3, capture locale
 #: `_research/oc-1.19.3/capture.jsonl`) : l'identité de session est portée par
 #: trois noms, avec la MÊME valeur. Ordre mesuré sur le fil.
+# OpenCode 2.2.5 official wire (free/captures/2.2.5.json + apply_spec):
+# session quartet, tracing, per-IP project/client, then transport.
 OFFICIAL_ORDER = [
     "Authorization",
     "Content-Type",
@@ -87,24 +89,31 @@ OFFICIAL_ORDER = [
     "Accept",
     "Host",
     "Accept-Encoding",
+    "x-opencode-client",
+    "x-opencode-project",
+    "b3",
+    "traceparent",
 ]
 
 #: Suite COMPLÈTE des tools du client officiel 1.18.31 (capture intégrale
 #: 2026-10-25, `free/official_payload.json`). Le gate gratuit exige cette
 #: signature exacte : `read` seul -> 403 depuis le durcissement du 23/10.
-OFFICIAL_TOOL_NAMES = {
-    "bash",
+OFFICIAL_TOOL_ORDER = [
     "edit",
+    "experimental_image_generate",
     "glob",
     "grep",
+    "question",
     "read",
+    "shell",
     "skill",
-    "task",
-    "todowrite",
+    "subagent",
     "webfetch",
     "websearch",
     "write",
-}
+    "execute",
+]
+OFFICIAL_TOOL_NAMES = set(OFFICIAL_TOOL_ORDER)
 
 #: Wire LEGACY (client 1.18.31) — conservé pour le mode `legacy`
 #: (rollback à chaud) et pour les tests des IDs `msg_`, qui n'existent que
@@ -166,9 +175,7 @@ def test_header_set_exact(official_env):
         "anthropic-version",
         "x-stainless-arch",
         "x-parent-session-id",
-        # Quartet 1.18.x : plus emis (mesure : non requis par la porte).
-        "x-opencode-client",
-        "x-opencode-project",
+        # 2.2.5 re-emits client/project; request is absent from its wire.
         "x-opencode-request",
     ):
         assert banned not in lower, f"en-tete {banned!r} ne doit pas partir sur la jambe free"
@@ -194,18 +201,18 @@ def test_header_values_official(official_env):
     cet en-tete n'existe plus dans le wire officiel.
     """
     h = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions")
-    assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA
-    assert h["User-Agent"] == "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+    assert h["User-Agent"] == "opencode/latest/2.2.5/cli"
     assert h["Authorization"] == "Bearer public"
     assert h["Content-Type"] == "application/json"
-    # Identite de session : trois noms, une seule valeur.
+    # Identite de session : quartet, une seule valeur.
     sid = h["x-opencode-session-id"]
     assert SES_RE.fullmatch(sid), sid
     assert h["x-session-affinity"] == sid
     assert h["x-session-id"] == sid
     assert "Accept" in h, "Accept est pose explicitement (ordre du client)"
     assert "x-opencode-request" not in h
-    assert "x-opencode-project" not in h
+    assert h["x-opencode-client"] == "cli"
+    assert h["x-opencode-project"]
 
 
 def test_client_name_enum_matches_binary(official_env):
@@ -240,14 +247,43 @@ def test_project_id_derivation_matches_official(official_env, monkeypatch, tmp_p
     assert oc._official_project_id() == "global"
 
 
+def test_apply_spec_never_injects_captured_project_for_global():
+    """Un project ``global`` (hors dépôt) reste ``global``.
+
+    L'ancien ``apply_spec`` remplaçait ``global`` par le hash du dépôt réel
+    de l'opérateur, ce qui liait toutes ces IP au même repo.
+    """
+    from free.impersonation import apply_spec
+
+    out = apply_spec({"x-opencode-project": "global"}, "ses_a")
+    assert out["x-opencode-project"] == "global"
+    out_missing = apply_spec({}, "ses_a")
+    assert out_missing["x-opencode-project"] == "global"
+
+
+def test_trace_id_stable_per_session_span_per_request():
+    """Le client 2.2.5 garde le trace ID, change le span à chaque requête."""
+    from free.impersonation import apply_spec
+
+    a = apply_spec({}, "ses_a")
+    b = apply_spec({}, "ses_a")
+    c = apply_spec({}, "ses_b")
+    trace_a = a["traceparent"].split("-")[1]
+    trace_b = b["traceparent"].split("-")[1]
+    trace_c = c["traceparent"].split("-")[1]
+    assert trace_a == trace_b
+    assert trace_a != trace_c
+    assert a["b3"].split("-")[0] == b["b3"].split("-")[0] == trace_a
+    assert a["b3"].split("-")[1] != b["b3"].split("-")[1]
+
+
 def test_ua_per_endpoint(official_env):
     """Le client envoie provider-utils/4.0.40 sur /responses (mesuré)."""
     chat = oc._official_free_headers("https://opencode.ai/inference/openai/v1/chat/completions")
     resp = oc._official_free_headers("https://opencode.ai/inference/openai/v1/responses")
-    assert chat["User-Agent"] == oc._OPENCODE_OFFICIAL_UA
-    assert "4.0.23" in chat["User-Agent"]
-    assert resp["User-Agent"] == oc._OPENCODE_OFFICIAL_UA_RESPONSES
-    assert "4.0.40" in resp["User-Agent"]
+    # 2.2.5 ships one UA string for both endpoints.
+    assert chat["User-Agent"] == "opencode/latest/2.2.5/cli"
+    assert resp["User-Agent"] == "opencode/latest/2.2.5/cli"
     # Même jeu/ordre par ailleurs
     assert list(resp) == OFFICIAL_ORDER
 
@@ -301,8 +337,8 @@ def test_hostile_profile_extras_never_reach_free(official_env):
     for k in hostile["extra_headers"]:
         assert k.lower() not in lower, f"profile extra {k!r} leaked to free"
     assert set(h.keys()) == set(OFFICIAL_ORDER)
-    # Le jeu ferme comprend EXACTEMENT les en-tetes du client : hors extras
-    # hostiles, il ne doit rien contenir d'autre.
+    # Le jeu ferme comprend EXACTEMENT les en-tetes du client 2.2.5 : hors
+    # extras hostiles, il ne doit rien contenir d'autre.
     assert set(h) == set(CLIENT_WIRE_ORDER) - set(TRANSPORT_ONLY)
 
 
@@ -397,9 +433,10 @@ async def test_bun_replay_non_stream(official_env, monkeypatch):
     assert fp["extra_fp"] == {
         "tls_signature_algorithms": list(oc._OPENCODE_SIG_ALGS),
         "tls_grease": False,
-        # [ordre exact] header_order place Connection en 8e position comme
-        # le client (libcurl la mettrait en dernier). Cf. sonde AK.
-        "header_order": oc._OPENCODE_HEADER_ORDER,
+        # [ordre exact 2026-11-06] Le wire porte b3/traceparent : l'ordre
+        # imposé est celui du client 2.2.5 (tracing en 4-5), sinon libcurl
+        # les ajoute après Content-Length.
+        "header_order": oc._OPENCODE_HEADER_ORDER_225,
     }
     assert len(oc._OPENCODE_SIG_ALGS) == 9
     assert fp["http_version"] == "v1"  # Bun = HTTP/1.1 uniquement
@@ -408,7 +445,7 @@ async def test_bun_replay_non_stream(official_env, monkeypatch):
     # Corps non-stream → stream forcé sur le wire (grille)
     assert posts[0]["stream"] is True
     h = posts[0]["headers"]
-    assert h["User-Agent"] == oc._OPENCODE_OFFICIAL_UA
+    assert h["User-Agent"] == "opencode/latest/2.2.5/cli"
     assert h["Authorization"] == "Bearer public"
     assert list(h.keys()) == EXPECTED_ORDER
     lower = {k.lower() for k in h}
@@ -517,7 +554,7 @@ def test_free_wire_body_chat_appends_shim(official_env):
     assert wire["tool_choice"] == "auto"
     assert "No client tools" in wire["messages"][0]["content"]
     assert wire["messages"][0]["role"] == "system"
-    assert "You are opencode, an interactive CLI tool" in wire["messages"][0]["content"]
+    assert "You are an AI agent running in OpenCode" in wire["messages"][0]["content"]
     assert wire["messages"][-1] == {"role": "user", "content": "hi"}
     assert "tools" not in body and body.get("stream") is not True  # entrée intacte
     wire2, forced2 = oc._free_wire_body(wire, force_stream=True)
@@ -536,7 +573,7 @@ def test_free_wire_body_chat_keeps_client_tools(official_env):
     wire, forced = oc._free_wire_body(body, force_stream=True)
     assert forced is False  # déjà stream:true
     names = [t["function"]["name"] for t in wire["tools"]]
-    assert names == sorted(OFFICIAL_TOOL_NAMES) + ["Bash"]
+    assert names == OFFICIAL_TOOL_ORDER + ["Bash"]
     assert wire["tools"][-1] is mine
     assert wire["tool_choice"] == "auto"
 
@@ -576,12 +613,12 @@ def test_free_wire_body_passthrough():
     assert wire["stream_options"] == {"include_usage": True}
     assert list(wire) == [
         "model",
-        "max_tokens",
         "messages",
         "tools",
         "tool_choice",
         "stream",
         "stream_options",
+        "max_completion_tokens",
     ]
 
 

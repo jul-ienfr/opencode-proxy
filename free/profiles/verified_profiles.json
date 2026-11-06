@@ -1,0 +1,122 @@
+{
+  "schema": 1,
+  "updated_at": 1793963398.2565904,
+  "profiles": [
+    {
+      "profile_id": "oc-1.19.5-desktop-11",
+      "version": "1.19.5",
+      "client": "desktop",
+      "tls_family": "bun-1.4.4",
+      "ja3": "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43,4588-29-23-24,0",
+      "ja3_md5": "1523504b38f0fae0d881d4b6554aac1b",
+      "sigalgs": [
+        "ecdsa_secp256r1_sha256",
+        "rsa_pss_rsae_sha256",
+        "rsa_pkcs1_sha256",
+        "ecdsa_secp384r1_sha384",
+        "rsa_pss_rsae_sha384",
+        "rsa_pkcs1_sha384",
+        "rsa_pss_rsae_sha512",
+        "rsa_pkcs1_sha512",
+        "ed25519",
+        "ecdsa_secp521r1_sha512",
+        "rsa_pkcs1_sha1"
+      ],
+      "user_agent": "opencode/1.19.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4",
+      "body_capture": "free/captures/1.19.5.json",
+      "body_sha256": "8a88371c0fbc50641a807e16a8c059d572e55777d722b75ed49517e366c103b1",
+      "tools_count": 11,
+      "session_headers": [
+        "x-opencode-session",
+        "x-opencode-session-id"
+      ],
+      "status": "verified",
+      "evidence": [
+        {
+          "block": "2a09:bac1:2780:2060::/64",
+          "status": 200,
+          "content_ok": true,
+          "error_frame": false,
+          "latency_ms": 5906,
+          "response_sha256": "255008c039a8da2834991aabf25d55b759514e407a0854d5d557edf4e9ba4adc",
+          "checked_at": 1793958061.3694558,
+          "verdict": "pass"
+        },
+        {
+          "block": "2a09:bac5:32d7:26aa::/64",
+          "status": 200,
+          "content_ok": true,
+          "error_frame": false,
+          "latency_ms": 750,
+          "response_sha256": "0f34a4492d017daf535925adff72f3cd690d5e5861659ebcf144443221205e29",
+          "checked_at": 1793958062.1171575,
+          "verdict": "pass"
+        }
+      ],
+      "verified_at": 1793958097.8648236,
+      "expires_at": 1794562897.8648236,
+      "source": "live-1.19.5-2026-11-06",
+      "ttl_s": 604800.0,
+      "shared_by": []
+    },
+    {
+      "profile_id": "oc-2.2.5-cli-13",
+      "version": "2.2.5",
+      "client": "cli",
+      "tls_family": "bun-1.4.4",
+      "ja3": "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43,4588-29-23-24,0",
+      "ja3_md5": "1523504b38f0fae0d881d4b6554aac1b",
+      "sigalgs": [
+        "ecdsa_secp256r1_sha256",
+        "rsa_pss_rsae_sha256",
+        "rsa_pkcs1_sha256",
+        "ecdsa_secp384r1_sha384",
+        "rsa_pss_rsae_sha384",
+        "rsa_pkcs1_sha384",
+        "rsa_pss_rsae_sha512",
+        "rsa_pkcs1_sha512",
+        "ed25519",
+        "ecdsa_secp521r1_sha512",
+        "rsa_pkcs1_sha1"
+      ],
+      "user_agent": "opencode/latest/2.2.5/cli",
+      "body_capture": "free/captures/2.2.5.json",
+      "body_sha256": "d9ed2690184f4bb0b47b6b3a6bde43c182ef896322f5e32399ef4f82a8bc8f7b",
+      "tools_count": 13,
+      "session_headers": [
+        "x-opencode-session",
+        "x-opencode-session-id",
+        "x-session-affinity",
+        "x-session-id"
+      ],
+      "status": "verified",
+      "evidence": [
+        {
+          "block": "2a09:bac1:27c0:2060::/64",
+          "status": 200,
+          "content_ok": true,
+          "error_frame": false,
+          "latency_ms": 6734,
+          "response_sha256": "07b683da2a02b5d0a0cead1c8bb88e368b3770b13c8242f2ce7d5f0ed4f9a2ec",
+          "checked_at": 1793957664.1118605,
+          "verdict": "pass"
+        },
+        {
+          "block": "2a09:bac5:32d3:150f::/64",
+          "status": 200,
+          "content_ok": true,
+          "error_frame": false,
+          "latency_ms": 3156,
+          "response_sha256": "79f5f57e4ad60cd42b8ff37b922769922aec1ecb74eb147203a82a4ea3c5a268",
+          "checked_at": 1793957667.2722988,
+          "verdict": "pass"
+        }
+      ],
+      "verified_at": 1793957685.7300467,
+      "expires_at": 1794562485.7300467,
+      "source": "live-warp-verify-2026-11-06",
+      "ttl_s": 604800.0,
+      "shared_by": []
+    }
+  ]
+}

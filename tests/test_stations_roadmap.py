@@ -178,6 +178,9 @@ def test_quality_registry_prunes_removed_station():
 
 
 def test_pool_state_is_dirty_gated(tmp_path):
+    import json
+    import sqlite3
+
     from free.pool import FreeIPPool
 
     p = object.__new__(FreeIPPool)
@@ -192,14 +195,24 @@ def test_pool_state_is_dirty_gated(tmp_path):
     }
     p._dirty_state = False
     p._last_pool_persist_at = 0.0
-    out = tmp_path / "pool.json"
+    out = tmp_path / "free_pool.json"
     p._pool_state_file = lambda: str(out)  # type: ignore[method-assign]
     p.save_pool_state()
     assert not out.exists(), "état propre : aucun flush inutile"
+    assert not (tmp_path / "registry.db").exists(), "état propre : aucun flush inutile"
     p._dirty_state = True
     p._last_pool_persist_at = 0.0
     p.save_pool_state()
-    assert out.exists(), "état dirty : flush immédiat"
+    assert not out.exists(), "le JSON n'est plus la source de vérité"
+    conn = sqlite3.connect(tmp_path / "registry.db")
+    try:
+        raw = conn.execute(
+            "SELECT value FROM chain_state WHERE namespace='free_pool'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert raw is not None
+    assert json.loads(raw[0])["per"]["1"]["request_count"] == 7
     assert p._dirty_state is False
 
 

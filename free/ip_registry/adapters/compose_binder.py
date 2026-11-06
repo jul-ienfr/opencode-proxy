@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import time
@@ -79,6 +80,7 @@ class ComposeHostnameBinder:
         country: str | None = None,
         vpn_type: str | None = None,
         openvpn_protocol: str | None = None,
+        dns_mode: str | None = None,
     ) -> str:
         service = self.service_name(station)
         lines = [
@@ -93,6 +95,16 @@ class ComposeHostnameBinder:
             lines.append(f"      - VPN_TYPE={vpn_type}")
         if openvpn_protocol:
             lines.append(f"      - OPENVPN_PROTOCOL={openvpn_protocol}")
+        if dns_mode:
+            lines.append(f"      - DNS_UPSTREAM_RESOLVER_TYPE={dns_mode}")
+            if str(dns_mode).strip().lower() == "plain":
+                # Gluetun refuses to boot when the resolver type is plain and
+                # this list is empty ("upstream plain addresses ... 0
+                # addresses"). Keep a literal fallback so the DNS fallback can
+                # never turn a station into a restart loop.
+                lines.append(
+                    "      - DNS_UPSTREAM_PLAIN_ADDRESSES=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"
+                )
         return "\n".join(lines) + "\n"
 
     async def assign(
@@ -103,6 +115,7 @@ class ComposeHostnameBinder:
         *,
         vpn_type: str | None = None,
         openvpn_protocol: str | None = None,
+        dns_mode: str | None = None,
     ) -> BindResult:
         hostname = str(hostname or "").strip()
         country = str(country or "").strip() or None
@@ -113,7 +126,12 @@ class ComposeHostnameBinder:
             override_path.parent.mkdir(parents=True, exist_ok=True)
             override_path.write_text(
                 self.override_yaml(
-                    station, hostname, country, vpn_type, openvpn_protocol
+                    station,
+                    hostname,
+                    country,
+                    vpn_type,
+                    openvpn_protocol,
+                    dns_mode,
                 ),
                 encoding="utf-8",
             )
@@ -177,8 +195,22 @@ class ComposeHostnameBinder:
             return None
         return str(value or "").strip() or None
 
+    _STALE_STATION_ENV = re.compile(
+        r"^(VPN_TYPE|SERVER_HOSTNAMES|OPENVPN_PROTOCOL|SERVER_COUNTRIES)_STATION\d+$"
+    )
+
     def _run(self, command: list[str], cwd: str) -> subprocess.CompletedProcess:
-        env = os.environ.copy()
+        # The long-running proxy can carry station-specific variables from a
+        # previous boot. Compose gives the process env precedence over `.env`,
+        # so forwarding them silently overrides the per-bind override file.
+        # The override always sets VPN_TYPE / SERVER_HOSTNAMES /
+        # OPENVPN_PROTOCOL for its own service, so dropping the stale keys is
+        # safe and keeps the other stations on their `.env` values.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not self._STALE_STATION_ENV.match(key)
+        }
         return subprocess.run(
             command,
             cwd=cwd,

@@ -935,6 +935,15 @@ def _persist_vpn_config(updates: dict):
                 "socks5_proxy_port": "socks5_proxy_port",
                 "credentials_file": "credentials_file",
                 "server_countries": "server_countries",
+                # [2026-11-03 any-country] Perimeter + rotation were hot-
+                # reloadable in the manager but never persisted by the
+                # dashboard: a GUI/API change reverted on restart. Persist
+                # them with the rest of the ip_rotation block.
+                "country_rotation": "country_rotation",
+                "country_offset": "country_offset",
+                "country_offset_stride": "country_offset_stride",
+                "egress_allow_any_country": "egress_allow_any_country",
+                "free_model_spread": "free_model_spread",
                 "ip_check_url": "ip_check_url",
                 "circuit_breaker_threshold": "circuit_breaker_threshold",
                 "circuit_breaker_recovery": "circuit_breaker_recovery",
@@ -1446,6 +1455,12 @@ def _socks5_payload(pool) -> list:
                 "port": r.get("port", 0),
                 "enabled": bool(r.get("enabled", True)),
                 "has_password": bool(r.get("password")),
+                "label": r.get("label", ""),
+                "ipv6": bool(r.get("ipv6", False)),
+                "egress_ip": r.get("egress_ip", ""),
+                "block": r.get("block", ""),
+                "managed": bool(r.get("managed", False)),
+                "container": r.get("container", ""),
             }
         )
     return out
@@ -1634,12 +1649,15 @@ def _socks5_auto_rotate_state() -> bool:
     return True
 
 
-async def _socks5_probe(host: str, port: int, username=None, password=None) -> dict:
+async def _socks5_probe(
+    host: str, port: int, username=None, password=None, *, ipv6: bool = False
+) -> dict:
     """Test a static SOCKS5 proxy with the official Bun/TLS replay.
 
     The probe uses the same curl_cffi fingerprint as the inference leg
     (instead of a generic httpx/raw TLS client) so Cloudflare cannot reject
     a valid proxy on the TLS signature alone.
+    ``ipv6`` force la résolution IPv6 (WARP IPv4/IPv6 partagent host:port).
     """
     host = (host or "").strip()
     try:
@@ -1660,16 +1678,36 @@ async def _socks5_probe(host: str, port: int, username=None, password=None) -> d
                 "verify": True,
             }
         )
+        session_kwargs = {}
+        if ipv6:
+            try:
+                from curl_cffi import CurlOpt
+
+                session_kwargs["curl_options"] = {CurlOpt.IPRESOLVE: 2}
+            except Exception:
+                session_kwargs = {}
         started = time.monotonic()
-        r = curl_requests.get("https://api.ipify.org/", **kwargs)
-        elapsed = time.monotonic() - started
-        ip = str(getattr(r, "text", "") or "").strip()
-        ok = 200 <= int(getattr(r, "status_code", 0) or 0) < 400
-        try:
-            r2 = curl_requests.get("https://opencode.ai/", **kwargs)
-            oc_ok = 200 <= int(getattr(r2, "status_code", 0) or 0) < 400
-        except Exception:
-            oc_ok = False
+        if ipv6:
+            with curl_requests.Session(**session_kwargs) as session:
+                r = session.get("https://api64.ipify.org/", **kwargs)
+                elapsed = time.monotonic() - started
+                ip = str(getattr(r, "text", "") or "").strip()
+                ok = 200 <= int(getattr(r, "status_code", 0) or 0) < 400
+                try:
+                    r2 = session.get("https://opencode.ai/", **kwargs)
+                    oc_ok = 200 <= int(getattr(r2, "status_code", 0) or 0) < 400
+                except Exception:
+                    oc_ok = False
+        else:
+            r = curl_requests.get("https://api.ipify.org/", **kwargs)
+            elapsed = time.monotonic() - started
+            ip = str(getattr(r, "text", "") or "").strip()
+            ok = 200 <= int(getattr(r, "status_code", 0) or 0) < 400
+            try:
+                r2 = curl_requests.get("https://opencode.ai/", **kwargs)
+                oc_ok = 200 <= int(getattr(r2, "status_code", 0) or 0) < 400
+            except Exception:
+                oc_ok = False
         return ip, ok, elapsed, oc_ok
 
     try:
@@ -4964,7 +5002,24 @@ def register_dashboard(
             "proxies": _socks5_payload(pool),
             "rotate": _socks5_auto_rotate_state(),
             "fallback": _socks5_fallback_state(),
+            "mode": getattr(pool, "proxy_mode", ""),
+            "enabled": bool(getattr(pool, "enabled", False)),
         }
+
+    @app.post("/api/vpn/socks5/rotate-egress")
+    async def rotate_vpn_socks5_egress(request: Request):
+        """Force une rotation des WARP managés dont le bucket est épuisé."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        pool = _dashboard_pool()
+        if pool is None or not hasattr(pool, "rotate_exhausted_managed"):
+            return {"ok": False, "error": "pool_unavailable"}
+        try:
+            started = int(pool.rotate_exhausted_managed())
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "started": started}
 
     @app.post("/api/vpn/socks5")
     async def add_vpn_socks5(request: Request):
@@ -5042,9 +5097,33 @@ def register_dashboard(
         body = await request.json()
         host = body.get("host", "")
         port = body.get("port", 0)
+        label = str(body.get("label") or "").strip()
+        ipv6 = False
+        username = password = None
         pool = _dashboard_pool()
-        username, password = _stored_proxy_credentials(pool, "_socks5_proxies", host, port)
-        return await _socks5_probe(host, port, username=username, password=password)
+        row = None
+        if label and pool is not None:
+            row = next(
+                (
+                    r
+                    for r in (getattr(pool, "_socks5_proxies", None) or [])
+                    if isinstance(r, dict) and str(r.get("label") or "") == label
+                ),
+                None,
+            )
+        if row is not None:
+            host = row.get("host", host)
+            port = row.get("port", port)
+            username = row.get("username")
+            password = row.get("password")
+            ipv6 = bool(row.get("ipv6", False))
+        else:
+            username, password = _stored_proxy_credentials(
+                pool, "_socks5_proxies", host, port
+            )
+        return await _socks5_probe(
+            host, port, username=username, password=password, ipv6=ipv6
+        )
 
     @app.post("/api/vpn/socks5/rotate")
     async def rotate_vpn_socks5(request: Request):

@@ -1893,6 +1893,7 @@ async def _get_pooled_curl_session(
     fp_override: dict | None = None,
     egress_ip: str | None = None,
     variant: str = "",
+    curl_options: dict | None = None,
 ):
     """Emprunte une session du pool pour (proxy, face réseau, IP).
 
@@ -1946,6 +1947,16 @@ async def _get_pooled_curl_session(
             }
         except Exception:
             pass
+    # [2026-11-06] Options de session par endpoint (ex. IPRESOLVE=6 pour la
+    # station WARP IPv6). `curl_options` est une option de SESSION chez
+    # curl_cffi, pas de requête : elle doit être posée à la création et la
+    # clé de pool/variant doit séparer les familles.
+    if curl_options:
+        _existing = sess_kwargs.get("curl_options")
+        if isinstance(_existing, dict):
+            sess_kwargs["curl_options"] = {**_existing, **curl_options}
+        else:
+            sess_kwargs["curl_options"] = dict(curl_options)
     slot = await pool.checkout(
         lambda: _curl_requests_mod.AsyncSession(
             proxy=_curl_proxy_url(proxy_url),
@@ -2180,6 +2191,166 @@ def _sync_station_supervisors(shared_state) -> None:
         )
     except Exception as e:
         _debug(f"  [vpn] supervisor sync failed (fail-soft): {e}")
+
+
+def _fresh_chain_supervisor_alive() -> bool:
+    """True when the fresh-chain supervisor lock points to a live PID."""
+    try:
+        import json as _json
+        import sys as _sys
+        from pathlib import Path
+
+        lock = Path(__file__).resolve().parent / "logs" / "fresh_chain_supervisor.lock"
+        if not lock.exists():
+            return False
+        data = _json.loads(lock.read_text(encoding="utf-8"))
+        pid = int(data.get("pid") or 0)
+        if pid <= 0:
+            return False
+        if _sys.platform == "win32":
+            import subprocess as _sp
+
+            r = _sp.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=0x08000000,
+            )
+            return str(pid) in (r.stdout or "")
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_fresh_chain_supervisor() -> None:
+    """Auto-start the fresh-IP repair engine (idempotent, fail-soft).
+
+    The supervisor is the only component that changes a station's hostname
+    (fresh egress IP). Without it, a quota-exhausted fleet has no recovery
+    path. Its own lock makes a second launch harmless.
+    """
+    # [2026-11-04] The free CHAT quota is account-wide, not per-IP. The
+    # repair probes consume it and starve the client. `allocator.mode: off`
+    # means "do not probe": keep the quota for real client requests.
+    try:
+        if str(yaml_get("ip_registry", "allocator.mode", "off") or "off") == "off":
+            return
+    except Exception:
+        pass
+    if _fresh_chain_supervisor_alive():
+        return
+    try:
+        import subprocess as _sp
+        import sys as _sys
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent
+        _sp.Popen(
+            [_sys.executable, str(root / "scripts" / "fresh_chain_supervisor.py")],
+            cwd=str(root),
+            stdout=_sp.DEVNULL,
+            stderr=_sp.DEVNULL,
+            creationflags=0x08000000 if _sys.platform == "win32" else 0,
+        )
+        _debug("  [lifespan] fresh_chain supervisor autostarted")
+    except Exception as e:
+        _debug(f"  [lifespan] fresh_chain supervisor autostart failed: {e}")
+
+
+async def _fresh_chain_supervisor_watchdog() -> None:
+    """Restart the fresh-chain supervisor if it dies (every 60 s)."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            _ensure_fresh_chain_supervisor()
+        except Exception:
+            pass
+
+
+def _station_slo_alive() -> bool:
+    """True when the per-station SLO sampler lock points to a live PID."""
+    try:
+        import json as _json
+        import sys as _sys
+        from pathlib import Path
+
+        lock = Path(__file__).resolve().parent / "logs" / "station_slo_watch.lock"
+        if not lock.exists():
+            return False
+        data = _json.loads(lock.read_text(encoding="utf-8"))
+        pid = int(data.get("pid") or 0)
+        if pid <= 0:
+            return False
+        if _sys.platform == "win32":
+            import subprocess as _sp
+
+            r = _sp.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=0x08000000,
+            )
+            return str(pid) in (r.stdout or "")
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_station_slo_sampler() -> None:
+    """Auto-start the availability sampler (idempotent, fail-soft).
+
+    The sampler writes `logs/station_slo.jsonl` and opens/closes incidents in
+    `logs/station_incidents.db`. Without it there is no measured availability,
+    only instantaneous booleans.
+    """
+    try:
+        if not bool(yaml_get("ip_registry", "slo.enabled", True)):
+            return
+    except Exception:
+        pass
+    if _station_slo_alive():
+        return
+    try:
+        import subprocess as _sp
+        import sys as _sys
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent
+        try:
+            interval = int(yaml_get("ip_registry", "slo.sample_interval_s", 30) or 30)
+        except Exception:
+            interval = 30
+        _sp.Popen(
+            [
+                _sys.executable,
+                str(root / "scripts" / "station_slo_watch.py"),
+                "--duration",
+                "0",
+                "--interval",
+                str(max(5, interval)),
+            ],
+            cwd=str(root),
+            stdout=_sp.DEVNULL,
+            stderr=_sp.DEVNULL,
+            creationflags=0x08000000 if _sys.platform == "win32" else 0,
+        )
+        _debug("  [lifespan] station SLO sampler autostarted")
+    except Exception as e:
+        _debug(f"  [lifespan] station SLO sampler autostart failed: {e}")
+
+
+async def _station_slo_watchdog() -> None:
+    """Restart the availability sampler if it dies (every 60 s)."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            _ensure_station_slo_sampler()
+        except Exception:
+            pass
 
 
 def _boot_stagger_s() -> float:
@@ -2851,6 +3022,23 @@ async def _live_models_loop():
             await asyncio.sleep(60)
 
 
+async def _warp_rotation_watchdog():
+    """Tourne même sans requête : un bucket épuisé déclenche la rotation."""
+    while True:
+        try:
+            await asyncio.sleep(30)
+            pool = _free_ip_pool
+            if pool is None:
+                continue
+            started = pool.rotate_exhausted_managed()
+            if started:
+                _debug(f"  [warp-rotate] watchdog started {started} rotation(s)")
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            _debug(f"  [warp-rotate] watchdog error: {type(exc).__name__}: {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app):
     _debug("  [lifespan] app starting")
@@ -3098,6 +3286,11 @@ async def lifespan(app):
             shared_state.free_ip_pool._post_rotation_prewarm_cb = _free_prewarm_once  # type: ignore[attr-defined]
     except Exception:
         pass
+    try:
+        shared_state.free_ip_pool._post_rotation_probe_cb = _free_post_rotation_probe  # type: ignore[attr-defined]
+        shared_state.free_ip_pool._trial_dead_labels_cb = _trial_dead_managed_labels  # type: ignore[attr-defined]
+    except Exception:
+        pass
     # [plan] E: boot-time fan-out of the ip_rotation timings (connect retry,
     # bad TTL, rotation stagger) — the pool's built-in defaults are the
     # conservative legacy values.
@@ -3106,9 +3299,28 @@ async def lifespan(app):
         shared_state.free_ip_pool.load_pool_state()
     except Exception:
         pass
+    # [2026-11-03] Auto-start + watchdog the fresh-IP repair engine. Without
+    # it, a quota-exhausted fleet has no hostname-change recovery path.
+    # [001-free-station-availability] Close leases/assignments left open by a
+    # crash before any selection can read them.
+    try:
+        from free.ip_registry.registry_db import reconcile as _reconcile_registry
+
+        _reconciled = _reconcile_registry()
+        if any(_reconciled.values()):
+            _debug(f"  [lifespan] ip_registry reconcile: {_reconciled}")
+    except Exception as e:
+        _debug(f"  [lifespan] ip_registry reconcile failed (fail-soft): {e}")
+    _ensure_fresh_chain_supervisor()
+    app.state._fresh_supervisor_task = asyncio.create_task(
+        _fresh_chain_supervisor_watchdog()
+    )
+    _ensure_station_slo_sampler()
+    app.state._station_slo_task = asyncio.create_task(_station_slo_watchdog())
     global _vpn_manager, _free_ip_pool
     _vpn_manager = _managers[0]
     _free_ip_pool = shared_state.free_ip_pool
+    app.state._warp_rotation_task = asyncio.create_task(_warp_rotation_watchdog())
 
     # [plan 18/08 §2.2] Boot reconcile: a crash (or a stack flip that died
     # mid-way) leaves docker containers that do not match the registry —
@@ -6383,6 +6595,31 @@ _OPENCODE_HEADER_ORDER_119 = os.getenv(
     "x-opencode-request,x-opencode-session,x-opencode-session-id,Connection,Accept,"
     "Host,Accept-Encoding,Content-Length",
 )
+# [2026-11-06] Wire 1.19.3 natif : session-id + affinity + session-id, sans
+# quartet client/project/request/session.
+_OPENCODE_HEADER_ORDER_119_LEGACY = os.getenv(
+    "OPENCODE_FREE_HEADER_ORDER_119_LEGACY",
+    "Authorization,Content-Type,User-Agent,x-opencode-session-id,"
+    "x-session-affinity,x-session-id,Connection,Accept,Host,Accept-Encoding,"
+    "Content-Length",
+)
+# [2026-11-06] Wire 1.18.31 natif : affinity + session-id seulement.
+_OPENCODE_HEADER_ORDER_118 = os.getenv(
+    "OPENCODE_FREE_HEADER_ORDER_118",
+    "Authorization,Content-Type,User-Agent,x-session-affinity,x-session-id,"
+    "Connection,Accept,Host,Accept-Encoding,Content-Length",
+)
+# [2026-11-06] Ordre EXACT du client 2.2.5 (capture 2026-11-05) : le tracing
+# est placé après l'UA, le quartet de session après le projet. Sans cette
+# constante, libcurl ajoute b3/traceparent/x-session-* APRÈS Content-Length,
+# ce qui n'existe chez aucun client réel.
+_OPENCODE_HEADER_ORDER_225 = os.getenv(
+    "OPENCODE_FREE_HEADER_ORDER_225",
+    "Authorization,Content-Type,User-Agent,b3,traceparent,"
+    "x-opencode-client,x-opencode-project,x-opencode-session,"
+    "x-opencode-session-id,x-session-affinity,x-session-id,"
+    "Connection,Accept,Host,Accept-Encoding,Content-Length",
+)
 _FREE_HEADER_ORDER_ON = os.getenv("OPENCODE_FREE_HEADER_ORDER_ON", "1") not in (
     "0",
     "false",
@@ -6391,7 +6628,7 @@ _FREE_HEADER_ORDER_ON = os.getenv("OPENCODE_FREE_HEADER_ORDER_ON", "1") not in (
 )
 
 
-def _free_fp_override(version: str = "") -> dict:
+def _free_fp_override(version: str = "", header_names=()) -> dict:
     """Params de session curl_cffi pour la face Bun officielle (replay exact).
 
     Recette validée au captureur contre les vrais clients 1.18.31/1.19.0/
@@ -6415,7 +6652,8 @@ def _free_fp_override(version: str = "") -> dict:
     """
     if _OPENCODE_TLS_IMPERSONATE:
         return {}
-    is_1195 = str(version or "") == "1.19.5"
+    _version = str(version or "")
+    is_1195 = _version in ("1.19.5", "2.2.5")
     ja3 = _OPENCODE_JA3_1195 if is_1195 else _OPENCODE_JA3
     sigalgs = _OPENCODE_SIG_ALGS_1195 if is_1195 else _OPENCODE_SIG_ALGS
     fp = {
@@ -6423,11 +6661,17 @@ def _free_fp_override(version: str = "") -> dict:
         "tls_grease": False,
     }
     if _FREE_HEADER_ORDER_ON:
-        fp["header_order"] = (
-            _OPENCODE_HEADER_ORDER_119
-            if str(version or "") not in ("", "1.18.31")
-            else _OPENCODE_HEADER_ORDER
-        )
+        names = {str(name).strip().lower() for name in (header_names or ())}
+        if "b3" in names and "x-session-affinity" in names:
+            fp["header_order"] = _OPENCODE_HEADER_ORDER_225
+        elif _version == "1.18.31":
+            fp["header_order"] = _OPENCODE_HEADER_ORDER_118
+        elif _version in ("1.19.0", "1.19.3"):
+            fp["header_order"] = _OPENCODE_HEADER_ORDER_119_LEGACY
+        elif _version:
+            fp["header_order"] = _OPENCODE_HEADER_ORDER_119
+        else:
+            fp["header_order"] = _OPENCODE_HEADER_ORDER
     return {
         "impersonate": "chrome131",
         "ja3": ja3,
@@ -6437,23 +6681,17 @@ def _free_fp_override(version: str = "") -> dict:
     }
 
 
-def _get_free_fp_kwargs(version: str = "") -> tuple[str, dict | None]:
+def _get_free_fp_kwargs(version: str = "", header_names=()) -> tuple[str, dict | None]:
     """(impersonate, fp_override) pour la jambe free — kill-switch inclus.
 
-    ``version`` ajuste l'ordre des en-têtes : 1.18.31 n'a pas
-    x-opencode-session-id (12 en-têtes) ; 1.19.0+ l'insère en 8e position
-    (13 en-têtes). Sans version (sondes/legacy), l'ordre 1.18.31 reste le
-    défaut historique.
+    ``version`` ajuste le profil TLS ; ``header_names`` ajuste l'ordre imposé
+    à libcurl. Quand le wire porte le tracing + le quartet de session 2.2.5,
+    l'ordre 2.2.5 complet est utilisé (sinon b3/traceparent partiraient après
+    Content-Length). Sans ces en-têtes, l'ordre 1.19.x/1.18.x reste le défaut.
     """
     if _OPENCODE_TLS_IMPERSONATE:
         return _OPENCODE_TLS_IMPERSONATE, None
-    fp = _free_fp_override(version)
-    if isinstance(fp, dict) and version and version != "1.18.31":
-        fp = dict(fp)
-        extra = dict(fp.get("extra_fp") or {})
-        if _FREE_HEADER_ORDER_ON and _OPENCODE_HEADER_ORDER_119:
-            extra["header_order"] = _OPENCODE_HEADER_ORDER_119
-        fp["extra_fp"] = extra
+    fp = _free_fp_override(version, header_names)
     return "", fp
 
 
@@ -6555,7 +6793,10 @@ def _official_free_payload() -> dict:
             if isinstance(t, dict) and isinstance(t.get("function"), dict)
         },
         "system": system,
-        "max_tokens": body.get("max_tokens") or 32000,
+        "max_tokens": body.get("max_tokens") or body.get("max_completion_tokens") or 32000,
+        "max_completion_tokens": body.get("max_completion_tokens")
+        or body.get("max_tokens")
+        or 32000,
         "stream_options": body.get("stream_options") or {"include_usage": True},
     }
     # [2026-10-25] Échec bruyant : une copie absente/corrompue ferait envoyer
@@ -6775,13 +7016,19 @@ def _select_free_client_tools(tools, max_tools: int):
 
 
 def _free_official_placeholder_defs(official_defs):
-    """Définitions minimales des 10 outils officiels exigés par le gate.
+    """Définitions minimales des outils officiels exigés par le gate.
 
     Le gate free vérifie les **noms** ; le modèle doit utiliser les outils du
     client. L'ancienne copie conservait les schémas officiels complets
     (~6,9 Ko de placeholders, `bash` seul ~1,4 Ko de schéma) et mangeait le
     budget du gate au détriment de l'historique. On ne garde que le nom, une
-    description « ne pas appeler » et un schéma vide.
+    description « ne pas appeler » et un schéma minimal.
+
+    [2026-11-06] `properties` n'est plus vide : deux proxys indépendants
+    (xljiulang/opencode-proxy, 2026-11-05) mesurent qu'un schéma
+    ``{"type":"object","properties":{}}`` **ne compte pas** dans le gate et
+    qu'il faut 7 outils nommés avec des propriétés non vides ; le minimum
+    d'un seul `path` suffit et coûte ~50 octets par outil.
     """
     out = []
     for tool in official_defs or []:
@@ -6800,7 +7047,10 @@ def _free_official_placeholder_defs(official_defs):
                         "Gateway compatibility placeholder. DO NOT CALL. "
                         "Use the client's tools (terminal, read_file, patch, ...) instead."
                     ),
-                    "parameters": {"type": "object", "properties": {}},
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
                 },
             }
         )
@@ -6828,6 +7078,59 @@ def _replace_free_tools_note(content: str, note: str) -> str:
     if isinstance(content, str) and content.endswith(_AVAILABLE_TOOLS_NOTE):
         content = content[: -len(_AVAILABLE_TOOLS_NOTE)]
     return str(content or "") + note
+
+
+def _free_env_block_valid(messages) -> bool:
+    """Un message système porte-t-il ``<env>…Working directory:…</env>`` ?
+
+    [2026-11-06] Le gate free exige un couple ``<env>``/``</env>`` littéral
+    contenant ``Working directory:`` (mesuré par rianilham28/opencode2api et
+    alztrk/opencode-ip-rotator). Le contenu autour est libre, et le chemin
+    peut être vide ou arbitraire. On scanne tous les blocs, pas seulement le
+    premier : le prompt officiel 2.2.5 place le sien au milieu.
+    """
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+        if not isinstance(content, str):
+            continue
+        start = content.find("<env")
+        if start < 0:
+            continue
+        # Seul le PREMIER couple compte : un `<env></env>` vide, ou
+        # `<env x="1">`, devant un couple valide empoisonne la requête
+        # (mesuré par rianilham28/opencode2api). On s'arrête donc au premier
+        # token, valide ou non, au lieu de chercher un couple valide plus loin.
+        if not content.startswith("<env>", start):
+            return False
+        end = content.find("</env>", start + 5)
+        if end < 0:
+            return False
+        return "Working directory:" in content[start:end]
+    return False
+
+
+def _free_ensure_env_block(messages, workspace: str = "/"):
+    """Insère un bloc ``<env>`` valide si le corps n'en porte aucun.
+
+    Un premier couple ``<env>`` inutilisable empoisonne la requête (mesuré) :
+    le bloc valide est alors inséré **avant**, et le prompt officiel n'est
+    jamais modifié — c'est la signature du gate.
+    """
+    if _free_env_block_valid(messages):
+        return messages
+    block = {
+        "role": "system",
+        "content": f"<env>\n  Working directory: {workspace}\n</env>",
+    }
+    return [block] + list(messages or [])
 
 
 #: Marqueur du prompt de compaction/summary de Hermes. Ces requetes n'ont ni
@@ -7432,6 +7735,16 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     _summary_token_cap = _free_summary_max_tokens() if _is_summary else 0
     need_summary_tokens = bool(_is_summary and _summary_token_cap > 0)
     missing = [n for n in ("read",) if n not in have] if is_resp else []
+    # [2026-11-06] Garde <env> : même un corps « signature OK » peut avoir
+    # perdu son bloc (prompt officiel recopié sans l'environnement, ou
+    # <env> vide en tête). On le vérifie AVANT le retour rapide, sinon la
+    # garde ne s'appliquerait jamais au cas où elle sert.
+    need_env = bool(is_chat and not _free_env_block_valid(body.get("messages")))
+    # [2026-11-06] Le gate refuse `tool_choice: "none"` (mesuré sur le summary).
+    # L'ancien code ne le corrigeait que quand il injectait lui-même la grille :
+    # un client « signature OK » qui désactive les outils partait avec `none`
+    # et prenait un faux quota. On le retire toujours de la copie free.
+    need_tc_none = bool(is_chat and body.get("tool_choice") == "none")
     need_stream = force_stream and body.get("stream") is not True
     # [2026-11-01] Le client officiel envoie TOUJOURS stream_options quand il
     # streame. Un client qui pose stream:true sans stream_options avait un
@@ -7466,6 +7779,8 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         and not need_order
         and not need_clamp
         and not need_summary_tokens
+        and not need_env
+        and not need_tc_none
     ):
         return body, False
     wire = dict(body)
@@ -7686,13 +8001,14 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     if wire.get("stream") is True and "stream_options" not in wire and isinstance(_payload.get("stream_options"), dict):
         wire["stream_options"] = copy.deepcopy(_payload["stream_options"])
     if need_order:
-        # [2026-11-01] Le client officiel envoie TOUJOURS max_tokens: 32000
-        # (capture 1.18.31/1.19.0/1.19.3/1.19.5). Un corps générique injecté
-        # sans ce champ avait une forme différente de l'officiel.
-        if "max_tokens" not in wire:
-            _mt_official = _payload.get("max_tokens")
+        # [2026-11-04] Client 2.2.5 : `max_completion_tokens`, pas
+        # `max_tokens`. On convertit la copie free, jamais le corps client.
+        if "max_tokens" in wire and "max_completion_tokens" not in wire:
+            wire["max_completion_tokens"] = wire.pop("max_tokens")
+        if "max_completion_tokens" not in wire:
+            _mt_official = _payload.get("max_completion_tokens") or _payload.get("max_tokens")
             if isinstance(_mt_official, int) and _mt_official > 0:
-                wire["max_tokens"] = _mt_official
+                wire["max_completion_tokens"] = _mt_official
         wire = _reorder_client_body(wire)
     # [2026-10-31] Le plafond gate s'applique à la COPIE FREE FINALE
     # (system officiel + outils + messages), pas au corps client. L'ancien
@@ -7714,6 +8030,13 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
                     f"{_trimmed_messages} message(s) retiré(s) "
                     f"(wire={_wire_size} o, budget {_wire_cap} o)"
                 )
+    if need_env:
+        _env_messages = _free_ensure_env_block(wire.get("messages"))
+        if _env_messages is not wire.get("messages"):
+            wire = dict(wire)
+            wire["messages"] = _env_messages
+    if need_tc_none:
+        wire.pop("tool_choice", None)
     # ── [ALIGNEMENT 2026-10-20] DeepSeek « thinking mode » ──────────────────
     # L'amont exige que CHAQUE message assistant porte `reasoning_content`,
     # même vide : sans lui, 400 « The `reasoning_content` in the thinking mode
@@ -8659,6 +8982,40 @@ def _body_conversation_key(body) -> str | None:
     return None
 
 
+def _free_affinity_key(body) -> str:
+    """Clé stable de conversation pour l'affinité de station.
+
+    Priorité au chaînage ``conversation`` ; sinon empreinte
+    model + system + premier message user (les conversations chat sans ID
+    restent distinctes).
+    """
+    try:
+        conv = _body_conversation_key(body)
+        if conv:
+            return str(conv)
+        if not isinstance(body, dict):
+            return ""
+        import hashlib
+
+        model = str(body.get("model") or "")
+        system = ""
+        first_user = ""
+        for message in body.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            if role == "system" and not system:
+                system = str(content or "")
+            elif role == "user" and not first_user:
+                first_user = str(content or "")
+        if not first_user:
+            return ""
+        return hashlib.sha256(f"{model}|{system}|{first_user}".encode()).hexdigest()
+    except Exception:
+        return ""
+
+
 def _official_free_headers(
     endpoint: str = "", conversation_key: str | None = None, egress_ip: str | None = None
 ) -> dict:
@@ -8879,6 +9236,19 @@ def _official_free_headers(
             out["Accept"] = "*/*"
             out["Host"] = _host
             out["Accept-Encoding"] = _OPENCODE_ACCEPT_ENCODING
+    if _wire_style != "legacy":
+        try:
+            from free.impersonation import apply_spec
+
+            out = apply_spec(out, str(_conv_session))
+        except Exception:
+            pass
+    try:
+        from free.console_auth import apply_console_auth
+
+        out = apply_console_auth(out)
+    except Exception:
+        pass
     return out
 
 
@@ -9487,6 +9857,74 @@ def _signal_connection_failure(station) -> None:
         raise
 
 
+_STATION_IDENTITY_VAULT = None
+_STATION_PROFILE_REGISTRY = None
+_STATION_PROFILE_MTIME = 0.0
+
+
+def _station_identity_enabled() -> bool:
+    try:
+        raw = os.getenv("FREE_STATION_IDENTITY", "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+    except Exception:
+        pass
+    try:
+        return bool(yaml_get("free", "station_identity", False))
+    except Exception:
+        return False
+
+
+def _station_identity_runtime(station):
+    label = str(getattr(station, "label", "") or "").strip() if station is not None else ""
+    if not label:
+        return None
+    global _STATION_IDENTITY_VAULT, _STATION_PROFILE_REGISTRY, _STATION_PROFILE_MTIME
+    try:
+        from free.profile_registry import load_registry
+        from free.runtime_identity import resolve_station_identity
+        from free.station_identity import StationIdentityVault
+
+        if _STATION_IDENTITY_VAULT is None:
+            _STATION_IDENTITY_VAULT = StationIdentityVault()
+        path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "free",
+            "profiles",
+            "verified_profiles.json",
+        )
+        mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
+        if _STATION_PROFILE_REGISTRY is None or mtime != _STATION_PROFILE_MTIME:
+            _STATION_PROFILE_REGISTRY = load_registry(path)
+            _STATION_PROFILE_MTIME = mtime
+        return resolve_station_identity(
+            station,
+            _STATION_IDENTITY_VAULT,
+            _STATION_PROFILE_REGISTRY,
+        )
+    except Exception as exc:
+        _log(f"  [station-identity] résolution impossible: {exc}")
+        raise
+
+
+def _station_free_headers(runtime, conversation_key=None, endpoint=""):
+    from free.runtime_identity import build_headers
+
+    return build_headers(
+        runtime,
+        conversation_key=conversation_key,
+        endpoint=endpoint,
+    )
+
+
+def _station_free_body(body, runtime, client_body=None):
+    from free.runtime_identity import build_body
+
+    return build_body(body, runtime, client_body=client_body)
+
+
 async def _do_free_request_curl_cffi(
     body: dict,
     headers: dict,
@@ -9540,20 +9978,31 @@ async def _do_free_request_curl_cffi(
         except Exception:
             pass
     _egress_ip = (_egress_ip or "").strip() or None
-    req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _egress_ip)
-    _ident_version = ""
-    try:
-        if _egress_ip and _per_ip_identity_enabled():
-            _vlt_fp = _ip_vault()
-            if _vlt_fp is not None:
-                _ident_version = str(_vlt_fp.get(_egress_ip).version or "")
-    except Exception:
+    _station_runtime = None
+    if _station_identity_enabled() and station is not None:
+        _station_runtime = _station_identity_runtime(station)
+        if _station_runtime is not None and _station_runtime.profile is None:
+            raise RuntimeError("free station identity: aucun profil vérifié")
+    if _station_runtime is not None:
+        req_headers = _station_free_headers(_station_runtime, _body_conversation_key(body), endpoint or "")
+        _ident_version = _station_runtime.version
+    else:
+        req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _egress_ip)
         _ident_version = ""
-    _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version)
+        try:
+            if _egress_ip and _per_ip_identity_enabled():
+                _vlt_fp = _ip_vault()
+                if _vlt_fp is not None:
+                    _ident_version = str(_vlt_fp.get(_egress_ip).version or "")
+        except Exception:
+            _ident_version = ""
+    _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version, req_headers)
     # [gate body 2026-09-18] grille tools (bash+read) + stream forcé : un corps
     # non-stream ou sans tools serait 403. Si stream forcé ici, le SSE est
     # collecté plus bas et reconstitué en JSON (contrat non-stream inchangé).
     wire_body, _force_wire_stream = _free_wire_body(body, force_stream=True, egress_ip=_egress_ip)
+    if _station_runtime is not None:
+        wire_body = _station_free_body(wire_body, _station_runtime, body)
 
     # Pooled session — [A1 perf] checkout/checkin SANS verrou pendant le
     # transfert : le POST non-streaming ne sérialise plus la station.
@@ -9573,15 +10022,34 @@ async def _do_free_request_curl_cffi(
         # direct — sinon la boucle ne tourne jamais et ``raise last_exc``
         # lève None (TypeError: exceptions must derive from BaseException).
         proxies_to_try.append(None)
+    # [2026-11-06] Station IPv6 WARP : force CURL_IPRESOLVE_V6=2 au niveau
+    # SESSION, et sépare la clé de pool par famille pour ne pas partager une
+    # session IPv4 configurée sans l'option.
+    _station_ipv6 = bool(getattr(station, "ipv6", False))
+    _curl_options = None
+    if _station_ipv6:
+        try:
+            from curl_cffi import CurlOpt
+
+            _curl_options = {CurlOpt.IPRESOLVE: 2}
+        except Exception:
+            _curl_options = None
     last_exc: Exception | None = None
     for attempt_i, attempt_proxy in enumerate(proxies_to_try):
         is_last = attempt_i == len(proxies_to_try) - 1
+        _variant = f"free-{_ident_version}" if _ident_version else ""
+        if _station_ipv6:
+            _variant = f"{_variant}-ipv6" if _variant else "free-ipv6"
+        # N'ajoute `curl_options` que lorsqu'il y en a : les doubles de test
+        # historiques n'acceptent pas ce kwarg (rétro-compatibilité).
+        _pool_kwargs = {"egress_ip": _egress_ip, "variant": _variant}
+        if _curl_options:
+            _pool_kwargs["curl_options"] = _curl_options
         pool, slot = await _get_pooled_curl_session(
             attempt_proxy,
             _free_impersonate,
             _free_fp,
-            egress_ip=_egress_ip,
-            variant=f"free-{_ident_version}" if _ident_version else "",
+            **_pool_kwargs,
         )
         if endpoint:
             _ep = endpoint
@@ -11086,6 +11554,13 @@ def _free_parallel_should_hedge(body: dict, forced_pool=None) -> bool:
             return False
         if getattr(_free_ip_pool, "_free_parallel_mode", "load-balance") != "hedge":
             return False
+        # Une conversation déjà épinglée (gagnante d'un hedge précédent) ne
+        # repart pas en course : deux copies du même historique ne doivent
+        # jamais partir en parallèle.
+        if getattr(_free_ip_pool, "socks5_mode", False):
+            key = _free_affinity_key(body)
+            if key and key in getattr(_free_ip_pool, "_socks5_affinity", {}):
+                return False
         # need at least 2 usable candidates
         cands = _free_ip_pool.pick_candidates(forced_pool)
         return len(cands) >= 2
@@ -11892,7 +12367,16 @@ async def _open_free_stream_hedged(
         cands = pool.pick_candidates(forced_pool)[:2] if pool else []
     except Exception:
         cands = []
-    if len(cands) < 2:
+    _pinned_conversation = False
+    if pool is not None and getattr(pool, "socks5_mode", False):
+        try:
+            _pk = _free_affinity_key(body)
+            _pinned_conversation = bool(
+                _pk and _pk in getattr(pool, "_socks5_affinity", {})
+            )
+        except Exception:
+            _pinned_conversation = False
+    if _pinned_conversation or len(cands) < 2:
         async with _open_free_stream(
             endpoint,
             body,
@@ -12010,6 +12494,11 @@ async def _open_free_stream_hedged(
                     "hedged": True,
                 }
             )
+        except Exception:
+            pass
+        try:
+            if getattr(pool, "socks5_mode", False):
+                pool.pin_socks5_conversation(_free_affinity_key(body), winner["station"])
         except Exception:
             pass
         _debug(
@@ -12133,7 +12622,10 @@ async def _open_free_stream(
         elif count_request:
             try:
                 proxy_url, station = await _free_ip_pool.on_request(
-                    forced_pool, excluded=_dead_stations, model=_free_model_name
+                    forced_pool,
+                    excluded=_dead_stations,
+                    model=_free_model_name,
+                    conversation_key=_free_affinity_key(body),
                 )
             except TypeError:
                 try:
@@ -12228,11 +12720,26 @@ async def _open_free_stream(
                 # officielle par IP (vault : UA versionnée + ses_/msg_ isolés),
                 # face Bun rejouée, UA par endpoint — même sur les ré-essais.
                 # Session par conversation quand le corps porte un chaînage.
-                req_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _egress_ip_s or None)
-                _ident_version = str((_inst_snap or {}).get("version") or "")
-                _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version)
+                _station_runtime = None
+                if _station_identity_enabled() and station is not None:
+                    _station_runtime = _station_identity_runtime(station)
+                    if _station_runtime is not None and _station_runtime.profile is None:
+                        raise RuntimeError("free station identity: aucun profil vérifié")
+                if _station_runtime is not None:
+                    req_headers = _station_free_headers(
+                        _station_runtime, _body_conversation_key(body), endpoint or ""
+                    )
+                    _ident_version = _station_runtime.version
+                else:
+                    req_headers = _official_free_headers(
+                        endpoint or "", _body_conversation_key(body), _egress_ip_s or None
+                    )
+                    _ident_version = str((_inst_snap or {}).get("version") or "")
+                _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version, req_headers)
                 # [gate body 2026-09-18] grille tools sur le corps stream.
                 wire_body, _ = _free_wire_body(body, force_stream=True, egress_ip=_egress_ip_s or None)
+                if _station_runtime is not None:
+                    wire_body = _station_free_body(wire_body, _station_runtime, body)
                 # [P1.1 perf] timeout posé AU NIVEAU DE LA FACTORY
                 # de session poolée (_curl_timeout : connect 10 + read config
                 # upstream.timeout.read) : le POST ci-dessous n'a plus besoin
@@ -12381,6 +12888,13 @@ async def _open_free_stream(
                     raise _FreeTunnelFailure(station, e) from e
                 _debug(f"  [stream] curl_cffi proxy stream failed: {e}, falling back to direct stream")
                 _log(f"  FREE STREAM via VPN tunnel FAILED ({e}) → direct fallback (residential IP)")
+    if use_free and _station_identity_enabled():
+        _prev_station = (_current_free_attempt.get() or {}).get("station")
+        if getattr(_prev_station, "label", ""):
+            raise _FreeTunnelFailure(
+                _prev_station,
+                RuntimeError("station identity: pas de fallback direct"),
+            )
     if use_free:
         # Direct fallback to the free endpoint: same Bun/curl_cffi face as
         # the VPN path. L'ancien httpx avait une empreinte différente et le
@@ -12409,7 +12923,7 @@ async def _open_free_stream(
         )
         free_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _direct_ip or None)
         _ident_version = str((_direct_inst or {}).get("version") or "")
-        _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version)
+        _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version, free_headers)
         wire_body, _ = _free_wire_body(body, force_stream=True, egress_ip=_direct_ip or None)
         _dpool = None
         _dslot = None
@@ -12853,6 +13367,28 @@ _free_model_cooldowns: dict[str, float] = {}  # "model|ip" -> monotonic expiry
 # sweep vs set could otherwise lose writes — the GIL only prevents corruption.
 _free_cooldown_lock = threading.Lock()
 _FREE_COOLDOWN_MAX = 86400  # hard ceiling: retry-after beyond 24 h → default below
+# [2026-11-06] Plafond effectif du cooldown free après 429. Le `Retry-After`
+# upstream est la distance au prochain 00:00 UTC, pas la vraie recovery :
+# afree-proxy a mesuré RA=20 h 46 et un 200 sur la même IP 18 minutes plus
+# tard. Sans plafond, une station est parkée ~19 h (header) ou 6 h (trial mort
+# sans header) alors qu'elle peut être redevenue bonne. 20 min est le
+# compromis : re-test périodique sans brûler le quota en sondes.
+_FREE_COOLDOWN_CAP_DEFAULT = 1200.0
+
+
+def _free_cooldown_cap_seconds() -> float:
+    """Plafond du cooldown free (``free.cooldown_cap_s``, défaut 20 min).
+
+    0 = pas de plafond (comportement historique). Hot-reloadé à chaque
+    lecture, clampé par ``_FREE_COOLDOWN_MAX``.
+    """
+    try:
+        v = float(yaml_get("free", "cooldown_cap_s", _FREE_COOLDOWN_CAP_DEFAULT))
+    except (TypeError, ValueError):
+        return _FREE_COOLDOWN_CAP_DEFAULT
+    if v <= 0:
+        return 0.0
+    return min(v, float(_FREE_COOLDOWN_MAX))
 # [incident 17/08 PAYANT] zen's free API 429 (FreeUsageLimitError) carries NO
 # retry-after header. The old 3600 s default meant ONE 429 — even a transient
 # tunnel-blip direct fallback — disabled every free attempt for a FULL HOUR
@@ -12886,10 +13422,19 @@ def _free_cooldown_key(free_model: str, station=None) -> str:
             _direct_key_ip = ""
         return f"{free_model}|{_direct_key_ip or 'direct'}"
     if vpn is not None and getattr(vpn, "pid", None):
-        # [Axe 3.1] Static SOCKS5 proxy: no docker IP to key on — the
-        # proxy's identity IS its host:port. Each proxy gets its own
-        # bucket: a 429 on one must never cooldown the others, which
-        # egress separate IPs.
+        # [2026-11-06] WARP managé : le label est stable, l'egress change à
+        # chaque rotation. Keyer sur `socks5:<label>` gardait la station en
+        # cooldown après rotation → 429 permanent sans tentative. On keye sur
+        # l'IP réelle (normalisée /64 pour IPv6), avec repli label avant probe.
+        ip = str(getattr(vpn, "current_ip", "") or "").strip()
+        if ip and ip != "unknown" and not ip.startswith("socks5:"):
+            try:
+                from free.quota_ledger import server_ip_key
+
+                ip = server_ip_key(ip)
+            except Exception:
+                pass
+            return f"{free_model}|{ip}"
         return f"{free_model}|socks5:{vpn.pid}"
     ip = vpn.current_ip if (vpn and vpn.current_ip) else "direct"
     return f"{free_model}|{ip}"
@@ -12904,6 +13449,13 @@ def _free_429_cooldown_seconds(retry_after: str = "", body=None) -> float:
     → défaut 120 s. Tout ce qui est inparseable ou hors (0, 86400] →
     défaut (l'ancien contrat est inchangé quand `body` est absent).
     """
+    _cap = _free_cooldown_cap_seconds()
+
+    def _capped(seconds: float) -> float:
+        if _cap > 0:
+            return min(seconds, _cap)
+        return seconds
+
     if retry_after:
         v = 0.0
         try:
@@ -12917,14 +13469,14 @@ def _free_429_cooldown_seconds(retry_after: str = "", body=None) -> float:
             except (TypeError, ValueError, OverflowError):
                 v = 0.0
         if 0 < v <= _FREE_COOLDOWN_MAX:
-            return v
+            return _capped(v)
     if body:
         try:
             from core.errors import parse_body_retry_seconds as _parse_body_retry
 
             _bv = _parse_body_retry(body)
             if _bv is not None:
-                return _bv
+                return _capped(_bv)
         except Exception:
             pass
     return _FREE_429_DEFAULT
@@ -13974,6 +14526,12 @@ def _mark_free_stations_429(
                 pass
         else:
             _cd_secs = min(_free_429_cooldown_seconds(retry_after), 30.0)
+        # [2026-11-06] Le plafond s'applique APRÈS le `max` trial-mort (6 h par
+        # défaut) : sinon une IP sans header resterait parkée 6 h et le plafond
+        # du ledger ne changerait rien à la disponibilité réelle.
+        _cd_cap = _free_cooldown_cap_seconds()
+        if _cd_cap > 0:
+            _cd_secs = min(_cd_secs, _cd_cap)
         if _action_429 != "rotate":
             _set_free_cooldown(free_model, _cd_secs, station, scope=_scope if quota_flag else "transient")
         # [quota-ledger 2026-11-01] Le bucket est (IP, jour UTC) : changer
@@ -14560,7 +15118,9 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         _hedge_pre = False
     if _free_proxy_mode() != "direct" and _free_ip_pool and _free_ip_pool.enabled and not _hedge_pre:
         try:
-            _, station = await _free_ip_pool.on_request(forced_pool, model=free_model)
+            _, station = await _free_ip_pool.on_request(
+                forced_pool, model=free_model, conversation_key=_free_affinity_key(body)
+            )
         except TypeError:
             _, station = await _free_ip_pool.on_request()
         vpn = station or _vpn_manager
@@ -14711,7 +15271,6 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 _free_proxy_mode() != "direct"
                 and not free_body.get("stream")
                 and _free_ip_pool
-                and not getattr(_free_ip_pool, "socks5_mode", False)
                 and _free_parallel_should_hedge(free_body, forced_pool)
             ):
                 _hedge_cands = _free_ip_pool.pick_candidates(forced_pool)
@@ -14750,6 +15309,15 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                             free_ip = winner.current_ip
                         elif winner and getattr(winner, "pid", None):
                             free_ip = winner.pid
+                        try:
+                            if winner is not None and getattr(
+                                _free_ip_pool, "socks5_mode", False
+                            ):
+                                _free_ip_pool.pin_socks5_conversation(
+                                    _free_affinity_key(free_body), winner
+                                )
+                        except Exception:
+                            pass
                         # set headers for outer shared handling (resp_headers stays None for hedge)
                         _hedge_done = True
                         _debug(
@@ -21768,6 +22336,175 @@ async def _canary_cycle(model_override: str = "") -> dict:
     return {"model": model, "probes": out}
 
 
+def _post_rotation_probe_ok(status, verdict) -> bool:
+    """Verdict de la sonde post-rotation : 200/pass ou 429 (egress joignable)."""
+    try:
+        code = int(status or 0)
+    except (TypeError, ValueError):
+        return False
+    if code == 429:
+        return True
+    return code == 200 and str(verdict or "") == "pass"
+
+
+def _free_post_rotation_probe(endpoint) -> bool:
+    """Sonde `post_rotation_probe` : valide le nouvel egress après rotation.
+
+    Envoyée dans le thread de rotation WARP (synchrone), avec l'identité et le
+    profil vérifié de la station. `enabled=false` → no-op. En échec après
+    `max_attempts`, l'endpoint est bad-marké pour laisser le pool servir une
+    autre station. Ne lève jamais.
+    """
+    try:
+        cfg = IP_ROTATION.get("post_rotation_probe") or {}
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
+        return True
+    try:
+        max_attempts = max(1, min(5, int(cfg.get("max_attempts", 2) or 2)))
+        max_tokens = max(1, min(64, int(cfg.get("max_tokens", 4) or 4)))
+    except (TypeError, ValueError):
+        max_attempts, max_tokens = 2, 4
+    try:
+        runtime = _station_identity_runtime(endpoint)
+    except Exception:
+        runtime = None
+    if runtime is None or runtime.profile is None:
+        _log("  [post-rotation-probe] aucun profil vérifié — sonde ignorée")
+        return False
+    profile = runtime.profile
+    label = str(getattr(endpoint, "label", "") or "")
+    capture_path = str(getattr(profile, "body_capture", "") or "")
+    if not capture_path:
+        return False
+    if not os.path.isabs(capture_path):
+        capture_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), capture_path)
+    try:
+        with open(capture_path, encoding="utf-8") as fh:
+            capture = json.load(fh)
+        body = copy.deepcopy(capture["body"])
+        url = str(capture.get("url") or "")
+    except Exception as exc:
+        _log(f"  [post-rotation-probe] capture illisible: {exc}")
+        return False
+    if not url:
+        return False
+    body["model"] = str(body.get("model") or "")
+    if "max_completion_tokens" in body:
+        body["max_completion_tokens"] = max_tokens
+    elif "max_tokens" in body:
+        body["max_tokens"] = max_tokens
+    else:
+        body["max_tokens"] = max_tokens
+    proxy = str(getattr(endpoint, "socks5_url", "") or "")
+    if proxy.startswith("socks5://"):
+        proxy = "socks5h://" + proxy[len("socks5://") :]
+    if not proxy:
+        return False
+    header_order = (
+        _OPENCODE_HEADER_ORDER_225
+        if str(getattr(profile, "version", "")) == "2.2.5"
+        else _OPENCODE_HEADER_ORDER_119
+    )
+    try:
+        from free.profile_live import IdentityProfileSender
+        from free.profile_transport import CurlCffiTransport
+
+        transport = CurlCffiTransport(
+            proxies={label: proxy},
+            impersonate="chrome131",
+            ja3=str(getattr(profile, "ja3", "") or ""),
+            sigalgs=list(getattr(profile, "sigalgs", ()) or ()),
+            header_order=header_order,
+            ipv6=bool(getattr(endpoint, "ipv6", False)),
+            timeout_s=30.0,
+        )
+        sender = IdentityProfileSender(runtime.identity, profile, body, url, transport)
+        evidence = None
+        for _attempt in range(max_attempts):
+            evidence = sender(profile, label)
+            status = int(getattr(evidence, "status", 0) or 0)
+            verdict = str(getattr(evidence, "verdict", ""))
+            if _post_rotation_probe_ok(status, verdict):
+                if status == 429:
+                    _log(
+                        f"  [post-rotation-probe] {label}: egress OK, quota modèle "
+                        f"({getattr(evidence, 'latency_ms', '?')} ms)"
+                    )
+                else:
+                    _log(
+                        f"  [post-rotation-probe] {label}: 200 pass "
+                        f"({getattr(evidence, 'latency_ms', '?')} ms)"
+                    )
+                return True
+            time.sleep(0.5)
+        _log(
+            f"  [post-rotation-probe] {label}: échec après {max_attempts} essai(s) "
+            f"(status={getattr(evidence, 'status', '?')})"
+        )
+        try:
+            if _free_ip_pool is not None:
+                per = _free_ip_pool._per_station(endpoint)
+                per["bad_until"] = time.monotonic() + 120.0
+                per["bad_cause"] = "post_rotation_probe"
+        except Exception:
+            pass
+        return False
+    except Exception as exc:
+        _log(f"  [post-rotation-probe] erreur: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _trial_dead_managed_labels() -> set[str]:
+    """Labels WARP managés dont l'IP courante est trial-dead (tous modèles).
+
+    Utilisé par `rotate_exhausted_managed` : un trial-dead de 6 h ne doit pas
+    immobiliser une station managée alors qu'une rotation rend une IP fraîche.
+    """
+    labels: set[str] = set()
+    pool = _free_ip_pool
+    if pool is None:
+        return labels
+    try:
+        now = time.monotonic()
+        with _free_cooldown_lock:
+            keys = [key for key, expiry in _free_model_cooldowns.items() if expiry > now]
+        if not keys:
+            return labels
+        from free.quota_ledger import server_ip_key
+
+        wanted: set[str] = set()
+        for key in keys:
+            if "|" not in key:
+                continue
+            ip = key.split("|", 1)[1].strip()
+            if not ip or ip.startswith("socks5:"):
+                continue
+            try:
+                ip = server_ip_key(ip)
+            except Exception:
+                pass
+            wanted.add(ip)
+        if not wanted:
+            return labels
+        for endpoint in pool._socks5_enabled_eps():
+            if not getattr(endpoint, "managed", False):
+                continue
+            raw = str(getattr(endpoint, "current_ip", "") or "").strip()
+            if not raw or raw.startswith("socks5:"):
+                continue
+            try:
+                norm = server_ip_key(raw)
+            except Exception:
+                norm = raw
+            if norm in wanted:
+                labels.add(str(getattr(endpoint, "label", "") or ""))
+    except Exception:
+        return labels
+    return labels
+
+
 async def _free_prewarm_once() -> bool:
     """Établit TCP+TLS vers la station courante, sans consommer de quota.
 
@@ -22352,6 +23089,136 @@ async def api_drift():
         return {"status": "unknown", "error": str(exc), "legs": []}
 
 
+@app.get("/api/free-egress/diag")
+async def api_free_egress_diag():
+    """Diagnostic sélection/cooldown des endpoints socks5 (lecture seule)."""
+    pool = _free_ip_pool
+    if pool is None:
+        return {"ok": False, "error": "pool_unavailable"}
+    model = "mimo-v2.6-flash-free"
+    rows = []
+    try:
+        for endpoint in pool._socks5_enabled_eps():
+            per = pool._per_station(endpoint)
+            rows.append(
+                {
+                    "label": getattr(endpoint, "label", ""),
+                    "current_ip": getattr(endpoint, "current_ip", ""),
+                    "cooldown_key": _free_cooldown_key(model, endpoint),
+                    "cooldown": _free_cooldown_active(model, endpoint),
+                    "trial_dead": _free_trial_dead_active(model, endpoint),
+                    "usable": bool(pool._socks5_usable(endpoint, exclude_approaching=False)),
+                    "request_count": int(per.get("request_count", 0) or 0),
+                    "inflight": len(per.get("stream_tasks") or ()),
+                    "bad_until": per.get("bad_until"),
+                    "bad_remaining_s": (
+                        round(max(0.0, float(per.get("bad_until") or 0.0) - time.monotonic()), 1)
+                        if per.get("bad_until")
+                        else 0.0
+                    ),
+                    "bad_cause": per.get("bad_cause"),
+                }
+            )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        dead = sorted(str(getattr(st, "label", getattr(st, "_station", "?"))) for st in _trial_dead_stations(model))
+    except Exception:
+        dead = []
+    affinity = []
+    try:
+        now = __import__("time").monotonic()
+        for conv_key, (pid, expires) in list(getattr(pool, "_socks5_affinity", {}).items())[-20:]:
+            affinity.append(
+                {
+                    "key": str(conv_key)[:16],
+                    "pid": pid,
+                    "remaining_s": max(0.0, float(expires) - now),
+                }
+            )
+    except Exception:
+        affinity = []
+    timeout_pairs = 0
+    try:
+        _now = time.monotonic()
+        _win = float(getattr(pool, "_socks5_timeout_window_s", 60.0) or 60.0)
+        timeout_pairs = len(
+            {
+                (sid, ip)
+                for ts, sid, ip in (getattr(pool, "_socks5_timeout_log", None) or ())
+                if _now - float(ts) <= _win
+            }
+        )
+    except Exception:
+        timeout_pairs = 0
+    return {
+        "ok": True,
+        "enabled": bool(getattr(pool, "enabled", False)),
+        "proxy_mode": getattr(pool, "proxy_mode", ""),
+        "socks5_mode": bool(getattr(pool, "socks5_mode", False)),
+        "model": model,
+        "dead": dead,
+        "affinity": affinity,
+        "routing": {
+            "socks5_auto_rotate": bool(getattr(pool, "_socks5_auto_rotate", False)),
+            "free_parallel_enabled": bool(getattr(pool, "_free_parallel_enabled", False)),
+            "free_parallel_routing": str(getattr(pool, "_free_parallel_routing", "")),
+            "free_parallel_mode": str(getattr(pool, "_free_parallel_mode", "")),
+            "hedge_delay_ms": int(getattr(pool, "_free_parallel_hedge_delay_ms", 0) or 0),
+            "hedge_max_attempts": int(getattr(pool, "_free_parallel_hedge_max", 0) or 0),
+            "hedge_ready": bool(
+                str(getattr(pool, "_free_parallel_mode", "")) == "hedge"
+                and sum(1 for row in rows if row.get("usable")) >= 2
+            ),
+            "quality_rotation": bool(
+                (getattr(pool, "_quality_rotation", {}) or {}).get("enabled")
+            ),
+            "latency_rotation": bool(
+                getattr(
+                    getattr(getattr(pool, "latency_engine", None), "cfg", None),
+                    "enabled",
+                    False,
+                )
+            ),
+            "post_rotation_probe": dict(
+                getattr(pool, "_post_rotation_probe", {}) or {}
+            ),
+            "timeout_guard": {
+                "distinct_pairs": timeout_pairs,
+                "window_s": float(getattr(pool, "_socks5_timeout_window_s", 60.0) or 60.0),
+                "threshold": int(getattr(pool, "_socks5_timeout_threshold", 3) or 3),
+            },
+            "spread": bool(pool._socks5_spread_enabled()),
+        },
+        "endpoints": rows,
+    }
+
+
+@app.post("/api/free-egress/reset-cooldowns")
+async def api_reset_free_cooldowns():
+    """Reset opérationnel des cooldowns (model, IP) et bad-marks socks5."""
+    cleared = 0
+    try:
+        with _free_cooldown_lock:
+            cleared = len(_free_model_cooldowns)
+            _free_model_cooldowns.clear()
+            _free_cooldown_scope.clear()
+    except Exception:
+        pass
+    pool = _free_ip_pool
+    if pool is not None:
+        try:
+            for endpoint in pool._socks5_enabled_eps():
+                per = pool._per_station(endpoint)
+                per["bad_until"] = 0.0
+                per["bad_cause"] = ""
+                per["consec_429"] = 0
+        except Exception:
+            pass
+    _log(f"  [free] cooldowns reset ({cleared} clés)")
+    return {"ok": True, "cleared": cleared}
+
+
 @app.get("/api/free-health")
 async def api_free_health():
     """[V8.1] Quels modèles free ont réellement servi depuis le démarrage.
@@ -22651,17 +23518,125 @@ async def free_chain_status():
     base = os.path.dirname(os.path.abspath(__file__))
     logs = os.path.join(base, "logs")
     total = 0
-    try:
-        with open(os.path.join(logs, "fresh_chain_candidates.json"), encoding="utf-8") as handle:
-            total = len(json.load(handle) or [])
-    except Exception:
-        total = 0
-    chains = []
-    for sid in (5, 6):
-        state = {}
+    for name in (
+        "fresh_chain_candidates_auto.json",
+        "fresh_chain_candidates.json",
+        "fresh_chain_candidates_wireguard.json",
+    ):
         try:
-            with open(os.path.join(logs, f"fresh_chain_state_{sid}.json"), encoding="utf-8") as handle:
-                state = json.load(handle) or {}
+            with open(os.path.join(logs, name), encoding="utf-8") as handle:
+                total = max(total, len(json.load(handle) or []))
+        except Exception:
+            continue
+    next_candidate = None
+    sweep: dict = {}
+    quota: dict = {}
+    try:
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(
+            os.path.join(logs, "registry.db"), timeout=5.0
+        )
+        conn.row_factory = _sqlite3.Row
+        try:
+            now_ts = time.time()
+            row = conn.execute(
+                "SELECT c.hostname, c.country FROM catalog c "
+                "LEFT JOIN claims cl ON cl.hostname=c.hostname "
+                "WHERE cl.hostname IS NULL "
+                "   OR (cl.status='claimed' AND cl.lease_until < ?) "
+                "   OR (cl.status IN ('no_egress','bind_error','duplicate','abandoned','country_backoff') "
+                "       AND cl.lease_until <= ?) "
+                "   OR (cl.status='ok' AND cl.lease_until <= ?) "
+                "   OR (cl.status='429' AND cl.reset_at <= ?) "
+                "ORDER BY COALESCE(cl.fail_count,0), c.priority, c.hostname LIMIT 1",
+                (now_ts, now_ts, now_ts, now_ts),
+            ).fetchone()
+            catalog = int(
+                conn.execute("SELECT COUNT(*) FROM catalog").fetchone()[0] or 0
+            )
+            attempted = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM claims "
+                    "WHERE status NOT IN ('abandoned','country_backoff')"
+                ).fetchone()[0] or 0
+            )
+            statuses = {
+                str(item["status"]): int(item["n"])
+                for item in conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM claims GROUP BY status"
+                )
+            }
+            sweep = {
+                "catalog": catalog,
+                "attempted": attempted,
+                "remaining": max(0, catalog - attempted),
+                "percent": round(
+                    (100.0 * attempted / catalog) if catalog else 0.0, 1
+                ),
+                "statuses": statuses,
+            }
+            exhausted = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM egress_ips WHERE state='exhausted'"
+                ).fetchone()[0] or 0
+            )
+            reset_row = conn.execute(
+                "SELECT MIN(reset_at) FROM egress_ips "
+                "WHERE last_429_at IS NOT NULL AND reset_at > ?",
+                (time.time(),),
+            ).fetchone()
+            reset_at = float(reset_row[0]) if reset_row and reset_row[0] else None
+            quota = {
+                "exhausted_ips": exhausted,
+                "next_reset_at": reset_at,
+                "next_reset_in_s": (
+                    round(max(0.0, reset_at - time.time()), 1)
+                    if reset_at
+                    else None
+                ),
+            }
+        finally:
+            conn.close()
+        if row is not None:
+            next_candidate = {
+                "host": str(row["hostname"]),
+                "country": str(row["country"]),
+            }
+    except Exception:
+        next_candidate = None
+        sweep = {}
+        quota = {}
+    try:
+        from config.settings import yaml_get
+
+        station_count = max(
+            1, int(yaml_get("ip_rotation", "station_count", 6) or 6)
+        )
+    except Exception:
+        station_count = 6
+    chains = []
+    for sid in range(1, station_count + 1):
+        state = {}
+        transport = "auto"
+        try:
+            from free.chain_state import load_state as _load_chain_state
+
+            for suffix, label in (
+                ("_auto", "auto"),
+                ("", "wireguard"),
+                ("_openvpn-udp", "openvpn-udp"),
+                ("_openvpn-tcp", "openvpn-tcp"),
+            ):
+                candidate = _load_chain_state(
+                    os.path.join(
+                        logs, f"fresh_chain_state_{sid}{suffix}.json"
+                    )
+                )
+                if candidate.get("results") or candidate.get("winner"):
+                    state = candidate
+                    transport = label
+                    break
         except Exception:
             state = {}
         pid = None
@@ -22671,15 +23646,34 @@ async def free_chain_status():
         except Exception:
             pid = None
         results = state.get("results") or []
+        last = results[-1] if results else {}
+        recent = [item for item in results[-20:] if item.get("tested_at")]
+        rate_per_min = 0.0
+        eta_s = None
+        if len(recent) >= 2:
+            span = float(recent[-1]["tested_at"]) - float(recent[0]["tested_at"])
+            if span > 0:
+                rate_per_min = (len(recent) - 1) * 60.0 / span
+                remaining = max(0, total - len(results))
+                if rate_per_min > 0:
+                    eta_s = int(remaining * 60.0 / rate_per_min)
         chains.append(
             {
                 "station": sid,
+                "transport": transport,
                 "index": int(state.get("index") or 0),
                 "total": total,
                 "winner": state.get("winner"),
                 "pid": pid,
                 "results": results[-5:],
                 "tested": len(results),
+                "remaining": max(0, total - len(results)),
+                "rate_per_min": round(rate_per_min, 2),
+                "eta_s": eta_s,
+                "last_status": last.get("status"),
+                "last_host": last.get("host"),
+                "last_country": last.get("country"),
+                "reason": last.get("error") or last.get("status"),
             }
         )
     tail = []
@@ -22688,7 +23682,13 @@ async def free_chain_status():
             tail = [line.rstrip("\n") for line in handle.readlines()[-10:]]
     except Exception:
         tail = []
-    return {"chains": chains, "supervisor_log_tail": tail}
+    return {
+        "chains": chains,
+        "next_candidate": next_candidate,
+        "sweep": sweep,
+        "quota": quota,
+        "supervisor_log_tail": tail,
+    }
 
 
 @app.post("/api/free/hunter")
@@ -22735,11 +23735,26 @@ async def free_quota_clear(request: Request):
         body = {}
     ip = str((body or {}).get("ip") or "").strip() or None
     model = str((body or {}).get("model") or "").strip() or None
+    scope = str((body or {}).get("scope") or "").strip().lower()
     pool = _free_ip_pool
     if pool is None or not hasattr(pool, "clear_quota_buckets"):
         return JSONResponse(status_code=503, content={"error": "free pool unavailable"})
     cleared = await asyncio.to_thread(pool.clear_quota_buckets, ip, model)
-    return {"ok": True, "cleared": cleared, "ip": ip, "model": model}
+    cleared_model_global = 0
+    # ``clear_quota_buckets`` ne vide que le ledger d'IP. Le backoff modèle
+    # global vit en mémoire et doit être purgé explicitement, sinon le proxy
+    # continue à fabriquer des 429 locaux après le clear.
+    clear_global = scope in ("model_global", "all") or bool(model and scope != "ledger")
+    if clear_global and hasattr(pool, "clear_model_global"):
+        cleared_model_global = await asyncio.to_thread(pool.clear_model_global, model)
+    return {
+        "ok": True,
+        "cleared": cleared,
+        "cleared_model_global": cleared_model_global,
+        "ip": ip,
+        "model": model,
+        "scope": scope or "default",
+    }
 
 
 @app.post("/api/free/quota/mark")
@@ -22782,6 +23797,7 @@ async def free_quota_mark(request: Request):
     except (TypeError, ValueError):
         station_id = 0
     hostname = str((body or {}).get("hostname") or "").strip()
+    transport = str((body or {}).get("transport") or "").strip().lower()
     pool = _free_ip_pool
     if pool is None or not hasattr(pool, "_get_ledger"):
         return JSONResponse(status_code=503, content={"error": "free pool unavailable"})
@@ -22847,6 +23863,23 @@ async def free_quota_mark(request: Request):
                     # reflect the new pin.
                     mgr._pinned_hostname = hostname
                     mgr._current_host = hostname
+                if transport in ("wireguard", "openvpn-udp", "openvpn-tcp"):
+                    # The chain owns the real bind; keep the manager's status
+                    # in sync so dashboard/transport_effective do not lie.
+                    try:
+                        if transport.startswith("openvpn"):
+                            mgr._stack_effective = "openvpn"
+                            proto = transport.split("-", 1)[1]
+                            mgr._ovpn_protocol = proto
+                            mgr._ovpn_protocol_effective = proto
+                            mgr._ovpn_endpoint_port_effective = (
+                                "443" if proto == "tcp" else "1194"
+                            )
+                        else:
+                            mgr._stack_effective = "wireguard"
+                        mgr._transport_effective = transport
+                    except Exception:
+                        pass
             except Exception:
                 pass
             try:
@@ -26390,7 +27423,9 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
             # ci-dessous (repli direct/fail-closed, jamais de crash).
             assert pool is not None
             try:
-                _, station = await pool.on_request(forced_pool, model=free_model)
+                _, station = await pool.on_request(
+                    forced_pool, model=free_model, conversation_key=_free_affinity_key(body)
+                )
             except TypeError:
                 _, station = await pool.on_request(forced_pool)
         except Exception as e:
@@ -26411,7 +27446,6 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
         try:
             if (
                 pool is not None
-                and not getattr(pool, "socks5_mode", False)
                 and _free_parallel_should_hedge(body, forced_pool)
             ):
                 _hedge_cands = pool.pick_candidates(forced_pool)
@@ -26447,6 +27481,11 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                             free_ip = winner.current_ip
                         elif winner is not None and getattr(winner, "pid", None):
                             free_ip = winner.pid
+                        try:
+                            if winner is not None and getattr(pool, "socks5_mode", False):
+                                pool.pin_socks5_conversation(_free_affinity_key(body), winner)
+                        except Exception:
+                            pass
                         _hedge_done = True
                         _debug(
                             f"  [systemone-free] hedge winner station {getattr(winner, '_station', '?')} "

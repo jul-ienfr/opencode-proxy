@@ -52,7 +52,6 @@ Historicité — docstring latency_rotation.py :
 from __future__ import annotations
 
 import calendar
-import json
 import logging
 import os
 import time
@@ -389,12 +388,11 @@ class SharedRotationState:
             self._ip_events = self._ip_events[-self._WINDOW_CAP :]
 
     def _load(self) -> None:
-        """Load persisted state from disk (fail-open)."""
+        """Load persisted state from registry.db (fail-open)."""
         try:
-            if not os.path.exists(self._file):
-                return
-            with open(self._file) as f:
-                state = json.load(f)
+            from free.chain_state import load_json_state
+
+            state = load_json_state(self._file, default={}) or {}
             events = state.get("ip_events")
             if isinstance(events, list):
                 self._ip_events = [
@@ -448,9 +446,10 @@ class SharedRotationState:
             self._saved_at = None
 
     def _persist(self) -> None:
-        """Atomic write (temp file + os.replace), fail-open."""
+        """Persist into registry.db; JSON is only a SQLite-down fallback."""
         try:
-            os.makedirs(os.path.dirname(self._file), exist_ok=True)
+            from free.chain_state import save_json_state
+
             state = {
                 "ip_events": self._ip_events,
                 "cursor": self._cursor,
@@ -459,10 +458,7 @@ class SharedRotationState:
                 "last_country_by_station": self._last_country_by_station,
                 "saved_at": self._saved_at,
             }
-            tmp = self._file + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(state, f, indent=2)
-            os.replace(tmp, self._file)
+            save_json_state(self._file, state)
         except Exception as e:
             logger.debug("[shared-rotation] failed to persist state: %s", e)
 
@@ -718,9 +714,6 @@ class LatencyRotationEngine:
 
     def _save_engine_state(self) -> None:
         try:
-            import json as _js
-            import os as _os
-
             now = self._now()
             cds = []
             for (sid, ip), (kind, until) in list(self._cooldowns.items()):
@@ -734,25 +727,17 @@ class LatencyRotationEngine:
                 "total_hard": int(self.total_hard),
                 "saved_at": _now_utc(),
             }
-            fp = self._engine_state_file()
-            _os.makedirs(_os.path.dirname(fp), exist_ok=True)
-            tmp = fp + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                _js.dump(payload, f)
-            _os.replace(tmp, fp)
+            from free.chain_state import save_json_state
+
+            save_json_state(self._engine_state_file(), payload)
         except Exception as e:
             _lat_logger.debug("[latency] save engine state KO: %s", e)
 
     def _load_engine_state(self) -> None:
         try:
-            import json as _js
-            import os as _os
+            from free.chain_state import load_json_state
 
-            fp = self._engine_state_file()
-            if not _os.path.exists(fp):
-                return
-            with open(fp, encoding="utf-8") as f:
-                data = _js.load(f) or {}
+            data = load_json_state(self._engine_state_file(), default={}) or {}
             now = self._now()
             for e in data.get("cooldowns") or []:
                 try:

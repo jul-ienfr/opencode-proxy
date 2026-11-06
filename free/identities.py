@@ -4,12 +4,11 @@ Chaque IP d'egress (station VPN ou direct) obtient sa propre identité complète
 de client officiel, comme une installation OpenCode distincte sur une machine
 distincte :
 
-* version client (UA) : tirée du pool des versions MESURÉES à 200 sur la
-  gateway (1.18.31 locale + 1.19.3 capture `_research/oc-1.19.3/capture.jsonl`).
-  Le suffixe ai-sdk/Bun suit la version (4.0.23 chat / 4.0.40 responses,
-  runtime/bun/1.3.14 dans les deux cas mesurés). La face TLS reste le replay
-  Bun unique (même Bun 1.3.14 des deux côtés — varier le JA3 casserait la
-  parité au lieu de la renforcer).
+* version client (UA) : le wire free est aligné sur le client officiel 2.2.5
+  (`free/impersonation.json`), et le profil TLS 1.19.5 (Bun 1.4.4, JA3
+  `1523504b...`) est le seul identique au 2.2.5 mesuré. La rotation de
+  versions est donc gelée sur 1.19.5 tant que chaque version n'a pas son
+  profil complet (corps + titre + en-têtes).
 * identifiants : `x-opencode-client` (cli/desktop), `x-opencode-project`
   (dérivé par IP), `ses_` global + par conversation, `msg_` par envoi.
 
@@ -50,8 +49,8 @@ def _identities_dir() -> str:
 
 # Versions client MESURÉES sur la gateway (captures mitm 2026-11-01).
 # Chaque version porte sa face réseau exacte : UA + suffixe Bun + présence
-# de `x-opencode-session-id`. Le corps (11 tools + système) est identique
-# sur 1.18.31 / 1.19.0 / 1.19.3 / 1.19.5.
+# de `x-opencode-session-id`. Le corps est 10 tools pour 1.18.31–1.19.3,
+# 11 pour 1.19.5, 13 pour 2.2.5.
 _JA3_BUN_113 = (
     "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171"
     "-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43-21,"
@@ -136,10 +135,15 @@ VERSION_SPECS: dict[str, dict] = {
 KNOWN_CLIENT_VERSIONS = tuple(VERSION_SPECS)
 _BUN_SUFFIX = "runtime/bun/1.3.14"
 _BUN_BY_VERSION = {v: spec["bun"] for v, spec in VERSION_SPECS.items()}
-#: Ordre de rotation des installations (versions vérifiées, la plus récente
-#: d'abord). Le client reste `desktop` (seule valeur observée live sur
-#: `opencode run`) ; `cli`/`app` restent générables explicitement.
-ROTATION_VERSIONS = ("1.19.5", "1.19.3", "1.18.31", "1.19.0")
+#: Ordre de rotation des installations (versions vérifiées).
+#:
+#: [2026-11-06] Gel volontaire sur 1.19.5 : c'est le seul profil TLS
+#: (Bun 1.4.4, JA3 1523504b...) identique au client 2.2.5 dont le proxy
+#: rejoue l'UA/le corps. Rotationner 1.18.31/1.19.3 avec l'overlay 2.2.5
+#: produisait un tuple impossible (UA 2.2.5 + TLS Bun 1.3.14). La diversité
+#: par IP reste assurée par project/session/msg ; les profils versionnés
+#: complets reviendront quand chaque version aura son corps et son titre.
+ROTATION_VERSIONS = ("1.19.5",)
 SUPPORTED_CLIENTS = ("desktop", "cli", "app")
 #: Seul `desktop` a été observé sur le wire réel (`opencode run` 1.18.31,
 #: 1.19.0, 1.19.3, 1.19.5). `cli`/`app` sont dans l'enum du binaire mais
@@ -348,8 +352,17 @@ class IpIdentity:
             # maj de version ne s'applique jamais aux IP connues.
             stored_ver = str(data.get("version") or "")
             stored_cli = str(data.get("client") or "")
+            migrated = False
             if stored_ver in KNOWN_CLIENT_VERSIONS:
-                self.version = stored_ver
+                if stored_ver in ROTATION_VERSIONS:
+                    self.version = stored_ver
+                else:
+                    # [2026-11-06] Gel 2.2.5/TLS 1.19.5 : un ancien fichier
+                    # figé sur 1.18.31/1.19.0/1.19.3 produirait un tuple
+                    # UA 2.2.5 + TLS Bun 1.3.14. On migre vers la version
+                    # canonique gelée, puis on re-persiste.
+                    self.version = version_for(self.ip)
+                    migrated = True
             if stored_cli in KNOWN_CLIENT_NAMES:
                 self.client = stored_cli
             if isinstance(data.get("project"), str) and data["project"]:
@@ -368,6 +381,8 @@ class IpIdentity:
                 pass
             if ses.startswith("ses_") and len(ses) == 30 and (now - ts) < _SES_ROTATE_S:
                 self.ses_global, self.ses_ts = ses, ts
+                if migrated:
+                    self._persist()
                 return
         except Exception:
             pass
@@ -477,6 +492,18 @@ class IpIdentity:
         }
         if VERSION_SPECS.get(self.version, {}).get("session_id", True):
             out["x-opencode-session-id"] = ses
+        try:
+            from free.impersonation import apply_spec
+
+            out = apply_spec(out, ses)
+        except Exception:
+            pass
+        try:
+            from free.console_auth import apply_console_auth
+
+            out = apply_console_auth(out)
+        except Exception:
+            pass
         return out
 
     def session_header_items(self, ses: str) -> list[tuple[str, str]]:
@@ -650,6 +677,19 @@ class IdentityVault:
                 # Chaque génération change aussi le project/ses_/msg_.
                 version = self._forced_version or ROTATION_VERSIONS[(gen - 1) % len(ROTATION_VERSIONS)]
                 client = self._forced_client or "desktop"
+                # A rotation MUST change the face. With the 2.2.5 pool the
+                # first generation happened to land on the same version as the
+                # IP's canonical profile; bump to the next verified version.
+                old_version = str(getattr(old, "version", "") or "")
+                if (
+                    not self._forced_version
+                    and old_version in ROTATION_VERSIONS
+                    and version == old_version
+                ):
+                    version = ROTATION_VERSIONS[
+                        (ROTATION_VERSIONS.index(version) + 1)
+                        % len(ROTATION_VERSIONS)
+                    ]
                 ident = IpIdentity(
                     key,
                     self._base_project,

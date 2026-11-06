@@ -6,6 +6,7 @@
 
   import { apiGet } from '$lib/api';
   import { createQuery } from '$lib/query.svelte';
+  import { onEvent } from '$lib/realtime.svelte';
   import Card from '$lib/components/Card.svelte';
 
   interface Winner {
@@ -16,12 +17,34 @@
 
   interface Chain {
     station: number;
+    transport?: string;
     pid?: number;
     running?: boolean;
     age_s?: number;
     tested?: number;
+    remaining?: number;
+    rate_per_min?: number;
+    eta_s?: number | null;
     last_status?: string | number | null;
+    last_host?: string;
+    reason?: string | null;
     winner?: Winner | null;
+  }
+
+  interface FreeChainStatus {
+    sweep?: {
+      catalog?: number;
+      attempted?: number;
+      remaining?: number;
+      percent?: number;
+      statuses?: Record<string, number>;
+    };
+    next_candidate?: { host?: string; country?: string } | null;
+    quota?: {
+      exhausted_ips?: number;
+      next_reset_in_s?: number | null;
+    };
+    chains?: Chain[];
   }
 
   interface AllocatorStatus {
@@ -57,22 +80,41 @@
     initial: {}
   });
 
+  const chainQ = createQuery<FreeChainStatus>({
+    load: (signal) => apiGet<FreeChainStatus>('/api/free/chain', signal),
+    tags: () => ['vpn'],
+    initial: {}
+  });
+
   const data = $derived(statusQ.data ?? {});
   const alloc = $derived(data.allocator ?? {});
-  const chains = $derived(alloc.chains ?? []);
+  const chains = $derived(chainQ.data?.chains ?? alloc.chains ?? []);
   const claims = $derived(alloc.claims ?? {});
   const assignments = $derived(data.db?.open_assignments ?? []);
+  const sweep = $derived(chainQ.data?.sweep ?? {});
+  const nextCandidate = $derived(chainQ.data?.next_candidate ?? null);
+  const quota = $derived(chainQ.data?.quota ?? {});
   const pauseRemaining = $derived.by(() => {
     const until = Number(alloc.pause?.paused_until ?? 0);
     return until > 0 ? Math.max(0, until - Date.now() / 1000) : 0;
   });
   const nextReset = $derived(Number(claims.next_reset_in_s ?? 0));
 
+  onEvent('vpn_event', () => {
+    void statusQ.refresh(true);
+    void chainQ.refresh(true);
+  });
+
   function fmtDuration(seconds: number): string {
     if (!seconds || seconds <= 0) return '—';
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     return h > 0 ? `${h} h ${m} min` : `${m} min`;
+  }
+
+  function fmtEta(chain: Chain): string {
+    if (chain.eta_s === null || chain.eta_s === undefined) return '—';
+    return fmtDuration(Number(chain.eta_s));
   }
 
   function statusLabel(value: string | number | null | undefined): string {
@@ -93,6 +135,17 @@
     {#if nextReset > 0}
       <span class="badge">prochain reset 429 : {fmtDuration(nextReset)}</span>
     {/if}
+    {#if sweep.catalog}
+      <span class="badge">
+        balayage {sweep.attempted ?? 0}/{sweep.catalog} ({sweep.percent ?? 0} %)
+      </span>
+    {/if}
+    {#if quota.next_reset_in_s}
+      <span class="badge">reset IP : {fmtDuration(Number(quota.next_reset_in_s))}</span>
+    {/if}
+    {#if nextCandidate?.host}
+      <span class="badge">prochain : {nextCandidate.host} ({nextCandidate.country ?? '?'})</span>
+    {/if}
   </div>
 
   {#if chains.length === 0}
@@ -103,8 +156,12 @@
         <tr>
           <th>station</th>
           <th>chaîne</th>
+          <th>transport</th>
           <th>testés</th>
+          <th>débit</th>
+          <th>ETA</th>
           <th>dernier</th>
+          <th>raison</th>
           <th>winner</th>
         </tr>
       </thead>
@@ -113,8 +170,12 @@
           <tr>
             <td>s{chain.station}</td>
             <td>{chain.running ? 'en cours' : 'arrêtée'}</td>
+            <td>{chain.transport ?? '—'}</td>
             <td>{chain.tested ?? 0}</td>
+            <td>{chain.rate_per_min ? `${chain.rate_per_min}/min` : '—'}</td>
+            <td>{fmtEta(chain)}</td>
             <td>{statusLabel(chain.last_status)}</td>
+            <td class="muted">{chain.reason ?? '—'}</td>
             <td>
               {#if chain.winner?.host}
                 <strong>{chain.winner.host}</strong>

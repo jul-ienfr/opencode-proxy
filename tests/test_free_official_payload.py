@@ -13,21 +13,24 @@ import json
 
 import opencode as oc
 
+# official OpenCode 2.2.5 capture (free/captures/2.2.5.json)
 OFFICIAL_TOOL_NAMES = [
-    "bash",
     "edit",
+    "experimental_image_generate",
     "glob",
     "grep",
+    "question",
     "read",
+    "shell",
     "skill",
-    "task",
-    "todowrite",
+    "subagent",
     "webfetch",
     "websearch",
     "write",
+    "execute",
 ]
 
-SYSTEM_MARKER = "You are opencode, an interactive CLI tool"
+SYSTEM_MARKER = "You are an AI agent running in OpenCode"
 
 
 def test_le_fichier_de_capture_est_complet():
@@ -48,7 +51,9 @@ def test_un_corps_minimal_recoit_la_copie_integrale():
 
     assert forced is True
     assert wire["stream"] is True
-    # Client sans AUCUN outil : grille officielle pour le gate. `tool_choice`
+    # Client sans AUCUN outil : grille officielle 2.2.5 pour le gate.
+    # 2.2.5 no longer sends tool_choice; the gate accepts the official grid.
+    # `tool_choice`
     # reste `auto` (le gate refuse `none`) ; la note « no client tools »
     # interdit au modèle d'appeler les placeholders.
     assert wire["tool_choice"] == "auto"
@@ -121,9 +126,13 @@ def test_le_read_du_client_est_conserve_tel_quel():
     assert wire["tools"][read_index] == mine
 
 
-V2_SYSTEM = "You are an AI agent running in OpenCode, a coding agent harness. Help the user."
+V2_SYSTEM = (
+    "You are an AI agent running in OpenCode, a coding agent harness. Help the user.\n\n"
+    "<env>\n  Working directory: /workspace\n</env>"
+)
 V2_TOOLS = [
     "edit",
+    "experimental_image_generate",
     "glob",
     "grep",
     "question",
@@ -196,7 +205,7 @@ def test_systeme_custom_avec_read_recoit_le_prompt_officiel():
         "stream": True,
     }
     wire, _ = oc._free_wire_body(body, force_stream=True)
-    assert "You are opencode, an interactive CLI tool" in wire["messages"][0]["content"]
+    assert SYSTEM_MARKER in wire["messages"][0]["content"]
     client_system = wire["messages"][1]["content"]
     assert client_system.startswith("Tu es bref.")
     assert "Call ONLY these client tools" in client_system
@@ -206,11 +215,20 @@ def test_systeme_custom_avec_read_recoit_le_prompt_officiel():
 
 
 def test_l_ordre_des_cles_reste_celui_du_client():
-    """Ordre officiel : model, max_tokens, messages, tools, tool_choice, stream."""
+    """Ordre officiel 2.2.5 : model, messages, tools, stream, stream_options,
+    max_completion_tokens."""
     body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     wire, _ = oc._free_wire_body(body, force_stream=True)
-    cles = [k for k in wire if k in ("model", "max_tokens", "messages", "tools", "tool_choice", "stream")]
-    assert cles == ["model", "max_tokens", "messages", "tools", "tool_choice", "stream"]
+    allowed = (
+        "model",
+        "messages",
+        "tools",
+        "stream",
+        "stream_options",
+        "max_completion_tokens",
+    )
+    cles = [k for k in wire if k in allowed]
+    assert cles == list(allowed)
 
 
 def test_le_payload_est_serialisable_et_stable():

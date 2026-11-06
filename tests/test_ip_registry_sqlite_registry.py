@@ -41,6 +41,14 @@ def test_eligible_lists_fresh(registry):
     assert [r.egress_ip for r in registry.eligible(now=1000.0)] == ["87.120.102.53"]
 
 
+def test_eligible_ignores_rows_without_hostname(registry):
+    registry.upsert_record(
+        IpRecord(egress_ip="1.2.3.4", hostname="", country=""),
+        now=1000.0,
+    )
+    assert registry.eligible(now=1000.0) == []
+
+
 def test_claim_record_assign_release(registry):
     _seed(registry)
     lease = registry.claim("87.120.102.53", station=6, ttl_s=300, now=1000.0)

@@ -8,7 +8,8 @@ captures mitm du 2026-11-01 :
 * identité : project / session `ses_` / message `msg_` / UA / Bun ;
 * headers exacts du provider `opencode` (aucun x-session-affinity,
   directory ou workspace) ;
-* corps officiel 11 outils (websearch inclus), identique aux 4 captures.
+* corps officiel 2.2.5 (13 outils) par défaut ; les corps 1.18.31/1.19.3 (10)
+  et 1.19.5 (11) sont capturés séparément.
 
 Le proxy utilise la même primitive (`IpIdentity.official_provider_headers`)
 via `_official_free_headers` : un profil généré ici est donc rejouable

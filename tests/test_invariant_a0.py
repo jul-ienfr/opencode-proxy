@@ -230,9 +230,10 @@ def assert_official_free_identity(label, headers):
     # n'ont pas le même suffixe provider-utils/runtime. On vérifie la FORME
     # officielle, pas une version figée.
     ua = headers.get("user-agent") or ""
-    assert re.match(r"^opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/", ua), (
-        f"{label}: official UA expected, got {ua!r}"
-    )
+    assert re.match(
+        r"^(opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/|opencode/latest/2\.2\.5/cli$)",
+        ua,
+    ), f"{label}: official UA expected, got {ua!r}"
     # [ALIGNEMENT 2026-10-20] Wire officiel 1.19.3 : l'identité de session est
     # portée par x-opencode-session-id / x-session-affinity / x-session-id
     # (même valeur). Le quartet 1.18.x (client/project/request/session) n'est
@@ -613,6 +614,7 @@ async def test_open_free_stream_count_false_reuses_stored_station(free_env, monk
     assert extra.get("header_order") in (
         oc._OPENCODE_HEADER_ORDER,
         oc._OPENCODE_HEADER_ORDER_119,
+        oc._OPENCODE_HEADER_ORDER_225,
     )
     assert sess.get("http_version") == "v1"
     assert sess.get("default_headers") is False
@@ -656,7 +658,10 @@ async def test_open_free_stream_count_false_empty_attempt_direct_fallback(free_e
     # FORME officielle, pas une version figée — le test doit rester stable
     # quand le vault tire l'une ou l'autre.
     ua = kwargs["headers"].get("User-Agent") or ""
-    assert re.match(r"^opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/", ua), ua
+    assert re.match(
+        r"^(opencode/\d+\.\d+\.\d+ ai-sdk/provider-utils/\d+\.\d+\.\d+ runtime/bun/|opencode/latest/2\.2\.5/cli$)",
+        ua,
+    ), ua
     assert kwargs["headers"].get("Authorization") == "Bearer public"
     # Retry state: station None → the next attempt also falls back direct
     assert attempt.get("station") is None

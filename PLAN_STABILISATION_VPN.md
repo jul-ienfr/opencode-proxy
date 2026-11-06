@@ -2,6 +2,10 @@
 
 Date : 2026-09-05 | Etat : proposé (non implémenté)
 
+> **Mise à jour 2026-11-03** : voir `PLAN_FREE_6OF6_2026-11-03.md` pour l'objectif
+> **6/6 stations client-utilisables en permanence**, l'audit quota free et la
+> roadmap (scheduler quota-aware, warm pool, découverte ciblée 87.120.102.x).
+
 ---
 
 ## Diagnostic résumé (causes racines vérifiées par audit code+logs)

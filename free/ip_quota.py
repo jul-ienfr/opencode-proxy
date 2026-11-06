@@ -424,6 +424,19 @@ class IpQuotaRegistry:
             for item in self._items.values()
         ]
 
+    def apply_profile(self, profile: QuotaProfile | None = None) -> None:
+        """Applique le profil courant aux leases déjà créés.
+
+        ``quota_estimate`` est une valeur de profil, pas une mesure : quand
+        l'opérateur change ``quota_per_ip`` dans le GUI, les leases existants
+        doivent suivre immédiatement au lieu de conserver l'ancien plafond.
+        """
+        if profile is not None:
+            self.profile = profile
+        for item in self._items.values():
+            item.quota_estimate = self.profile.profile_for(item.model)
+            item.refresh(self.profile)
+
     def restore_state(self, data: Any) -> None:
         if not isinstance(data, list):
             return
@@ -439,7 +452,7 @@ class IpQuotaRegistry:
                     station=sid,
                     model=model,
                     ip=ip,
-                    quota_estimate=max(1, int(raw.get("quota_estimate", self.profile.profile_for(model)))),
+                    quota_estimate=max(1, int(self.profile.profile_for(model))),
                 )
                 item.used = max(0, int(raw.get("used", 0) or 0))
                 item.success_count = max(0, int(raw.get("success_count", 0) or 0))
@@ -458,6 +471,7 @@ class IpQuotaRegistry:
                 continue
             while len(self._items) > self._max_entries:
                 self._items.pop(next(iter(self._items)))
+        self.apply_profile()
 
     def leases_for_model(self, model: str | None) -> list[IpQuotaLease]:
         mid = str(model or "").strip().lower()

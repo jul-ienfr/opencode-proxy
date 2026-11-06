@@ -1,9 +1,11 @@
 {
   "_comment": "Gate CI (PC-14/O1) : scripts/config_coverage.py --baseline ce_fichier échoue sur toute clé MORTE hors listes.",
   "morte_connue": [
-    "geo.policies.meta-muse-spark.last_checked_at"
+    "geo.policies.meta-muse-spark.last_checked_at",
+    "thinking.effort_caps.ling-3.0-flash-fin",
+    "thinking.effort_caps.muse_spark"
   ],
-  "_morte_comment": "last_checked_at = métadonnée d'audit humaine (date de vérification de la politique géo), pas un knob — lue par l'opérateur, jamais par le code. Ne pas 'corriger' en la câblant.",
+  "_morte_comment": "last_checked_at = m?tadonn?e d'audit humaine ; les deux entr?es effort_caps sont des donn?es de la table lue en bloc par config.effort_caps (cl?s de mod?les, pas des knobs). Ne pas les c?bler individuellement.",
   "legacy_a_retirer": [
     "ip_rotation.dual_station",
     "ip_rotation.vpn_proxy_port_2",

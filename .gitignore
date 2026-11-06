@@ -85,6 +85,10 @@ ENV/
 # Secrets
 vpn_configs/
 credentials.env
+credentials.env.bak-*
+credentials.env.*.bak*
+free/*.json.bak
+free/*.json.bak-*
 logs/vpn_state*.json*
 logs/shared_rotation.json
 env_dump.json
@@ -93,6 +97,8 @@ env_dump.json
 # Debug dumps / transient scratch (debugging artifacts, not source)
 logs/_*
 logs/identities/
+logs/identity_secret
+logs/identity_secret.tmp
 logs/panel_dump.json
 logs/commit-*-msg.txt
 logs/env_vpn_type_backup_*

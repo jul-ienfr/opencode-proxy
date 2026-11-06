@@ -383,7 +383,7 @@ def test_socks5_test_delegates_to_probe_with_stored_credentials(ctx, monkeypatch
     fast, s1, s2, pool, cfg, persisted = ctx
     calls = []
 
-    async def _fake_probe(host, port, username=None, password=None):
+    async def _fake_probe(host, port, username=None, password=None, *, ipv6=False):
         calls.append((host, port, username, password))
         return {"ok": True, "ip": "5.5.5.5", "opencode_ok": True, "latency_ms": 12.3}
 
@@ -392,6 +392,35 @@ def test_socks5_test_delegates_to_probe_with_stored_credentials(ctx, monkeypatch
     assert resp == {"ok": True, "ip": "5.5.5.5", "opencode_ok": True, "latency_ms": 12.3}
     # NordVPN SOCKS5 requires auth: the stored row supplies it server-side.
     assert calls == [("p1.example.com", 1080, "u1", "s3cr3t")]
+
+
+def test_socks5_test_label_selects_ipv6_row(ctx, monkeypatch):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    pool._socks5_proxies.append(
+        {
+            "host": "127.0.0.1",
+            "port": 11080,
+            "label": "warp-ipv6",
+            "ipv6": True,
+            "enabled": True,
+            "username": None,
+            "password": None,
+        }
+    )
+    calls = []
+
+    async def _fake_probe(host, port, username=None, password=None, *, ipv6=False):
+        calls.append((host, port, ipv6))
+        return {"ok": True}
+
+    monkeypatch.setattr(api, "_socks5_probe", _fake_probe)
+    resp = _post(
+        fast,
+        "/api/vpn/socks5/test",
+        {"host": "ignored", "port": 1, "label": "warp-ipv6"},
+    )
+    assert resp == {"ok": True}
+    assert calls == [("127.0.0.1", 11080, True)]
 
 
 # ?? HTTPS CONNECT proxies (NordVPN :89) ????????????????????????????

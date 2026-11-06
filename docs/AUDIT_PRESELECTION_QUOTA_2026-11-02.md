@@ -55,7 +55,7 @@ sqlite3 logs/requests.db "PRAGMA table_info(requests);"
   `min_requests`, `min_samples`, plafond horaire, cooldown 600 s par station,
   pause si la flotte est globalement lente, indépendance vis-à-vis du moteur
   latence.
-- `post_rotation_probe` reste volontairement inactif (phase 4 non branchée).
+- `post_rotation_probe` est branché : sonde d'egress post-rotation WARP (200/429 = joignable, autres échecs retentés).
 
 ### 3.2 Lacune corrigée : `server_host`
 

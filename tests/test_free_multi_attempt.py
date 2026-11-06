@@ -104,6 +104,7 @@ def assert_no_paid_artifacts(label, headers, body=""):
     except Exception:
         _ok_uas = set()
     _ok_uas.add(oc._OPENCODE_OFFICIAL_UA)
+    _ok_uas.add("opencode/latest/2.2.5/cli")
     try:
         _ok_uas.add(oc._OPENCODE_OFFICIAL_UA_RESPONSES)
     except Exception:

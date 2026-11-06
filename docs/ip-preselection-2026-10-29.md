@@ -327,7 +327,7 @@ rechargé à chaud.
 |---|---|---|
 | `quality_preselection` | `enabled`, `fast_tps`, `slow_tps`, `max_load`, `tier_b_quota`, `tier_c_quota` | Tri des hostnames candidats (A rapide → B inconnu/moyen → C lent), plafond de charge API, quota par tier. Efficace en **OpenVPN** (pin de hostnames) ; en WireGuard gluetun choisit le pair, mais la qualité reste mesurée par IP. |
 | `quality_rotation` | `enabled`, `min_requests`, `min_samples`, `trend_pct`, `ttfb_ceiling_ms`, `max_per_hour`, `global_slow_guard` | Rotation **avant** le quota si tok/s < plancher, TTFB > plafond ou tendance en baisse ; garde-fous min./cooldown/anti-flap/flotte lente. |
-| `post_rotation_probe` | `enabled`, `max_attempts`, `max_tokens` | **Expérimental** : persisté pour la Phase 4, pas encore branché (la sonde upstream 1–4 tokens reste à implémenter). |
+| `post_rotation_probe` | `enabled`, `max_attempts`, `max_tokens` | **Actif** : après une rotation WARP, envoie une complétion minuscule via le nouvel egress. Un `200` ou un `429` prouve la joignabilité ; les autres échecs sont retentés puis bad-markés. |
 
 **Attribution hostname** : les logs OpenVPN donnent directement le hostname ;
 WireGuard ne loggue que l'IP de peering. Une carte complète `entry IP → hostname`

@@ -2,11 +2,11 @@
 
 MESURE : sur 243 requetes du client officiel 1.18.31, l'ordre des cles du
 corps chat est identique dans 242 cas :
-    model, max_tokens, messages, tools, tool_choice, stream, stream_options
+    model, max_completion_tokens, messages, tools, tool_choice, stream, stream_options
 et ``tool_choice: "auto"`` est present 242/242 fois dès qu'il y a des tools.
 
 Avant correctif, la jambe free produisait :
-    model, stream, stream_options, max_tokens, messages, tools
+    model, stream, stream_options, max_completion_tokens, messages, tools
 et n'emettait jamais tool_choice.
 """
 
@@ -18,12 +18,12 @@ import opencode as oc  # noqa: E402
 
 CLIENT_KEY_ORDER = [
     "model",
-    "max_tokens",
     "messages",
     "tools",
     "tool_choice",
     "stream",
     "stream_options",
+    "max_completion_tokens",
 ]
 
 _TOOL = {
@@ -36,17 +36,19 @@ _TOOL = {
 }
 
 OFFICIAL_TOOL_NAMES = [
-    "bash",
     "edit",
+    "experimental_image_generate",
     "glob",
     "grep",
+    "question",
     "read",
+    "shell",
     "skill",
-    "task",
-    "todowrite",
+    "subagent",
     "webfetch",
     "websearch",
     "write",
+    "execute",
 ]
 
 
@@ -64,12 +66,12 @@ def _chat_tool(name):
 def _body(**over):
     base = {
         "model": "mimo-v2.5-free",
-        "max_tokens": 32000,
         "messages": [{"role": "user", "content": "bonjour"}],
         "tools": [_TOOL, {**_TOOL, "function": {**_TOOL["function"], "name": "read"}}],
         "tool_choice": "auto",
         "stream": True,
         "stream_options": {"include_usage": True},
+        "max_completion_tokens": 32000,
     }
     base.update(over)
     return base
@@ -115,9 +117,9 @@ def test_tool_choice_auto_meme_sans_outil_client():
     assert list(wire) == [k for k in CLIENT_KEY_ORDER if k in wire]
 
 
-def test_summary_request_gets_official_grid_auto_and_max_tokens():
+def test_summary_request_gets_official_grid_auto_and_max_completion_tokens():
     """La compaction Hermes n'a ni tools ni systeme : le gate exige quand meme
-    la grille officielle, `tool_choice: auto` et un `max_tokens`."""
+    la grille officielle, `tool_choice: auto` et un `max_completion_tokens`."""
     body = {
         "model": "m",
         "stream": True,
@@ -136,20 +138,20 @@ def test_summary_request_gets_official_grid_auto_and_max_tokens():
     names = [t["function"]["name"] for t in wire["tools"]]
     assert names == OFFICIAL_TOOL_NAMES
     assert wire["tool_choice"] == "auto"
-    assert wire["max_tokens"] == 4096
+    assert wire["max_completion_tokens"] == 4096
     assert wire["reasoning_effort"] == "none"
     systems = [m for m in wire["messages"] if m.get("role") == "system"]
     assert len(systems) == 1
     assert len(systems[0]["content"]) > 20000, "le prompt officiel ne doit jamais etre tronque"
     assert "summarization request" in systems[0]["content"]
-    assert "max_tokens" not in body and "tools" not in body
+    assert "max_completion_tokens" not in body and "tools" not in body
 
 
-def test_summary_request_keeps_client_max_tokens():
+def test_summary_request_keeps_client_max_completion_tokens():
     body = {
         "model": "m",
         "stream": True,
-        "max_tokens": 4096,
+        "max_completion_tokens": 4096,
         "messages": [
             {
                 "role": "user",
@@ -158,7 +160,7 @@ def test_summary_request_keeps_client_max_tokens():
         ],
     }
     wire, _ = oc._free_wire_body(body, force_stream=True)
-    assert wire["max_tokens"] == 4096
+    assert wire["max_completion_tokens"] == 4096
 
 
 def test_summary_request_caps_output_and_truncates_input():
@@ -170,18 +172,18 @@ def test_summary_request_caps_output_and_truncates_input():
     body = {
         "model": "m",
         "stream": True,
-        "max_tokens": 128000,
+        "max_completion_tokens": 128000,
         "messages": [{"role": "user", "content": client_content}],
     }
     wire, _ = oc._free_wire_body(body, force_stream=True)
-    assert wire["max_tokens"] == 4096
+    assert wire["max_completion_tokens"] == 4096
     assert wire["reasoning_effort"] == "none"
     user_messages = [m for m in wire["messages"] if m.get("role") == "user"]
     assert len(user_messages) == 1
     assert len(user_messages[0]["content"]) <= 16384 + 200
     assert "summary input truncated by proxy" in user_messages[0]["content"]
     assert body["messages"][0]["content"] == client_content, "corps client intact"
-    assert body["max_tokens"] == 128000
+    assert body["max_completion_tokens"] == 128000
 
 
 def test_hermes_gets_official_grid_plus_core_client_tools():
@@ -211,8 +213,8 @@ def test_hermes_gets_official_grid_plus_core_client_tools():
     ]
     wire, _ = oc._free_wire_body(body, force_stream=True)
     names = [t["function"]["name"] for t in wire["tools"]]
-    assert names[:11] == OFFICIAL_TOOL_NAMES
-    assert len(names) == 20
+    assert names[:len(OFFICIAL_TOOL_NAMES)] == OFFICIAL_TOOL_NAMES
+    assert len(names) == len(OFFICIAL_TOOL_NAMES) + 9
     for core in (
         "terminal",
         "read_file",
@@ -233,7 +235,7 @@ def test_hermes_gets_official_grid_plus_core_client_tools():
 def test_hermes_long_system_is_truncated_on_free_wire():
     """Le prompt Hermes de 31 Ko est coupe a 4 Ko ; l'officiel reste complet."""
     client_system = "# SOUL.md\n" + ("consigne " * 3000)
-    body = _body(max_tokens=32000)
+    body = _body(max_completion_tokens=32000)
     body["messages"] = [
         {"role": "system", "content": client_system},
         {"role": "user", "content": "bonjour"},
@@ -252,7 +254,7 @@ def test_hermes_long_system_is_truncated_on_free_wire():
 def test_harness_system_is_not_truncated():
     """Un client deja aligne sur la grille officielle garde son prompt."""
     harness_system = "You are deepseek harness. " + ("policy " * 2000)
-    body = _body(max_tokens=32000)
+    body = _body(max_completion_tokens=32000)
     body["messages"] = [
         {"role": "system", "content": harness_system},
         {"role": "user", "content": "bonjour"},
@@ -344,22 +346,22 @@ def test_responses_body_untouched():
     assert list(wire)[:2] == ["model", "input"]
 
 
-def test_max_tokens_clamped_to_official_cap():
+def test_max_completion_tokens_clamped_to_official_cap():
     """Hermes demande 128000 ; l'amont free n'accepte que le plafond officiel.
 
     Mesure : le harnais DeepSeek (32768) passe, Hermes (128000) prend un 429
     sur une conversation de ~318 Ko. Le corps client ne doit pas etre modifie.
     """
-    body = _body(max_tokens=128000)
+    body = _body(max_completion_tokens=128000)
     wire, _ = oc._free_wire_body(body, force_stream=True)
-    assert wire["max_tokens"] == 32000
-    assert body["max_tokens"] == 128000
+    assert wire["max_completion_tokens"] == 32000
+    assert body["max_completion_tokens"] == 128000
 
 
 def test_max_completion_tokens_clamped_to_official_cap():
     """Forme v2 (`max_completion_tokens`) : meme plafond, meme non-mutation."""
     body = _body()
-    body.pop("max_tokens")
+    body.pop("max_completion_tokens")
     body["max_completion_tokens"] = 128000
     wire, _ = oc._free_wire_body(body, force_stream=True)
     assert wire["max_completion_tokens"] == 32000
@@ -368,9 +370,9 @@ def test_max_completion_tokens_clamped_to_official_cap():
 
 def test_small_output_budget_is_preserved():
     """Un client qui demande moins que le plafond n'est pas releve."""
-    body = _body(max_tokens=16000)
+    body = _body(max_completion_tokens=16000)
     wire, _ = oc._free_wire_body(body, force_stream=True)
-    assert wire["max_tokens"] == 16000
+    assert wire["max_completion_tokens"] == 16000
 
 
 def test_responses_max_output_tokens_clamped():
@@ -388,7 +390,7 @@ def test_responses_max_output_tokens_clamped():
 
 def test_clamp_does_not_mutate_the_client_body():
     """La copie d'envoi est isolee, messages compris."""
-    body = _body(max_tokens=128000)
+    body = _body(max_completion_tokens=128000)
     body["messages"] = [
         {"role": "user", "content": "bonjour"},
         {"role": "assistant", "content": "salut"},
@@ -410,7 +412,7 @@ def _long_history(n=120):
 def test_free_wire_trims_oversized_non_official_history(monkeypatch):
     """Hermes (299 messages) : au-delà du plafond, le tour courant reste."""
     monkeypatch.setattr(oc, "_free_max_wire_bytes", lambda: 400000)
-    body = _body(max_tokens=128000)
+    body = _body(max_completion_tokens=128000)
     body["messages"] = _long_history()
     wire, _ = oc._free_wire_body(body, force_stream=True)
     assert oc._quick_body_size(wire) <= oc._free_max_wire_bytes()
@@ -419,12 +421,12 @@ def test_free_wire_trims_oversized_non_official_history(monkeypatch):
     assert any("TASK START" in str(m.get("content") or "") for m in wire["messages"]), "la tache initiale doit rester"
     assert {"read", "bash"} <= {t["function"]["name"] for t in wire["tools"]}
     assert len(body["messages"]) == len(_long_history()), "le corps client ne doit pas etre tronque"
-    assert body["max_tokens"] == 128000
+    assert body["max_completion_tokens"] == 128000
 
 
 def test_free_wire_trim_keeps_tool_pairs_contiguous():
     """On ne garde jamais un resultat d'outil sans son appel assistant."""
-    body = _body(max_tokens=32000)
+    body = _body(max_completion_tokens=32000)
     messages = [{"role": "user", "content": "task"}]
     for i in range(80):
         call_id = f"call_{i}"
@@ -457,11 +459,14 @@ def test_free_wire_trim_keeps_tool_pairs_contiguous():
 
 def test_official_signature_is_never_trimmed():
     """Un client officiel (systeme opencode + read) traverse tel quel."""
-    body = _body(max_tokens=32000)
+    body = _body(max_completion_tokens=32000)
     body["messages"] = [
         {
             "role": "system",
-            "content": "You are opencode, an interactive CLI tool that helps users with software engineering tasks.",
+            "content": (
+                "You are opencode, an interactive CLI tool that helps users with software engineering tasks.\n\n"
+                "<env>\n  Working directory: /workspace\n</env>"
+            ),
         },
         *_long_history(20),
     ]
@@ -514,18 +519,18 @@ def test_trim_uses_final_wire_size_not_client_body(monkeypatch):
     produisait >30 Ko de wire sans trim. Le gate refusait alors que le proxy
     croyait le corps sous la borne.
     """
-    monkeypatch.setattr(oc, "_free_max_wire_bytes", lambda: 30000)
+    monkeypatch.setattr(oc, "_free_max_wire_bytes", lambda: 40000)
     messages = [{"role": "user", "content": "TASK: garder le fil"}]
     for i in range(8):
         messages.append({"role": "assistant", "content": f"réponse {i} " + ("x" * 900)})
         messages.append({"role": "user", "content": f"question {i} " + ("y" * 900)})
     messages.append({"role": "user", "content": "question finale"})
     body = {"model": "m", "stream": True, "messages": messages}
-    assert oc._quick_body_size(body) < 30000
+    assert oc._quick_body_size(body) < 40000
 
     wire, _ = oc._free_wire_body(body, force_stream=True)
 
-    assert oc._quick_body_size(wire) <= 30000
+    assert oc._quick_body_size(wire) <= 40000
     non_system = [m for m in wire["messages"] if m.get("role") != "system"]
     assert len(non_system) < len(body["messages"]), "l'historique final doit être trimmé"
 
@@ -548,13 +553,144 @@ def test_summary_truncation_keeps_middle_fact():
 
 
 def test_official_placeholders_are_minimal_but_keep_names():
-    """Les 10 placeholders du gate ne doivent pas manger le budget historique."""
+    """Les placeholders du gate ne doivent pas manger le budget historique.
+
+    [2026-11-06] ``properties`` doit être NON vide : xljiulang/opencode-proxy
+    mesure qu'un schéma vide ne compte pas dans le gate (7 outils nommés avec
+    propriétés non vides requis). Un seul ``path`` suffit et reste léger.
+    """
     payload = oc._official_free_payload()
     official = [t for t in (payload.get("tools") or []) if isinstance(t, dict)]
     placeholders = oc._free_official_placeholder_defs(official)
     names = [t["function"]["name"] for t in placeholders]
     assert names == [t["function"]["name"] for t in official]
-    assert len(json.dumps(placeholders, ensure_ascii=False).encode()) < 3000
+    assert len(json.dumps(placeholders, ensure_ascii=False).encode()) < 4500
     for tool in placeholders:
-        assert tool["function"]["parameters"] == {"type": "object", "properties": {}}
+        params = tool["function"]["parameters"]
+        assert params["type"] == "object"
+        assert params["properties"], "schéma vide = outil non compté par le gate"
         assert "DO NOT CALL" in tool["function"]["description"]
+
+
+def test_env_guard_adds_block_when_official_marker_has_no_env():
+    """Un prompt « officiel » recopié sans <env> ne doit pas partir tel quel."""
+    body = {
+        "model": "deepseek-v4.1-flash-free",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are an AI agent running in OpenCode, a coding agent harness.",
+            },
+            {"role": "user", "content": "ping"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "x",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    }
+    wire, _ = oc._free_wire_body(body)
+    assert oc._free_env_block_valid(wire["messages"])
+    # Le corps client n'est jamais muté.
+    assert not oc._free_env_block_valid(body["messages"])
+
+
+def test_env_guard_keeps_existing_valid_block():
+    """Un <env> valide existant n'est ni dupliqué ni déplacé."""
+    body = {
+        "model": "deepseek-v4.1-flash-free",
+        "messages": [
+            {
+                "role": "system",
+                "content": "<env>\n  Working directory: /tmp\n</env>\nYou are an AI agent running in OpenCode, a coding agent harness.",
+            },
+            {"role": "user", "content": "ping"},
+        ],
+    }
+    wire, _ = oc._free_wire_body(body)
+    assert wire["messages"] == body["messages"]
+
+
+def test_env_guard_rejects_empty_first_pair_before_valid_one():
+    """Un premier couple vide empoisonne la requête, même suivi d'un valide."""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an AI agent running in OpenCode, a coding agent harness.\n"
+                "<env></env>\n<env>\n  Working directory: /tmp\n</env>"
+            ),
+        }
+    ]
+    assert oc._free_env_block_valid(messages) is False
+    body = {
+        "model": "deepseek-v4.1-flash-free",
+        "messages": messages + [{"role": "user", "content": "ping"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "x",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    }
+    wire, _ = oc._free_wire_body(body)
+    assert oc._free_env_block_valid(wire["messages"]) is True
+    assert wire["messages"][0]["content"].startswith("<env>")
+
+
+def test_tool_choice_none_is_dropped_from_free_wire():
+    """Le gate refuse `tool_choice: none`, même sur un corps « signature OK »."""
+    body = {
+        "model": "deepseek-v4.1-flash-free",
+        "messages": [
+            {
+                "role": "system",
+                "content": "<env>\n  Working directory: /\n</env>\nYou are an AI agent running in OpenCode, a coding agent harness.",
+            },
+            {"role": "user", "content": "ping"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "x",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+        "tool_choice": "none",
+        "stream": True,
+    }
+    wire, _ = oc._free_wire_body(body, force_stream=True)
+    assert "tool_choice" not in wire
+    assert body["tool_choice"] == "none", "le corps client n'est jamais muté"
+
+
+def test_env_guard_rejects_malformed_first_tag():
+    """`<env x=\"1\">` n'est pas `<env>` : le gate le refuse."""
+    messages = [
+        {
+            "role": "system",
+            "content": '<env x="1">\n  Working directory: /tmp\n</env>',
+        }
+    ]
+    assert oc._free_env_block_valid(messages) is False

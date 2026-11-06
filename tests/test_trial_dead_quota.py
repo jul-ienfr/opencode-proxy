@@ -51,8 +51,23 @@ def test_body_duration_parsing():
 
 def test_cooldown_header_wins_over_body():
     assert oc._free_429_cooldown_seconds("90", "retry in 3hr 12min") == 90.0
-    assert oc._free_429_cooldown_seconds("", "retry in 3hr 12min") == 3 * 3600 + 12 * 60
+    # [2026-11-06] Le corps « 3hr 12min » est plafonné à 20 min : ce n'est pas
+    # une vraie recovery (cf. afree-proxy). Le plafond reste désactivable.
+    assert oc._free_429_cooldown_seconds("", "retry in 3hr 12min") == 1200.0
     assert oc._free_429_cooldown_seconds("") == oc._FREE_429_DEFAULT
+
+
+def test_cooldown_cap_applies_to_huge_retry_after(monkeypatch):
+    monkeypatch.setattr(oc, "_free_cooldown_cap_seconds", lambda: 1200.0)
+    # Retry-After ~19 h (distance à minuit UTC) -> 20 min effectives.
+    assert oc._free_429_cooldown_seconds("67000") == 1200.0
+    assert oc._free_429_cooldown_seconds("", "retry in 3hr 12min") == 1200.0
+
+
+def test_cooldown_cap_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(oc, "_free_cooldown_cap_seconds", lambda: 0.0)
+    assert oc._free_429_cooldown_seconds("67000") == 67000.0
+    assert oc._free_429_cooldown_seconds("", "retry in 3hr 12min") == 3 * 3600 + 12 * 60
 
 
 def _stub_station(ip="9.9.9.9"):
@@ -96,6 +111,21 @@ def test_trial_dead_expiry_purges(_clean_ledger):
     assert oc._free_trial_dead_active("test-trial-m", st) is False
     assert key not in oc._free_model_cooldowns
     assert key not in oc._free_cooldown_scope
+
+
+def test_socks5_cooldown_key_uses_real_egress_not_label():
+    from free.pool import Socks5Endpoint
+
+    configured = Socks5Endpoint(
+        "127.0.0.1",
+        11080,
+        label="warp-ipv6",
+        ipv6=True,
+        egress_ip="2a09:bac5:32d4:be::13:23e",
+    )
+    assert oc._free_cooldown_key("test-m", configured) == "test-m|2a09:bac5:32d4:be"
+    unprobed = Socks5Endpoint("127.0.0.1", 11085, label="warp-ipv6-2", ipv6=True)
+    assert oc._free_cooldown_key("test-m", unprobed) == "test-m|socks5:warp-ipv6-2"
 
 
 def test_trial_dead_stations_helper(monkeypatch, _clean_ledger):

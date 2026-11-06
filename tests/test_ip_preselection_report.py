@@ -6,6 +6,7 @@ import importlib.util
 import json
 import sqlite3
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -32,19 +33,23 @@ def _db(path: Path, *, with_host: bool) -> None:
     if with_host:
         columns += ", server_host TEXT"
     conn.execute(f"CREATE TABLE requests ({columns})")
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     if with_host:
         conn.execute(
-            "INSERT INTO requests VALUES('2026-11-02T08:00:00Z',1,100,1000,500,"
-            "'203.0.113.7','nl1050.nordvpn.com')"
+            "INSERT INTO requests VALUES(?,1,100,1000,500,"
+            "'203.0.113.7','nl1050.nordvpn.com')",
+            (now,),
         )
         conn.execute(
-            "INSERT INTO requests VALUES('2026-11-02T08:01:00Z',1,100,1000,500,"
-            "'203.0.113.8','nl1050.nordvpn.com')"
+            "INSERT INTO requests VALUES(?,1,100,1000,500,"
+            "'203.0.113.8','nl1050.nordvpn.com')",
+            (now,),
         )
     else:
         conn.execute(
-            "INSERT INTO requests VALUES('2026-11-02T08:00:00Z',1,100,1000,500,"
-            "'203.0.113.7')"
+            "INSERT INTO requests VALUES(?,1,100,1000,500,"
+            "'203.0.113.7')",
+            (now,),
         )
     conn.commit()
     conn.close()

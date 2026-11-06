@@ -106,11 +106,19 @@ def _load_control_api_key() -> str | None:
 
 def _sync_server_countries() -> bool:
     countries = _load_server_countries()
-    if not countries:
+    if countries is None:
         print(f"WARN: could not read ip_rotation.server_countries from {CONFIG_PATH} — .env not updated")
         return False
+    # [2026-11-03 any-country] config.yaml uses a folded scalar (spaces after
+    # commas for readability); gluetun's SERVER_COUNTRIES parser is happiest
+    # with the compact comma-separated form. An empty value is intentional:
+    # it means "any country", not "failed to read".
+    countries = ",".join(c.strip() for c in countries.split(",") if c.strip())
     _upsert_env_var(ENV_PATH, "SERVER_COUNTRIES", countries)
-    print(f"OK: {ENV_PATH} SERVER_COUNTRIES synced from config.yaml ({len(countries.split(','))} countries)")
+    if countries:
+        print(f"OK: {ENV_PATH} SERVER_COUNTRIES synced from config.yaml ({len(countries.split(','))} countries)")
+    else:
+        print(f"OK: {ENV_PATH} SERVER_COUNTRIES empty (any country)")
     return True
 
 

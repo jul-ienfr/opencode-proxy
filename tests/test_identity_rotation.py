@@ -48,8 +48,11 @@ def test_rotate_changes_face_same_ip(tmp_path):
         assert after["ip"] == "9.9.9.9"
         assert after["generation"] == 1
         assert after["ses"] != before["ses"], "nouveau ses_"
-        # Pool mesuré à 2 versions / 2 clients : gen+1 bascule forcément.
-        assert (after["version"], after["client"]) != (before["version"], before["client"])
+        # [2026-11-06] Le profil officiel est gelé sur la version 1.19.5 /
+        # client desktop : la rotation change le ses_ et le project, pas la
+        # version réseau. Les anciennes versions ne sont plus émises.
+        assert after["version"] == "1.19.5"
+        assert after["client"] == "desktop"
         again = v.rotate_installation("9.9.9.9")
         assert again["generation"] == 2
         assert again["ses"] != after["ses"]
@@ -108,6 +111,9 @@ def test_hook_marks_bucket_without_rotating_identity(monkeypatch):
 
     pool = _Pool()
     monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    # This test exercises the IP-rotation lever explicitly; live config uses
+    # repair_owner=supervisor/on_429_action=cooldown, which delegates instead.
+    monkeypatch.setattr(oc._cfg_settings, "get_429_action", lambda: "both")
     monkeypatch.setattr(oc, "_record_global_429", lambda: None)
     monkeypatch.setattr(oc, "_note_free_429", lambda m: None)
     monkeypatch.setattr(oc, "_log", lambda *a, **k: None)
@@ -115,7 +121,10 @@ def test_hook_marks_bucket_without_rotating_identity(monkeypatch):
 
     before = oc._ip_vault().get("9.9.9.9").snapshot()
 
-    quota_body = '{"error":{"message":"usage_not_included: plan does not include this usage"}}'
+    quota_body = (
+        '{"type":"error","error":{"type":"FreeUsageLimitError",'
+        '"message":"Free usage limit reached. Free models work in OpenCode"}}'
+    )
     oc._mark_free_stations_429("m", "", stations=[st], body=quota_body)
 
     after = oc._ip_vault().get("9.9.9.9").snapshot()

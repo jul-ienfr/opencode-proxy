@@ -23,7 +23,7 @@ x-gluetun-multi-base: &gluetun-multi-base
   # IMPORTANT : `docker compose pull` frais au déploiement (le tag bouge).
   # Vérifié le 2026-09-08 : sha256:89e3cbe22e0d6f09a18d3e86269392fd9f7f08e8991040741e577f8f127cdfe4
   # (revision 0fef7b2 = master post-hotfixes firewall/DNS 01/09, prouvé via API GitHub).
-  image: qmcgaw/gluetun:latest
+  image: qmcgaw/gluetun@sha256:4af0c804003481e100180e1f8d4d5e9c48163fedc0f88d061881b615aef9d183
   cap_add:
     - NET_ADMIN
   devices:
@@ -57,26 +57,30 @@ x-gluetun-multi-env: &gluetun-multi-env
   # No inline fallback (audit F-H5): the single source is config.yaml.
   VPN_SERVICE_PROVIDER: nordvpn
   OPENVPN_VERBOSITY: '4'   # hostname in logs (see vpn-gluetun comment)
-  SERVER_COUNTRIES: ${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - run python scripts/make_credentials_env.py}
+  SERVER_COUNTRIES: ${SERVER_COUNTRIES:-}
   # [PC-8 audit 2026-09-08] source UNIQUE de fraîcheur = le refresh
   # applicatif (incident + périodique server_list_refresh_interval_s).
   # UPDATER_PERIOD volontairement absent (défaut gluetun sinon) : deux
   # sources = cache écrasé en course avec le wipe.
   HTTPPROXY: 'on'
   SOCKS5_ENABLED: 'on'
-  # [plan B 2026-09-08] DNS chiffré (DoT) au lieu de plain UDP/53 :
-  # l'UDP/53 sortant des conteneurs est mort au niveau Docker Desktop
-  # (prouvé : timeout 1.1.1.1/8.8.8.8, TCP/443 OK) — le plain ne peut plus
-  # marcher. DoT = TCP/853. Historique v10 (DoT flanchait) périmé : pool
-  # DoT corrigé build 01/09. Repli possible : RESOLVER_TYPE=doh (443 prouvé)
-  # ou re-plain si le plan réseau change. Recommandation wiki : 2 providers.
-  DNS_UPSTREAM_RESOLVER_TYPE: doh
-  DNS_UPSTREAM_RESOLVERS: cloudflare,google
-  # [incident v10] PMTUD échoue systématiquement sur ce réseau (ICMP+TCP) ->
-  # MTU retombé à 1320 insuffisant : les gros paquets TLS des probes
-  # black-holent -> stations en error intermittentes. Knob officiel FAQ
-  # healthcheck : baisser le MTU explicitement.
-  WIREGUARD_MTU: '1280'
+  # [2026-11-05] DoH est mesuré mort sur ce réseau : toutes les requêtes
+  # dns.google / cloudflare-dns / dns.quad9 expirent et le healthcheck
+  # redémarre le tunnel en boucle. DoT et plain ont été validés live sur le
+  # même serveur NordVPN ; DoT garde le chiffrement, plain est le repli si
+  # TCP/853 est bloqué.
+  DNS_UPSTREAM_RESOLVER_TYPE: dot
+  DNS_UPSTREAM_PLAIN_ADDRESSES: 1.1.1.1:53,8.8.8.8:53,9.9.9.9:53
+  DNS_UPSTREAM_RESOLVERS: cloudflare,google,quad9
+  # [2026-11-05] Do NOT force 1.1.1.1/8.8.8.8 as health targets: several
+  # NordVPN servers drop TCP/443 to those addresses while cloudflare.com /
+  # github.com work. Gluetun then restarts the tunnel every 6 s and every
+  # bind looks like no-egress. The default hostname targets are kept; DoT
+  # (above) resolves them without depending on the broken DoH stack.
+  # [2026-11-05] WIREGUARD_MTU=1280 was measured harmful: with DoT and the
+  # same ca1947 key, the default MTU passes traffic while 1280 makes every
+  # healthcheck DNS lookup time out and the tunnel restart every 6 s. Leave
+  # WireGuard's MTU at the image default; MSSFIX only clamps OpenVPN.
   OPENVPN_MSSFIX: '1280'
   FIREWALL: 'on'
   PUID: '1000'
@@ -179,7 +183,7 @@ services:
         condition: service_healthy
 
   vpn-gluetun:
-    image: qmcgaw/gluetun:latest
+    image: qmcgaw/gluetun@sha256:4af0c804003481e100180e1f8d4d5e9c48163fedc0f88d061881b615aef9d183
     container_name: opencode-vpn
     mem_limit: 512m
     cpus: 0.5
@@ -231,7 +235,7 @@ services:
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
       # choices" and silently break the rotation.
       # Source unique: config.yaml ip_rotation.server_countries (no inline fallback, audit F-H5).
-      - SERVER_COUNTRIES=${SERVER_COUNTRIES_STATION1:-${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}}
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES_STATION1:-${SERVER_COUNTRIES:-}}
       # [fix 2026-11-01] No hard-coded default: a dead pinned server
       # blocked the station forever (no re-pick, healthcheck restart loop).
       # Empty = gluetun chooses a server inside SERVER_COUNTRIES. The
@@ -242,12 +246,12 @@ services:
       - HTTPPROXY_LISTENING_ADDRESS=:8888
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1080
-      # [plan B 2026-09-08] DoT (cf. ancre) — pas de plain UDP (mort).
-      - DNS_UPSTREAM_RESOLVER_TYPE=doh
-      - DNS_UPSTREAM_RESOLVERS=cloudflare,google
+      # [2026-11-05] DoH mesuré mort ; DoT validé live (repli plain).
+      - DNS_UPSTREAM_RESOLVER_TYPE=dot
+      - DNS_UPSTREAM_PLAIN_ADDRESSES=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53
+      - DNS_UPSTREAM_RESOLVERS=cloudflare,google,quad9
       # [incident v10] blocs littéraux st1/st2 : le MTU de l'ancre partagée
       # n'atteint pas ces services — TLS black-holait au-delà de ~1300 octets.
-      - WIREGUARD_MTU=1280
       - OPENVPN_MSSFIX=1280
       - FIREWALL=on
       - PUID=1000
@@ -290,7 +294,7 @@ services:
   # vpn-gluetun-2` when dual_station is enabled — explicitly targeting a
   # profiled service runs it regardless of its profile.
   vpn-gluetun-2:
-    image: qmcgaw/gluetun:latest
+    image: qmcgaw/gluetun@sha256:4af0c804003481e100180e1f8d4d5e9c48163fedc0f88d061881b615aef9d183
     profiles: ["dual-station", "multi-station"]
     container_name: opencode-vpn-2
     mem_limit: 512m
@@ -338,7 +342,7 @@ services:
       # "United_Kingdom"/"Czechia" are rejected with a WARN "not in
       # choices" and silently break the rotation.
       # Source unique: config.yaml ip_rotation.server_countries (no inline fallback, audit F-H5).
-      - SERVER_COUNTRIES=${SERVER_COUNTRIES_STATION2:-${SERVER_COUNTRIES:?Set SERVER_COUNTRIES from config.yaml - see .env.example}}
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES_STATION2:-${SERVER_COUNTRIES:-}}
       # [fix 2026-11-01] Same as station 1: no dead-server default.
       - SERVER_HOSTNAMES=${SERVER_HOSTNAMES_STATION2:-}
       # [PC-8] pas de UPDATER_PERIOD : source unique = refresh applicatif.
@@ -346,10 +350,10 @@ services:
       - HTTPPROXY_LISTENING_ADDRESS=:8889
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1081
-      # [plan B 2026-09-08] DoT (cf. ancre) — pas de plain UDP (mort).
-      - DNS_UPSTREAM_RESOLVER_TYPE=doh
-      - DNS_UPSTREAM_RESOLVERS=cloudflare,google
-      - WIREGUARD_MTU=1280
+      # [2026-11-05] DoH mesuré mort ; DoT validé live (repli plain).
+      - DNS_UPSTREAM_RESOLVER_TYPE=dot
+      - DNS_UPSTREAM_PLAIN_ADDRESSES=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53
+      - DNS_UPSTREAM_RESOLVERS=cloudflare,google,quad9
       - OPENVPN_MSSFIX=1280
       - FIREWALL=on
       - PUID=1000
@@ -433,6 +437,8 @@ services:
       - "127.0.0.1:1084:1084"    # SOCKS5 proxy (loopback only)
     environment:
       <<: *gluetun-multi-env
+      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION5:-}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES_STATION5:-${SERVER_COUNTRIES}}
       VPN_TYPE: ${VPN_TYPE_STATION5:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION5:-${OPENVPN_PROTOCOL:-udp}}
       OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION5:-${OPENVPN_ENDPOINT_PORT:-}}
@@ -453,6 +459,8 @@ services:
       - "127.0.0.1:1085:1085"    # SOCKS5 proxy (loopback only)
     environment:
       <<: *gluetun-multi-env
+      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION6:-}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES_STATION6:-${SERVER_COUNTRIES}}
       VPN_TYPE: ${VPN_TYPE_STATION6:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION6:-${OPENVPN_PROTOCOL:-udp}}
       OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION6:-${OPENVPN_ENDPOINT_PORT:-}}
@@ -473,6 +481,8 @@ services:
       - "127.0.0.1:1086:1086"    # SOCKS5 proxy (loopback only)
     environment:
       <<: *gluetun-multi-env
+      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION7:-}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES_STATION7:-${SERVER_COUNTRIES}}
       VPN_TYPE: ${VPN_TYPE_STATION7:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION7:-${OPENVPN_PROTOCOL:-udp}}
       OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION7:-${OPENVPN_ENDPOINT_PORT:-}}
@@ -493,6 +503,8 @@ services:
       - "127.0.0.1:1087:1087"    # SOCKS5 proxy (loopback only)
     environment:
       <<: *gluetun-multi-env
+      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION8:-}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES_STATION8:-${SERVER_COUNTRIES}}
       VPN_TYPE: ${VPN_TYPE_STATION8:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION8:-${OPENVPN_PROTOCOL:-udp}}
       OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION8:-${OPENVPN_ENDPOINT_PORT:-}}
@@ -513,6 +525,8 @@ services:
       - "127.0.0.1:1088:1088"    # SOCKS5 proxy (loopback only)
     environment:
       <<: *gluetun-multi-env
+      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION9:-}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES_STATION9:-${SERVER_COUNTRIES}}
       VPN_TYPE: ${VPN_TYPE_STATION9:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION9:-${OPENVPN_PROTOCOL:-udp}}
       OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION9:-${OPENVPN_ENDPOINT_PORT:-}}
@@ -533,6 +547,8 @@ services:
       - "127.0.0.1:1089:1089"    # SOCKS5 proxy (loopback only)
     environment:
       <<: *gluetun-multi-env
+      SERVER_HOSTNAMES: ${SERVER_HOSTNAMES_STATION10:-}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES_STATION10:-${SERVER_COUNTRIES}}
       VPN_TYPE: ${VPN_TYPE_STATION10:-openvpn}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL_STATION10:-${OPENVPN_PROTOCOL:-udp}}
       OPENVPN_ENDPOINT_PORT: ${OPENVPN_ENDPOINT_PORT_STATION10:-${OPENVPN_ENDPOINT_PORT:-}}
@@ -560,7 +576,7 @@ services:
   # mechanism as vpn-gluetun-2, see comment above) and the canary never
   # starts automatically.
   vpn-wg-test:
-    image: qmcgaw/gluetun:latest
+    image: qmcgaw/gluetun@sha256:4af0c804003481e100180e1f8d4d5e9c48163fedc0f88d061881b615aef9d183
     profiles: ["wg-test"]
     container_name: opencode-wg-test
     mem_limit: 512m
@@ -590,15 +606,15 @@ services:
       # endpoint fails, the next country is tried before declaring FAIL.
       # (spaced name — gluetun enum, see comment on SERVER_COUNTRIES above).
       - SERVER_COUNTRIES=Switzerland,Germany,Netherlands
-      - WIREGUARD_MTU=1280
       - UPDATER_PERIOD=480h
       - HTTPPROXY=on
       - HTTPPROXY_LISTENING_ADDRESS=:8898
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1090
-      # [plan B 2026-09-08] DoT (cf. ancre) — pas de plain UDP (mort).
-      - DNS_UPSTREAM_RESOLVER_TYPE=doh
-      - DNS_UPSTREAM_RESOLVERS=cloudflare,google
+      # [2026-11-05] DoH mesuré mort ; DoT validé live (repli plain).
+      - DNS_UPSTREAM_RESOLVER_TYPE=dot
+      - DNS_UPSTREAM_PLAIN_ADDRESSES=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53
+      - DNS_UPSTREAM_RESOLVERS=cloudflare,google,quad9
       - FIREWALL=on
       - PUID=1000
       - PGID=1000

@@ -140,8 +140,8 @@ def test_free_leg_carries_the_official_session_identity():
     assert h["x-opencode-session-id"].startswith("ses_")
     assert h["x-session-affinity"] == h["x-opencode-session-id"]
     assert h["x-session-id"] == h["x-opencode-session-id"]
-    assert "x-opencode-client" not in h
-    assert "x-opencode-project" not in h
+    assert h["x-opencode-client"] == "cli"
+    assert h["x-opencode-project"]
     assert "x-opencode-request" not in h
 
 

@@ -138,10 +138,23 @@ class ProbeResult:
     retry_after_s: float = 0.0
     latency_ms: float | None = None
     error: str | None = None
+    # A 200 is only a recovery when the stream actually produced content.
+    # ``valid`` stays True for the legacy/status-only path; the scanner turns
+    # on SSE validation and sets it to False on an error/empty first frame.
+    valid: bool = True
+    validation: str | None = None
+    # Stable template fingerprint (body + header order + UA/client/version).
+    # The full byte-exact body test remains the source of truth; this makes
+    # every live probe auditable without logging session values.
+    request_fingerprint: str = ""
+    # 429 taxonomy from the response body: daily | rate_limit | transient |
+    # unknown. The scanner must not blacklist an IP until midnight for a
+    # transient upstream overload.
+    quota_scope: str = ""
 
     @property
     def ok(self) -> bool:
-        return self.status == 200
+        return self.status == 200 and self.valid
 
     @property
     def is_quota_429(self) -> bool:

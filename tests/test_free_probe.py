@@ -493,9 +493,9 @@ def test_gate_promue_alive_limited_et_fige_dead(monkeypatch):
     # face officielle transmise à la sonde (chat + responses selon id)
     chat_seen = next(s for s in seen_holder["seen"] if s["mid"] == "good-free")
     assert chat_seen["headers"]["Authorization"] == "Bearer public"
-    assert "provider-utils/4.0.23" in chat_seen["headers"]["User-Agent"]
+    assert chat_seen["headers"]["User-Agent"] == "opencode/latest/2.2.5/cli"
     resp_seen = next(s for s in seen_holder["seen"] if s["mid"] == "muse-spark-1.4-free")
-    assert "4.0.40" in resp_seen["headers"]["User-Agent"]
+    assert resp_seen["headers"]["User-Agent"] == "opencode/latest/2.2.5/cli"
     assert "responses" in resp_seen["url"]
     # ── cycle suivant : le dead est gelé (pas re-sondé), les vivants connus ──
     state_writer = _probe_state_write(oc)

@@ -103,6 +103,31 @@ async def test_429_then_200_rotates(registry):
     assert ("87.120.102.2", "assigned") in statuses
 
 
+async def test_100_candidates_429_until_a_fresh_200(registry):
+    egress = {}
+    for index in range(100):
+        ip = f"87.120.102.{index + 1}"
+        host = f"h{index}.nordvpn.com"
+        _seed(registry, ip, host)
+        egress[host] = ip
+    binder = FakeBinder(egress)
+    probe = FakeProbe(
+        [ProbeResult(status=429, tested_at=1001.0, retry_after_s=3600)] * 99
+        + [ProbeResult(status=200, tested_at=1002.0)]
+    )
+    allocator = IpAllocator(
+        registry, binder, probe, model="m", max_attempts=100, clock=lambda: 1000.0
+    )
+
+    outcome = await allocator.allocate(StationNeed(6, NeedReason.QUOTA_429))
+
+    assert outcome.ok
+    assert outcome.attempts == 100
+    assert outcome.egress_ip == "87.120.102.100"
+    assert len(binder.calls) == 100
+    assert len({ip for _station, ip in [(0, outcome.egress_ip)]}) == 1
+
+
 async def test_bind_failure_tries_next(registry):
     _seed(registry, "87.120.102.1", "a.nordvpn.com")
     _seed(registry, "87.120.102.2", "b.nordvpn.com")

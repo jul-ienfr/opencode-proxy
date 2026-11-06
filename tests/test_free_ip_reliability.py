@@ -92,6 +92,17 @@ def test_note_model_global_cooldown_honors_long_retry_and_never_shortens(monkeyp
     assert pool.model_global_remaining("m") > 7190
 
 
+def test_clear_model_global_purges_target_or_all(monkeypatch):
+    pool = _pool(monkeypatch)
+    pool.note_model_global_cooldown("m1", 100)
+    pool.note_model_global_cooldown("m2", 100)
+    assert pool.clear_model_global("m1") == 1
+    assert pool.model_global_remaining("m1") == 0
+    assert pool.model_global_remaining("m2") > 0
+    assert pool.clear_model_global() == 1
+    assert pool.model_global_remaining("m2") == 0
+
+
 def test_rotation_threshold_uses_model_profile(monkeypatch):
     pool = _pool(monkeypatch, profile={"deepseek-v4.1-flash-free": 150})
     st = _Station(sid=1)

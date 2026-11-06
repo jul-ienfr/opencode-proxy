@@ -41,7 +41,6 @@ from pathlib import Path
 SKIP_SUBTREES = {"models", "custom_routes", "free_model_map"}
 SKIP_DIRS = {
     "docs",
-    "scripts",
     ".git",
     ".venv",
     "venv",
@@ -127,6 +126,10 @@ def iter_py_files(root: Path, tests_only: bool):
             or p.name.startswith("test_")
             or p.name.endswith("_test.py")
         )
+        # Le script d'audit se cite lui-même dans ses needles : il ne prouve
+        # aucun consommateur runtime.
+        if p.name == "config_coverage.py":
+            continue
         # tests/ est exclu de SKIP_DIRS : on le filtre ici explicitement.
         if tests_only != is_test:
             continue

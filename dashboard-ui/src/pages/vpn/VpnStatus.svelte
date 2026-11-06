@@ -158,6 +158,12 @@
     void act('latency', () => apiPost('/api/vpn-config', { latency_rotation: { enabled } }));
   }
 
+  function setProactiveRotation(enabled: boolean): void {
+    void act('proactive', () =>
+      apiPost('/api/vpn-config', { rotation_planner: { enabled } })
+    );
+  }
+
   function setQuota(value: number): void {
     const n = Number(value) || 300;
     void act('quota', () => apiPost('/api/vpn-config', { quota_per_ip: n }));
@@ -380,6 +386,12 @@
           label={t('vpn.latency_cooldown')}
           disabled={busy === 'latency'}
           onchange={setLatency}
+        />
+        <Toggle
+          checked={!!s.rotation_planner_enabled}
+          label={t('vpn.proactive_rotation')}
+          disabled={busy === 'proactive'}
+          onchange={setProactiveRotation}
         />
       </div>
     </div>

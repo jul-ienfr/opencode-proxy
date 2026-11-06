@@ -30,7 +30,7 @@ routing:
   aliases:
     nimo: mimo
 free_model_map:
-  mimo-v2.5: mimo-v2.6-flash-free
+  mimo-v2.5: deepseek-v4-flash-free
   qwen3.7-max: mimo-v2.6-flash-free
   glm-5.1: mimo-v2.6-flash-free
   kimi-k2.6: mimo-v2.6-flash-free
@@ -66,7 +66,7 @@ stations:
   reconciler:
     enabled: true
   quality:
-    enabled: true
+    enabled: false
     probe_interval_s: 30
     probe_timeout_s: 5
     min_samples: 5
@@ -90,15 +90,15 @@ stations:
     rotate_floor: 0.35
     consecutive_low: 3
 ip_rotation:
-  auto_flip_cooldown_min: 15
+  auto_flip_cooldown_min: 5
   auto_hetero_boot: false
   auto_max_free_attempts: false
   auto_mixed_stacks: false
-  auto_ov_fail_threshold: 3
+  auto_ov_fail_threshold: 1
   auto_ov_return_min: 60
   auto_wg_egress_ticks: 20
   backoff_max_delay: 60
-  bad_ip_ttl_s: 1800
+  bad_ip_ttl_s: 900
   bad_ttl: 10
   bad_ttl_by_cause:
     auth: 0
@@ -112,8 +112,8 @@ ip_rotation:
   breaker_warmup_grace_s: 60
   cascade_enabled: true
   cascade_max_duration_s: 120
-  circuit_breaker_recovery: 300
-  circuit_breaker_threshold: 3
+  circuit_breaker_recovery: 5
+  circuit_breaker_threshold: 1000
   compose_service_2: vpn-gluetun-2
   connect_retry_interval: 20
   control_enabled: true
@@ -165,6 +165,8 @@ ip_rotation:
     ledger_bucket_mode: default
     ledger_daily_limit: 0
     ledger_enabled: true
+    ledger_max_block_s: 1200
+    ledger_path: logs/registry.db
     quota_reserve_pct: 10
     rotation_threshold_pct: 20
     selection_demand: 10
@@ -189,13 +191,13 @@ ip_rotation:
     soft_cooldown_sec: 600
     stream_metric: ttfb
     window: 20
-  max_free_attempts: 6
+  max_free_attempts: 5
   max_inflight_per_model_ip: 8
   model_global_429_min_ips: 3
   model_global_429_window_s: 60
   model_global_cooldown_s: 60
   model_slot_wait_s: 3
-  on_429_action: both
+  on_429_action: cooldown
   ov_auth_backoff_max_s: 600
   ov_auth_backoff_s: 90
   ov_auth_cascade_cooldown_min: 30
@@ -216,7 +218,8 @@ ip_rotation:
     enabled: false
     max_attempts: 2
     max_tokens: 4
-  proxy_mode: vpn
+  proactive_tick_s: 60
+  proxy_mode: socks5
   quality_preselection:
     enabled: true
     fast_tps: 55.0
@@ -232,19 +235,8 @@ ip_rotation:
     min_samples: 3
     trend_pct: 25.0
     ttfb_ceiling_ms: 8000
-  quota_ip_block_s: 120
+  quota_ip_block_s: 300
   quota_per_ip: 500
-  quota_per_ip_by_model:
-    deepseek-v4-flash: 150
-    deepseek-v4-flash-free: 150
-    deepseek-v4.1-flash: 150
-    deepseek-v4.1-flash-free: 150
-    glm-5.3-flash-free: 8
-    jev-1.13-free: 150
-    mimo-v2.6-flash-free: 20
-    muse-spark-1.3-contributor-free: 150
-    nemotron-3.5-lightning-free: 40
-    nemotron-3.5-super-vl-free: 40
   recent_ip_max_age: 1800
   recent_ip_window: 20
   reliability_canary:
@@ -252,48 +244,145 @@ ip_rotation:
     percent: 0
     salt: reliability
     shadow: true
+  repair_owner: supervisor
   rotation_concurrency: 1
   rotation_fail_cooldown: 60
   rotation_max_duration: 240
   rotation_planner:
-    enabled: true
-    spare_station: 7
+    enabled: false
+    spare_station: 0
   rotation_stagger: 10
-  rotation_storm_cooldown_s: 600
+  rotation_storm_cooldown_s: 30
   rotation_wait_timeout: 5
-  server_countries: Albania
+  server_countries: ''
   server_issue_grace_s: 25
   server_issue_recheck: true
   server_list_refresh_interval_s: 21600
-  server_pick_mode: proxy
+  server_pick_mode: gluetun
   server_provider: nordvpn
   shared_rotation_file: logs/shared_rotation.json
   socks5_auto_rotate: true
   socks5_fallback_enabled: false
-  socks5_proxies: []
+  socks5_proxies:
+  - host: 127.0.0.1
+    port: 11080
+    username: null
+    password: null
+    enabled: true
+    label: warp-ipv4
+    ipv6: false
+    egress_ip: ''
+    managed: false
+    container: ''
+    image: ''
+    block: ''
+  - host: 127.0.0.1
+    port: 11080
+    username: null
+    password: null
+    enabled: true
+    label: warp-ipv6
+    ipv6: true
+    egress_ip: 2a09:bac5:32d7:1519::21a:22
+    managed: true
+    container: warp-test
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d7:1519::/64
+  - host: 127.0.0.1
+    port: 11085
+    username: null
+    password: null
+    enabled: true
+    label: warp-ipv6-2
+    ipv6: true
+    egress_ip: 2a09:bac5:32d3:be::13:277
+    managed: true
+    container: warp-test2
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d3:be::/64
+  - host: 127.0.0.1
+    port: 11086
+    username: null
+    password: null
+    enabled: true
+    label: warp-ipv6-3
+    ipv6: true
+    egress_ip: 2a09:bac5:32d3:14e6::215:c9
+    managed: true
+    container: warp-test3
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d3:14e6::/64
+  - host: 127.0.0.1
+    port: 11087
+    username: null
+    password: null
+    enabled: true
+    label: warp-ipv6-4
+    ipv6: true
+    egress_ip: 2a09:bac5:32d4:be::13:2c0
+    managed: true
+    container: warp-test4
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d4:be::/64
+  - host: 127.0.0.1
+    port: 11103
+    username: null
+    password: null
+    enabled: true
+    label: warp-restore1
+    ipv6: true
+    egress_ip: 2a09:bac1:27e0:2060::13:2c9
+    managed: true
+    container: warp-restore1
+    image: caomingjun/warp:latest
+    block: 2a09:bac1:27e0:2060::/64
+  - host: 127.0.0.1
+    port: 11105
+    username: null
+    password: null
+    enabled: true
+    label: warp-restore3
+    ipv6: true
+    egress_ip: 104.28.230.203
+    managed: true
+    container: warp-restore3
+    image: caomingjun/warp:latest
+    block: 104.28.230.203/32
+  - host: 127.0.0.1
+    port: 11084
+    username: null
+    password: null
+    enabled: false
+    label: direct
+    ipv6: false
+    egress_ip: ''
+    managed: false
+    container: ''
+    image: ''
+    block: ''
   socks5_proxy_port: 1080
   socks5_proxy_port_2: 1081
   socks_catchup_s: 90
   socks_down_routable: true
   stack_age_guard_s: 600
   state_file_2: logs/vpn_state2.json
-  station_bad_ttl_s: 60
-  station_connect_retry_interval_s: 300
-  station_count: 6
+  station_bad_ttl_s: 10
+  station_connect_retry_interval_s: 30
+  station_count: 1
   station_health:
-    max_effective_age_s: 60
-    shadow: false
+    max_effective_age_s: 180
+    shadow: true
     strict: true
   station_max_rotations_per_hour: 10
   station_repair:
     auth_backoff_s:
-    - 300
-    - 900
-    - 1800
+    - 30
+    - 60
+    - 120
     auth_global_min_stations: 2
-    auth_global_pause_s: 300
+    auth_global_pause_s: 30
     auth_global_window_s: 60
-    bad_probes: 2
+    bad_probes: 4
     connect_hard_deadline_s: 180
     detect_after_s: 20
     egress_auth_cool_max_wait_s: 30
@@ -301,7 +390,7 @@ ip_rotation:
     egress_recovery_deadline_s: 240
     egress_recreate_after_s: 120
     egress_restart_budget_per_hour: 6
-    enabled: true
+    enabled: false
     good_probes: 2
     last_good_first: true
     max_recreates_per_hour: 1
@@ -312,6 +401,12 @@ ip_rotation:
   status_cache_seconds: 5.0
   strict_free: true
   switch_delay: 1
+  transport_auth_backoff_s: 90
+  transport_cycle_timeout_s: 45
+  transport_order:
+  - wireguard
+  - openvpn-udp
+  - openvpn-tcp
   trial_dead_cooldown_s: 21600
   update_apply_idle_minutes: 15
   update_apply_max_defer_hours: 24
@@ -651,6 +746,8 @@ retry_until_success:
   keepalive_interval_s: 10
   buffer_max_bytes: 10485760
 free:
+  station_identity: true
+  cooldown_cap_s: 1200
   max_wire_bytes: 900000
   max_client_system_chars: 4096
   max_client_tools: 9
@@ -680,12 +777,12 @@ free:
         required:
         - filePath
 canary:
-  enabled: true
+  enabled: false
   interval_s: 1800
   model: deepseek-v4.1-flash-free
   timeout_s: 90
 free_prewarm:
-  enabled: true
+  enabled: false
   interval_s: 300
   url: ''
 suspect_tiny_output:
@@ -704,10 +801,20 @@ observability:
       p95_ms: 30000
 ip_registry:
   enabled: true
+  slo:
+    enabled: true
+    sample_interval_s: 30
   db_path: logs/ip_registry.db
+  registry_db_path: logs/registry.db
+  alerts:
+    enabled: true
+    client_usable_min: 5
+    warm_pool_min: 3
+    sweep_stalled_s: 900
+  maintenance_interval_s: 21600
   catalog_refresh_s: 21600
   test_timeout_s: 60
-  lease_ttl_s: 300
+  lease_ttl_s: 600
   retention_days: 7
   score:
     availability_weight: 0.55
@@ -716,27 +823,83 @@ ip_registry:
     latency_budget_ms: 8000
     freshness_ttl_h: 48
     min_score: 20
+  selection:
+    unique_ip: true
+    allow_countries: []
+    deny_countries: []
+    warm_pool_size: 9
+    warm_ttl_s: 21600
+    score_weights:
+      success: 0.4
+      latency: 0.25
+      throughput: 0.2
+      stability: 0.1
+      freshness: 0.05
+  dns:
+    fallback_order:
+    - dot
+    failures_before_fallback: 2
+  repair:
+    shared_wireguard_key: true
   eligibility:
     error_cooldown_s: 1800
   allocator:
-    mode: enforce
+    mode: active
     max_attempts_per_need: 20
-    max_parallel_repairs: 2
-    rebind_limit_per_min: 4
-    winner_cooldown_s: 120
-    winner_grace_s: 20
-    failure_cooldown_s: 60
-    max_candidates_per_chain: 20
+    max_parallel_repairs: 6
+    rebind_limit_per_min: 12
+    winner_cooldown_s: 0
+    winner_grace_s: 10
+    failure_cooldown_s: 5
+    max_candidates_per_chain: 500
+    host_429_cooldown_s: 600
+    no_egress_backoff_s: 120
+    no_egress_backoff_max_s: 60
+    settle_s: 8
+    egress_wait_s: 35
+    egress_poll_s: 2
+    auth_fallback_transport: wireguard
+    probe_validate_sse: true
+    stop_after_429: true
+    fast_discovery: true
+    fast_discovery_transport: wireguard
+    max_state_age_s: 90
+    verified_spare_ttl_s: 21600
+    scan_audit_enabled: true
     probe_models:
     - deepseek-v4.1-flash-free
     - glm-5.3-flash-free
     - mimo-v2.6-flash-free
-    global_429_window_s: 1800
-    global_429_threshold: 20
+    - beam-free
+    - crouton-alpha-free
+    - flint-40b-free
+    - iceman-contributor-free
+    - nemotron-3.5-lightning-free
+    - nemotron-3.5-super-vl-free
+    - pulse-alpha-free
+    - big-pickle
+    transports:
+    - station: 1
+      transport: auto
+    - station: 2
+      transport: auto
+    - station: 3
+      transport: auto
+    - station: 4
+      transport: auto
+    - station: 5
+      transport: auto
+    - station: 6
+      transport: auto
+    refresh_when_exhausted: true
+    refresh_cooldown_s: 900
+    refresh_min_available: 1
+    global_429_window_s: 600
+    global_429_threshold: 100000
     global_429_pause_s: 900
-    exhausted_threshold: 40
+    exhausted_threshold: 5000
     exhausted_pause_s: 1800
-    poll_interval_s: 20
+    poll_interval_s: 10
   binder:
     mode: compose_hostname
   sources:
@@ -975,11 +1138,9 @@ models:
     protocol: gemini
   gemini-3.8-flash:
     protocol: gemini
-  gemini-3-flash:
-    protocol: gemini
-  gemini-3-pro:
-    protocol: gemini
-  gemini-3.1-pro:
-    protocol: gemini
-  gemini-4-argon-contributor:
-    protocol: gemini
+  pulse-alpha-free:
+    protocol: openai
+  crouton-alpha-free:
+    protocol: openai
+  hy4:
+    protocol: openai

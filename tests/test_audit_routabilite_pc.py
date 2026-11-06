@@ -430,6 +430,14 @@ def test_pc11_perimeter_helper(tmp_path):
     assert mgr._country_in_perimeter("") is False
 
 
+def test_pc11_empty_perimeter_allows_any_country(tmp_path):
+    mgr = GraceFake(_gcfg(tmp_path, server_countries=""), tmp_path)
+    assert mgr._country_in_perimeter("Germany") is True
+    assert mgr._country_in_perimeter("Brazil") is True
+    assert mgr._country_in_perimeter("") is False
+    assert mgr._assigned_country() is None
+
+
 async def test_pc11_out_of_perimeter_refused(tmp_path, caplog):
     """Pin hors périmètre ⇒ refusé + loggé, aucun PUT ne part."""
     mgr = GraceFake(

@@ -3,7 +3,14 @@
 Pure domain, scoring and eligibility rules.  No I/O, no provider import.
 """
 
-from .adapters import ComposeHostnameBinder, StationEgress, StationProbe
+from .adapters import (
+    ComposeHostnameBinder,
+    GluetunControlBinder,
+    HybridBinder,
+    StationEgress,
+    StationProbe,
+    host_public_ip,
+)
 from .allocator import AllocationOutcome, AllocationReport, IpAllocator, StationNeed
 from .catalog import NordVpnCatalog
 from .domain import (
@@ -18,6 +25,7 @@ from .domain import (
     Server,
     can_transition,
 )
+from .dns import DnsFallback
 from .eligibility import EligibilityDecision, check_eligibility
 from .scoring import ScoreWeights, score_record
 from .sources import SourceManifest, SourceRegistry, SourceSnapshot
@@ -29,6 +37,9 @@ __all__ = [
     "AllocationReport",
     "BindResult",
     "ComposeHostnameBinder",
+    "DnsFallback",
+    "GluetunControlBinder",
+    "HybridBinder",
     "EligibilityDecision",
     "GeoFilter",
     "IpAllocator",
@@ -48,6 +59,7 @@ __all__ = [
     "StationEgress",
     "StationNeed",
     "StationProbe",
+    "host_public_ip",
     "can_transition",
     "check_eligibility",
     "registry_status",

@@ -8,6 +8,7 @@ effacé par une simple lecture ``/api/vpn-status``.
 
 import time
 
+from free.ip_quota import QuotaProfile
 from free_ip_pool import FreeIPPool
 
 
@@ -38,6 +39,29 @@ def _pool(st):
     pool._bad_ttl = 60.0
     pool._launch_rotation = lambda *a, **k: None
     return pool
+
+
+def test_gui_quota_per_ip_hot_reload_updates_model_leases():
+    st = _Station(ip="4.4.4.4")
+    st._config = {
+        "quota_per_ip": 500,
+        "ip_quota": {"enabled": True, "quota_reserve_pct": 10, "rotation_threshold_pct": 20},
+    }
+    pool = _pool(st)
+    # Ancien profil par modèle (150) encore présent dans les leases.
+    pool._quota.apply_profile(
+        QuotaProfile.from_config({"quota_per_ip_by_model": {"deepseek-v4.1-flash-free": 150}})
+    )
+    pool._note_model_request("deepseek-v4.1-flash-free", st)
+    lease = pool._quota.lease_for("deepseek-v4.1-flash-free", st)
+    assert lease.quota_estimate == 150
+    assert pool._rotation_threshold(st, "deepseek-v4.1-flash-free") == 120
+
+    # Changement GUI : le profil et les leases existants passent à 500/400.
+    pool.update_config({"quota_per_ip": 500})
+    lease = pool._quota.lease_for("deepseek-v4.1-flash-free", st)
+    assert lease.quota_estimate == 500
+    assert pool._rotation_threshold(st, "deepseek-v4.1-flash-free") == 400
 
 
 def test_ip_change_resets_once_and_reanchors():

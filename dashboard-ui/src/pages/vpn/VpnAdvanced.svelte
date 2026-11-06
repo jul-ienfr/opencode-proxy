@@ -57,6 +57,11 @@
     port?: number;
     enabled?: boolean;
     username?: string | null;
+    label?: string;
+    ipv6?: boolean;
+    egress_ip?: string;
+    block?: string;
+    managed?: boolean;
   }
 
   interface Socks5State {
@@ -373,13 +378,17 @@
     });
   }
 
+  function proxyKey(p: Socks5Proxy): string {
+    return p.label || `${p.host}:${p.port}`;
+  }
+
   function testProxy(index: number, p: Socks5Proxy): void {
     void run('test-proxy', async () => {
-      const key = `${p.host}:${p.port}`;
+      const key = proxyKey(p);
       testResults = { ...testResults, [key]: '…' };
       const res = await apiPost<{ ok?: boolean; ip?: string; latency_ms?: number; error?: string }>(
         '/api/vpn/socks5/test',
-        { host: p.host, port: p.port }
+        { host: p.host, port: p.port, label: p.label }
       );
       testResults = {
         ...testResults,
@@ -824,15 +833,27 @@
     {#if proxies.length === 0}
       <p class="muted small">{t('vpn.no_proxies')}</p>
     {:else}
-      {#each proxies as p, i (i)}
+      {#each proxies as p, i (p.label || `${p.host}:${p.port}:${i}`)}
         <div class="proxy" class:off={!p.enabled}>
-          <span class="mono proxy-addr">{p.host}:{p.port}</span>
+          <span class="mono proxy-addr">{p.label || `${p.host}:${p.port}`}</span>
+          {#if p.label}
+            <span class="muted small mono">{p.host}:{p.port}</span>
+          {/if}
+          {#if p.egress_ip}
+            <span class="muted small mono">{p.egress_ip}</span>
+          {/if}
+          {#if p.block}
+            <span class="muted small mono">{p.block}</span>
+          {/if}
+          {#if p.managed}
+            <span class="muted small">WARP</span>
+          {/if}
           {#if p.username}
             <span class="muted small">{p.username}</span>
           {/if}
           <span class="muted small">{p.enabled ? t('vpn.on') : t('vpn.off')}</span>
-          {#if testResults[`${p.host}:${p.port}`]}
-            <span class="muted small">{testResults[`${p.host}:${p.port}`]}</span>
+          {#if testResults[proxyKey(p)]}
+            <span class="muted small">{testResults[proxyKey(p)]}</span>
           {/if}
           <div class="proxy-actions">
             <input
@@ -899,7 +920,10 @@
     {/if}
   </div>
   {#if hunter.last_log?.length}
-    <pre class="result hunter-log">{hunter.last_log.join('\n')}</pre>
+    <pre class="result hunter-log">{hunter.last_log
+        .slice(-12)
+        .map((line) => (line.length > 400 ? `${line.slice(0, 400)}…` : line))
+        .join('\n')}</pre>
   {/if}
 </Card>
 
@@ -1063,5 +1087,8 @@
 
   .hunter-log {
     max-height: 240px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 </style>

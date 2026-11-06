@@ -311,8 +311,11 @@ d'IP. Le pool distingue désormais :
 * **limite modèle globale** : 429 sur 3 IP distinctes en 60 s → arrêt des
   rotations et backoff (`model_global_cooldown_s`) ; une IP neuve ne réglerait
   rien ;
-* **seuil par modèle** : `ip_rotation.quota_per_ip_by_model` coupe avant le mur
-  réel (DeepSeek 150, au lieu du plafond global 500) ;
+* **seuil global piloté par l'opérateur** : `ip_rotation.quota_per_ip`
+  (champ « Quota / IP » du GUI) est le profil effectif de chaque lease
+  `(modèle, IP)`. Le seuil proactif reste calculé avec
+  `rotation_threshold_pct` (20 % par défaut) ; aucun plafond par modèle n'est
+  imposé en dur, et un 429 reste le déclencheur de secours ;
 * **concurrence** : au plus `max_inflight_per_model_ip` requêtes en vol par
   couple `(modèle, station)` ; les autres attendent brièvement au lieu de
   partir en rafale sur la même IP.

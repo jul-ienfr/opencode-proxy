@@ -78,6 +78,12 @@ from vpn.auth import (
 # (« failure #1 » toutes les ~40 s) au lieu d'être évité globalement.
 _GLOBAL_FAILED_HOSTS: dict[str, dict] = {}
 
+# [2026-11-03 any-country] hostname -> country memo for the dashboard.
+# The persisted current_country is the PIN, not the live egress; the
+# hostname is the only runtime signal that survives a pin change. Filled
+# lazily from logs/ip_registry.db (servers table), never on the hot path.
+_COUNTRY_BY_HOST_CACHE: dict[str, str | None] = {}
+
 # [plan v10 §14.1.9] Sérialise le read-modify-write du .env entre managers
 # concurrents (hot-reload vs auto-flip hétérogène). La section critique est
 # 100% synchrone (file I/O, aucun await) → threading.Lock suffit.
@@ -1855,6 +1861,13 @@ class VPNManager:
         # pin dernier bon serveur -> recreate -> stack -> park 30 min.
         self._repair_policy: RepairPolicy = RepairPolicy.from_config(cfg)
         self._station_repair_enabled: bool = bool(self._repair_policy.enabled)
+        # [2026-11-05] Who owns hostname rotation/repair:
+        # "manager" (legacy/tests) or "supervisor" (live allocator).
+        # Default manager keeps the existing unit contracts; production sets
+        # supervisor in config.yaml.
+        self._repair_owner = str(
+            cfg.get("repair_owner", "manager") or "manager"
+        ).strip().lower()
         self._repair_state: RepairState = RepairState()
         self._auth_repair_task: asyncio.Task | None = None
         self._auth_park_until: float = 0.0
@@ -2113,7 +2126,12 @@ class VPNManager:
         # saine — d'où la rafale de 6 AUTH + throttle compte à chaque
         # restart du proxy alors que les 6 tunnels étaient montés.
         _up = VPNState.is_up(self._status) and bool(self._current_ip)
-        if self._enabled and self._proxy_mode == "vpn" and not _up:
+        if (
+            self._enabled
+            and self._proxy_mode == "vpn"
+            and not _up
+            and getattr(self, "_repair_owner", "manager") != "supervisor"
+        ):
             # Startup must NOT block the HTTP server: compose up +
             # wait_healthy (≤120s) + up to 3 _finalize_ip rotation rounds can
             # take minutes. Connect in a background task — the watchdog and
@@ -2288,7 +2306,7 @@ class VPNManager:
                 self._set_status(VPNState.CONNECTED)
                 self._current_server = {
                     "name": self._docker_container,
-                    "country": self._current_country or self._server_countries,
+                    "country": self._current_country or self._assigned_country(),
                 }
                 self._breaker_charge_success()  # ferme la fenêtre warm-up (A1)
                 self._backoff.record_success()
@@ -2547,7 +2565,7 @@ class VPNManager:
                 self._current_ip = new_ip
                 self._current_server = {
                     "name": self._docker_container,
-                    "country": self._current_country or self._server_countries,
+                    "country": self._current_country or self._assigned_country(),
                 }
                 self._connected_at = time.monotonic()
                 self._set_status(VPNState.CONNECTED)
@@ -3122,7 +3140,7 @@ class VPNManager:
                         self._secondary_path_issue_until = time.monotonic() + _hold if _hold > 0 else 0.0
                         self._current_server = {
                             "name": self._docker_container,
-                            "country": self._current_country or self._server_countries,
+                            "country": self._current_country or self._assigned_country(),
                         }
                         # [roadmap] bruit : ces resets sont une information de
                         # voie secondaire, pas une erreur du tunnel effectif.
@@ -3312,7 +3330,7 @@ class VPNManager:
                                     self._set_status(VPNState.DEGRADED)
                                 self._current_server = {
                                     "name": self._docker_container,
-                                    "country": self._current_country or self._server_countries,
+                                    "country": self._current_country or self._assigned_country(),
                                 }
                                 return self.get_status()
                     else:
@@ -3335,7 +3353,7 @@ class VPNManager:
                             self._set_status(VPNState.DEGRADED)
                         self._current_server = {
                             "name": self._docker_container,
-                            "country": self._current_country or self._server_countries,
+                            "country": self._current_country or self._assigned_country(),
                         }
                         return self.get_status()
                     try:
@@ -3350,7 +3368,7 @@ class VPNManager:
                     self._error = None
                     self._current_server = {
                         "name": self._docker_container,
-                        "country": self._current_country or self._server_countries,
+                        "country": self._current_country or self._assigned_country(),
                     }
                     return self.get_status()
             elif ctl is False:
@@ -3397,7 +3415,7 @@ class VPNManager:
                     self._set_status(VPNState.DEGRADED)
                 self._current_server = {
                     "name": self._docker_container,
-                    "country": self._current_country or self._server_countries,
+                    "country": self._current_country or self._assigned_country(),
                 }
                 return self.get_status()
             try:
@@ -3408,7 +3426,7 @@ class VPNManager:
             self._error = None
             self._current_server = {
                 "name": self._docker_container,
-                "country": self._current_country or self._server_countries,
+                "country": self._current_country or self._assigned_country(),
             }
         else:
             try:
@@ -4605,7 +4623,15 @@ class VPNManager:
         if "switch_delay" in updates:
             self._switch_delay = max(0.0, float(updates["switch_delay"]))
         if "server_countries" in updates:
-            self._server_countries = str(updates["server_countries"])
+            _new_sc = str(updates["server_countries"])
+            if _new_sc != self._server_countries:
+                # [2026-11-03 any-country] A new perimeter invalidates the
+                # old pin label. Without this, the dashboard kept showing a
+                # stale country (Angola/Afghanistan/Guyana) restored from
+                # vpn_state*.json even though the new egress was elsewhere.
+                self._current_country = None
+                self._country_pinned_at = None
+            self._server_countries = _new_sc
         if "ip_check_urls" in updates:
             urls = updates["ip_check_urls"]
             if isinstance(urls, list):
@@ -4775,6 +4801,19 @@ class VPNManager:
         # [O3-mixed] interrupteur flotte mixte (hot-reloadable, rollback).
         if "auto_mixed_stacks" in updates:
             self._auto_mixed_stacks = bool(updates["auto_mixed_stacks"])
+        # [2026-11-03 AUTH→WG] Hot-reload the auth-driven flip thresholds:
+        # one AUTH_FAILED can trigger the automatic WireGuard fallback without
+        # a proxy restart. The operator wants zero manual intervention.
+        if "auto_ov_fail_threshold" in updates:
+            try:
+                self._auto_ov_fail_threshold = max(1, int(updates["auto_ov_fail_threshold"]))
+            except (TypeError, ValueError):
+                pass
+        if "auto_flip_cooldown_min" in updates:
+            try:
+                self._auto_flip_cooldown_min = max(0, int(updates["auto_flip_cooldown_min"]))
+            except (TypeError, ValueError):
+                pass
         # [phase 1] interrupteur choix des serveurs (GUI + hot-reload).
         if "server_pick_mode" in updates:
             _spm = str(updates.get("server_pick_mode") or "proxy").strip().lower()
@@ -4930,8 +4969,38 @@ class VPNManager:
         except Exception as e:
             logger.warning("[vpn] update_health_policy failed for s%s: %s", self._station, e)
 
+    def _country_for_host(self, host: str | None) -> str | None:
+        """Best-effort country for a NordVPN hostname (registry catalog).
+
+        Never raises: a missing/locked DB returns None and the caller falls
+        back to the deterministic assigned country.
+        """
+        if not host:
+            return None
+        key = str(host).strip().lower()
+        if key in _COUNTRY_BY_HOST_CACHE:
+            return _COUNTRY_BY_HOST_CACHE[key]
+        country = None
+        try:
+            import sqlite3
+
+            db = os.path.join(ROOT, "logs", "registry.db")
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2) as conn:
+                row = conn.execute(
+                    "select country from servers where lower(hostname) = ? and country != '' limit 1",
+                    (key,),
+                ).fetchone()
+            country = str(row[0]) if row and row[0] else None
+        except Exception:
+            country = None
+        _COUNTRY_BY_HOST_CACHE[key] = country
+        return country
+
     def get_status(self) -> dict:
         """Return current VPN status for the dashboard."""
+        _live_country = self._current_country or self._country_for_host(
+            getattr(self, "_current_host", None)
+        )
         if self._connected_at:
             elapsed = int(time.monotonic() - self._connected_at)
         elif self._ip_history:
@@ -4973,7 +5042,8 @@ class VPNManager:
             "current_host": getattr(self, "_current_host", None),
             "pinned_hostname": getattr(self, "_pinned_hostname", None),
             "server": self._current_server.get("name") if self._current_server else None,
-            "country": self._current_server.get("country") if self._current_server else None,
+            "country": _live_country or self._assigned_country(),
+            "live_country": _live_country,
             "current_country": self._current_country,
             "country_pinned_at": self._country_pinned_at,
             "next_country": self._next_country_preview(),
@@ -5328,6 +5398,33 @@ class VPNManager:
         still carries the previous one.
         """
         env = dict(os.environ)
+        # [2026-11-03 any-country] The parent os.environ carries the
+        # BOOT-TIME SERVER_COUNTRIES (e.g. Albania) and docker compose gives
+        # the parent env precedence over .env. A hot-reloaded perimeter was
+        # therefore silently reverted to the old country on every recreate.
+        # Re-read the authoritative .env and pass it explicitly, exactly like
+        # the per-station hostname pin below.
+        try:
+            _env_path = os.path.join(os.path.dirname(self._compose_file_path()), ".env")
+            _global_sc = ""
+            _station_sc: dict[int, str] = {}
+            with open(_env_path, encoding="utf-8") as _fh:
+                for _raw in _fh:
+                    _line = _raw.strip()
+                    if _line.startswith("SERVER_COUNTRIES="):
+                        _global_sc = _line.split("=", 1)[1].strip().strip('"').strip("'")
+                    elif _line.startswith("SERVER_COUNTRIES_STATION"):
+                        _k, _, _v = _line.partition("=")
+                        try:
+                            _station_sc[int(_k.rsplit("STATION", 1)[1])] = _v.strip().strip('"').strip("'")
+                        except (ValueError, IndexError):
+                            pass
+            if _global_sc:
+                env["SERVER_COUNTRIES"] = _global_sc
+            for _s in stations or [self._station]:
+                env[f"SERVER_COUNTRIES_STATION{_s}"] = _station_sc.get(int(_s), "")
+        except OSError:
+            pass
         if stack is None:
             stack = self._stack_effective or "openvpn"
         for s in stations or [self._station]:
@@ -5919,11 +6016,19 @@ class VPNManager:
         return nxt
 
     def _country_in_perimeter(self, country: str | None) -> bool:
-        """[PC-11 — audit 2026-09-08] True si `country` ∈ server_countries."""
+        """[PC-11 — audit 2026-09-08] True si `country` ∈ server_countries.
+
+        [T021] Une liste vide signifie « tous les pays » : le périmètre n’est
+        plus une porte par défaut. Une allowlist GUI non vide reste
+        appliquée.
+        """
         try:
             if not country:
                 return False
-            return _normalize_country(country) in self._countries_list()
+            countries = self._countries_list()
+            if not countries:
+                return True
+            return _normalize_country(country) in countries
         except Exception:
             return False
 
@@ -6209,6 +6314,17 @@ class VPNManager:
             since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 21600))
             host = await self._current_hostname(since)
             if not host:
+                # [2026-11-03 any-country] The full IP→hostname map is ONE
+                # API call (/v1/servers?limit=8000). The per-country
+                # least-loaded fetch is 150 calls with a 150-country
+                # perimeter and rate-limits the NordVPN API (observed
+                # HTTP 429 on every country). Prefer the single map; only
+                # fall back to the per-country fetch if it is still empty.
+                if not self._nord_ip_hosts:
+                    try:
+                        await self._fetch_nord_ip_map()
+                    except Exception:
+                        pass
                 if not self._nord_ip_hosts:
                     try:
                         await self._fetch_nord_loads()
@@ -6288,7 +6404,10 @@ class VPNManager:
                     _raw = _bo if _bo > 0 else 15.0
                     if not os.getenv("PYTEST_CURRENT_TEST"):
                         _raw *= random.uniform(0.8, 1.2)
-                    await asyncio.sleep(_raw)
+                    # Injectable clock: the offline control suites replace
+                    # `_sleep_fn` with a no-op. Bypassing it made a single
+                    # fast-pin test wall 6 × 15 s (92 s measured).
+                    await self._sleep_fn(_raw)
                     continue  # dead host: the next country can work
                 return False  # infra failure: compose path is the escalation
             host = await self._current_hostname(since)
@@ -6315,10 +6434,10 @@ class VPNManager:
                     max_skips + 1,
                 )
                 # [fiab 09/09] jitter ±20% : désync les re-pins parallèles.
+                _skip_delay = 5.0
                 if not os.getenv("PYTEST_CURRENT_TEST"):
-                    await asyncio.sleep(5 * random.uniform(0.8, 1.2))
-                else:
-                    await asyncio.sleep(5)
+                    _skip_delay *= random.uniform(0.8, 1.2)
+                await self._sleep_fn(_skip_delay)
                 continue
             if await self._finalize_ip(allow_stale=False):
                 self._watchdog_backoff.record_success()
@@ -6426,6 +6545,9 @@ class VPNManager:
     def _compose_pin_key(self) -> str:
         return f"SERVER_HOSTNAMES_STATION{self._station}"
 
+    def _compose_country_key(self) -> str:
+        return f"SERVER_COUNTRIES_STATION{self._station}"
+
     def _clear_compose_pin_file(self) -> None:
         """Persist ``SERVER_HOSTNAMES_STATIONn=`` next to the compose file.
 
@@ -6440,6 +6562,7 @@ class VPNManager:
         except OSError:
             return
         key = self._compose_pin_key()
+        country_key = self._compose_country_key()
         changed = False
         out: list[str] = []
         for line in lines:
@@ -6447,6 +6570,14 @@ class VPNManager:
             if stripped.startswith(key + "="):
                 if stripped != key + "=":
                     line = key + "="
+                    changed = True
+            elif stripped.startswith(country_key + "="):
+                # [2026-11-03] A hostname pin and its country pin are one
+                # unit: dropping the dead host must also drop the country,
+                # otherwise the station stays trapped in the exhausted
+                # country instead of re-picking from the global perimeter.
+                if stripped != country_key + "=":
+                    line = country_key + "="
                     changed = True
             out.append(line)
         if not changed:
@@ -6490,6 +6621,10 @@ class VPNManager:
         )
         try:
             os.environ[self._compose_pin_key()] = ""
+        except Exception:
+            pass
+        try:
+            os.environ[self._compose_country_key()] = ""
         except Exception:
             pass
         try:
@@ -9592,6 +9727,18 @@ class VPNManager:
             return  # VPN feature off or tunnel bypassed — nothing to watch
         if not getattr(self, "_desired_connected", True):
             return  # disconnect explicite : le watchdog ne doit pas reconnecter
+        if getattr(self, "_repair_owner", "manager") == "supervisor":
+            # [2026-11-05] Single repair owner: the allocator/supervisor owns
+            # hostname rotation and compose repair. The watchdog still keeps
+            # the status cache fresh, but it must never restart or re-pin a
+            # station behind the supervisor's back (the two used to race:
+            # a chain bound host A, the watchdog recreated to host B, and the
+            # chain's egress probe saw no-egress).
+            try:
+                await self.refresh_status()
+            except Exception:
+                pass
+            return
         # [qualité] Hostname réel après un boot compose (sans pin) — une
         # lecture de logs par minute maximum, jamais dans la boucle chaude.
         if not self._current_host:
@@ -9783,6 +9930,22 @@ class VPNManager:
                 tunnel_alive = await asyncio.wait_for(self._probe_tunnel_light(), self._ip_probe_budget)
             except TimeoutError:
                 tunnel_alive = False
+            # [fleet-guard 2026-11-03] Real client traffic outranks the
+            # synthetic probe. Under a burst, the SOCKS5/CONNECT probe can
+            # time out while real 200s are still flowing; treating that as a
+            # dead station rotated away live IPs and made every station repair
+            # at once. A recent real 200 wins until the grace expires.
+            _real_ok_at = float(getattr(self, "_last_effective_ok_at", 0.0) or 0.0)
+            if not tunnel_alive and _real_ok_at:
+                _real_age = time.monotonic() - _real_ok_at
+                if _real_age < 120.0:
+                    if self._egress_failures:
+                        logger.info(
+                            "[vpn-watchdog] probe KO mais trafic réel OK il y a %.0fs — egress conservé",
+                            _real_age,
+                        )
+                    self._egress_failures = 0
+                    return
             # [P1] Alimente la machine à états santé du pool : 2 probes réels
             # avant de réadmettre, 2 échecs avant réparation.
             try:
@@ -9793,16 +9956,16 @@ class VPNManager:
                 pass
             if not tunnel_alive:
                 self._egress_failures += 1
-                # [audit 2026-10-30] Dès le premier échec, la station n'est
-                # plus un tunnel sain pour le pool : sans ce marqueur, une
-                # station qui était `tunnel_up_full` restait routable alors
-                # que la sonde data-plane échouait.
-                try:
-                    self._egress_state = "tunnel_down"
-                except Exception:
-                    pass
                 _eg_thr = self._egress_repair_threshold()
+                # Do not condemn the tunnel on a single failed probe: the
+                # ``tunnel_down`` marker only appears after the full grace
+                # window, so a transient probe timeout cannot remove a
+                # serving station from routing.
                 if self._egress_failures >= _eg_thr:
+                    try:
+                        self._egress_state = "tunnel_down"
+                    except Exception:
+                        pass
                     egress_dead = True
                     pool = getattr(shared_state, "free_ip_pool", None)
                     if pool is not None:
@@ -10775,8 +10938,19 @@ class VPNManager:
             # persisted before the name fix must not label the dashboard or
             # skew the nxt == _current_country comparison.
             restored_country = state.get("current_country")
-            if isinstance(restored_country, str) and restored_country:
+            # [2026-11-03 any-country] With country rotation ON, the persisted
+            # country is only the LAST pin, not the live egress. Restoring it
+            # blindly is what kept the dashboard on Angola/Afghanistan/Guyana
+            # after server_countries had already changed. The next rotation
+            # re-pins and re-derives the label; until then None is honest.
+            if (
+                isinstance(restored_country, str)
+                and restored_country
+                and not self._country_rotation
+            ):
                 self._current_country = _normalize_country(restored_country)
+            else:
+                self._current_country = None
             # [plan 18/08] Restore the hostname blacklist; prune entries whose
             # 24 h window has passed (wall-clock epoch, monotonic-independent).
             now = time.time()

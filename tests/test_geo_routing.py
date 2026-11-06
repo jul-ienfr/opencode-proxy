@@ -5,6 +5,16 @@ import config.settings as st
 
 
 class TestGeoResolve:
+    def test_empty_server_countries_accepts_allowlist(self, monkeypatch):
+        monkeypatch.setattr(st, "IP_ROTATION", {"server_countries": ""})
+        route = {
+            "model": "x",
+            "geo": {"allowed_countries": ["Brazil"], "mode": "strict"},
+        }
+        result = st.resolve_geo(route)
+        assert result["geo_status"] == "ok"
+        assert "Brazil" in result["effective_allowed"]
+
     def test_disabled_passthrough(self, monkeypatch):
         monkeypatch.setattr(st, "GEO_ENABLED", False)
         route = {

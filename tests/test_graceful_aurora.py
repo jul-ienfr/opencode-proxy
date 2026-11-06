@@ -948,8 +948,12 @@ class TestServerPickMode:
     async def test_status_and_config_expose_mode(self, tmp_path):
         mgr = _pick_mgr(tmp_path, server_pick_mode="gluetun")
         assert mgr.get_status()["server_pick_mode"] == "gluetun"
-        # get_config lit le miroir persisté (config.yaml édité : proxy).
-        assert mgr.get_config()["server_pick_mode"] == "proxy"
+        # get_config lit le miroir persisté (config.yaml) — la valeur peut
+        # différer du champ live ; on compare à la config réellement chargée
+        # au lieu de figer "proxy" (le défaut du dépôt peut évoluer).
+        from config.settings import IP_ROTATION
+
+        assert mgr.get_config()["server_pick_mode"] == IP_ROTATION.get("server_pick_mode", "proxy")
 
 
 # ── Incident st1 12/10 : serveur NordVPN qui refuse (Connection refused) ──

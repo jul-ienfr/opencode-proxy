@@ -94,6 +94,17 @@ def _compose(tmp_path, monkeypatch):
 # ── _compose_env (déterministe — construction du dict env) ─────────
 
 
+def test_empty_server_countries_is_valid_compose_interpolation():
+    """Empty means any-country; compose must not fail-closed on it."""
+
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    text = (root / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "SERVER_COUNTRIES:?Set" not in text
+    assert "${SERVER_COUNTRIES:-}" in text
+
+
 class TestComposeEnv:
     def test_single_station_carries_station_var(self, tmp_path, monkeypatch):
         # Importing config.settings already loaded the repo .env into
@@ -154,6 +165,24 @@ class TestComposeEnv:
 
         assert env["SERVER_HOSTNAMES_STATION3"] == ""
         assert m._pinned_hostname is None
+
+    def test_global_server_countries_read_from_env(self, tmp_path, monkeypatch):
+        """[2026-11-03 any-country] A hot-reloaded perimeter must beat the
+        boot-time os.environ, exactly like the per-station hostname pin."""
+        _compose(tmp_path, monkeypatch)
+        (tmp_path / ".env").write_text(
+            "SERVER_COUNTRIES=Germany,France\n"
+            "SERVER_COUNTRIES_STATION3=\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SERVER_COUNTRIES", "Albania")
+        cfg, _ = _cfg_with(tmp_path)
+        m = _EnvRecFake(cfg, station=3, tmp_path=tmp_path)
+
+        env = m._compose_env()
+
+        assert env["SERVER_COUNTRIES"] == "Germany,France"
+        assert env["SERVER_COUNTRIES_STATION3"] == ""
 
     def test_explicit_stack_override_wins(self, tmp_path):
         """During a flip, _apply_stack passes the TARGET stack — the child

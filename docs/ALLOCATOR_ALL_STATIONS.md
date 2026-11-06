@@ -14,8 +14,9 @@
    (`ip_state` + `assignments` + `observations`) et **conservée** sur la station.
 4. **Une IP n’appartient qu’à une station** : claims exclusifs par hostname et
    index d’unicité en base.
-5. **Catalogue partagé** : `servers` (9948 entrées), `catalog_claims.db`
-   (qui a testé quoi), `ip_registry.db` (observations et assignations).
+5. **Catalogue partagé** : `servers` (9948 entrées), `claims` (qui a testé
+   quoi), `egress_ips` / `leases` (IP et propriétaire) — tout dans
+   `logs/registry.db`, seule source d’état runtime.
 6. Les stations réparent **en parallèle**, avec une borne :
    `max_parallel_repairs` chaînes simultanées et un **budget global de rebind**
    (`rebind_limit_per_min`) pour ne pas faire tomber le compte NordVPN.
@@ -129,17 +130,45 @@ Logs :
 ```text
 logs/fresh_chain_supervisor.log   # décisions, winners, réconciliation
 logs/fresh_chain_<n>.log          # détail des candidats par station
-logs/fresh_chain_state_<n>.json   # résultats et winner par station
+logs/registry.db                  # table chain_state : résultats et winner
 ```
 
 Vérifier les assignations :
 
 ```bash
-sqlite3 logs/ip_registry.db \
-  "SELECT station, egress_ip, hostname FROM assignments WHERE released_at IS NULL;"
-sqlite3 logs/catalog_claims.db \
+sqlite3 logs/registry.db \
+  "SELECT station, ip, hostname FROM leases WHERE status='active';"
+sqlite3 logs/registry.db \
   "SELECT status, COUNT(*) FROM claims GROUP BY status;"
 ```
+
+### 6.0 Incidents et alertes
+
+Le superviseur écrit les incidents de flotte dans la table `incidents` de
+`registry.db` (dédupliqués par `(scope, cause)`, fermés automatiquement) :
+
+| Cause | Seuil | Remédiation |
+|---|---|---|
+| `client_usable_low` | `model_usable < alerts.client_usable_min` (5) | chaînes de réparation |
+| `warm_pool_low` | `warm_pool < alerts.warm_pool_min` (3) | continuer le scan |
+| `capacity_degraded` | capacité sous le nombre configuré | vérifier les stations |
+| `duplicate_ip` | deux stations sur la même IP | rotation d’une station |
+| `sweep_stalled` | aucune écriture `chain_state` depuis `alerts.sweep_stalled_s` | inspecter/relancer le superviseur |
+
+Lecture : `GET /api/free/ip-registry/status` → `incidents`, et
+`GET /api/free/chain` → `sweep` (catalogue, tentés, restants, pourcentage,
+statuts) + `next_candidate`.
+
+### 6.1 DNS et image Gluetun
+
+- L’image est épinglée par digest
+  `qmcgaw/gluetun@sha256:4af0c804003481e100180e1f8d4d5e9c48163fedc0f88d061881b615aef9d183`.
+- Le mode DoT est primaire. Le repli `plain` doit toujours fournir des
+  adresses **avec port** : `DNS_UPSTREAM_PLAIN_ADDRESSES=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53`.
+  Sans port, Gluetun refuse de démarrer (`not an ip:port`).
+- Le manifeste est installé atomiquement avant chaque bind
+  (`cp` vers `.tmp`, `mv`, `test -s`, `grep '"servers"'`), puis relu depuis
+  le volume de la station.
 
 ## 7. Preuve live du 2026-11-02
 
@@ -156,6 +185,43 @@ sqlite3 logs/catalog_claims.db \
   manager ou en rotation : le gate free renvoyait des **429**
   (`Retry-After` ~11-14 h) sur de nombreux candidats. Le système continue ;
   il ne peut pas fabriquer un 200.
+
+## 7 bis. Clôture 6/6 — 2026-11-02
+
+La cause racine de la boucle `bind-error:no-egress` n'était pas le pool d'IP :
+la chaîne proposait à Gluetun des hostnames issus du catalogue embarqué
+obsolète, que le manifeste runtime du conteneur ne connaissait pas. Gluetun
+refusait la configuration **avant** d'ouvrir le tunnel, et le superviseur
+relançait la chaîne toutes les 20 s parce qu'il interprétait `repairing` comme
+« station saine ».
+
+Correctifs appliqués :
+
+- `fresh_chain` fusionne tous les manifestes Gluetun disponibles (embarqué,
+  volumes, API), installe l'union dans le volume de la station avant le bind,
+  puis ne propose que des hostnames présents dans cette union.
+- Le superviseur ne stoppe une chaîne que si la station sert réellement ; un
+  drain de quota sur un modèle ne déclenche plus de rotation.
+- `CatalogClaims` purge les hostnames absents du catalogue courant et libère
+  les gagnants `ok` après leur lease.
+- Les pins `.env` périmés ne sont effacés que si l'hôte live connu diffère.
+- Débit : 4 chaînes, 8 rebinds/min, 80 candidats, sans pause globale à 20 429.
+- `station_repair.enabled=false` : l'allocateur est l'unique propriétaire des
+  réparations ; le watchdog ne recrée plus la même station en parallèle.
+
+Preuve live finale :
+
+| Station | Hostname | Egress | Probe |
+|---:|---|---|---:|
+| 1 | `al75.nordvpn.com` | `87.120.102.74` | 200 |
+| 2 | `al37.nordvpn.com` | `87.120.102.28` | 200 |
+| 3 | `al74.nordvpn.com` | `87.120.102.61` | 200 |
+| 4 | `al41.nordvpn.com` | `87.120.102.87` | 200 |
+| 5 | `al46.nordvpn.com` | `87.120.102.218` | 200 |
+| 6 | `al45.nordvpn.com` | `87.120.102.199` | 200 |
+
+`/api/free-health` : `usable_stations=6`, `unique_ips_with_quota=6`,
+`capacity_degraded=false`. 12 requêtes client consécutives : **12/12 200**.
 
 ## 8. Limites honnêtes
 

@@ -62,6 +62,29 @@ def test_free_usage_429_marks_bucket_until_midnight():
     assert ledger.headroom("10.0.0.7", MODEL) == 0
 
 
+def test_retry_after_cap_reprobes_before_midnight():
+    """[2026-11-06] RA = distance à 00:00 UTC, pas la vraie recovery.
+
+    afree-proxy mesure RA=20 h 46 et un 200 sur la même IP 18 min plus tard.
+    Quand ``max_block_s`` est configuré, le bucket reste marqué épuisé mais
+    redevient candidate au plafond ; la valeur brute reste visible.
+    """
+    ledger = QuotaLedger(persist=False, clock=lambda: NOW, max_block_s=1200)
+    ledger.note_result(
+        "10.0.0.7",
+        MODEL,
+        429,
+        error_type="FreeUsageLimitError",
+        retry_after=MIDNIGHT - NOW,
+        body=FREE_BODY,
+    )
+    assert ledger.reset_at("10.0.0.7", MODEL) == NOW + 1200
+    assert ledger.is_exhausted("10.0.0.7", MODEL) is True
+    # Au plafond, l'IP redevient testable sans attendre minuit.
+    ledger.clock = lambda: NOW + 1201
+    assert ledger.is_exhausted("10.0.0.7", MODEL) is False
+
+
 def test_same_ip_different_model_shares_default_bucket():
     ledger = QuotaLedger(persist=False, clock=lambda: NOW)
     ledger.note_result(

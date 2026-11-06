@@ -42,6 +42,62 @@ def _db_summary(db_path: Path) -> dict[str, Any]:
         summary["error"] = f"{type(exc).__name__}: {exc}"
         return summary
     try:
+        tables = {
+            str(r[0])
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        target_schema = "egress_ips" in tables and "leases" in tables
+        if target_schema:
+            row = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
+            summary["schema_version"] = int(row["v"]) if row and row["v"] else None
+            total = conn.execute("SELECT COUNT(*) AS n FROM servers").fetchone()["n"]
+            stale = conn.execute(
+                "SELECT COUNT(*) AS n FROM servers WHERE stale=1"
+            ).fetchone()["n"]
+            summary["servers"] = {
+                "total": total,
+                "active": total - stale,
+                "stale": stale,
+            }
+            summary["sources"] = {
+                str(r["source_id"]): int(r["n"])
+                for r in conn.execute(
+                    "SELECT source_id, COUNT(*) AS n FROM servers "
+                    "GROUP BY source_id ORDER BY source_id"
+                )
+            }
+            summary["snapshots"] = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT source_id, fetched_at, stale, server_count, error "
+                    "FROM catalog_sources ORDER BY fetched_at DESC LIMIT 5"
+                )
+            ]
+            summary["stale"] = (
+                bool(summary["snapshots"][0]["stale"]) if summary["snapshots"] else None
+            )
+            summary["ip_state"] = {
+                str(r["state"]): int(r["n"])
+                for r in conn.execute(
+                    "SELECT state, COUNT(*) AS n FROM egress_ips "
+                    "GROUP BY state ORDER BY state"
+                )
+            }
+            summary["observations"] = conn.execute(
+                "SELECT COUNT(*) AS n FROM observations"
+            ).fetchone()["n"]
+            summary["open_assignments"] = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT l.station, l.ip AS egress_ip, l.hostname, "
+                    "l.started_at AS assigned_at "
+                    "FROM leases l WHERE l.status='active' ORDER BY l.station"
+                )
+            ]
+            summary["assignments_open"] = len(summary["open_assignments"])
+            return summary
         row = conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
@@ -123,7 +179,7 @@ def _host_attribution() -> dict[str, Any] | None:
 
 
 def _claims_summary() -> dict[str, Any]:
-    path = ROOT / "logs" / "catalog_claims.db"
+    path = ROOT / "logs" / "registry.db"
     if not path.exists():
         return {"exists": False}
     try:
@@ -167,41 +223,75 @@ def _allocator_summary(cfg: dict[str, Any]) -> dict[str, Any]:
 
     chains: list[dict[str, Any]] = []
     now = time.time()
-    for lock in sorted((ROOT / "logs").glob("fresh_chain_*.lock")):
-        suffix = lock.stem.removeprefix("fresh_chain_")
-        if not suffix.isdigit():
-            continue
-        station = int(suffix)
-        try:
-            data = json.loads(lock.read_text(encoding="utf-8"))
-            pid = int(data.get("pid") or 0)
-        except Exception:
-            pid = 0
+    try:
+        from config.settings import yaml_get
+
+        station_count = max(
+            1, int(yaml_get("ip_rotation", "station_count", 6) or 6)
+        )
+    except Exception:
+        station_count = 6
+    for station in range(1, station_count + 1):
+        locks = sorted((ROOT / "logs").glob(f"fresh_chain_{station}*.lock"))
+        lock = next(
+            (item for item in locks if item.stem.endswith("_auto")),
+            locks[0] if locks else None,
+        )
+        pid = 0
+        if lock is not None:
+            try:
+                data = json.loads(lock.read_text(encoding="utf-8"))
+                pid = int(data.get("pid") or 0)
+            except Exception:
+                pid = 0
         state: dict[str, Any] = {}
-        state_path = ROOT / "logs" / f"fresh_chain_state_{station}.json"
-        try:
-            if state_path.exists():
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-        except Exception:
-            state = {}
+        transport = "auto"
+        for suffix, label in (
+            ("_auto", "auto"),
+            ("", "wireguard"),
+            ("_openvpn-udp", "openvpn-udp"),
+            ("_openvpn-tcp", "openvpn-tcp"),
+        ):
+            try:
+                from free.chain_state import load_state as _load_chain_state
+
+                candidate = _load_chain_state(
+                    ROOT / "logs" / f"fresh_chain_state_{station}{suffix}.json"
+                )
+            except Exception:
+                candidate = {}
+            if candidate.get("results") or candidate.get("winner"):
+                state = candidate
+                transport = label
+                break
         results = state.get("results") or []
+        last = results[-1] if results else {}
         chains.append(
             {
                 "station": station,
-                "pid": pid,
-                "running": bool(pid and now - lock.stat().st_mtime < 3600.0),
-                "age_s": round(now - lock.stat().st_mtime, 1),
+                "transport": transport,
+                "pid": pid or None,
+                "running": bool(
+                    pid and lock is not None and now - lock.stat().st_mtime < 3600.0
+                ),
+                "age_s": (
+                    round(now - lock.stat().st_mtime, 1) if lock is not None else None
+                ),
                 "tested": len(results),
-                "last_status": (results[-1] or {}).get("status") if results else None,
+                "last_status": last.get("status"),
+                "last_host": last.get("host"),
+                "reason": last.get("error") or last.get("status"),
                 "winner": state.get("winner"),
             }
         )
     alloc = cfg.get("allocator") if isinstance(cfg.get("allocator"), dict) else {}
     pause: dict[str, Any] = {}
     try:
-        state_path = ROOT / "logs" / "allocator_state.json"
-        if state_path.exists():
-            pause = json.loads(state_path.read_text(encoding="utf-8"))
+        from free.chain_state import load_json_state
+
+        pause = load_json_state(
+            ROOT / "logs" / "allocator_state.json", default={}
+        ) or {}
     except Exception:
         pause = {}
     return {
@@ -224,7 +314,7 @@ def registry_status(
     cfg = config if isinstance(config, dict) else load_registry_config()
     sources_cfg = cfg.get("sources") if isinstance(cfg.get("sources"), dict) else {}
     path = Path(db_path) if db_path is not None else _resolve(
-        cfg.get("db_path"), "logs/ip_registry.db"
+        cfg.get("registry_db_path") or cfg.get("db_path"), "logs/registry.db"
     )
 
     registry = None
@@ -279,6 +369,13 @@ def registry_status(
             }
         )
 
+    incidents: list[dict[str, Any]] = []
+    try:
+        from observability.incidents import open_incidents
+
+        incidents = open_incidents(path=path, limit=50)
+    except Exception:
+        incidents = []
     return {
         "generated_at": datetime.now(UTC).isoformat(),
         "enabled": bool(cfg.get("enabled", False)),
@@ -289,6 +386,7 @@ def registry_status(
         "sources": sources,
         "no_adapter": [item["id"] for item in sources if not item["adapter"]],
         "allocator": _allocator_summary(cfg),
+        "incidents": incidents,
         "host_attribution": _host_attribution(),
         "quality": _quality_summary(),
     }

@@ -157,6 +157,26 @@ def test_quota_profile_uses_percentages_not_hardcoded_150():
     assert profile.rotation_at_used("glm-5.3-flash-free") == 6
 
 
+def test_apply_profile_refreshes_existing_leases_and_restore_uses_current_profile():
+    profile = QuotaProfile.from_config({"quota_per_ip_by_model": {"m": 150}})
+    reg = IpQuotaRegistry(profile)
+    st = _station(ip="5.5.5.5")
+    reg.note_request("m", st, now=10.0)
+    assert reg.lease_for("m", st, now=10.0).quota_estimate == 150
+
+    # Changement GUI : le lease existant doit suivre immédiatement.
+    reg.apply_profile(QuotaProfile.from_config({"quota_per_ip": 500}))
+    lease = reg.lease_for("m", st, now=11.0)
+    assert lease.quota_estimate == 500
+    assert lease.headroom == 499
+
+    # Un état persisté avec l'ancien 150 ne doit pas ressusciter l'ancien
+    # plafond au redémarrage.
+    reg2 = IpQuotaRegistry(QuotaProfile.from_config({"quota_per_ip": 500}))
+    reg2.restore_state([{"model": "m", "ip": "6.6.6.6", "quota_estimate": 150, "used": 3}])
+    assert reg2.lease_for("m", _station(ip="6.6.6.6"), now=12.0).quota_estimate == 500
+
+
 def test_lease_bad_429_without_success_is_blacklisted_then_recovers_after_ttl():
     profile = QuotaProfile.from_config(
         {

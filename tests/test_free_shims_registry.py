@@ -214,7 +214,7 @@ class TestInjection:
         """Un client générique reçoit la grille exigée par le gate."""
         wire = self._wire({"messages": [{"role": "user", "content": "hi"}]})
         names = [t["function"]["name"] for t in wire.get("tools") or []]
-        assert "bash" in names and "task" in names and "todowrite" in names
+        assert "edit" in names and "read" in names and "shell" in names
 
     def test_client_tools_are_preserved_after_the_official_set(self):
         """La grille officielle d'abord, puis les outils du client."""

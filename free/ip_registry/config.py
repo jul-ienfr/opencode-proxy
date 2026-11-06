@@ -32,6 +32,9 @@ def _defaults() -> dict[str, Any]:
     return {
         "enabled": bool(yaml_get("ip_registry", "enabled", False)),
         "db_path": str(yaml_get("ip_registry", "db_path", "logs/ip_registry.db")),
+        "registry_db_path": str(
+            yaml_get("ip_registry", "registry_db_path", "logs/registry.db")
+        ),
         "catalog_refresh_s": float(
             yaml_get("ip_registry", "catalog_refresh_s", 21600) or 21600
         ),
@@ -96,6 +99,26 @@ def _defaults() -> dict[str, Any]:
                         "mimo-v2.6-flash-free",
                     ],
                 )
+            ),
+            "transports": list(
+                yaml_get("ip_registry", "allocator.transports", []) or []
+            ),
+            "refresh_when_exhausted": bool(
+                yaml_get(
+                    "ip_registry", "allocator.refresh_when_exhausted", True
+                )
+            ),
+            "refresh_cooldown_s": float(
+                yaml_get(
+                    "ip_registry", "allocator.refresh_cooldown_s", 900
+                )
+                or 900
+            ),
+            "refresh_min_available": int(
+                yaml_get(
+                    "ip_registry", "allocator.refresh_min_available", 3
+                )
+                or 3
             ),
             "global_429_window_s": float(
                 yaml_get("ip_registry", "allocator.global_429_window_s", 600) or 600

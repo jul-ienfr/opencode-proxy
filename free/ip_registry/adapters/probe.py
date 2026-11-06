@@ -25,6 +25,42 @@ PAYLOAD_PATH = Path(__file__).resolve().parent.parent.parent / "official_payload
 PROBE_VERSIONS = ("1.19.5", "1.19.3", "1.18.31", "1.19.0")
 
 
+def classify_429_scope(body: str) -> str:
+    """Classify a 429 response body into a quota scope.
+
+    Only ``daily`` justifies an IP ban until UTC midnight. A transient
+    upstream overload must not blacklist a healthy egress.
+    """
+
+    low = str(body or "").lower()
+    if not low:
+        return "unknown"
+    if (
+        "freeusagelimiterror" in low
+        or "free usage limit" in low
+        or "trial" in low
+        or "quota" in low
+        or "daily" in low
+    ):
+        return "daily"
+    if (
+        "rate limit" in low
+        or "rate_limit" in low
+        or "ratelimit" in low
+        or "too many requests" in low
+        or "throttl" in low
+    ):
+        return "rate_limit"
+    if (
+        "endpoint is unavailable" in low
+        or "overloaded" in low
+        or "unavailable" in low
+        or "temporarily" in low
+    ):
+        return "transient"
+    return "unknown"
+
+
 class StationProbe:
     def __init__(
         self,
@@ -33,11 +69,15 @@ class StationProbe:
         egress: Callable[[int], Awaitable[str]] | None = None,
         timeout_s: float = 60.0,
         clock: Callable[[], float] = time.time,
+        validate_sse: bool = False,
+        sse_timeout_s: float = 5.0,
     ) -> None:
         self._post = post or self._curl_post
         self._egress = egress
         self._timeout_s = max(1.0, float(timeout_s))
         self._clock = clock
+        self._validate_sse = bool(validate_sse)
+        self._sse_timeout_s = max(0.5, float(sse_timeout_s))
         self._body, self._body_raw = self._load_payload()
 
     async def probe(self, station: int, model: str) -> ProbeResult:
@@ -51,6 +91,7 @@ class StationProbe:
         content = self._wire_bytes(model)
         version = self._version_for(egress_ip)
         headers = self._headers(egress_ip, version)
+        fingerprint = self._template_fingerprint(model, version)
         last_error = "no-attempt"
         for scheme in ("socks5h", "socks5"):
             proxy = f"{scheme}://127.0.0.1:{1079 + int(station)}"
@@ -73,6 +114,30 @@ class StationProbe:
                     )
                 except (TypeError, ValueError):
                     retry_after = 0.0
+                quota_scope = ""
+                if status == 429:
+                    try:
+                        body = await asyncio.wait_for(
+                            asyncio.to_thread(self._read_small_body, resp),
+                            timeout=2.0,
+                        )
+                    except Exception:
+                        body = ""
+                    quota_scope = classify_429_scope(body)
+                valid = True
+                validation = None
+                if status == 200 and self._validate_sse:
+                    try:
+                        valid, validation = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self._validate_sse_frame, resp, self._sse_timeout_s
+                            ),
+                            timeout=self._sse_timeout_s + 1.0,
+                        )
+                    except Exception as exc:
+                        # A slow first frame is not proof of a dead IP. Keep
+                        # the status-only verdict rather than false-negative it.
+                        valid, validation = True, f"validate-timeout:{type(exc).__name__}"
                 try:
                     resp.close()
                 except Exception:
@@ -82,10 +147,120 @@ class StationProbe:
                     tested_at=tested_at,
                     retry_after_s=max(0.0, retry_after),
                     latency_ms=(time.monotonic() - started) * 1000.0,
+                    valid=valid,
+                    validation=validation,
+                    request_fingerprint=fingerprint,
+                    quota_scope=quota_scope,
                 )
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
         return ProbeResult(status=0, tested_at=tested_at, error=last_error[:200])
+
+    def _template_fingerprint(self, model: str, version: str = "1.19.5") -> str:
+        """Stable hash of the official request template for this model/version.
+
+        Session/request IDs vary per egress and are intentionally excluded;
+        the body bytes, header order, UA, client and TLS version are not.
+        """
+
+        content = self._wire_bytes(model)
+        headers = self._headers("0.0.0.0", version)
+        stable = {
+            "endpoint": ENDPOINT,
+            "version": str(version),
+            "header_names": list(headers.keys()),
+            "user_agent": str(headers.get("User-Agent") or ""),
+            "client": str(headers.get("x-opencode-client") or ""),
+            "body_sha256": hashlib.sha256(content).hexdigest(),
+        }
+        return hashlib.sha256(
+            json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _read_small_body(resp: Any, limit: int = 4096) -> str:
+        try:
+            text = getattr(resp, "text", "")
+            if callable(text):
+                text = text()
+            if text:
+                return str(text)[:limit]
+        except Exception:
+            pass
+        try:
+            raw = getattr(resp, "content", b"") or b""
+            if isinstance(raw, bytes):
+                return raw.decode("utf-8", "replace")[:limit]
+            return str(raw)[:limit]
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _validate_sse_frame(resp: Any, timeout_s: float) -> tuple[bool, str]:
+        """Read the first real SSE frame; reject error/empty 200s.
+
+        The request itself is untouched: this only reads the official stream
+        the client would have read. A frame we cannot see in time is treated
+        as unknown (valid) to avoid false-negating a slow model.
+        """
+
+        import time as _time
+
+        deadline = _time.monotonic() + max(0.5, float(timeout_s))
+        if hasattr(resp, "iter_content"):
+            iterator = resp.iter_content(chunk_size=1024)
+        elif hasattr(resp, "iter_lines"):
+            iterator = resp.iter_lines()
+        else:
+            return True, "no-iterator"
+        buf = ""
+        saw_data = False
+        try:
+            for chunk in iterator:
+                if chunk is None:
+                    continue
+                text = (
+                    chunk.decode("utf-8", "replace")
+                    if isinstance(chunk, bytes)
+                    else str(chunk)
+                )
+                low_chunk = text.lower()
+                if (
+                    '"error"' in low_chunk
+                    and '"choices"' not in low_chunk
+                    and "data:" not in low_chunk
+                ):
+                    return False, "error-body"
+                buf += text
+                if len(buf) > 16384:
+                    return False, "frame-too-large"
+                for line in buf.splitlines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if not payload or payload == "[DONE]":
+                        continue
+                    saw_data = True
+                    low = payload.lower()
+                    if '"error"' in low or "freeusagelimiterror" in low:
+                        return False, "error-frame"
+                    if '"content":""' in payload or '"content":null' in payload:
+                        continue
+                    if any(
+                        key in low
+                        for key in ('"content"', '"tool_calls"', '"reasoning"')
+                    ):
+                        return True, "content"
+                if _time.monotonic() >= deadline:
+                    # A slow stream is not proof of a burned IP: keep the
+                    # status-only verdict rather than false-negative it.
+                    return True, "timeout"
+            # The stream closed on its own. A 200 that produced no content is
+            # an empty completion, not a healthy recovery.
+            return (False, "no-content") if saw_data else (False, "empty-stream")
+        except Exception as exc:  # noqa: BLE001 - probe must not fail here
+            return True, f"read-error:{type(exc).__name__}"
 
     @staticmethod
     def _load_payload() -> tuple[dict, str]:

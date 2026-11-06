@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 
+from free.ip_registry.adapters import compose_binder as compose_module
 from free.ip_registry.adapters.compose_binder import ComposeHostnameBinder
 
 
@@ -16,6 +17,27 @@ class FakeRunner:
     def __call__(self, command, cwd):
         self.calls.append((list(command), cwd))
         return subprocess.CompletedProcess(command, self.returncode, "", self.stderr)
+
+
+def test_run_drops_stale_station_env(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setenv("VPN_TYPE_STATION5", "openvpn")
+    monkeypatch.setenv("SERVER_HOSTNAMES_STATION5", "old.nordvpn.com")
+    monkeypatch.setenv("OPENVPN_PROTOCOL_STATION5", "tcp")
+    monkeypatch.setenv("KEEP_ME", "yes")
+    monkeypatch.setattr(compose_module.subprocess, "run", fake_run)
+
+    ComposeHostnameBinder(tmp_path)._run(["docker"], str(tmp_path))
+
+    assert "VPN_TYPE_STATION5" not in captured
+    assert "SERVER_HOSTNAMES_STATION5" not in captured
+    assert "OPENVPN_PROTOCOL_STATION5" not in captured
+    assert captured["KEEP_ME"] == "yes"
 
 
 async def test_assign_writes_override_and_recreates(tmp_path):
@@ -86,6 +108,18 @@ async def test_assign_writes_an_openvpn_override(tmp_path):
     override = binder.override_path_for(5).read_text(encoding="utf-8")
     assert "VPN_TYPE=openvpn" in override
     assert "OPENVPN_PROTOCOL=tcp" in override
+
+
+def test_wireguard_override_sets_vpn_type_explicitly(tmp_path):
+    binder = ComposeHostnameBinder(tmp_path)
+    override = binder.override_yaml(
+        5,
+        "al37.nordvpn.com",
+        country="Albania",
+        vpn_type="wireguard",
+    )
+    assert "VPN_TYPE=wireguard" in override
+    assert "OPENVPN_PROTOCOL" not in override
 
 
 async def test_assign_reports_recreate_failure(tmp_path):

@@ -105,7 +105,7 @@ class TestKeepalive:
 
         async def gen():
             yield b"a"
-            await asyncio.sleep(0.09)  # at least one ping
+            await asyncio.sleep(0.15)  # >=9 Windows ticks; at least one ping
             yield b"b"
             await asyncio.sleep(0.02)
             yield b"c"

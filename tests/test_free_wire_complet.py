@@ -121,11 +121,12 @@ def test_free_wire_uses_official_session_identity(monkeypatch):
 
 
 @pytest.mark.skipif(not oc._ensure_curl_cffi(), reason="curl_cffi requis")
-def test_free_wire_drops_legacy_quartet(monkeypatch):
-    """Le quartet 1.18.x n'est PAS emis (mesure : inutile pour la porte)."""
+def test_free_wire_uses_official_quartet(monkeypatch):
+    """2.2.5 re-emits client/project; request is absent from its wire."""
     got = {k.lower() for k, _ in _capture_headers("official", monkeypatch)}
-    presents = [h for h in free_gate.LEGACY_IDENTITY_HEADERS if h in got]
-    assert not presents, f"quartet legacy reintroduit : {presents}"
+    assert "x-opencode-client" in got
+    assert "x-opencode-project" in got
+    assert "x-opencode-request" not in got
 
 
 @pytest.mark.skipif(not oc._ensure_curl_cffi(), reason="curl_cffi requis")
@@ -272,7 +273,7 @@ def test_full_headers_kill_switch(monkeypatch):
     h = oc._official_free_headers(ENDPOINT)
     for hdr in TRANSPORT_HEADERS:
         assert hdr not in h, f"{hdr} devrait etre absent avec le kill-switch"
-    assert len(h) == 6, f"wire officiel sans transport = 6 en-tetes, recu {sorted(h)}"
+    assert len(h) == 10, f"wire 2.2.5 sans transport = 10 en-tetes, recu {sorted(h)}"
 
 
 def test_host_recomputed_per_endpoint():
