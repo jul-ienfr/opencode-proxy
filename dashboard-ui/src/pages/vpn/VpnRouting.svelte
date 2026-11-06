@@ -68,6 +68,7 @@
   const cfg = $derived(vpnQ.data);
   const parallel = $derived(cfg?.free_parallel ?? {});
   const retry = $derived(retryQ.data ?? {});
+  const proxyMode = $derived(String(cfg?.proxy_mode ?? 'vpn'));
 
   let stationCount = $state('1');
   let cooldown = $state('60');
@@ -150,6 +151,7 @@
 </script>
 
 <Card title={t('vpn.routing_title')}>
+  {#if proxyMode === 'vpn'}
   <div class="panel">
     <div class="row">
       <strong class="row-title">{t('vpn.stack.title')}</strong>
@@ -212,6 +214,17 @@
       </div>
     </div>
     <p class="muted small">{t('vpn.stations.hint')}</p>
+  </div>
+  {/if}
+
+  <div class="panel">
+    <div class="row">
+      <strong class="row-title">{t('vpn.common_routing_title')}</strong>
+      <span class="muted small">{t('vpn.common_routing_hint')}</span>
+    </div>
+    {#if proxyMode === 'direct'}
+      <p class="muted small">{t('vpn.common_direct_hint')}</p>
+    {/if}
 
     <div class="row">
       <span class="label">{t('vpn.exhaust_mode')}</span>

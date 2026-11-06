@@ -1,8 +1,9 @@
 <script lang="ts">
   /**
    * Panneau de statut « Modèles Gratuits » : bascule master, mode de sortie
-   * (VPN / SOCKS5 / direct), politique de substitution, état temps réel du VPN
-   * (stations, rotation, cooldown latence) et géolocalisation.
+   * (NordVPN / WARP / Direct), politique de substitution, état temps réel
+   * (stations NordVPN ou endpoints WARP), rotation, cooldown latence et
+   * géolocalisation.
    *
    * L'ancienne interface rafraîchissait ce bloc sur un intervalle ; ici on
    * s'abonne aux événements SSE `vpn_event` / `geo_warning` et on re-tire
@@ -13,7 +14,7 @@
   import { config, reloadConfig } from '$lib/config.svelte';
   import { t } from '$lib/i18n.svelte';
   import { onEvent } from '$lib/realtime.svelte';
-  import { createQuery } from '$lib/query.svelte';
+  import { createQuery, invalidateTag } from '$lib/query.svelte';
   import { showToast } from '$lib/toast.svelte';
   import Card from '$lib/components/Card.svelte';
   import Toggle from '$lib/components/Toggle.svelte';
@@ -151,7 +152,12 @@
   }
 
   function setMode(mode: ProxyMode): void {
-    void act('mode', () => apiPost('/api/vpn/proxy-mode', { mode }));
+    void act('mode', async () => {
+      await apiPost('/api/vpn/proxy-mode', { mode });
+      // Les panneaux VpnRouting/VpnServers/VpnAdvanced lisent /api/vpn-config :
+      // sans invalidation, ils gardaient les sections de l'ancien mode.
+      invalidateTag('vpn');
+    });
   }
 
   function setLatency(enabled: boolean): void {
@@ -387,12 +393,14 @@
           disabled={busy === 'latency'}
           onchange={setLatency}
         />
-        <Toggle
-          checked={!!s.rotation_planner_enabled}
-          label={t('vpn.proactive_rotation')}
-          disabled={busy === 'proactive'}
-          onchange={setProactiveRotation}
-        />
+        {#if mode === 'vpn'}
+          <Toggle
+            checked={!!s.rotation_planner_enabled}
+            label={t('vpn.proactive_rotation')}
+            disabled={busy === 'proactive'}
+            onchange={setProactiveRotation}
+          />
+        {/if}
       </div>
     </div>
 
@@ -411,7 +419,7 @@
       {/if}
     </div>
 
-    {#if stations.length > 0}
+    {#if mode === 'vpn' && stations.length > 0}
       <div class="stations">
         {#each stations as st, i (st.station ?? i)}
           <div class="station" class:station--off={st.station_usable === false} title={st.error_detail ?? st.model_usable_reason ?? ''}>
@@ -439,6 +447,10 @@
           </div>
         {/each}
       </div>
+    {:else if mode === 'socks5'}
+      <p class="muted small">{t('vpn.warp_stations_hint')}</p>
+    {:else if mode === 'direct'}
+      <p class="muted small">{t('vpn.direct_no_station')}</p>
     {/if}
 
     {#if envKeys.length > 0}
@@ -466,18 +478,20 @@
         <span class="label">{t('vpn.current_ip')}</span>
         <span class="value mono">{s.current_ip ?? '—'}</span>
       </div>
-      <div class="item">
-        <span class="label">{t('vpn.identity')}</span>
-        <span class="value mono">{identityLabel}</span>
-      </div>
-      <div class="item">
-        <span class="label">{t('vpn.current_server')}</span>
-        <span class="value">{s.current_server ?? '—'}</span>
-      </div>
-      <div class="item">
-        <span class="label">{t('vpn.country')}</span>
-        <span class="value">{s.current_country ?? '—'}</span>
-      </div>
+      {#if mode === 'vpn'}
+        <div class="item">
+          <span class="label">{t('vpn.identity')}</span>
+          <span class="value mono">{identityLabel}</span>
+        </div>
+        <div class="item">
+          <span class="label">{t('vpn.current_server')}</span>
+          <span class="value">{s.current_server ?? '—'}</span>
+        </div>
+        <div class="item">
+          <span class="label">{t('vpn.country')}</span>
+          <span class="value">{s.current_country ?? '—'}</span>
+        </div>
+      {/if}
       <div class="item">
         <span class="label">{t('vpn.requests_this_ip')}</span>
         <span class="value mono">{s.requests_this_ip ?? 0} / {s.quota_per_ip ?? 300}</span>
@@ -490,10 +504,12 @@
         <span class="label">{t('vpn.ips_used')}</span>
         <span class="value mono">{s.ips_used ?? 0}</span>
       </div>
-      <div class="item">
-        <span class="label">{t('vpn.switches')}</span>
-        <span class="value mono">{s.vpn?.total_switches ?? 0}</span>
-      </div>
+      {#if mode === 'vpn'}
+        <div class="item">
+          <span class="label">{t('vpn.switches')}</span>
+          <span class="value mono">{s.vpn?.total_switches ?? 0}</span>
+        </div>
+      {/if}
       <div class="item">
         <span class="label">{t('vpn.quota_per_ip')}</span>
         <input

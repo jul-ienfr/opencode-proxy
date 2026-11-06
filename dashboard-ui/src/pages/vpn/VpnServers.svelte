@@ -51,6 +51,7 @@
   const cfg = $derived(cfgQ.data);
   const servers = $derived(cfg?.servers ?? []);
   const creds = $derived(credQ.data ?? {});
+  const proxyMode = $derived(String(cfg?.proxy_mode ?? 'vpn'));
 
   let busy = $state<string | null>(null);
   let username = $state('');
@@ -153,6 +154,7 @@
   );
 </script>
 
+{#if proxyMode === 'vpn'}
 <Card title={t('vpn.config')}>
   <div class="actions">
     <button class="btn btn--primary" disabled={busy === 'connect'} onclick={connect}>
@@ -304,6 +306,7 @@
     </section>
   </div>
 </Card>
+{/if}
 
 <style>
   .actions {

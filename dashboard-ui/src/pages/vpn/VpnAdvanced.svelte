@@ -42,6 +42,7 @@
   }
 
   interface VpnConfig {
+    proxy_mode?: string;
     circuit_breaker_threshold?: number;
     circuit_breaker_recovery?: number;
     backoff_max_delay?: number;
@@ -131,6 +132,7 @@
 
   const cfg = $derived(cfgQ.data);
   const proxies = $derived(socksQ.data?.proxies ?? []);
+  const proxyMode = $derived(String(cfg?.proxy_mode ?? 'vpn'));
   const httpsProxies = $derived(httpsQ.data?.proxies ?? []);
   const hunter = $derived(hunterQ.data ?? {});
 
@@ -559,19 +561,21 @@
             void saveQuality('quality_preselection', { slow_tps: Number(e.currentTarget.value) })}
         />
       </div>
-      <div class="field">
-        <span class="label">{t('vpn.q_max_load')}</span>
-        <input
-          class="input input--narrow"
-          type="number"
-          min="0"
-          max="100"
-          value={String(cfg?.quality_preselection?.max_load ?? 80)}
-          disabled={busy === 'quality'}
-          onchange={(e) =>
-            void saveQuality('quality_preselection', { max_load: Number(e.currentTarget.value) })}
-        />
-      </div>
+      {#if proxyMode === 'vpn'}
+        <div class="field">
+          <span class="label">{t('vpn.q_max_load')}</span>
+          <input
+            class="input input--narrow"
+            type="number"
+            min="0"
+            max="100"
+            value={String(cfg?.quality_preselection?.max_load ?? 80)}
+            disabled={busy === 'quality'}
+            onchange={(e) =>
+              void saveQuality('quality_preselection', { max_load: Number(e.currentTarget.value) })}
+          />
+        </div>
+      {/if}
       <div class="field">
         <span class="label">{t('vpn.q_tier_b')}</span>
         <input
@@ -698,6 +702,7 @@
     </div>
   </div>
 
+  {#if proxyMode === 'socks5'}
   <div class="quality-section">
     <div class="quality-head">
       <h4>{t('vpn.q_probe')}</h4>
@@ -740,8 +745,10 @@
       </div>
     </div>
   </div>
+  {/if}
 </Card>
 
+{#if proxyMode === 'vpn'}
 <Card title={t('free_models.https_title')} hint={t('free_models.https_hint')}>
   <div class="row">
     <Toggle
@@ -812,7 +819,9 @@
     </button>
   </div>
 </Card>
+{/if}
 
+{#if proxyMode === 'socks5'}
 <Card title={t('free_models.socks5_title')} hint={t('free_models.socks5_hint')}>
   <div class="row">
     <Toggle
@@ -900,6 +909,7 @@
     </button>
   </div>
 </Card>
+{/if}
 
 <Card
   title="Fresh IP Hunter"

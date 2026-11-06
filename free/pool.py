@@ -6484,7 +6484,7 @@ class FreeIPPool:
         elif _configured and len(_quota_ips) < _configured:
             _capacity_reason = f"{len(_quota_ips)}/{_configured} IP avec quota"
         _planner_snap = self._rotation_planner.snapshot() if hasattr(self, "_rotation_planner") else {}
-        return {
+        _result = {
             "enabled": self._vpn.enabled,
             "proxy_mode": self._vpn.proxy_mode,
             "dual_station": _dual_cfg,
@@ -6580,3 +6580,117 @@ class FreeIPPool:
             },
             "hedge_wins": dict(self._hedge_wins),
         }
+        if self.socks5_mode:
+            # [fiab 2026-11-06] /api/vpn-status doit suivre le mode actif :
+            # en WARP, la capacité et les lignes viennent des endpoints, pas
+            # des stations Docker vides (sinon « Error 0/1 » à la GUI).
+            eps = self._socks5_enabled_eps()
+            usable_eps = []
+            rows = []
+            repairing = 0
+            real_ips: set[str] = set()
+            now = time.monotonic()
+            try:
+                from free.quota_ledger import server_ip_key
+            except Exception:
+                server_ip_key = None
+            for ep in eps:
+                per = self._per_station(ep)
+                bad_until = per.get("bad_until")
+                bad_remaining = max(0.0, float(bad_until) - now) if bad_until else 0.0
+                usable = bool(
+                    self._socks5_usable(
+                        ep, exclude_approaching=False, ignore_latency_cool=True
+                    )
+                )
+                if bad_remaining > 0:
+                    repairing += 1
+                if usable:
+                    usable_eps.append(ep)
+                    raw_ip = str(getattr(ep, "current_ip", "") or "")
+                    if raw_ip and raw_ip != "unknown" and not raw_ip.startswith("socks5:"):
+                        try:
+                            real_ips.add(server_ip_key(raw_ip) if server_ip_key else raw_ip)
+                        except Exception:
+                            real_ips.add(raw_ip)
+                rows.append(
+                    {
+                        "station": ep._station,
+                        "vpn_status": "connected" if ep.enabled else "disabled",
+                        "current_ip": ep.current_ip,
+                        "current_server": ep.label or ep.pid,
+                        "requests_this_ip": int(per.get("request_count", 0) or 0),
+                        "quota_per_ip": int(ep._quota_per_ip or 0),
+                        "remaining": max(
+                            0, int(ep._quota_per_ip or 0) - int(per.get("request_count", 0) or 0)
+                        ),
+                        "bad_until": bad_until,
+                        "bad_remaining": bad_remaining,
+                        "bad_cause": per.get("bad_cause"),
+                        "degraded_override": bool(per.get("degraded_override")),
+                        "station_usable": usable,
+                        "model_usable": usable,
+                        "client_usable": usable,
+                        "model_usable_reason": None if usable else (per.get("bad_cause") or "unusable"),
+                        "non_routable_reason": None if usable else (per.get("bad_cause") or "unusable"),
+                        "egress_state": "tunnel_up_full" if usable else "tunnel_down",
+                        "ip_state": "active" if ep is self._socks5_current else None,
+                        "quota_headroom": max(
+                            0, int(ep._quota_per_ip or 0) - int(per.get("request_count", 0) or 0)
+                        ),
+                        "quota_estimate": int(ep._quota_per_ip or 0),
+                        "health": {"state": "healthy" if usable else "repairing"},
+                        "wire_identity": {},
+                        "vpn": ep.get_status() if hasattr(ep, "get_status") else {},
+                    }
+                )
+            configured = len(eps)
+            usable_n = len(usable_eps)
+            current = self._socks5_current
+            if current not in eps:
+                current = usable_eps[0] if usable_eps else (eps[0] if eps else None)
+            current_per = self._per_station(current) if current is not None else {}
+            degraded = configured > 0 and usable_n < configured
+            _reason = f"{usable_n}/{configured} endpoints usable" if degraded else None
+            _result.update(
+                {
+                    "station_count": configured,
+                    "active_station": getattr(current, "_station", 0) or 0,
+                    "stations": rows,
+                    "healthy": usable_n,
+                    "healthy_routable": usable_n,
+                    "total": configured,
+                    "configured_stations": configured,
+                    "stations_total": configured,
+                    "usable_stations": usable_n,
+                    "unique_usable_ips": len(real_ips),
+                    "active_stations_with_quota": usable_n,
+                    "unique_ips_with_quota": len(real_ips),
+                    "duplicate_ip_groups": 0,
+                    "duplicate_stations": 0,
+                    "warm_spare_ready": False,
+                    "spare_station": None,
+                    "spare_promoted": False,
+                    "repairing_stations": repairing,
+                    "parked_stations": 0,
+                    "capacity_degraded": degraded,
+                    "capacity_reason": _reason,
+                    "status": "connected" if usable_n else "error",
+                    "vpn_status": "connected" if usable_n else "error",
+                    "degraded_routable": 0,
+                    "routable": usable_n,
+                    "current_ip": getattr(current, "current_ip", None),
+                    "current_server": getattr(current, "label", None)
+                    or getattr(current, "pid", None),
+                    "requests_this_ip": int(current_per.get("request_count", 0) or 0),
+                    "quota_per_ip": int(getattr(current, "_quota_per_ip", 0) or 0),
+                    "remaining": max(
+                        0,
+                        int(getattr(current, "_quota_per_ip", 0) or 0)
+                        - int(current_per.get("request_count", 0) or 0),
+                    ),
+                    "rotation_planner_enabled": False,
+                    "wire_identity": {},
+                }
+            )
+        return _result
