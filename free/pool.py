@@ -2507,10 +2507,35 @@ class FreeIPPool:
             ttl = self._bad_ttl_for(cause)
         except Exception:
             ttl = self._bad_ttl
+        _socks5_override = False
+        if isinstance(target, Socks5Endpoint) and cause == "timeout":
+            # [fiab 2026-11-06] Même garde N-2 que les stations Docker : au
+            # plancher, le marqueur reste traçable mais la station continue
+            # d'être servie (degraded_override), sinon une vague de timeouts
+            # peut encore réduire la flotte à 1 candidat.
+            try:
+                _enabled = self._socks5_enabled_eps()
+                _floor = min(3, max(1, len(_enabled) - 1))
+                _healthy = self._socks5_healthy_others(target)
+                _socks5_override = _healthy < _floor
+            except Exception:
+                _socks5_override = False
         per["bad_until"] = time.monotonic() + ttl
         per["bad_cause"] = cause
+        per["degraded_override"] = _socks5_override
         self._dirty_state = True
         if isinstance(target, Socks5Endpoint):
+            if _socks5_override:
+                try:
+                    logger.warning(
+                        "[pool] invariant_n2 socks5 gardé sur %s (cause=%s) — %d/%d sains",
+                        getattr(target, "pid", "?"),
+                        cause,
+                        self._socks5_healthy_others(target),
+                        min(3, max(1, len(self._socks5_enabled_eps()) - 1)),
+                    )
+                except Exception:
+                    pass
             if cause in ("rate_limit", "quota") and getattr(target, "managed", False):
                 try:
                     self._request_warp_rotation(target, cause)
@@ -4912,7 +4937,7 @@ class FreeIPPool:
             try:
                 per = self._per_station(ep)
                 bu = per.get("bad_until")
-                if bu and now < float(bu):
+                if bu and now < float(bu) and not per.get("degraded_override"):
                     continue
             except Exception:
                 pass

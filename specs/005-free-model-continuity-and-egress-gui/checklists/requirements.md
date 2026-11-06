@@ -234,7 +234,7 @@ pas un statut d'implémentation : aucun code de la spec 005 n'est écrit.
 - [x] CHK120 La GUI SOCKS5 affiche label/egress/bloc et le Test cible le
       label exact (IPv6 forcé pour un endpoint IPv6).
 - [x] CHK121 Un timeout SOCKS5 respecte le plancher de redondance
-      `min(3, n-1)` avant tout bad-mark.
+      `min(3, n-1)` avant tout bad-mark, y compris via `_apply_bad_mark` central.
 - [x] CHK122 En SOCKS5, `/health` capacité = endpoints statiques réels
       (7/7), pas les stations Docker vides.
 

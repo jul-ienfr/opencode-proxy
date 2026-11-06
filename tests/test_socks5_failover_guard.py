@@ -68,3 +68,21 @@ def test_capacity_snapshot_counts_socks5_endpoints():
     assert cap["usable_stations"] == 2
     assert cap["capacity_degraded"] is True
     assert cap["capacity_reason"] == "2/3 endpoints usable"
+
+
+def test_apply_bad_mark_keeps_socks5_floor_for_timeout():
+    pool, first, _calls = _pool()
+    del pool._apply_bad_mark  # use the real method, not the recorder
+    pool._bad_ttl = 60.0
+    pool._bad_ttl_by_cause = {}
+    third = Socks5Endpoint("127.0.0.1", 11086, label="warp-c", ipv6=True, index=2)
+    fourth = Socks5Endpoint("127.0.0.1", 11087, label="warp-d", ipv6=True, index=3)
+    pool._socks5_eps = [first, *pool._socks5_eps[1:], third, fourth]
+    busy_until = time.monotonic() + 60.0
+    pool._per_station(pool._socks5_eps[1])["bad_until"] = busy_until
+    pool._per_station(third)["bad_until"] = busy_until
+    pool._apply_bad_mark(first, "timeout")
+    per = pool._per_station(first)
+    assert per["bad_until"] > time.monotonic()
+    assert per["bad_cause"] == "timeout"
+    assert per["degraded_override"] is True

@@ -101,7 +101,7 @@ autre ; une conversation reste sur une station.
   station par clé de conversation, failover si elle devient inutilisable,
   round-robin pour les nouvelles. **Validée live** : deux tours sur -2,
   nouvelle conversation sur -7.
-- [x] **T-575** Suite complète hors Docker : **4808 tests, exit 0**. Le test
+- [x] **T-575** Suite complète hors Docker : **4809 tests, exit 0**. Le test
   `test_watchdog_auth_failed_fast_pins_once` bloquait la gate (6 × 15 s de
   sleeps réels, 92 s) ; les pauses fast-pin passent par `_sleep_fn` → 0,92 s,
   fichier `test_gluetun_control_api.py` 59/59. Marge du test SSE keepalive
@@ -153,8 +153,10 @@ autre ; une conversation reste sur une station.
   navigateur : 8 lignes, 6 WARP avec blocs distincts, aucune erreur console.
   Test live `warp-ipv6-2` → `✓ 2a09:bac1:27a0:2060::3da:52 — 750 ms`.
 - [x] **T-587** Plancher de redondance SOCKS5 : un timeout ne bad-mark pas si
-  les autres sains sont sous `min(3, n-1)`. Évite l'effondrement à 1-2
-  candidats au-delà de la fenêtre corrélée.
+  les autres sains sont sous `min(3, n-1)`. La garde est centrale dans
+  `_apply_bad_mark` (marqueur traçable + `degraded_override`) et couvre aussi
+  les timeouts hors `notify_connection_failure`. Évite l'effondrement à 1-2
+  candidats.
 - [x] **T-588** Capacité SOCKS5 honnête dans `/health` : `capacity_snapshot`
   compte les endpoints statiques. Avant : `degraded`, « 0/1 stations usable »
   alors que 7/7 répondaient. Après : `status=ok`, `configured=7`, `usable=7`,

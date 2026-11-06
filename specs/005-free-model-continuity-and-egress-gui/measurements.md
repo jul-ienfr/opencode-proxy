@@ -405,6 +405,6 @@ requêtes proxy et la preuve directe 6/6 rendent 200.
 - **Fait** : six stations WARP managées, six blocs distincts, rotation
   automatique, six requêtes proxy consécutives en 200 et preuve directe
   6/6 (200/pass).
-- **Fait** : suite complète hors Docker **4808 tests, exit 0** ; le test
+- **Fait** : suite complète hors Docker **4809 tests, exit 0** ; le test
   fast-pin qui bloquait à 37 % (92 s de sleeps réels) passe par `_sleep_fn`
   et tombe à 0,92 s. `test_gluetun_control_api.py` : 59/59 en 13 s.

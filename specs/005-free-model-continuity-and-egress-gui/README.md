@@ -115,7 +115,7 @@ prompt est templaté avant tout envoi.
   station ; `round-robin`/`strict` → 3 stations distinctes ;
   `socks5_auto_rotate=false` ou `free_parallel.enabled=false` → sticky.
   En `hedge`, le premier tour course 2 stations puis la gagnante est épinglée.
-- **Suite complète** : `pytest -k "not docker"` → **4808 tests, exit 0**.
+- **Suite complète** : `pytest -k "not docker"` → **4809 tests, exit 0**.
   Le test fast-pin qui bloquait à 37 % (92 s) utilise désormais `_sleep_fn`
   et passe en 0,92 s ; `tests/test_gluetun_control_api.py` : 59/59.
 - **Compatibilité runtime**: deux dernières versions uniquement —
