@@ -148,7 +148,12 @@ class WarpRotator:
                                 forbidden.add(blocked)
                 except Exception:
                     pass
-                result = self.rotate(endpoint, forbidden_blocks=forbidden)
+                probe = getattr(pool, "_post_rotation_probe_cb", None)
+                result = self.rotate(
+                    endpoint,
+                    forbidden_blocks=forbidden,
+                    probe=probe,
+                )
                 # [fiab 2026-11-06] Appliquer l'egress SOUS le verrou global :
                 # sinon deux rotations concurrentes voyaient toutes deux
                 # l'ancien état et pouvaient choisir le même /64. Le probe
@@ -169,7 +174,13 @@ class WarpRotator:
             with _LOCK:
                 INFLIGHT.discard(label)
 
-    def rotate(self, endpoint, *, forbidden_blocks: set[str] | None = None) -> WarpRotationResult:
+    def rotate(
+        self,
+        endpoint,
+        *,
+        forbidden_blocks: set[str] | None = None,
+        probe=None,
+    ) -> WarpRotationResult:
         forbidden = set(forbidden_blocks or ())
         label = str(getattr(endpoint, "label", "") or "")
         container = str(getattr(endpoint, "container", "") or "")
@@ -207,6 +218,23 @@ class WarpRotator:
             if new_block and new_block in forbidden:
                 last_reason = "duplicate_block"
                 continue
+            # Le probe quota (modèle réel) doit tourner AVANT d'accepter le
+            # bloc : une IP fraîche peut déjà être épuisée upstream. On pose
+            # l'egress candidat pour que le ledger et l'identité pointent sur
+            # la bonne IP ; le probe 429 rejette et on recrée.
+            endpoint.egress_ip = new_ip
+            endpoint.current_ip = new_ip
+            if new_block:
+                endpoint.block = new_block
+            endpoint._egress_probe_attempted = True
+            if callable(probe):
+                try:
+                    verdict = probe(endpoint)
+                except Exception:
+                    verdict = None
+                if verdict is False:
+                    last_reason = "quota_exhausted"
+                    continue
             return WarpRotationResult(
                 label=label,
                 ok=True,
@@ -246,15 +274,9 @@ class WarpRotator:
             persist(str(getattr(endpoint, "label", "") or ""), str(result.new_ip or ""), result.block or "")
         except Exception as exc:
             logger.warning("[warp-rotate] persist failed: %s", exc)
-        # [GUI post_rotation_probe] Valide le nouvel egress avant de rendre la
-        # station au pool. Le callback est injecté par opencode (identité,
-        # profil et transport officiels) ; absent en test/offline.
-        probe = getattr(pool, "_post_rotation_probe_cb", None)
-        if callable(probe):
-            try:
-                probe(endpoint)
-            except Exception as exc:
-                logger.warning("[warp-rotate] post-rotation probe failed: %s", exc)
+        # Le probe a déjà validé l'egress et le quota dans ``rotate()`` (il
+        # doit pouvoir rejeter un bloc et relancer la rotation). Ne pas le
+        # rejouer ici : chaque probe consomme une requête free.
         logger.info("[warp-rotate] %s: %s", result.label, result.as_dict())
 
     def _apply_tracking(self, endpoint, pool, persist, result: WarpRotationResult) -> None:

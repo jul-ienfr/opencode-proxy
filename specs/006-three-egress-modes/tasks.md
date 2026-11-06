@@ -79,6 +79,9 @@
 - [x] **T-023** Sonde post-rotation quota-aware : test du dernier modèle
   demandé, 429 → `note_model_ip` + ledger (cap `ledger_max_block_s`), 200 →
   clear. `post_rotation_probe.enabled=true` (max_attempts=1, max_tokens=8).
+- [x] **T-024** Sonde quota intégrée à la boucle de rotation : un 429 rejette
+  le bloc et relance un essai (jusqu'à 4), au lieu d'accepter puis d'attendre
+  5 min. Vérifié live : rotations enchaînées, `with_quota` honnête, mimo 200.
 
 ## Suivi
 

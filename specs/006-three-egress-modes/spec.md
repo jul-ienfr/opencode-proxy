@@ -227,6 +227,10 @@ actions ne sont pas présentées comme actives.
   demandé et alimenter le ledger : un 429 sur un egress frais marque le `/64`
   épuisé et la station repart en rotation au lieu d'être comptée « avec
   quota » jusqu'à la première requête client.
+- **FR-029** La sonde quota DOIT tourner dans la boucle d'essais de rotation,
+  avant d'accepter un bloc : un 429 rejette le candidat et la rotation essaie
+  un autre `/64` dans la même passe (jusqu'à `MAX_ROTATION_ATTEMPTS`), au lieu
+  d'attendre la prochaine fenêtre de rotation.
 
 ### Key Entities
 

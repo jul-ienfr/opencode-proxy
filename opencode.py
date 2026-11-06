@@ -22450,34 +22450,42 @@ def _free_post_rotation_probe(endpoint) -> bool:
             evidence = sender(profile, label)
             status = int(getattr(evidence, "status", 0) or 0)
             verdict = str(getattr(evidence, "verdict", ""))
-            if _post_rotation_probe_ok(status, verdict):
-                # Alimente le ledger avec le résultat réel : une IP fraîche
-                # mais déjà épuisée pour ce modèle ne doit pas être comptée
-                # « with_quota » jusqu'à la première requête client.
-                try:
-                    if _free_ip_pool is not None and _last_model:
-                        if status == 429:
-                            _cap = 1200.0
-                            try:
-                                _cap = float(
-                                    (IP_ROTATION.get("ip_quota") or {}).get(
-                                        "ledger_max_block_s", 1200
-                                    )
-                                    or 1200
+            # Alimente le ledger avec le résultat réel : une IP fraîche
+            # mais déjà épuisée pour ce modèle ne doit pas être comptée
+            # « with_quota » jusqu'à la première requête client.
+            try:
+                if _free_ip_pool is not None and _last_model:
+                    if status == 429:
+                        _cap = 1200.0
+                        try:
+                            _cap = float(
+                                (IP_ROTATION.get("ip_quota") or {}).get(
+                                    "ledger_max_block_s", 1200
                                 )
-                            except (TypeError, ValueError):
-                                _cap = 1200.0
-                            _free_ip_pool.note_model_ip(
-                                _last_model,
-                                endpoint,
-                                429,
-                                error_type="FreeUsageLimitError",
-                                retry_after=_cap,
+                                or 1200
                             )
-                        elif 200 <= status < 300:
-                            _free_ip_pool.note_model_ip(_last_model, endpoint, 200)
-                except Exception:
-                    pass
+                        except (TypeError, ValueError):
+                            _cap = 1200.0
+                        _free_ip_pool.note_model_ip(
+                            _last_model,
+                            endpoint,
+                            429,
+                            error_type="FreeUsageLimitError",
+                            retry_after=_cap,
+                        )
+                    elif 200 <= status < 300:
+                        _free_ip_pool.note_model_ip(_last_model, endpoint, 200)
+            except Exception:
+                pass
+            if status == 429 and _last_model:
+                # Quota réel du modèle sur ce bloc : inutile d'insister sur
+                # la même IP, la rotation doit essayer un autre /64.
+                _log(
+                    f"  [post-rotation-probe] {label}: quota {_last_model} — "
+                    f"bloc rejeté, rotation suivante"
+                )
+                return False
+            if _post_rotation_probe_ok(status, verdict):
                 if status == 429:
                     _log(
                         f"  [post-rotation-probe] {label}: egress OK, quota modèle "

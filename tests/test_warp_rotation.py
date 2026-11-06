@@ -167,7 +167,7 @@ def test_run_forbids_ledger_exhausted_blocks(monkeypatch):
     rotator = WarpRotator()
     captured = {}
 
-    def fake_rotate(endpoint, *, forbidden_blocks=None):
+    def fake_rotate(endpoint, *, forbidden_blocks=None, probe=None):
         captured["forbidden"] = set(forbidden_blocks or ())
         from free.warp_rotation import WarpRotationResult
 
@@ -354,25 +354,60 @@ def test_rotate_exhausted_managed_rotates_duplicate_block():
     assert pool.calls == [("warp-restore3", "duplicate_block")]
 
 
-def test_apply_invokes_post_rotation_probe():
+def test_rotate_invokes_probe_with_candidate_egress(monkeypatch):
     rotator = WarpRotator()
-    ep = _endpoint()
-    pool = FakePool()
-    probes = []
-    pool._post_rotation_probe_cb = probes.append
-    from free.warp_rotation import WarpRotationResult
-
-    result = WarpRotationResult(
-        label="warp-restore1",
-        ok=True,
-        old_ip=ep.egress_ip,
-        new_ip="2a09:bac1:2780:2060::216:7f",
-        block="2a09:bac1:2780:2060::/64",
-        attempts=1,
-        reason="rotated",
+    monkeypatch.setattr(rotator, "_docker", lambda args, timeout=60: "")
+    monkeypatch.setattr(rotator, "_wait_healthy", lambda container: True)
+    monkeypatch.setattr(
+        rotator,
+        "_resolve_egress",
+        lambda port, ipv6: "2a09:bac1:2780:2060::216:7f",
     )
-    rotator._apply(ep, pool, lambda *args: None, result)
-    assert probes == [ep]
+    probed = []
+
+    def probe(endpoint):
+        probed.append(endpoint.current_ip)
+        return True
+
+    result = rotator.rotate(_endpoint(), probe=probe)
+    assert result.ok is True
+    assert probed == ["2a09:bac1:2780:2060::216:7f"]
+
+
+def test_rotate_retries_when_quota_probe_rejects(monkeypatch):
+    rotator = WarpRotator()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(rotator, "_docker", lambda args, timeout=60: calls.append(args) or "")
+    monkeypatch.setattr(rotator, "_wait_healthy", lambda container: True)
+    responses = iter(
+        [
+            "2a09:bac1:2780:2060::216:7f",
+            "2a09:bac1:27e0:2060::10:2",
+        ]
+    )
+    monkeypatch.setattr(rotator, "_resolve_egress", lambda port, ipv6: next(responses))
+    verdicts = iter([False, True])
+
+    result = rotator.rotate(_endpoint(), probe=lambda endpoint: next(verdicts))
+    assert result.ok is True
+    assert result.attempts == 2
+    assert result.new_ip == "2a09:bac1:27e0:2060::10:2"
+    assert sum(1 for call in calls if call[:2] == ["rm", "-f"]) == 1
+
+
+def test_rotate_fails_after_probe_rejections(monkeypatch):
+    rotator = WarpRotator()
+    monkeypatch.setattr(rotator, "_docker", lambda args, timeout=60: "")
+    monkeypatch.setattr(rotator, "_wait_healthy", lambda container: True)
+    monkeypatch.setattr(
+        rotator,
+        "_resolve_egress",
+        lambda port, ipv6: "2a09:bac1:2780:2060::216:7f",
+    )
+    result = rotator.rotate(_endpoint(), probe=lambda endpoint: False)
+    assert result.ok is False
+    assert result.reason == "quota_exhausted"
+    assert result.new_ip == "2a09:bac1:2780:2060::216:7f"
 
 
 def test_disabled_post_rotation_probe_is_noop(monkeypatch):
