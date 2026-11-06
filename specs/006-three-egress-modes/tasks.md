@@ -76,6 +76,9 @@
   (`quota_ip_block_s`, 120 s) au lieu de `bad_ip_ttl_s` (1800 s).
 - [x] **T-022** Vérification live mimo : ping proxy 200, 6 stations
   configurées, blocs `/64` distincts, rotation automatique des blocs 429.
+- [x] **T-023** Sonde post-rotation quota-aware : test du dernier modèle
+  demandé, 429 → `note_model_ip` + ledger (cap `ledger_max_block_s`), 200 →
+  clear. `post_rotation_probe.enabled=true` (max_attempts=1, max_tokens=8).
 
 ## Suivi
 

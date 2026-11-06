@@ -223,6 +223,10 @@ actions ne sont pas présentées comme actives.
 - **FR-027** Un `FreeUsageLimitError` NE DOIT PAS appliquer le TTL « mauvaise
   IP » de 30 min : il utilise le blocage quota court (`quota_ip_block_s`),
   le ledger journalier portant le vrai reset.
+- **FR-028** La sonde post-rotation DOIT tester le dernier modèle réellement
+  demandé et alimenter le ledger : un 429 sur un egress frais marque le `/64`
+  épuisé et la station repart en rotation au lieu d'être comptée « avec
+  quota » jusqu'à la première requête client.
 
 ### Key Entities
 

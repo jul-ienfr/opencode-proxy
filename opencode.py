@@ -22407,7 +22407,14 @@ def _free_post_rotation_probe(endpoint) -> bool:
         return False
     if not url:
         return False
-    body["model"] = str(body.get("model") or "")
+    # [mimo 2026-11-06] Sonder le modèle réellement demandé : un egress
+    # frais peut déjà être épuisé côté upstream. Sans cela, la station
+    # revient « with_quota » et le premier client se prend le 429.
+    try:
+        _last_model = str(getattr(_free_ip_pool, "_last_model", "") or "").strip()
+    except Exception:
+        _last_model = ""
+    body["model"] = _last_model or str(body.get("model") or "")
     if "max_completion_tokens" in body:
         body["max_completion_tokens"] = max_tokens
     elif "max_tokens" in body:
@@ -22444,6 +22451,33 @@ def _free_post_rotation_probe(endpoint) -> bool:
             status = int(getattr(evidence, "status", 0) or 0)
             verdict = str(getattr(evidence, "verdict", ""))
             if _post_rotation_probe_ok(status, verdict):
+                # Alimente le ledger avec le résultat réel : une IP fraîche
+                # mais déjà épuisée pour ce modèle ne doit pas être comptée
+                # « with_quota » jusqu'à la première requête client.
+                try:
+                    if _free_ip_pool is not None and _last_model:
+                        if status == 429:
+                            _cap = 1200.0
+                            try:
+                                _cap = float(
+                                    (IP_ROTATION.get("ip_quota") or {}).get(
+                                        "ledger_max_block_s", 1200
+                                    )
+                                    or 1200
+                                )
+                            except (TypeError, ValueError):
+                                _cap = 1200.0
+                            _free_ip_pool.note_model_ip(
+                                _last_model,
+                                endpoint,
+                                429,
+                                error_type="FreeUsageLimitError",
+                                retry_after=_cap,
+                            )
+                        elif 200 <= status < 300:
+                            _free_ip_pool.note_model_ip(_last_model, endpoint, 200)
+                except Exception:
+                    pass
                 if status == 429:
                     _log(
                         f"  [post-rotation-probe] {label}: egress OK, quota modèle "
