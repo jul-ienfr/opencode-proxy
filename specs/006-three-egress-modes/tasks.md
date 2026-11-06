@@ -66,6 +66,16 @@
   ignore l'identifiant logique, `_per_station` ne l'ancre plus comme
   `last_confirmed_ip`, et les anciens buckets `socks5:*` sont purgés au
   chargement (JSON + SQLite). Vérifié live : `socks5_buckets=0`.
+- [x] **T-019** Egress WARP IPv6 : résolution via `api6.ipify.org`, rejet
+  d'une adresse IPv4 sur un endpoint `ipv6=true`, même contrat pour
+  `_model_ip_state` (jamais `socks5:<label>`).
+- [x] **T-020** Rotation anti-bloc épuisé : les `/64` du ledger épuisé sont
+  interdits, jusqu'à 4 essais restart/recreate, et l'IP résolue est trackée
+  même si le bloc est refusé (`rotation_rejected`).
+- [x] **T-021** 429 `FreeUsageLimitError` : blocage modèle court
+  (`quota_ip_block_s`, 120 s) au lieu de `bad_ip_ttl_s` (1800 s).
+- [x] **T-022** Vérification live mimo : ping proxy 200, 6 stations
+  configurées, blocs `/64` distincts, rotation automatique des blocs 429.
 
 ## Suivi
 

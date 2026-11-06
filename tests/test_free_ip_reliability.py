@@ -9,6 +9,7 @@ from __future__ import annotations
 import threading
 
 import free.pool as fp
+from free.pool import Socks5Endpoint
 
 
 class _Station:
@@ -61,6 +62,26 @@ def test_bad_ip_without_success_is_quarantined(monkeypatch):
     assert pool.model_ip_bad("deepseek-v4.1-flash-free", st) is False
 
 
+FREE_BODY = (
+    '{"type":"error","error":{"type":"FreeUsageLimitError","message":'
+    '"Free usage limit reached."}}'
+)
+
+
+def test_free_usage_limit_uses_short_quota_block(monkeypatch):
+    pool = _pool(monkeypatch)
+    st = _Station()
+    pool.note_model_ip(
+        "mimo-v2.6-flash-free",
+        st,
+        429,
+        body=FREE_BODY,
+        error_type="FreeUsageLimitError",
+    )
+    rem = pool.model_ip_block_remaining("mimo-v2.6-flash-free", st)
+    assert 0 < rem <= 121
+
+
 def test_new_ip_gets_a_fresh_bucket(monkeypatch):
     pool = _pool(monkeypatch)
     st = _Station(ip="10.0.0.1")
@@ -68,6 +89,26 @@ def test_new_ip_gets_a_fresh_bucket(monkeypatch):
     assert pool.model_ip_bad("m", st) is True
     st.current_ip = "10.0.0.2"
     assert pool.model_ip_bad("m", st) is False
+
+
+def test_socks5_label_is_not_a_model_ip_key(monkeypatch):
+    pool = _pool(monkeypatch)
+    ep = Socks5Endpoint("127.0.0.1", 11080, label="warp-a", ipv6=True, index=0)
+    assert ep.current_ip == "socks5:warp-a"
+    pool.note_model_ip("mimo-v2.6-flash-free", ep, 429, ip="socks5:warp-a")
+    assert all(not str(key[2]).startswith("socks5:") for key in pool._model_ip_health)
+    assert pool._model_ip_health == {}
+    assert pool.model_ip_bad("mimo-v2.6-flash-free", ep) is False
+
+
+def test_model_ip_uses_last_confirmed_real_ip(monkeypatch):
+    pool = _pool(monkeypatch)
+    ep = Socks5Endpoint("127.0.0.1", 11081, label="warp-b", ipv6=True, index=1)
+    ep._station = -2
+    pool._per = {-2: {"last_confirmed_ip": "2a09:bac5:32d4:be::1"}}
+    pool.note_model_ip("mimo-v2.6-flash-free", ep, 429)
+    assert ("mimo-v2.6-flash-free", -2, "2a09:bac5:32d4:be::1") in pool._model_ip_health
+    assert pool.model_ip_bad("mimo-v2.6-flash-free", ep) is True
 
 
 def test_three_distinct_ips_open_model_global_backoff(monkeypatch):

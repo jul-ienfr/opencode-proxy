@@ -23212,6 +23212,9 @@ async def api_free_egress_diag():
             },
             "spread": bool(pool._socks5_spread_enabled()),
         },
+        "rotation_scan": (
+            pool.rotation_scan() if hasattr(pool, "rotation_scan") else []
+        ),
         "endpoints": rows,
     }
 

@@ -95,6 +95,109 @@ def test_rotate_recreates_when_block_is_same(monkeypatch):
     assert any(call[:2] == ["run", "-d"] for call in calls)
 
 
+def test_rotate_retries_until_a_fresh_block(monkeypatch):
+    rotator = WarpRotator()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(rotator, "_docker", lambda args, timeout=60: calls.append(args) or "")
+    monkeypatch.setattr(rotator, "_wait_healthy", lambda container: True)
+    responses = iter(
+        [
+            "2a09:bac1:27a0:2060::214:7d",  # same block
+            "2a09:bac1:27e0:2060::10:1",  # forbidden (ledger exhausted)
+            "2a09:bac1:2780:2060::216:7f",  # fresh
+        ]
+    )
+    monkeypatch.setattr(rotator, "_resolve_egress", lambda port, ipv6: next(responses))
+    result = rotator.rotate(
+        _endpoint(),
+        forbidden_blocks={"2a09:bac1:27e0:2060::/64"},
+    )
+    assert result.ok is True
+    assert result.attempts == 3
+    assert result.block == "2a09:bac1:2780:2060::/64"
+    assert sum(1 for call in calls if call[:2] == ["rm", "-f"]) == 2
+
+
+def test_rotate_failure_keeps_last_resolved_egress(monkeypatch):
+    rotator = WarpRotator()
+    monkeypatch.setattr(rotator, "_docker", lambda args, timeout=60: "")
+    monkeypatch.setattr(rotator, "_wait_healthy", lambda container: True)
+    monkeypatch.setattr(
+        rotator,
+        "_resolve_egress",
+        lambda port, ipv6: "2a09:bac1:27a0:2060::214:7d",
+    )
+    result = rotator.rotate(_endpoint())
+    assert result.ok is False
+    assert result.reason == "same_block"
+    assert result.new_ip == "2a09:bac1:27a0:2060::214:7d"
+    assert result.block == "2a09:bac1:27a0:2060::/64"
+
+
+def test_apply_tracking_updates_rejected_egress(monkeypatch):
+    rotator = WarpRotator()
+    ep = _endpoint()
+    pool = FakePool()
+    persisted = []
+    from free.warp_rotation import WarpRotationResult
+
+    result = WarpRotationResult(
+        label="warp-restore1",
+        ok=False,
+        old_ip=ep.egress_ip,
+        new_ip="2a09:bac1:27a0:2060::214:7e",
+        block="2a09:bac1:27a0:2060::/64",
+        attempts=4,
+        reason="same_block",
+    )
+    rotator._apply_tracking(
+        ep,
+        pool,
+        lambda label, ip, block: persisted.append((label, ip, block)),
+        result,
+    )
+    assert ep.egress_ip == "2a09:bac1:27a0:2060::214:7e"
+    assert ep.current_ip == "2a09:bac1:27a0:2060::214:7e"
+    assert pool.state[ep._station]["bad_cause"] == "rotation_rejected"
+    assert pool.state[ep._station]["bad_until"] > time.monotonic()
+    assert persisted == [("warp-restore1", "2a09:bac1:27a0:2060::214:7e", "2a09:bac1:27a0:2060::/64")]
+
+
+def test_run_forbids_ledger_exhausted_blocks(monkeypatch):
+    rotator = WarpRotator()
+    captured = {}
+
+    def fake_rotate(endpoint, *, forbidden_blocks=None):
+        captured["forbidden"] = set(forbidden_blocks or ())
+        from free.warp_rotation import WarpRotationResult
+
+        return WarpRotationResult(
+            label=endpoint.label,
+            ok=False,
+            old_ip=endpoint.egress_ip,
+            new_ip=None,
+            block=None,
+            attempts=1,
+            reason="health_timeout",
+        )
+
+    class Ledger:
+        def exhausted_ips(self):
+            return {"2a09:bac1:27e0:2060", "104.28.198.203"}
+
+    class Pool(FakePool):
+        def _socks5_enabled_eps(self):
+            return []
+
+        def _get_ledger(self):
+            return Ledger()
+
+    monkeypatch.setattr(rotator, "rotate", fake_rotate)
+    rotator._run(_endpoint(), Pool(), lambda *args: None)
+    assert "2a09:bac1:27e0:2060::/64" in captured["forbidden"]
+    assert "104.28.198.203/32" in captured["forbidden"]
+
+
 def test_rotate_fails_cleanly(monkeypatch):
     rotator = WarpRotator()
     monkeypatch.setattr(rotator, "_docker", lambda args, timeout=60: "")

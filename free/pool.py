@@ -53,7 +53,7 @@ from typing import Any, cast
 
 from free.best_ip import BestIpSelector
 from free.ip_quota import IpQuotaRegistry, QuotaProfile
-from free.quota_ledger import QuotaLedger, bucket_for
+from free.quota_ledger import QuotaLedger, bucket_for, is_free_usage_error
 from free.reliability_canary import CanaryConfig, CanaryRouter
 from free.rotation_planner import RotationPlanner
 from free.station_health import SUSPECT, StationHealthRegistry, station_contract
@@ -1958,12 +1958,32 @@ class FreeIPPool:
             sid = int(getattr(station, "_station", 0) or 0)
         except (TypeError, ValueError):
             sid = 0
+        if ip is not None:
+            ip = str(ip).strip()
+            if ip.startswith("socks5:"):
+                ip = None
         if ip is None:
+            # [mimo 2026-11-06] Ne jamais indexer la santé modèle sur
+            # ``socks5:<label>`` (identifiant logique, pas une IP). Tant que
+            # l'egress n'est pas résolu, on renvoie un état éphémère : la
+            # quarantaine sera posée dès qu'une IP réelle sera connue.
             try:
-                ip = getattr(station, "current_ip", "") or getattr(station, "pid", "") or "unknown"
+                ip = self._ledger_ip(station)
             except Exception:
-                ip = "unknown"
-        key = (mid, sid, str(ip or "unknown"))
+                ip = ""
+        if not ip or str(ip) == "unknown":
+            if not create:
+                return {}
+            return {
+                "ok": 0,
+                "n429": 0,
+                "consecutive_429": 0,
+                "last_ok_at": 0.0,
+                "last_429_at": 0.0,
+                "blocked_until": 0.0,
+                "last_status": None,
+            }
+        key = (mid, sid, str(ip))
         lock = getattr(self, "_model_ip_lock", None)
         health = getattr(self, "_model_ip_health", None)
         if not isinstance(health, dict):
@@ -2083,11 +2103,22 @@ class FreeIPPool:
                     quota_block = float(_yaml_get("ip_rotation", "quota_ip_block_s", 120) or 120)
                 except (TypeError, ValueError):
                     quota_block = 120.0
-                # 0 succès = IP mauvaise/blacklistée. Après un historique
-                # positif, un 429 est un quota : blocage court.
-                block = bad_ttl if ok == 0 else quota_block
-                if ok > 0 and int(st.get("consecutive_429") or 0) >= 3:
-                    block = max(block, bad_ttl)
+                # Un FreeUsageLimitError est un quota, pas une mauvaise IP :
+                # même avec 0 succès sur cette IP, un blocage de 30 min est
+                # inutile (le ledger tient déjà le vrai reset). On tourne.
+                quota_429 = False
+                try:
+                    quota_429 = bool(is_free_usage_error(str(error_type or ""), body))
+                except Exception:
+                    quota_429 = False
+                if quota_429:
+                    block = quota_block
+                else:
+                    # 0 succès = IP mauvaise/blacklistée. Après un historique
+                    # positif, un 429 est un quota : blocage court.
+                    block = bad_ttl if ok == 0 else quota_block
+                    if ok > 0 and int(st.get("consecutive_429") or 0) >= 3:
+                        block = max(block, bad_ttl)
                 st["blocked_until"] = max(float(st.get("blocked_until") or 0.0), now + max(1.0, block))
                 self._note_health_probe(station, False, cause="429")
                 try:
@@ -2226,7 +2257,13 @@ class FreeIPPool:
         out: list[dict] = []
         try:
             now = time.monotonic()
-            items = list((getattr(self, "_model_ip_health", {}) or {}).items())[-max(1, int(limit)) :]
+            health = getattr(self, "_model_ip_health", {}) or {}
+            # Purge défensive des anciennes clés ``socks5:*`` (créées avant
+            # le correctif d'indexation) : elles ne doivent plus apparaître
+            # dans la vue santé ni dans les décisions de rotation.
+            for old_key in [k for k in health if len(k) >= 3 and str(k[2]).startswith("socks5:")]:
+                health.pop(old_key, None)
+            items = list(health.items())[-max(1, int(limit)) :]
             for (mid, sid, ip), st in items:
                 out.append(
                     {
@@ -2619,8 +2656,10 @@ class FreeIPPool:
         marquées bad (donc aucune requête ne les touche), la rotation part.
         """
         if not self.socks5_mode:
+            self._last_rotation_scan = []
             return 0
         started = 0
+        scan: list[dict[str, Any]] = []
         eps = self._socks5_enabled_eps()
         managed = [ep for ep in eps if getattr(ep, "managed", False)]
         logger.debug(
@@ -2709,6 +2748,18 @@ class FreeIPPool:
                 selectable,
                 bad_cause,
             )
+            entry = {
+                "label": str(getattr(ep, "label", "") or ""),
+                "exhausted": bool(exhausted),
+                "model_blocked": bool(model_blocked),
+                "trial_dead": bool(trial_dead),
+                "duplicate_block": bool(duplicate),
+                "selectable": bool(selectable),
+                "bad_cause": bad_cause,
+                "requested": False,
+                "cause": None,
+            }
+            scan.append(entry)
             if (
                 not exhausted
                 and not model_blocked
@@ -2727,11 +2778,18 @@ class FreeIPPool:
                     cause = "trial_dead"
                 else:
                     cause = "exhausted"
+                entry["cause"] = cause
                 if self._request_warp_rotation(ep, cause):
+                    entry["requested"] = True
                     started += 1
             except Exception:
                 pass
+        self._last_rotation_scan = scan
         return started
+
+    def rotation_scan(self) -> list[dict[str, Any]]:
+        """Dernier scan de rotation (label + raisons), pour le diagnostic."""
+        return list(getattr(self, "_last_rotation_scan", []) or [])
 
     def _persist_socks5_egress(self, label: str, egress_ip: str, block: str) -> None:
         if not label or not egress_ip:

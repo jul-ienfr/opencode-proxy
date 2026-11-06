@@ -210,6 +210,19 @@ actions ne sont pas présentées comme actives.
   logique `socks5:<label>` comme IP : seules les IP réelles confirmées
   indexent un bucket, et les buckets `socks5:*` hérités sont purgés au
   chargement.
+- **FR-024** Un endpoint WARP `ipv6=true` DOIT résoudre son egress via une
+  cible IPv6-only (`api6.ipify.org`) et refuser une adresse de la mauvaise
+  famille. Le même contrat s'applique à la santé `(modèle, IP)`.
+- **FR-025** La rotation WARP DOIT éviter les blocs `/64` déjà épuisés dans
+  le ledger et retenter la recréation (jusqu'à 4 essais) pour trouver un bloc
+  frais, au lieu de réutiliser un bloc qui répondra 429.
+- **FR-026** Si une rotation recrée le conteneur mais que le bloc obtenu est
+  refusé (same_block/duplicate), la nouvelle IP DOIT quand même être trackée
+  et persistée : un `current_ip` stale fausse le ledger et la détection de
+  doublons.
+- **FR-027** Un `FreeUsageLimitError` NE DOIT PAS appliquer le TTL « mauvaise
+  IP » de 30 min : il utilise le blocage quota court (`quota_ip_block_s`),
+  le ledger journalier portant le vrai reset.
 
 ### Key Entities
 

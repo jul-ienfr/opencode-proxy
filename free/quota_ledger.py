@@ -163,7 +163,7 @@ class BucketState:
             return None
 
 
-def _is_free_usage_error(error_type: str, body: Any) -> bool:
+def is_free_usage_error(error_type: str, body: Any) -> bool:
     et = str(error_type or "").strip().lower()
     if et in (
         "freeusagelimiterror",
@@ -178,6 +178,10 @@ def _is_free_usage_error(error_type: str, body: Any) -> bool:
     low = body.lower()
     compact = low.replace(" ", "").replace("_", "").replace("-", "")
     return "freeusagelimiterror" in compact or "free usage limit" in low
+
+
+# Rétro-compatibilité pour les appelants internes historiques.
+_is_free_usage_error = is_free_usage_error
 
 
 @dataclass
@@ -422,6 +426,21 @@ class QuotaLedger:
                 if state.exhausted and state.reset_at > 0:
                     resets.append(float(state.reset_at))
             return min(resets) if resets else None
+
+    def exhausted_ips(self, now: float | None = None) -> set[str]:
+        """IPs (déjà normalisées en /64 ou /32) dont le bucket est épuisé.
+
+        Utilisé par la rotation WARP pour éviter de recréer un conteneur dans
+        un bloc dont le quota est déjà connu comme consommé.
+        """
+        ts = self._now(now)
+        out: set[str] = set()
+        with self._lock:
+            for state in self._items.values():
+                self._refresh(state, ts)
+                if state.exhausted:
+                    out.add(state.ip)
+        return out
 
     def snapshot(self, limit: int = 80, now: float | None = None) -> list[dict[str, Any]]:
         ts = self._now(now)

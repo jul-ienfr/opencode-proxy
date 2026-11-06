@@ -31,6 +31,26 @@ LAST_ROTATION: dict[str, float] = {}
 _LOCK = threading.Lock()
 _ROTATE_LOCK = threading.Lock()
 MIN_ROTATION_INTERVAL_S = 300.0
+# Un restart peut rendre le même /64 (WARP réutilise les blocs Cloudflare).
+# On retente la recréation pour trouver un bloc frais, sans boucler à l'infini.
+MAX_ROTATION_ATTEMPTS = 4
+# Egress forcé par famille : ifconfig.me renvoie l'IPv4 partagée WARP sur un
+# endpoint « ipv6 », ce qui faisait tracker la mauvaise IP et condamnait la
+# station pour le quota d'une autre famille.
+EGRESS_URL_V4 = "https://api.ipify.org"
+EGRESS_URL_V6 = "https://api6.ipify.org"
+
+
+def block_for_ledger_key(raw: str) -> str | None:
+    """Convertit une clé ledger (4 premiers groupes IPv6) en bloc /64.
+
+    ``server_ip_key`` tronque une IPv6 à ``a:b:c:d`` sans ``::``, ce qui n'est
+    pas une adresse complète pour ``ipaddress``. On reconstitue le préfixe.
+    """
+    value = str(raw or "").strip()
+    if ":" in value and "::" not in value and value.count(":") == 3:
+        value = f"{value}::"
+    return block_for_ip(value)
 
 
 def block_for_ip(ip: str) -> str | None:
@@ -115,6 +135,19 @@ class WarpRotator:
                             forbidden.add(other_block)
                 except Exception:
                     forbidden = set()
+                # [mimo 2026-11-06] Ne pas recréer un conteneur dans un /64
+                # dont le bucket journalier est déjà épuisé : WARP réutilise
+                # souvent les mêmes blocs Cloudflare, et la station revient
+                # immédiatement en 429 sans que le ledger puisse l'expliquer.
+                try:
+                    ledger = pool._get_ledger() if hasattr(pool, "_get_ledger") else None
+                    if ledger is not None and hasattr(ledger, "exhausted_ips"):
+                        for raw in ledger.exhausted_ips():
+                            blocked = block_for_ledger_key(str(raw or ""))
+                            if blocked:
+                                forbidden.add(blocked)
+                except Exception:
+                    pass
                 result = self.rotate(endpoint, forbidden_blocks=forbidden)
                 # [fiab 2026-11-06] Appliquer l'egress SOUS le verrou global :
                 # sinon deux rotations concurrentes voyaient toutes deux
@@ -123,6 +156,12 @@ class WarpRotator:
                 if result.ok and result.new_ip:
                     self._apply(endpoint, pool, persist, result)
                 else:
+                    # Le conteneur a bien été recréé : même si le bloc est
+                    # refusé (same_block/duplicate/exhausted), l'IP réelle a
+                    # changé. La laisser stale fausse le ledger, la détection
+                    # de doublons et la rotation suivante.
+                    if result.new_ip:
+                        self._apply_tracking(endpoint, pool, persist, result)
                     logger.warning("[warp-rotate] %s: %s", label, result.as_dict())
         except Exception as exc:
             logger.warning("[warp-rotate] %s failed: %s", label, exc)
@@ -140,7 +179,10 @@ class WarpRotator:
         old_block = block_for_ip(old_ip) if old_ip else None
         attempts = 0
         last_reason = "not_started"
-        for attempt in (1, 2):
+        last_ip: str | None = None
+        last_block: str | None = None
+        max_attempts = max(2, int(MAX_ROTATION_ATTEMPTS))
+        for attempt in range(1, max_attempts + 1):
             attempts = attempt
             try:
                 if attempt == 1:
@@ -158,6 +200,7 @@ class WarpRotator:
                 last_reason = "egress_unresolved"
                 continue
             new_block = block_for_ip(new_ip)
+            last_ip, last_block = new_ip, new_block
             if old_block and new_block == old_block:
                 last_reason = "same_block"
                 continue
@@ -177,8 +220,10 @@ class WarpRotator:
             label=label,
             ok=False,
             old_ip=old_ip,
-            new_ip=None,
-            block=None,
+            # Conserver la dernière IP réellement observée : le conteneur
+            # tourne dessus même si son bloc est refusé.
+            new_ip=last_ip,
+            block=last_block,
             attempts=attempts,
             reason=last_reason,
         )
@@ -190,8 +235,11 @@ class WarpRotator:
         if result.block:
             endpoint.block = result.block
         try:
-            pool._per_station(endpoint)["bad_until"] = 0.0
-            pool._per_station(endpoint)["consec_429"] = 0
+            per = pool._per_station(endpoint)
+            per["bad_until"] = 0.0
+            per["bad_cause"] = None
+            per["degraded_override"] = False
+            per["consec_429"] = 0
         except Exception:
             pass
         try:
@@ -208,6 +256,37 @@ class WarpRotator:
             except Exception as exc:
                 logger.warning("[warp-rotate] post-rotation probe failed: %s", exc)
         logger.info("[warp-rotate] %s: %s", result.label, result.as_dict())
+
+    def _apply_tracking(self, endpoint, pool, persist, result: WarpRotationResult) -> None:
+        """Met à jour l'egress même quand le bloc est refusé.
+
+        Le conteneur a été recréé et possède une nouvelle IP ; ne pas la
+        tracker laisse ``current_ip``/``block`` sur l'ancienne valeur, ce qui
+        fausse la détection de doublons et l'imputation du quota. On marque la
+        station brièvement bad pour qu'elle ne serve pas ce bloc avant la
+        prochaine rotation.
+        """
+        ip = str(result.new_ip or "").strip()
+        if not ip:
+            return
+        endpoint.egress_ip = ip
+        endpoint.current_ip = ip
+        endpoint._egress_probe_attempted = True
+        if result.block:
+            endpoint.block = result.block
+        try:
+            per = pool._per_station(endpoint)
+            per["bad_until"] = max(
+                float(per.get("bad_until") or 0.0),
+                time.monotonic() + 60.0,
+            )
+            per["bad_cause"] = "rotation_rejected"
+        except Exception:
+            pass
+        try:
+            persist(str(getattr(endpoint, "label", "") or ""), ip, result.block or "")
+        except Exception as exc:
+            logger.warning("[warp-rotate] persist failed: %s", exc)
 
     def _recreate(self, container: str, port: int, endpoint) -> None:
         image = str(getattr(endpoint, "image", "") or self.image)
@@ -263,6 +342,7 @@ class WarpRotator:
     def _resolve_egress(self, port: int, ipv6: bool) -> str | None:
         if port <= 0:
             return None
+        url = EGRESS_URL_V6 if ipv6 else EGRESS_URL_V4
         deadline = time.monotonic() + self.egress_timeout_s
         while time.monotonic() < deadline:
             try:
@@ -277,9 +357,11 @@ class WarpRotator:
                 if ipv6:
                     kwargs["curl_options"] = {CurlOpt.IPRESOLVE: 2}
                 with curl_requests.Session(**kwargs) as session:
-                    response = session.get("https://ifconfig.me")
+                    response = session.get(url)
                 ip = str(getattr(response, "text", "") or "").strip()
-                ipaddress.ip_address(ip)
+                parsed = ipaddress.ip_address(ip)
+                if bool(parsed.version == 6) != bool(ipv6):
+                    raise ValueError(f"egress family mismatch: {ip}")
                 return ip
             except Exception:
                 try:
@@ -287,7 +369,7 @@ class WarpRotator:
                     if ipv6:
                         cmd.insert(1, "-6")
                     proc = subprocess.run(
-                        [*cmd, "https://ifconfig.me"],
+                        [*cmd, url],
                         capture_output=True,
                         text=True,
                         timeout=15,
@@ -295,11 +377,13 @@ class WarpRotator:
                         creationflags=CREATE_NO_WINDOW,
                     )
                     ip = str(proc.stdout or "").strip()
-                    ipaddress.ip_address(ip)
+                    parsed = ipaddress.ip_address(ip)
+                    if bool(parsed.version == 6) != bool(ipv6):
+                        raise ValueError(f"egress family mismatch: {ip}")
                     return ip
                 except Exception:
                     time.sleep(3)
         return None
 
 
-__all__ = ["WarpRotator", "WarpRotationResult", "block_for_ip"]
+__all__ = ["WarpRotator", "WarpRotationResult", "block_for_ip", "block_for_ledger_key"]

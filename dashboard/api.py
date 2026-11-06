@@ -5017,9 +5017,10 @@ def register_dashboard(
             return {"ok": False, "error": "pool_unavailable"}
         try:
             started = int(pool.rotate_exhausted_managed())
+            scan = pool.rotation_scan() if hasattr(pool, "rotation_scan") else []
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "started": started}
+        return {"ok": True, "started": started, "scan": scan}
 
     @app.post("/api/vpn/socks5")
     async def add_vpn_socks5(request: Request):
