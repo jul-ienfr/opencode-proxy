@@ -82,6 +82,10 @@
 - [x] **T-024** Sonde quota intégrée à la boucle de rotation : un 429 rejette
   le bloc et relance un essai (jusqu'à 4), au lieu d'accepter puis d'attendre
   5 min. Vérifié live : rotations enchaînées, `with_quota` honnête, mimo 200.
+- [x] **T-025** Les causes `rotation_rejected` et `post_rotation_probe`
+  déclenchent une nouvelle rotation même si l'endpoint est encore
+  `selectable`. Test de non-régression ajouté. Vérifié live : les stations
+  rejetées repartent en réparation au lieu de rester bloquées.
 
 ## Suivi
 

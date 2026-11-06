@@ -304,6 +304,27 @@ def test_rotate_exhausted_managed_rotates_model_blocked_endpoint():
     assert pool.calls == [("warp-restore1", "model_ip")]
 
 
+def test_rotate_exhausted_managed_retries_rejected_block():
+    from free.pool import FreeIPPool
+
+    class RejectedPool(ProactivePool):
+        def _get_ledger(self):
+            class _Ledger:
+                def is_exhausted(self, raw, model):
+                    return False
+
+            return _Ledger()
+
+        def _per_station(self, endpoint):
+            return {"bad_cause": "rotation_rejected"}
+
+    managed = _endpoint(label="warp-restore1", container="warp-restore1")
+    pool = RejectedPool([managed])
+    count = FreeIPPool.rotate_exhausted_managed(pool)
+    assert count == 1
+    assert pool.calls == [("warp-restore1", "exhausted")]
+
+
 def test_rotate_exhausted_managed_rotates_trial_dead_endpoint():
     from free.pool import FreeIPPool
 

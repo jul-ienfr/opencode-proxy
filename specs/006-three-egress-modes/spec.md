@@ -231,6 +231,10 @@ actions ne sont pas présentées comme actives.
   avant d'accepter un bloc : un 429 rejette le candidat et la rotation essaie
   un autre `/64` dans la même passe (jusqu'à `MAX_ROTATION_ATTEMPTS`), au lieu
   d'attendre la prochaine fenêtre de rotation.
+- **FR-030** Un endpoint dont le dernier essai a été rejeté
+  (`bad_cause=rotation_rejected` ou `post_rotation_probe`) DOIT rester
+  éligible à une nouvelle rotation, même s'il est encore `selectable` : sinon
+  il reste sur un bloc dont on sait déjà qu'il répond 429.
 
 ### Key Entities
 

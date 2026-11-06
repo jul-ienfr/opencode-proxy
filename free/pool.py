@@ -2760,13 +2760,18 @@ class FreeIPPool:
                 "cause": None,
             }
             scan.append(entry)
+            # [mimo 2026-11-06] ``rotation_rejected`` / ``post_rotation_probe``
+            # signifient que la dernière IP a été refusée par la sonde quota.
+            # Sans ce trigger, la station reste « selectable » sur un bloc dont
+            # on sait déjà qu'il répond 429, et aucune rotation ne repart.
+            _retry_causes = {"rate_limit", "rotation_rejected", "post_rotation_probe"}
             if (
                 not exhausted
                 and not model_blocked
                 and not trial_dead
                 and not duplicate
                 and selectable
-                and bad_cause != "rate_limit"
+                and bad_cause not in _retry_causes
             ):
                 continue
             try:
