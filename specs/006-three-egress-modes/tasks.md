@@ -34,8 +34,9 @@
 ## Backend
 
 - [x] **T-008** `FreeIPPool.get_status()` retourne, en mode SOCKS5, les
-  endpoints WARP comme lignes de statut et une capacité `usable/configured`
-  réelle (plus de « Error 0/1 »).
+  endpoints WARP comme lignes de statut, une capacité `usable/configured`
+  réelle et `with_quota` par modèle (cohérent avec `/health`), plus de
+  « Error 0/1 ».
 - [x] **T-009** Conserver `capacity_snapshot()` mode-aware pour `/health`.
 
 ## Validation

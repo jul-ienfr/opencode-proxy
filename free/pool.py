@@ -1182,8 +1182,17 @@ class FreeIPPool:
             configured = len(eps)
             usable = 0
             usable_ips: set[str] = set()
+            quota_ips: set[str] = set()
+            with_quota = 0
             repairing = 0
             now = time.monotonic()
+            model = str(getattr(self, "_last_model", None) or "")
+            probe_models = _yaml_get("ip_registry", "allocator.probe_models", []) or []
+            models = [
+                str(item).strip()
+                for item in dict.fromkeys([model, *list(probe_models)])
+                if str(item).strip()
+            ]
             for ep in eps:
                 try:
                     per = self._per_station(ep)
@@ -1202,17 +1211,29 @@ class FreeIPPool:
                         ip = str(getattr(ep, "current_ip", "") or "")
                         if ip and ip != "unknown" and not ip.startswith("socks5:"):
                             usable_ips.add(ip)
+                        quota_ok = True
+                        if models:
+                            quota_ok = any(
+                                self.model_usable(item, ep)[0] for item in models
+                            )
+                        if quota_ok:
+                            with_quota += 1
+                            if ip and ip != "unknown" and not ip.startswith("socks5:"):
+                                quota_ips.add(ip)
                 except Exception:
                     continue
             degraded = configured > 0 and usable < configured
             reason = f"{usable}/{configured} endpoints usable" if degraded else None
+            if not degraded and configured > 0 and models and with_quota < configured:
+                degraded = True
+                reason = f"{with_quota}/{configured} IP avec quota"
             return {
                 "configured_stations": configured,
                 "stations_total": configured,
                 "usable_stations": usable,
                 "unique_usable_ips": len(usable_ips),
-                "active_stations_with_quota": usable,
-                "unique_ips_with_quota": len(usable_ips),
+                "active_stations_with_quota": with_quota,
+                "unique_ips_with_quota": len(quota_ips),
                 "duplicate_ip_groups": 0,
                 "duplicate_stations": 0,
                 "warm_spare_ready": False,
@@ -6589,6 +6610,15 @@ class FreeIPPool:
             rows = []
             repairing = 0
             real_ips: set[str] = set()
+            quota_ips: set[str] = set()
+            with_quota = 0
+            model = str(getattr(self, "_last_model", None) or "")
+            probe_models = _yaml_get("ip_registry", "allocator.probe_models", []) or []
+            models = [
+                str(item).strip()
+                for item in dict.fromkeys([model, *list(probe_models)])
+                if str(item).strip()
+            ]
             now = time.monotonic()
             try:
                 from free.quota_ledger import server_ip_key
@@ -6605,14 +6635,32 @@ class FreeIPPool:
                 )
                 if bad_remaining > 0:
                     repairing += 1
+                raw_ip = str(getattr(ep, "current_ip", "") or "")
                 if usable:
                     usable_eps.append(ep)
-                    raw_ip = str(getattr(ep, "current_ip", "") or "")
                     if raw_ip and raw_ip != "unknown" and not raw_ip.startswith("socks5:"):
                         try:
                             real_ips.add(server_ip_key(raw_ip) if server_ip_key else raw_ip)
                         except Exception:
                             real_ips.add(raw_ip)
+                quota_ok, quota_why = True, None
+                if models:
+                    try:
+                        quota_ok = any(
+                            self.model_usable(item, ep)[0] for item in models
+                        )
+                        quota_why = None if quota_ok else "quota"
+                    except Exception:
+                        quota_ok, quota_why = True, None
+                else:
+                    quota_ok = usable
+                if usable and quota_ok:
+                    with_quota += 1
+                    if raw_ip and raw_ip != "unknown" and not raw_ip.startswith("socks5:"):
+                        try:
+                            quota_ips.add(server_ip_key(raw_ip) if server_ip_key else raw_ip)
+                        except Exception:
+                            quota_ips.add(raw_ip)
                 rows.append(
                     {
                         "station": ep._station,
@@ -6629,9 +6677,11 @@ class FreeIPPool:
                         "bad_cause": per.get("bad_cause"),
                         "degraded_override": bool(per.get("degraded_override")),
                         "station_usable": usable,
-                        "model_usable": usable,
-                        "client_usable": usable,
-                        "model_usable_reason": None if usable else (per.get("bad_cause") or "unusable"),
+                        "model_usable": bool(quota_ok),
+                        "client_usable": bool(usable and quota_ok),
+                        "model_usable_reason": None
+                        if quota_ok
+                        else (quota_why or "quota"),
                         "non_routable_reason": None if usable else (per.get("bad_cause") or "unusable"),
                         "egress_state": "tunnel_up_full" if usable else "tunnel_down",
                         "ip_state": "active" if ep is self._socks5_current else None,
@@ -6651,7 +6701,13 @@ class FreeIPPool:
                 current = usable_eps[0] if usable_eps else (eps[0] if eps else None)
             current_per = self._per_station(current) if current is not None else {}
             degraded = configured > 0 and usable_n < configured
-            _reason = f"{usable_n}/{configured} endpoints usable" if degraded else None
+            if degraded:
+                _reason = f"{usable_n}/{configured} endpoints usable"
+            elif configured > 0 and with_quota < configured:
+                degraded = True
+                _reason = f"{with_quota}/{configured} IP avec quota"
+            else:
+                _reason = None
             _result.update(
                 {
                     "station_count": configured,
@@ -6664,8 +6720,8 @@ class FreeIPPool:
                     "stations_total": configured,
                     "usable_stations": usable_n,
                     "unique_usable_ips": len(real_ips),
-                    "active_stations_with_quota": usable_n,
-                    "unique_ips_with_quota": len(real_ips),
+                    "active_stations_with_quota": with_quota,
+                    "unique_ips_with_quota": len(quota_ips),
                     "duplicate_ip_groups": 0,
                     "duplicate_stations": 0,
                     "warm_spare_ready": False,
