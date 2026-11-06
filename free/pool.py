@@ -970,6 +970,12 @@ class FreeIPPool:
         # valeur de test), on ne doit pas imputer l'ancien quota à la nouvelle.
         try:
             _cur_ip = str(getattr(station, "current_ip", "") or "")
+            # ``socks5:<label>`` est un identifiant logique, pas une IP : ne
+            # jamais l'ancrer comme ``last_confirmed_ip`` (sinon le ledger
+            # fabrique un bucket ``socks5:*`` et la station reste bloquée
+            # après rotation).
+            if _cur_ip.startswith("socks5:"):
+                _cur_ip = ""
             _last_ip = str(per.get("last_confirmed_ip") or "")
             if _cur_ip and not _last_ip:
                 # Ancien état sans ancre : ne jamais imputer un compteur
@@ -1337,10 +1343,19 @@ class FreeIPPool:
             raw = str(ip or getattr(station, "current_ip", "") or "").strip()
         except Exception:
             raw = str(ip or "").strip()
+        # [fiab 2026-11-06] Un endpoint SOCKS5 non encore probe expose
+        # ``socks5:<label>``. Ce n'est PAS une IP : l'utiliser comme clé de
+        # ledger créait un bucket ``socks5:warp-*`` qui bloquait la station
+        # même après rotation vers une IP fraîche. On ignore l'identifiant
+        # logique et on ne retombe que sur une vraie IP confirmée.
+        if raw.startswith("socks5:"):
+            raw = ""
         if not raw:
             try:
                 raw = str((self._per_station(station) or {}).get("last_confirmed_ip") or "").strip()
             except Exception:
+                raw = ""
+            if raw.startswith("socks5:"):
                 raw = ""
         return raw
 

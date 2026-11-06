@@ -86,3 +86,11 @@ def test_apply_bad_mark_keeps_socks5_floor_for_timeout():
     assert per["bad_until"] > time.monotonic()
     assert per["bad_cause"] == "timeout"
     assert per["degraded_override"] is True
+
+
+def test_ledger_ip_ignores_logical_socks5_label():
+    pool, endpoint, _calls = _pool()
+    endpoint.current_ip = "socks5:warp-a"
+    assert pool._ledger_ip(endpoint) == ""
+    pool._per_station(endpoint)["last_confirmed_ip"] = "2a09:bac5:32d4:be::1"
+    assert pool._ledger_ip(endpoint) == "2a09:bac5:32d4:be::1"

@@ -61,6 +61,16 @@ def server_ip_key(raw: Any) -> str:
     return s
 
 
+def is_logical_proxy_key(raw: Any) -> bool:
+    """``socks5:<label>`` est un identifiant de station, pas une IP d'egress.
+
+    Les anciennes versions du pool l'ont utilisé comme clé de ledger, créant
+    des buckets ``socks5:warp-*`` qui restaient épuisés après une rotation
+    vers une IP fraîche. On purge ces clés au chargement.
+    """
+    return str(raw or "").strip().startswith("socks5:")
+
+
 def utc_day(now: float | None = None) -> str:
     """``YYYYMMDD`` UTC, comme ``buildYYYYMMDD`` côté serveur."""
     ts = float(now if now is not None else time.time())
@@ -464,10 +474,13 @@ class QuotaLedger:
             return
         now = self._now(None)
         for row in rows:
+            ip_key = server_ip_key(row["ip"])
+            if is_logical_proxy_key(ip_key):
+                continue
             status = int(row["last_status"] or 0)
             reset_at = float(row["reset_at"] or 0.0)
             state = BucketState(
-                ip=server_ip_key(row["ip"]),
+                ip=ip_key,
                 day=str(row["day"]),
                 bucket=str(row["bucket"] or "default"),
                 requests=max(0, int(row["used"] or 0)),
@@ -484,6 +497,17 @@ class QuotaLedger:
             self._items[(state.ip, state.day, state.bucket)] = state
         self._enforce_cap_locked()
         self._prune_locked(now)
+        # Purge durable des buckets hérités ``socks5:*`` (identifiants de
+        # station utilisés à tort comme IP par les anciennes versions).
+        try:
+            conn = sqlite3.connect(self._path, timeout=10.0)
+            try:
+                conn.execute("DELETE FROM quota_buckets WHERE ip LIKE 'socks5:%'")
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
 
     def _load(self) -> None:
         if not self.persist:
@@ -499,7 +523,7 @@ class QuotaLedger:
                 return
             for rec in items:
                 state = BucketState.from_dict(rec)
-                if state is None:
+                if state is None or is_logical_proxy_key(state.ip):
                     continue
                 self._items[(state.ip, state.day, state.bucket)] = state
             self._enforce_cap_locked()
@@ -630,7 +654,7 @@ class QuotaLedger:
         with self._lock:
             for rec in data:
                 state = BucketState.from_dict(rec)
-                if state is None:
+                if state is None or is_logical_proxy_key(state.ip):
                     continue
                 self._items[(state.ip, state.day, state.bucket)] = state
             self._enforce_cap_locked()

@@ -206,6 +206,10 @@ actions ne sont pas présentées comme actives.
 - **FR-022** En mode manuel, `max_free_attempts` NE DOIT PAS être écrasé par le
   budget effectif (élargi par `strict_free`) au démarrage ou lors d'un
   changement de `station_count` ; la valeur opérateur 1–3 doit persister.
+- **FR-023** Le ledger de quota NE DOIT JAMAIS utiliser un identifiant
+  logique `socks5:<label>` comme IP : seules les IP réelles confirmées
+  indexent un bucket, et les buckets `socks5:*` hérités sont purgés au
+  chargement.
 
 ### Key Entities
 

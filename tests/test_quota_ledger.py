@@ -188,6 +188,35 @@ def test_persistence_round_trip(tmp_path):
     assert restored.headroom("10.0.0.14", MODEL) == 0
 
 
+def test_logical_socks5_bucket_is_ignored_on_load(tmp_path):
+    path = tmp_path / "quota_ledger.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "items": [
+                    {
+                        "ip": "socks5:warp-ipv6-4",
+                        "day": "20231114",
+                        "bucket": "default",
+                        "requests": 0,
+                        "failures": 223,
+                        "last_status": 429,
+                        "last_error": "FreeUsageLimitError",
+                        "reset_at": MIDNIGHT,
+                        "exhausted": True,
+                        "source": "observed",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger = QuotaLedger(path=str(path), persist=True, clock=lambda: NOW)
+    assert ledger.snapshot() == []
+    assert ledger.earliest_reset() is None
+
+
 def test_snapshot_shape():
     ledger = QuotaLedger(persist=False, clock=lambda: NOW)
     ledger.note_result(

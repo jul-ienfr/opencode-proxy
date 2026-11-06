@@ -62,6 +62,10 @@
   écrasé par le budget effectif `strict_free=7` au boot ni lors du changement
   de `station_count`. Vérifié après restart : `auto=false, max=3,
   effective=7`.
+- [x] **T-018** Ledger jamais indexé sur `socks5:<label>` : `_ledger_ip`
+  ignore l'identifiant logique, `_per_station` ne l'ancre plus comme
+  `last_confirmed_ip`, et les anciens buckets `socks5:*` sont purgés au
+  chargement (JSON + SQLite). Vérifié live : `socks5_buckets=0`.
 
 ## Suivi
 
