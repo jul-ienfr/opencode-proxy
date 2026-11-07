@@ -270,6 +270,10 @@ Tous les principes restent **PASS**. Les points à surveiller :
 
 ## Next Step
 
+> **Voir aussi** : `specs/008-auto-egress-mode/` pour le mode multi-provider
+> Auto-Egress (NordVPN + WARP + proxys), qui réutilise l'abstraction provider
+> et la taxonomie d'erreurs de cette feature.
+
 Exécuter `/speckit.tasks` (ou lire `tasks.md`) puis démarrer par la **Phase 0**
 et la **Phase 1** gratuitement. La Phase 1bis (MicroWARP/usque, IPv6 box
 actuelle, Oracle/Proton Free si compte existant) suit. Les phases VPS 2/3 et
