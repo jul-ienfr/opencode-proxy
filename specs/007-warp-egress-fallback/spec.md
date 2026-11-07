@@ -126,7 +126,7 @@ la valeur effective est celle utilisée par le runtime.
 
 ---
 
-### User Story 5 - Gateway IPv6 VPS optionnel (Priority: P3)
+### User Story 5 - Gateway IPv6 VPS optionnel (Priority: P3 — différé, payant)
 
 Si les replis gratuits ne suffisent pas, l'opérateur peut activer un gateway
 IPv6 sur un VPS avec un `/48` routé. Le gateway alloue un `/64` par station,
@@ -165,6 +165,42 @@ redémarrage.
 - Le fallback payant est désactivé et la capacité gratuite est insuffisante.
 - Le préfixe IPv6 de la box change après reboot.
 - Un compte/clé unique est la vraie limite, pas le bloc.
+
+## Scope — Free only (décision opérateur, 2026-11-07)
+
+**Principe** : on implémente uniquement ce qui est **gratuit** et **à notre
+portée**. Aucun achat, aucun abonnement, aucun second compte payant, aucune
+attente comme solution.
+
+### In scope
+
+- Optimisations et fiabilisation WARP (park/reset, rotation, dédup, probes).
+- Abstraction provider, taxonomie 403/429, observabilité, tests.
+- Repli de continuité **MicroWARP/usque** (gratuit, même pool).
+- IPv6 de la box/ISP **si la box actuelle le délègue déjà** (pas de
+  remplacement matériel).
+- **Oracle Always Free** et **Proton Free** si un compte gratuit est
+  disponible ou créable sans achat.
+- Windscribe/Privado Free (10 Go) en urgence, sans achat.
+- Validation Phase 0 sur l'infrastructure existante.
+- GUI, métriques, runbooks et preuves live.
+
+### Out of scope (cette itération)
+
+- VPS payant `/48` (BuyVM, Linode, Hetzner, Vultr, Contabo).
+- VPN payant (Mullvad, PIA, Surfshark, AirVPN, IVPN).
+- Forfaits 5G payants (Free 5G+, Free Box 5G).
+- Abonnement OpenCode Go.
+- Empilement de comptes/clés.
+- Proxies publics, Tor, VPN Gate.
+- Remplacement de la box/routeur pour obtenir un `/56`.
+
+### Conditionnel
+
+- Oracle/Proton : uniquement si le compte gratuit existe déjà ou peut être
+  créé sans carte payante ni abonnement.
+- IPv6 box/ISP : uniquement avec la box actuelle ; si elle ne délègue qu'un
+  `/64`, on l'utilise tel quel (1 bucket), sans achat.
 
 ## Requirements *(mandatory)*
 
@@ -210,12 +246,15 @@ redémarrage.
   pouvoir servir de repli de continuité sans promettre de quota
   supplémentaire.
 - **FR-015** Proton Free DOIT être supporté comme repli de capacité pour **une
-  seule station**, avec data illimitée et un seul appareil.
-- **FR-016** Le gateway IPv6 VPS optionnel DOIT allouer un `/64` par station,
-  lier une source stable, persister les allocations et exposer
-  `/health`, `/allocate`, `/rotate`, `/release`.
-- **FR-017** Une rotation VPS DOIT prendre moins de 10 s et ne jamais changer
-  le port SOCKS5 de la station.
+  seule station**, avec data illimitée et un seul appareil, sous réserve d'un
+  compte gratuit disponible sans achat.
+- **FR-016 (différé)** Le gateway IPv6 VPS optionnel DOIT allouer un `/64` par
+  station, lier une source stable, persister les allocations et exposer
+  `/health`, `/allocate`, `/rotate`, `/release`. **Hors périmètre de cette
+  itération (payant).**
+- **FR-017 (différé)** Une rotation VPS DOIT prendre moins de 10 s et ne jamais
+  changer le port SOCKS5 de la station. **Hors périmètre de cette itération
+  (payant).**
 - **FR-018** Aucun proxy public, Tor ou VPN Gate NE DOIT être utilisé pour des
   credentials ou du trafic API.
 - **FR-019** L'empilement de comptes/clés NE DOIT PAS être une stratégie par
@@ -232,6 +271,9 @@ redémarrage.
   `429` par modèle/axe, `403` gate, rotations, doublons, temps de reset.
 - **FR-025** Un changement de provider NE DOIT PAS interrompre une requête en
   vol ; le drain se fait avant la bascule.
+- **FR-026** Aucun composant payant NE DOIT être ajouté dans cette itération ;
+  les options payantes restent documentées, désactivées par défaut et hors
+  périmètre d'implémentation.
 
 ### Key Entities
 
@@ -266,8 +308,9 @@ redémarrage.
   **0** faux positif sur le jeu de tests.
 - **SC-007** La Phase 0 produit un document go/no-go pour **au moins deux
   modèles free**, avec preuves brutes `403`/`429`.
-- **SC-008** Une rotation VPS alloue un `/64` distinct en **< 10 s**, trois
-  rotations donnent trois blocs et trois `200`.
+- **SC-008 (différé)** Une rotation VPS alloue un `/64` distinct en **< 10 s**,
+  trois rotations donnent trois blocs et trois `200`. Hors périmètre de cette
+  itération (payant).
 - **SC-009** Le dashboard affiche provider, bloc et état pour **100 %** des
   endpoints actifs.
 - **SC-010** Aucune bascule silencieuse vers le direct ou le payant :

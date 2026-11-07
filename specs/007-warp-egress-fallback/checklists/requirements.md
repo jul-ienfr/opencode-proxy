@@ -37,6 +37,15 @@
 - [x] Feature meets measurable outcomes defined in Success Criteria.
 - [x] No implementation details leak into the specification.
 
+## Scope Decision (2026-11-07)
+
+- [x] Free-only confirmed by the operator: no paid VPS, no paid VPN, no paid
+      5G, no OpenCode Go, no account/key stacking, no box replacement.
+- [x] In scope: WARP reliability, park/reset, provider abstraction, error
+      taxonomy, MicroWARP/usque, current-box IPv6, Oracle/Proton Free only if a
+      free account already exists, Windscribe/Privado emergency, GUI/tests.
+- [x] Deferred: US5/VPS gateway and all paid provider tasks.
+
 ## Notes
 
 - The main unresolved measurement is the quota granularity (address vs `/64`

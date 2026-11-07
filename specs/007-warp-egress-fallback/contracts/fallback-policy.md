@@ -22,6 +22,7 @@ ip_rotation:
     cooldown_s: 900
     max_block_s: 0          # 0 = park strict jusqu'à reset_at
     fail_closed: true
+    # Les providers payants (vps_ipv6, mullvad) sont hors périmètre 2026-11-07.
     direct_allowed: false
 ```
 

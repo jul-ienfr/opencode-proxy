@@ -10,6 +10,11 @@ exigence (FR-022).
 
 **Organization**: tâches groupées par user story, dans l'ordre de priorité.
 
+**Scope free only (décision 2026-11-07)**: seules les tâches **gratuites et
+déjà disponibles** sont exécutées. La Phase 7 (VPS payant) est **différée** et
+ne doit pas être lancée. Les providers payants, la 5G payante, OpenCode Go,
+l'empilement de comptes et le remplacement de box sont hors périmètre.
+
 ## Format: `[ID] [P?] [Story] Description`
 
 - **[P]**: parallélisable (fichiers différents, pas de dépendance)
@@ -152,7 +157,11 @@ l'affichage et l'effet réel du toggle.
 
 ---
 
-## Phase 7: User Story 5 - Gateway IPv6 VPS optionnel (Priority: P3)
+## Phase 7: [DIFFÉRÉ] User Story 5 - Gateway IPv6 VPS optionnel (Priority: P3, payant)
+
+> **Hors périmètre de cette itération.** Ne pas exécuter T049–T058 avant une
+> décision explicite de l'opérateur. Le gateway VPS est payant et ne fait pas
+> partie du MVP gratuit.
 
 **Goal**: ajouter un gateway `/48` payant, opt-in, rotation < 10 s, sans
 collision.
@@ -232,14 +241,15 @@ persistance après redémarrage.
 3. Valider `quickstart.md` §5.
 4. Déployer.
 
-### Incremental Delivery
+### Incremental Delivery — Free only
 
 1. US1 → WARP park/rotate stable.
-2. US3 → Phase 0 go/no-go (avant fallback de capacité).
-3. US2 → fallback gratuit (MicroWARP/usque, Proton).
+2. US3 → Phase 0 go/no-go (gratuit, sur l'infrastructure existante).
+3. US2 → fallback gratuit (MicroWARP/usque, IPv6 box actuelle, Oracle/Proton
+   Free si compte existant).
 4. US4 → visibilité/pilotage.
-5. US5 → VPS optionnel si nécessaire.
-6. Polish → soak, docs, dette.
+5. Polish → soak, docs, dette.
+6. **US5/Phase 7 (VPS payant) : différé, non exécuté.**
 
 ### Parallel Team Strategy
 

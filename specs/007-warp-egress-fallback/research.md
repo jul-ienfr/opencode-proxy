@@ -77,9 +77,11 @@ conteneur casse ou si la rotation Docker est bloquée.
 
 ## D5 — Box/ISP : vérifier avant de compter
 
-**Decision**: la Phase 0 vérifie la délégation IPv6 réelle. Chez Red by SFR,
-la box fournie ne délègue qu'un `/64` (1–2 buckets) ; le `/56` (256 buckets)
-exige un routeur compatible (OPNsense/OpenWrt) et DHCPv6-PD.
+**Decision**: la Phase 0 vérifie la délégation IPv6 réelle **avec la box
+actuelle**. Chez Red by SFR, la box fournie ne délègue qu'un `/64`
+(1–2 buckets) ; le `/56` (256 buckets) exigerait un routeur compatible, ce qui
+est **hors périmètre** (achat/remplacement matériel). On utilise donc le `/64`
+existant s'il est disponible, sans achat.
 
 **Rationale**: les retours SFR/RED et le guide OPNsense convergent : le réseau
 attribue un `/56`, mais la box ne le transmet pas. Sans remplacement, le gain
@@ -93,7 +95,9 @@ est marginal.
 ## D6 — Proton Free = un secours de capacité pour une station
 
 **Decision**: Proton Free via gluetun est le premier secours de capacité
-gratuit, limité à **une station** (un appareil).
+gratuit, limité à **une station** (un appareil), **sous réserve d'un compte
+gratuit disponible ou créable sans achat**. Sinon, ce repli reste documenté et
+désactivé.
 
 **Rationale**: data illimitée, bon débit, mais un seul appareil simultané.
 Windscribe/Privado (10 Go) sont réservés aux coupures courtes.
@@ -103,10 +107,11 @@ Windscribe/Privado (10 Go) sont réservés aux coupures courtes.
 - Proxies résidentiels : coût au Go, CGU, pas pour ce volume.
 - VPN Gate/Tor/listes publiques : instables, MITM, à éviter.
 
-## D7 — VPS `/48` : dernier recours payant, opt-in
+## D7 — VPS `/48` : dernier recours payant, **différé hors périmètre**
 
 **Decision**: un gateway IPv6 sur VPS `/48` (BuyVM 24 $/an ou équivalent) est
-optionnel, désactivé par défaut, et ne porte que 1–2 stations.
+documenté mais **non implémenté dans cette itération**. Il reste désactivé par
+défaut et ne pourra être activé que sur décision explicite ultérieure.
 
 **Rationale**: 65 536 `/64` donnent une capacité réelle, rotation en secondes,
 pas de throttle Cloudflare. Mais c'est payant et ne doit pas devenir la source

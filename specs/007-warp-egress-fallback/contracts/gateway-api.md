@@ -1,4 +1,8 @@
-# Contract — IPv6 Egress Gateway API (optionnel VPS)
+# Contract — IPv6 Egress Gateway API (DIFFÉRÉ, payant, hors périmètre)
+
+> **Non implémenté dans cette itération.** Ce contrat documente une option
+> payante future. Aucun achat, aucun VPS, aucun gateway ne doit être déployé
+> avant une décision explicite de l'opérateur.
 
 **But**: exposer une rotation de bloc IPv6 en quelques secondes, sans recréer
 de conteneur, tout en gardant le ledger exact (source stable par `/64`).

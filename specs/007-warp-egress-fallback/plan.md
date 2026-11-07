@@ -20,6 +20,14 @@ Le plan formalise aussi la **Phase 0** : mesurer si le quota est par adresse,
 par `/64`, par ASN/compte ou par modèle, avant d'investir dans une source de
 capacité. Un `403` ne doit jamais être traité comme un `429`.
 
+**Décision opérateur 2026-11-07 — free only** : cette itération n'implémente
+que le gratuit et le déjà disponible. Le VPS payant, les VPN payants, la 5G
+payante, OpenCode Go, l'empilement de comptes et le remplacement de box sont
+**hors périmètre**. Ils restent documentés comme options futures, désactivés
+par défaut. Le MVP gratuit est : WARP fiabilisé + park/reset + taxonomie
+d'erreurs + MicroWARP/usque + IPv6 box actuelle + Oracle/Proton Free si un
+compte gratuit existe déjà.
+
 ## Technical Context
 
 **Language/Version**: Python 3.12+, PowerShell 5.1/7, TypeScript/Svelte 5
@@ -187,7 +195,7 @@ capacité.
 **Critère** : WARP reste primaire, une station bascule sur un repli gratuit,
 revient après 2 succès, aucun bloc fallback réutilisé par WARP.
 
-## Phase 2 — Gateway IPv6 VPS (optionnel, payant)
+## Phase 2 — Gateway IPv6 VPS (différé, payant, hors périmètre)
 
 1. Gateway SOCKS5 asyncio : handshake, CONNECT, bind source, relay.
 2. Allocateur `/64` + SQLite : label → bloc → port → source.
@@ -200,7 +208,7 @@ revient après 2 succès, aucun bloc fallback réutilisé par WARP.
 **Critère** : 1 station VPS + WARP primaire, 24 h de soak, 0 doublon,
 rotation < 10 s, retour WARP propre.
 
-## Phase 3 — Intégration fallback VPS
+## Phase 3 — Intégration fallback VPS (différé, payant, hors périmètre)
 
 1. `Ipv6GatewayProvider.rotate` : appelle `/rotate`, retourne `new_ip`/`block`.
 2. `refresh_egress` vérifie la famille et le `/64`.
@@ -262,5 +270,8 @@ Tous les principes restent **PASS**. Les points à surveiller :
 
 ## Next Step
 
-Exécuter `/speckit.tasks` (ou lire `tasks.md`) puis démarrer par la Phase 0
-et la Phase 1. Ne pas activer le VPS avant le go/no-go de la Phase 0.
+Exécuter `/speckit.tasks` (ou lire `tasks.md`) puis démarrer par la **Phase 0**
+et la **Phase 1** gratuitement. La Phase 1bis (MicroWARP/usque, IPv6 box
+actuelle, Oracle/Proton Free si compte existant) suit. Les phases VPS 2/3 et
+les providers payants restent **hors périmètre** jusqu'à décision explicite
+ultérieure.
