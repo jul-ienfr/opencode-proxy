@@ -229,3 +229,41 @@ def test_observed_ignores_unselected_provider():
     assert report.providers["nordvpn"].observed_share == 100.0
     assert report.providers["warp"].observed == 0
     assert report.providers["warp"].observed_share is None
+
+
+def test_endpoint_hotspot_warning():
+    report = _report(
+        strategy="balance",
+        endpoint_observed=[
+            {"provider": "nordvpn", "endpoint": "s1", "requests": 10},
+            {"provider": "warp", "endpoint": "w1", "requests": 10},
+            {"provider": "warp", "endpoint": "w2", "requests": 40},
+        ],
+    )
+    assert any(w["code"] == "endpoint_hotspot" for w in report.warnings)
+    assert any(r["code"] == "endpoint_reweight" for r in report.recommendations)
+
+
+def test_endpoint_hotspot_no_warning_below_threshold():
+    report = _report(
+        strategy="balance",
+        endpoint_observed=[
+            {"provider": "nordvpn", "endpoint": "s1", "requests": 10},
+            {"provider": "warp", "endpoint": "w1", "requests": 10},
+            {"provider": "warp", "endpoint": "w2", "requests": 15},
+        ],
+    )
+    assert not any(w["code"] == "endpoint_hotspot" for w in report.warnings)
+
+
+def test_endpoint_hotspot_ignores_unselected_provider():
+    report = _report(
+        selected=["warp"],
+        strategy="balance",
+        endpoint_observed=[
+            {"provider": "nordvpn", "endpoint": "s1", "requests": 100},
+            {"provider": "warp", "endpoint": "w1", "requests": 10},
+            {"provider": "warp", "endpoint": "w2", "requests": 10},
+        ],
+    )
+    assert not any(w["code"] == "endpoint_hotspot" for w in report.warnings)

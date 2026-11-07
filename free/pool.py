@@ -4239,6 +4239,40 @@ class FreeIPPool:
                 continue
         return out
 
+    def endpoint_request_counts(self) -> list[dict[str, Any]]:
+        """Compteurs par endpoint (cumul) pour détecter un point chaud.
+
+        Inclut les stations NordVPN et les endpoints WARP/proxys. Le
+        conseiller filtre ensuite sur les providers sélectionnés.
+        """
+        out: list[dict[str, Any]] = []
+        for station in list(getattr(self, "_stations", None) or []):
+            try:
+                requests = int(self._per_station(station).get("request_count", 0) or 0)
+            except Exception:
+                requests = 0
+            out.append(
+                {
+                    "provider": "nordvpn",
+                    "endpoint": str(getattr(station, "pid", None) or getattr(station, "_station", "")),
+                    "requests": max(0, requests),
+                }
+            )
+        for endpoint in list(getattr(self, "_socks5_eps", None) or []):
+            name = "warp" if self._provider_matches(endpoint, "warp") else "proxies"
+            try:
+                requests = int(self._per_station(endpoint).get("request_count", 0) or 0)
+            except Exception:
+                requests = 0
+            out.append(
+                {
+                    "provider": name,
+                    "endpoint": str(getattr(endpoint, "pid", "") or ""),
+                    "requests": max(0, requests),
+                }
+            )
+        return out
+
     def _socks5_pick_for(
         self, provider: str | None, *, excluded=None, conversation_key: str | None = None
     ):

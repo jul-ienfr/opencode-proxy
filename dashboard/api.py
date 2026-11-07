@@ -1520,6 +1520,19 @@ def _egress_observed_counts() -> dict[str, int]:
     return {}
 
 
+def _egress_endpoint_observed() -> list[dict]:
+    """Compteurs par endpoint (cumul pool) pour T029."""
+    pool = _dashboard_pool()
+    if pool is not None and hasattr(pool, "endpoint_request_counts"):
+        try:
+            counts = pool.endpoint_request_counts()
+            if isinstance(counts, list):
+                return [item for item in counts if isinstance(item, dict)]
+        except Exception:
+            pass
+    return []
+
+
 def _egress_capacity_counts() -> dict[str, dict[str, int]]:
     """Capacité configurée/activée/utilisable par provider (010).
 
@@ -4247,6 +4260,7 @@ def register_dashboard(
             target_slots=target,
             reserve_policy=policy,
             observed=_egress_observed_counts(),
+            endpoint_observed=_egress_endpoint_observed(),
         )
         return report.to_dict()
 

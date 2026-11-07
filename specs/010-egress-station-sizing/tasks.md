@@ -74,7 +74,7 @@
   `provider_request_counts()`).
 - [x] T028 Afficher part observée vs attendue et charge/endpoint observée
   (colonne `Observé`, warning `observed_shift` > 20 points).
-- [ ] T029 Alerte si un endpoint dépasse 2× la médiane ; proposer un
+- [x] T029 Alerte si un endpoint dépasse 2× la médiane ; proposer un
   reweight, jamais appliquer silencieusement.
 
 ## Dependencies & Execution Order

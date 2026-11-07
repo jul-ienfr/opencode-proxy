@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from statistics import median
 from typing import Any
 
 from free.auto_egress import equal_weights, normalize_weights
@@ -259,6 +260,7 @@ def evaluate_capacity(
     target_slots: int = DEFAULT_TARGET_SLOTS,
     reserve_policy: str = "full",
     observed: dict[str, int] | None = None,
+    endpoint_observed: list[dict[str, Any]] | None = None,
 ) -> CapacityReport:
     """Construit le rapport de capacité pour le GUI/API."""
     target = max(1, min(10, int(target_slots or DEFAULT_TARGET_SLOTS)))
@@ -456,6 +458,54 @@ def evaluate_capacity(
                     "Part observée éloignée des poids : " + ", ".join(shifted) + ".",
                     "Observed share differs from weights: " + ", ".join(shifted) + ".",
                     "warn",
+                )
+            )
+
+    endpoint_counts: list[tuple[str, str, int]] = []
+    for item in endpoint_observed or []:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or "").strip().lower()
+        if provider not in selected_names:
+            continue
+        try:
+            requests = int(item.get("requests", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if requests > 0:
+            endpoint_counts.append(
+                (provider, str(item.get("endpoint") or ""), requests)
+            )
+    if len(endpoint_counts) >= 3:
+        values = sorted(requests for _provider, _endpoint, requests in endpoint_counts)
+        median_value = float(median(values))
+        hot = [
+            (provider, endpoint, requests)
+            for provider, endpoint, requests in endpoint_counts
+            if median_value > 0 and requests > 2.0 * median_value
+        ]
+        if hot:
+            provider, endpoint, requests = max(hot, key=lambda item: item[2])
+            ratio = requests / median_value
+            warnings.append(
+                _message(
+                    "endpoint_hotspot",
+                    f"Endpoint {endpoint or '?'} ({provider_label(provider)}) : "
+                    f"{requests} requêtes, {ratio:.1f}× la médiane. Vérifie son "
+                    "quota ou ajuste les poids.",
+                    f"Endpoint {endpoint or '?'} ({provider_label(provider)}): "
+                    f"{requests} requests, {ratio:.1f}× the median. Check its quota "
+                    "or adjust the weights.",
+                    "warn",
+                )
+            )
+            recommendations.append(
+                _message(
+                    "endpoint_reweight",
+                    "Pour répartir la charge, augmente le poids des providers "
+                    "sous-utilisés ou désactive l'endpoint saturé.",
+                    "To spread the load, increase the weight of underused providers "
+                    "or disable the saturated endpoint.",
                 )
             )
 

@@ -8,7 +8,7 @@
 
 ```text
 python -m pytest tests/test_capacity.py tests/test_vpn_endpoints.py
-  -> 64 passed
+  -> 71 passed
 python -m ruff check free/capacity.py free/pool.py dashboard/api.py tests/...
   -> OK
 npm --prefix dashboard-ui run check -> 0 errors, 0 warnings
@@ -132,6 +132,19 @@ provider, `observed` + `observed_share` (cumul depuis le démarrage du pool).
 
 Test live après redémarrage : `observé = 0`, colonne affichée `—` ; la
 capacité reste `OK` (6/6 WARP).
+
+## Point chaud par endpoint (T029)
+
+`endpoint_request_counts()` expose les compteurs par station/endpoint. Le
+conseiller calcule la médiane des endpoints sélectionnés (≥ 3 endpoints) et
+émet :
+
+- `endpoint_hotspot` si un endpoint dépasse **2× la médiane** ;
+- `endpoint_reweight` pour proposer d'augmenter le poids des providers
+  sous-utilisés ou de désactiver l'endpoint saturé.
+
+Exemple testé : `10, 10, 40` → médiane 10, l'endpoint à 40 est signalé
+(4×). `10, 10, 15` → aucun signalement. Un provider décoché est ignoré.
 
 ## GUI
 
