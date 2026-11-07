@@ -8,7 +8,9 @@
   import { config } from '$lib/config.svelte';
   import { debugQuery } from '$lib/debug.svelte';
   import { PAGE_LOADERS } from './pages';
-  import { lastRefresh } from '$lib/query.svelte';
+  import { createQuery, lastRefresh } from '$lib/query.svelte';
+  import { apiGet } from '$lib/api';
+  import { showToast } from '$lib/toast.svelte';
   import { formatDateTime } from '$lib/format';
   import Toasts from '$lib/components/Toasts.svelte';
   import DeleteHistory from '$lib/components/DeleteHistory.svelte';
@@ -17,6 +19,40 @@
   const visibleTabs = $derived(
     TABS.filter((tab) => tab !== 'debug' || (debugQuery.data?.enabled ?? false)) as readonly TabId[]
   );
+
+  interface CapacityStatus {
+    verdict?: 'ok' | 'degraded' | 'insufficient';
+    total_usable?: number;
+    target_slots?: number;
+  }
+
+  const capacityQ = createQuery<CapacityStatus>({
+    load: (signal) => apiGet<CapacityStatus>('/api/egress/capacity', signal),
+    tags: () => ['vpn'],
+    initial: {}
+  });
+
+  let lastCapacityVerdict: CapacityStatus['verdict'] | null = null;
+  $effect(() => {
+    const verdict = capacityQ.data?.verdict;
+    if (!verdict) return;
+    if (lastCapacityVerdict === null) {
+      lastCapacityVerdict = verdict;
+      return;
+    }
+    if (verdict === lastCapacityVerdict) return;
+    const previous = lastCapacityVerdict;
+    lastCapacityVerdict = verdict;
+    const usable = capacityQ.data?.total_usable ?? 0;
+    const target = capacityQ.data?.target_slots ?? 6;
+    if (verdict === 'insufficient') {
+      showToast(t('free_models.capacity_alert_insufficient', { usable, target }), 'error');
+    } else if (verdict === 'degraded') {
+      showToast(t('free_models.capacity_alert_degraded', { usable, target }), 'warning');
+    } else if (previous !== 'ok') {
+      showToast(t('free_models.capacity_alert_restored', { usable, target }), 'success');
+    }
+  });
 
   // Capitalisé : Svelte 5 rend un composant via un identifiant en majuscule.
   let Current = $state<Component<Record<string, never>> | null>(null);

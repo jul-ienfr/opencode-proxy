@@ -171,6 +171,8 @@ Carte `Capacité` dans `Modèles Gratuits > Egress & providers` :
 
 - Chip `Capacité 6 / 6 OK` sur `Vue d’ensemble`, cliquable vers
   `Egress & providers` ; couleur selon le verdict.
+- Toast global quand le verdict change : `insuffisante`, `dégradée`,
+  `restaurée` (ex. 5/6 → 6/6 après réactivation d’un endpoint).
 - En-tête : titre + verdict (`OK`, `Dégradé`, `Insuffisant`).
 - Contrôles : cible `target_slots` (1–10), politique de réserve
   (`Redondance totale`, `Capacité partagée`, `Proportionnelle aux poids`),

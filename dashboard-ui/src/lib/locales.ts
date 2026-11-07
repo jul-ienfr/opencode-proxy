@@ -90,6 +90,12 @@ export const LOCALE: Record<Locale, LocaleTable> = {    en: {
         'free_models.capacity_apply': 'Apply',
         'free_models.capacity_saved': 'Capacity settings saved.',
         'free_models.capacity_save_error': 'Could not save capacity settings.',
+        'free_models.capacity_alert_degraded':
+          'Egress capacity degraded: {usable}/{target} stations.',
+        'free_models.capacity_alert_insufficient':
+          'Egress capacity insufficient: {usable}/{target} stations.',
+        'free_models.capacity_alert_restored':
+          'Egress capacity restored: {usable}/{target} stations.',
         'free_models.capacity_apply_nordvpn': 'Apply {n} NordVPN stations',
         'free_models.capacity_station_confirm':
           'Resize the NordVPN pool to {n} stations? Containers will be started/stopped.',
@@ -723,6 +729,12 @@ export const LOCALE: Record<Locale, LocaleTable> = {    en: {
         'free_models.capacity_apply': 'Appliquer',
         'free_models.capacity_saved': 'Réglages de capacité enregistrés.',
         'free_models.capacity_save_error': 'Impossible d’enregistrer les réglages de capacité.',
+        'free_models.capacity_alert_degraded':
+          'Capacité egress dégradée : {usable}/{target} stations.',
+        'free_models.capacity_alert_insufficient':
+          'Capacité egress insuffisante : {usable}/{target} stations.',
+        'free_models.capacity_alert_restored':
+          'Capacité egress restaurée : {usable}/{target} stations.',
         'free_models.capacity_apply_nordvpn': 'Appliquer {n} stations NordVPN',
         'free_models.capacity_station_confirm':
           'Redimensionner le pool NordVPN à {n} stations ? Des conteneurs seront démarrés/arrêtés.',
