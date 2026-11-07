@@ -133,7 +133,15 @@ ip_rotation:
   docker_events: true
   dual_station: false
   egress_allow_any_country: true
+  egress_capacity:
+    reserve_policy: full
+    target_slots: 6
   egress_failure_tick_interval: 15.0
+  egress_providers:
+  - warp
+  egress_strategy: fallback
+  egress_weights:
+    warp: 100
   enabled: true
   enforce_vpn_only: true
   fallback:
@@ -141,7 +149,6 @@ ip_rotation:
     fail_closed: true
     max_block_s: 0
     max_fallback_stations: 2
-    park_window_s: 1800
     order:
     - warp
     - warp_alt
@@ -150,6 +157,7 @@ ip_rotation:
     - proton
     - windscribe
     - vps_ipv6
+    park_window_s: 1800
     probe_interval_s: 300
     recovery_successes: 2
   free_exception_fallback: station-first
@@ -207,7 +215,7 @@ ip_rotation:
     soft_cooldown_sec: 600
     stream_metric: ttfb
     window: 20
-  max_free_attempts: 1
+  max_free_attempts: 6
   max_inflight_per_model_ip: 8
   model_global_429_min_ips: 3
   model_global_429_window_s: 60
@@ -278,7 +286,7 @@ ip_rotation:
   server_provider: nordvpn
   shared_rotation_file: logs/shared_rotation.json
   socks5_auto_rotate: true
-  socks5_fallback_enabled: false
+  socks5_fallback_enabled: true
   socks5_proxies:
   - block: ''
     container: ''
@@ -291,6 +299,7 @@ ip_rotation:
     managed: false
     password: null
     port: 11080
+    provider: warp
     username: null
   - block: 2a09:bac5:32d0:14dc::/64
     container: warp-test
@@ -303,6 +312,7 @@ ip_rotation:
     managed: true
     password: null
     port: 11080
+    provider: warp
     username: null
   - block: 2a09:bac5:32d6:26b4::/64
     container: warp-test2
@@ -315,6 +325,7 @@ ip_rotation:
     managed: true
     password: null
     port: 11085
+    provider: warp
     username: null
   - block: 2a09:bac5:32d4:14dc::/64
     container: warp-test3
@@ -327,6 +338,7 @@ ip_rotation:
     managed: true
     password: null
     port: 11086
+    provider: warp
     username: null
   - block: 2a09:bac1:27a0:2060::/64
     container: warp-test4
@@ -339,6 +351,7 @@ ip_rotation:
     managed: true
     password: null
     port: 11087
+    provider: warp
     username: null
   - block: 2a09:bac5:32d3:28a0::/64
     container: warp-restore1
@@ -351,6 +364,7 @@ ip_rotation:
     managed: true
     password: null
     port: 11103
+    provider: warp
     username: null
   - block: 2a09:bac5:32d6:be::/64
     container: warp-restore3
@@ -363,6 +377,7 @@ ip_rotation:
     managed: true
     password: null
     port: 11105
+    provider: warp
     username: null
   - block: ''
     container: ''
@@ -375,6 +390,7 @@ ip_rotation:
     managed: false
     password: null
     port: 11084
+    provider: static
     username: null
   socks5_proxy_port: 1080
   socks5_proxy_port_2: 1081
@@ -384,7 +400,7 @@ ip_rotation:
   state_file_2: logs/vpn_state2.json
   station_bad_ttl_s: 10
   station_connect_retry_interval_s: 30
-  station_count: 1
+  station_count: 6
   station_health:
     max_effective_age_s: 180
     shadow: true
@@ -896,17 +912,17 @@ ip_registry:
     - big-pickle
     transports:
     - station: 1
-      transport: auto
+      transport: openvpn-udp
     - station: 2
-      transport: auto
+      transport: openvpn-udp
     - station: 3
-      transport: auto
+      transport: openvpn-tcp
     - station: 4
-      transport: auto
+      transport: openvpn-udp
     - station: 5
-      transport: auto
+      transport: wireguard
     - station: 6
-      transport: auto
+      transport: openvpn-udp
     refresh_when_exhausted: true
     refresh_cooldown_s: 900
     refresh_min_available: 1
