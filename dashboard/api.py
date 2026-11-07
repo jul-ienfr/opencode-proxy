@@ -924,6 +924,9 @@ def _persist_vpn_config(updates: dict):
             key_map = {
                 "enabled": "enabled",
                 "proxy_mode": "proxy_mode",
+                "egress_providers": "egress_providers",
+                "egress_strategy": "egress_strategy",
+                "egress_weights": "egress_weights",
                 "dual_station": "dual_station",
                 "strict_free": "strict_free",
                 "free_substitution_policy": "free_substitution_policy",
@@ -3737,6 +3740,23 @@ def register_dashboard(
             # [Axe 3.1] socks5 backend state — the GUI's proxy table + the
             # auto-rotate toggle (never ship passwords).
             data["proxy_mode"] = _vpn_proxy_mode()
+            try:
+                from free.auto_egress import providers_from_mode
+
+                _sel = (getattr(config_settings, "IP_ROTATION", None) or {}).get(
+                    "egress_providers"
+                )
+                if not isinstance(_sel, list) or not _sel:
+                    _sel = providers_from_mode(str(data["proxy_mode"]))
+                data["egress_providers"] = list(_sel)
+                _ip_rot = getattr(config_settings, "IP_ROTATION", None) or {}
+                data["egress_strategy"] = str(
+                    _ip_rot.get("egress_strategy") or "fallback"
+                )
+                _w = _ip_rot.get("egress_weights")
+                data["egress_weights"] = dict(_w) if isinstance(_w, dict) else {}
+            except Exception:
+                data["egress_providers"] = []
             # [plan v10 §4 Lot 4] latence-adaptive per-station (moteur §3.6)
             try:
                 from latency_rotation import get_engine as _get_leng
@@ -4074,6 +4094,19 @@ def register_dashboard(
                 for _block in _QUALITY_BLOCK_SPEC:
                     if isinstance(_ip_rot.get(_block), dict):
                         cfg[_block] = dict(_ip_rot[_block])
+                from free.auto_egress import providers_from_mode
+
+                _providers = _ip_rot.get("egress_providers")
+                if not isinstance(_providers, list) or not _providers:
+                    _providers = providers_from_mode(str(cfg.get("proxy_mode") or "vpn"))
+                cfg["egress_providers"] = list(_providers)
+                cfg["egress_strategy"] = str(
+                    _ip_rot.get("egress_strategy") or "fallback"
+                )
+                _weights = _ip_rot.get("egress_weights")
+                cfg["egress_weights"] = (
+                    dict(_weights) if isinstance(_weights, dict) else {}
+                )
             except Exception:
                 pass
             return cfg
@@ -5286,22 +5319,83 @@ def register_dashboard(
         if err:
             return err
         body = await request.json()
-        mode = str(body.get("mode", "")).strip()
-        if mode not in ("vpn", "socks5", "direct"):
-            return {"error": f"mode doit être vpn|socks5|direct, reçu {mode!r}"}
+        try:
+            from free.auto_egress import (
+                derive_mode,
+                equal_weights,
+                normalize_providers,
+                normalize_weights,
+                providers_from_mode,
+            )
+
+            if "providers" in body:
+                providers = normalize_providers(body.get("providers"))
+                if not providers:
+                    return {"error": "au moins un provider est requis"}
+                mode = derive_mode(providers)
+            else:
+                mode = str(body.get("mode", "")).strip()
+                if mode not in ("vpn", "socks5", "direct", "auto_egress"):
+                    return {
+                        "error": f"mode doit être vpn|socks5|direct|auto_egress, reçu {mode!r}"
+                    }
+                providers = providers_from_mode(mode)
+            _ip_cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+            strategy = str(body.get("strategy") or "").strip().lower()
+            if strategy not in ("fallback", "balance"):
+                strategy = str(_ip_cfg.get("egress_strategy") or "fallback").strip().lower()
+            if strategy not in ("fallback", "balance"):
+                strategy = "fallback"
+            raw_weights = body.get("weights")
+            if isinstance(raw_weights, dict):
+                weights = normalize_weights(raw_weights, providers)
+            elif strategy == "balance":
+                weights = equal_weights(providers)
+            else:
+                _existing = _ip_cfg.get("egress_weights")
+                weights = dict(_existing) if isinstance(_existing, dict) else {}
+        except ValueError as exc:
+            return {"error": str(exc)}
         managers = _dashboard_managers()
         if not managers:
             return {"error": "gestionnaire VPN non initialisé"}
+        # Le moteur runtime reste `vpn` quand NordVPN est coché : les chemins
+        # free existants (`proxy_mode in ("vpn","socks5")`) continuent de
+        # fonctionner, et WARP/proxys servent de repli. Le GUI dérive la
+        # sélection multi-provider depuis `egress_providers`.
+        runtime_mode = "vpn" if mode == "auto_egress" else mode
         for m in managers:
-            m.proxy_mode = mode
-        _persist_vpn_config({"proxy_mode": mode})
+            m.proxy_mode = runtime_mode
+        _persist_vpn_config(
+            {
+                "proxy_mode": runtime_mode,
+                "egress_providers": providers,
+                "egress_strategy": strategy,
+                "egress_weights": weights,
+            }
+        )
+        if mode == "auto_egress":
+            # WARP/proxys servent de repli quand NordVPN n'a plus de station.
+            _persist_vpn_config({"socks5_fallback_enabled": True})
+        try:
+            _pool = _dashboard_pool()
+            if _pool is not None and hasattr(_pool, "set_egress_config"):
+                _pool.set_egress_config(
+                    providers=providers,
+                    strategy=strategy,
+                    weights=weights,
+                )
+            elif _pool is not None:
+                _pool._egress_providers = list(providers)
+        except Exception:
+            pass
         # When switching from direct → vpn/socks5, the boot gate
         # `vpn_manager.start()` only dials when proxy_mode==vpn, so
         # stations 2..N that were left disconnected in direct must be
         # resurrected now. Fire-and-forget start() for every enabled
         # manager that is not already connected; fail-soft (docker down
         # must not block the API).
-        if mode in ("vpn", "socks5"):
+        if runtime_mode in ("vpn", "socks5"):
             try:
                 # Ensure every configured station (station_count) is present.
                 # If the registry is short (e.g. boot direct with 1), rebuild
@@ -5319,7 +5413,7 @@ def register_dashboard(
                         # re-read after upscale
                         managers = _dashboard_managers()
                         for mm in managers:
-                            mm.proxy_mode = mode
+                            mm.proxy_mode = runtime_mode
                 except Exception as _e:
                     _debug(f"  [vpn] proxy-mode upscale check failed: {_e}")
                 # Now ensure every enabled manager is at least started.

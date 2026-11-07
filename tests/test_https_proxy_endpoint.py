@@ -35,7 +35,10 @@ class _Station:
 
 
 def _pool() -> fp.FreeIPPool:
-    return fp.FreeIPPool(_Station(1))
+    pool = fp.FreeIPPool(_Station(1))
+    # Chemin legacy : ne dépend pas de l'ordre Auto-Egress du config.yaml live.
+    pool._egress_providers = []
+    return pool
 
 
 def test_https_endpoint_builds_a_tls_connect_url():

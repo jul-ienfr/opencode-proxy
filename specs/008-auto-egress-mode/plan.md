@@ -28,6 +28,80 @@ différents. Chaque provider garde sa santé, son quota et sa rotation ; un
 down ne casse pas les autres. Le mode est fail-closed : pas de direct
 silencieux.
 
+### Implementation note (MVP 2026-11-07)
+
+Première livraison : le GUI expose les cases à cocher et persiste
+`egress_providers`. Le mode logique dérivé est `auto_egress` quand plusieurs
+providers sont cochés, mais le **runtime** reste `vpn` si NordVPN est coché
+(avec WARP/proxys en fallback) pour réutiliser les chemins free existants.
+Le sélecteur parallèle à score/poids (T005/T006/T009) reste à implémenter ;
+le MVP garantit déjà la sélection multi-provider, la persistance et le fallback.
+L'ordre des cases est la priorité runtime : le pool essaie le premier provider
+disponible (NordVPN, WARP, proxys), puis le suivant ; les flèches ↑/↓ du GUI
+persistent cet ordre dans `egress_providers`.
+
+## Deux modes de répartition
+
+Le GUI sépare clairement **deux modes** dans un segmented control :
+
+```text
+Stratégie :  [ Fallback / Priorité ]   [ Répartition / Charge ]
+```
+
+### Mode Fallback (priorité)
+
+```text
+☑ NordVPN   1er   ↑ ↓
+☑ WARP      2e    ↑ ↓
+☑ Proxys    3e    ↑ ↓
+☐ Direct    4e
+```
+
+- Le premier provider coché sert.
+- Les suivants ne servent qu'en cas d'échec/quota.
+- Pas de pourcentage : uniquement l'ordre.
+- Les flèches ↑/↓ sont le contrôle principal.
+
+### Mode Répartition (charge)
+
+```text
+☑ NordVPN   ● sain   [======== 50% ] 50%   ↑ ↓
+☑ WARP      ● sain   [====== 30% ]   30%   ↑ ↓
+☑ Proxys    ◐ quota  [==== 20% ]     20%   ↑ ↓
+☐ Direct
+
+Répartition : [████ NordVPN 50% ███ WARP 30% ██ Proxys 20%] 100 %
+[ Tout équilibrer ]  [ Priorité au premier ]
+```
+
+- Chaque provider coché a un poids 0–100 ; la somme est normalisée à 100 %.
+- Poids 0 = **secours** (utilisé seulement si les providers à poids positif
+  sont indisponibles), pas désactivé.
+- L'ordre ↑/↓ reste la priorité de failover et départage les poids égaux.
+- La barre empilée montre la répartition effective en temps réel.
+- « Tout équilibrer » répartit à parts égales entre 2, 3 ou 4 providers.
+- « Priorité au premier » remet 100/0/0 et bascule visuellement en Fallback.
+
+Direct peut être coché avec les autres : c'est un egress à part entière
+(IP de la machine, sans tunnel), ce qui permet la répartition à 4 voies.
+Le GUI affiche un avertissement explicite.
+
+### Sémantique
+
+| Contrôle | Signification |
+|---|---|
+| Case à cocher | Provider autorisé / désactivé |
+| Flèches ↑/↓ | Ordre de failover (qui essaye en premier) |
+| Slider (%) | Part de charge en mode Répartition |
+| Segmented control | Fallback (ordre seul) ou Répartition (poids) |
+| Barre empilée | Aperçu de la charge effective |
+
+Le runtime applique :
+- Fallback : l'ordre, sans tirage ;
+- Répartition : smooth weighted round-robin sur les providers sains ;
+- un provider à poids 0 est un secours ;
+- un provider down/quota est retiré et son poids effectif est redistribué.
+
 ## Technical Context
 
 **Language/Version**: Python 3.12+, TypeScript/Svelte 5, PowerShell 5.1/7

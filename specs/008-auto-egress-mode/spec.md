@@ -247,6 +247,28 @@ répartition et le provider de chaque requête récente.
 - **FR-027** Direct DOIT être une case explicite, désactivée par défaut, avec
   un avertissement ; coché seul il reproduit le mode direct, coché avec
   d'autres il est traité comme un provider à part entière.
+- **FR-028** L'opérateur DOIT choisir entre **deux modes** :
+  **Fallback/Priorité** (un provider après l'autre) et **Répartition**
+  (charge partagée entre 2, 3 ou 4 providers). Le mode Auto est une
+  évolution future, hors MVP.
+- **FR-029** En mode **Fallback**, seul l'ordre compte : le premier provider
+  coché sert, puis le deuxième en cas d'échec, puis le troisième, etc.
+  Aucun poids n'est affiché.
+- **FR-030** En mode **Répartition**, chaque provider coché DOIT avoir un
+  poids 0–100 ; la somme DOIT être normalisée à 100 %. Un poids 0 signifie
+  **secours** (utilisé seulement si aucun provider à poids positif n'est
+  disponible), pas désactivé.
+- **FR-031** En mode Répartition, l'ordre des cases (↑/↓) reste la priorité
+  de failover : il départage les providers de même poids et sert de repli.
+- **FR-032** Le GUI DOIT afficher un aperçu de la répartition (barre
+  empilée) et le total 100 % en temps réel.
+- **FR-033** Les presets « Équilibrer » (parts égales 2/3/4) et « Priorité au
+  premier » (100/0/0) DOIVENT être disponibles.
+- **FR-034** Le runtime DOIT utiliser l'ordre en mode Fallback, et un tirage
+  pondéré déterministe (smooth weighted round-robin) en mode Répartition.
+- **FR-035** Un provider sans quota/santé DOIT être signalé ; en mode
+  Répartition, son poids effectif peut être réduit sans changer le poids
+  configuré.
 
 ### Key Entities
 
@@ -281,6 +303,14 @@ répartition et le provider de chaque requête récente.
 - **SC-009** Les poids configurés sont respectés à **±10 points** sur 100
   requêtes.
 - **SC-010** Les caps de concurrence par provider sont respectés à **100 %**.
+- **SC-011** Mode Fallback : le premier provider sert tant qu'il est sain ;
+  le suivant ne sert qu'après échec/quota (**0** usage prématuré).
+- **SC-012** Mode Répartition à 2 providers : 50/50 à ±10 points sur 100
+  requêtes simulées.
+- **SC-013** Mode Répartition à 3 providers : 33/33/33 à ±10 points.
+- **SC-014** Mode Répartition à 4 providers : 25/25/25/25 à ±10 points.
+- **SC-015** Un provider à poids 0 n'est utilisé que si tous les providers à
+  poids positif sont indisponibles (**0** usage en temps normal).
 
 ## Assumptions
 

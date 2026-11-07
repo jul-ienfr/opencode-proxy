@@ -209,7 +209,98 @@ def test_proxy_mode_sets_all_managers_and_persists(ctx):
     assert resp == {"ok": True, "mode": "socks5"}
     assert s1.proxy_mode == "socks5"
     assert s2.proxy_mode == "socks5"
-    assert persisted == [{"proxy_mode": "socks5"}]
+    assert persisted == [
+        {
+            "proxy_mode": "socks5",
+            "egress_providers": ["warp"],
+            "egress_strategy": "fallback",
+            "egress_weights": {},
+        }
+    ]
+
+
+def test_proxy_mode_providers_derives_auto_egress(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    resp = _post(
+        fast,
+        "/api/vpn/proxy-mode",
+        {"providers": ["warp", "nordvpn"]},
+    )
+    assert resp == {"ok": True, "mode": "auto_egress"}
+    # Runtime = vpn (NordVPN primary, WARP fallback) ; l'ordre est persisté.
+    assert s1.proxy_mode == "vpn"
+    assert s2.proxy_mode == "vpn"
+    assert persisted[0] == {
+        "proxy_mode": "vpn",
+        "egress_providers": ["warp", "nordvpn"],
+        "egress_strategy": "fallback",
+        "egress_weights": {},
+    }
+
+
+def test_proxy_mode_balance_persists_normalized_weights(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    resp = _post(
+        fast,
+        "/api/vpn/proxy-mode",
+        {
+            "providers": ["nordvpn", "warp", "proxies"],
+            "strategy": "balance",
+            "weights": {"nordvpn": 2, "warp": 1, "proxies": 1},
+        },
+    )
+    assert resp == {"ok": True, "mode": "auto_egress"}
+    assert persisted[0]["egress_strategy"] == "balance"
+    assert persisted[0]["egress_weights"] == {
+        "nordvpn": 50,
+        "warp": 25,
+        "proxies": 25,
+    }
+
+
+def test_proxy_mode_balance_without_weights_equalizes(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    resp = _post(
+        fast,
+        "/api/vpn/proxy-mode",
+        {"providers": ["warp", "proxies"], "strategy": "balance"},
+    )
+    assert resp == {"ok": True, "mode": "socks5"}
+    assert persisted[0]["egress_weights"] == {"warp": 50, "proxies": 50}
+
+
+def test_proxy_mode_fallback_keeps_weights_but_ignores_them(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    resp = _post(
+        fast,
+        "/api/vpn/proxy-mode",
+        {
+            "providers": ["warp", "nordvpn"],
+            "strategy": "fallback",
+            "weights": {"warp": 10, "nordvpn": 90},
+        },
+    )
+    assert resp == {"ok": True, "mode": "auto_egress"}
+    assert persisted[0]["egress_strategy"] == "fallback"
+    assert persisted[0]["egress_weights"] == {"warp": 10, "nordvpn": 90}
+
+
+def test_proxy_mode_balance_four_providers_including_direct(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    providers = ["nordvpn", "warp", "proxies", "direct"]
+    resp = _post(
+        fast,
+        "/api/vpn/proxy-mode",
+        {"providers": providers, "strategy": "balance"},
+    )
+    assert resp == {"ok": True, "mode": "auto_egress"}
+    assert persisted[0]["egress_providers"] == providers
+    assert persisted[0]["egress_weights"] == {
+        "nordvpn": 25,
+        "warp": 25,
+        "proxies": 25,
+        "direct": 25,
+    }
 
 
 def test_proxy_mode_invalid_is_error(ctx):

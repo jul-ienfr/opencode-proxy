@@ -24,7 +24,7 @@ Aucun nouvel abonnement payant, aucun direct silencieux.
 **Purpose**: préparer la config, les libellés et les fixtures.
 
 - [ ] T001 Ajouter la section `ip_rotation.auto_egress` (providers, weights, caps, hedge, direct, diversity, sticky) dans `config.yaml`.
-- [ ] T002 [P] Ajouter les libellés de la section « Egress providers » (NordVPN, WARP, Proxys, Direct, avertissement, zéro provider) dans `dashboard-ui/src/lib/locales.ts` (FR + EN).
+- [X] T002 [P] Ajouter les libellés de la section « Egress providers » (NordVPN, WARP, Proxys, Direct, avertissement, zéro provider) dans `dashboard-ui/src/lib/locales.ts` (FR + EN).
 - [ ] T003 [P] Créer les fixtures providers (`warp`, `nordvpn`, `proxy`, `down`, `403`, `429`) dans `tests/fixtures/auto_egress_providers.py`.
 
 ---
@@ -65,11 +65,11 @@ sélection.
 
 ### Implementation for User Story 1
 
-- [ ] T015 [US1] Remplacer le radio group par une section de cases à cocher dans `dashboard-ui/src/pages/vpn/VpnStatus.svelte`.
-- [ ] T016 [US1] Étendre `POST /api/vpn/proxy-mode` pour accepter `providers: [...]` et dériver `vpn`/`socks5`/`direct`/`auto_egress` dans `dashboard/api.py` et `opencode.py`.
-- [ ] T017 [US1] Persister/restaurer `egress.providers` dans `config.yaml` ; convertir le legacy `proxy_mode` en liste au boot.
+- [X] T015 [US1] Remplacer le radio group par une section de cases à cocher dans `dashboard-ui/src/pages/vpn/VpnStatus.svelte`.
+- [X] T016 [US1] Étendre `POST /api/vpn/proxy-mode` pour accepter `providers: [...]` et dériver `vpn`/`socks5`/`direct`/`auto_egress` dans `dashboard/api.py` et `opencode.py`.
+- [X] T017 [US1] Persister/restaurer `egress.providers` dans `config.yaml` ; convertir le legacy `proxy_mode` en liste au boot.
 - [ ] T018 [US1] Implémenter le drain des requêtes en vol avant changement de sélection dans `free/pool.py`.
-- [ ] T019 [US1] Valider zéro provider (refus GUI/API) et afficher un avertissement sur Direct dans `dashboard-ui/src/pages/vpn/VpnStatus.svelte`.
+- [X] T019 [US1] Valider zéro provider (refus GUI/API) et afficher un avertissement sur Direct dans `dashboard-ui/src/pages/vpn/VpnStatus.svelte`.
 
 **Checkpoint**: US1 livrable seule (mode activable, sans sélection multi-provider complète).
 
@@ -186,6 +186,21 @@ répartition et les caps.
 - [ ] T059 [P] Test de compatibilité legacy : `proxy_mode` existant converti en liste au boot dans `tests/test_auto_egress_mode.py`.
 - [ ] T060 [P] Test Direct explicite : case désactivée par défaut, avertissement, coché seul = direct, coché avec d'autres = provider dans `tests/test_auto_egress_direct.py`.
 - [ ] T061 Commit final et push ; mettre à jour `.specify/feature.json` si nécessaire.
+
+---
+
+## Phase 9: Fallback vs Répartition (poids de charge)
+
+**Goal**: séparer clairement le mode ordre/failover du mode charge répartie.
+
+- [x] T062 Ajouter `egress_strategy` (`fallback|balance`) et `egress_weights` à `config.yaml` et `config/settings.py`.
+- [x] T063 Implémenter `normalize_weights`, `equal_weights`, `SmoothWeightedRoundRobin` dans `free/auto_egress.py`.
+- [x] T064 Brancher le mode Fallback (ordre seul) et Répartition (SWRR) dans `free/pool.py`, avec renormalisation si provider down/quota.
+- [x] T065 Ajouter le segmented control Fallback/Répartition dans `dashboard-ui/src/pages/vpn/VpnStatus.svelte`.
+- [x] T066 Ajouter les sliders 0–100, le total 100 %, la barre empilée et les presets « Tout équilibrer » / « Priorité au premier ».
+- [x] T067 Persister `egress_strategy` + `egress_weights` via `dashboard/api.py` et les exposer dans `/api/vpn-status`.
+- [x] T068 Tests : fallback 100 % premier, 50/50, 33/33/33, 25/25/25/25, poids 0 secours, provider down, persistance.
+- [x] T069 Direct est combinable avec les autres providers (4 voies) ; `derive_mode` reste cohérent (`auto_egress` avec NordVPN, `socks5` sinon).
 
 ---
 

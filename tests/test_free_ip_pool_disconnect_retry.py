@@ -74,6 +74,9 @@ class _StubStation:
 
 def _pool(st1, st2=None, *, bad_ttl=60):
     pool = FreeIPPool(st1, st2)
+    # Ces tests couvrent le chemin legacy VPN/SOCKS5 : l'ordre Auto-Egress
+    # vient du config.yaml live et ne doit pas changer leur scénario.
+    pool._egress_providers = []
     pool._bad_ttl = float(bad_ttl)
     # Stub the background-rotation launcher: keep tests free of loop tasks.
     pool.rotated = []

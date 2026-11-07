@@ -51,6 +51,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
+from free.auto_egress import SmoothWeightedRoundRobin, normalize_weights
 from free.best_ip import BestIpSelector
 from free.egress_provider import block_for_egress, family_for_egress
 from free.ip_quota import IpQuotaRegistry, QuotaProfile
@@ -877,6 +878,27 @@ class FreeIPPool:
         except Exception:
             self._fallback_policy = None
         self._last_fallback_decision: dict[str, Any] = {}
+        try:
+            self._egress_providers = [
+                str(p).strip().lower()
+                for p in (_yaml_get("ip_rotation", "egress_providers", []) or [])
+                if str(p).strip()
+            ]
+        except Exception:
+            self._egress_providers = []
+        try:
+            self._egress_strategy = str(
+                _yaml_get("ip_rotation", "egress_strategy", "fallback") or "fallback"
+            ).strip().lower()
+            if self._egress_strategy not in ("fallback", "balance"):
+                self._egress_strategy = "fallback"
+            self._egress_weights = dict(
+                _yaml_get("ip_rotation", "egress_weights", {}) or {}
+            )
+        except Exception:
+            self._egress_strategy = "fallback"
+            self._egress_weights = {}
+        self._egress_swrr = SmoothWeightedRoundRobin()
 
         # [free_parallel] Deux routings découplés — (B) Stations free
         # enabled=false → pas de parallélisation (sticky), routing
@@ -4112,6 +4134,149 @@ class FreeIPPool:
         per["last_connect_attempt"] = now
         self._launch_rotation(station, forced_pool=forced_pool)
 
+    async def _serve_socks5(self, ep, model: str | None):
+        """Comptabilise et retourne un endpoint SOCKS5 (WARP/proxy)."""
+        if getattr(ep, "ipv6", False) and not getattr(ep, "_egress_probe_attempted", False):
+            ep._egress_probe_attempted = True
+            try:
+                await asyncio.to_thread(ep.refresh_egress, 6.0)
+                if ep.egress_ip:
+                    logger.info("[free-ip] ipv6 egress resolved %s", ep.egress_ip)
+            except Exception:
+                logger.debug(
+                    "[free-ip] ipv6 egress probe failed for %s", ep.pid, exc_info=True
+                )
+        self._active_station = ep
+        per = self._per_station(ep)
+        if (
+            per["last_quota_per_ip"] is not None
+            and per["last_quota_per_ip"] != ep._quota_per_ip
+        ):
+            logger.info(
+                "[free-ip] socks5 quota_per_ip changed %s → %s — resetting request counter",
+                per["last_quota_per_ip"],
+                ep._quota_per_ip,
+            )
+            per["request_count"] = 0
+        per["last_quota_per_ip"] = ep._quota_per_ip
+        async with self._pool_pick_lock:
+            per["request_count"] += 1
+        self._note_model_request(model, ep)
+        self._dirty_state = True
+        ep.note_free_request()
+        ip = ep.current_ip or ep.pid
+        if ip not in per["ip_stats"]:
+            per["ip_stats"][ip] = {
+                "requests": 0,
+                "start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "server": "socks5",
+            }
+        per["ip_stats"][ip]["requests"] += 1
+        self._socks5_current = ep
+        return ep.socks5_url, ep
+
+    def _provider_matches(self, endpoint, provider: str) -> bool:
+        name = str(getattr(endpoint, "provider", "") or "").strip().lower()
+        if provider == "warp":
+            return name == "warp" or (not name and bool(getattr(endpoint, "managed", False)))
+        if provider == "proxies":
+            return name != "warp"
+        return True
+
+    def _socks5_provider_available(self, provider: str, excluded=None) -> bool:
+        excluded = excluded or set()
+        for ep in self._socks5_enabled_eps():
+            if ep in excluded or not self._provider_matches(ep, provider):
+                continue
+            try:
+                if self._socks5_usable(ep, exclude_approaching=False):
+                    return True
+            except Exception:
+                return True
+        return False
+
+    def _socks5_pick_for(
+        self, provider: str | None, *, excluded=None, conversation_key: str | None = None
+    ):
+        """Choisit un endpoint SOCKS5 du provider demandé (warp/proxies)."""
+        if provider not in ("warp", "proxies"):
+            return self._socks5_pick(
+                excluded=excluded, conversation_key=conversation_key
+            )
+        key = str(conversation_key or "").strip()
+        excluded_set = set(excluded or ())
+        for _ in range(len(self._socks5_enabled_eps()) + 1):
+            ep = self._socks5_pick(
+                excluded=excluded_set, conversation_key=conversation_key
+            )
+            if ep is None:
+                return None
+            if self._provider_matches(ep, provider):
+                return ep
+            excluded_set.add(ep)
+            if key:
+                self._socks5_affinity.pop(key, None)
+            conversation_key = None
+        return None
+
+    def set_egress_config(
+        self,
+        *,
+        providers: list[str] | None = None,
+        strategy: str | None = None,
+        weights: dict[str, int] | None = None,
+    ) -> None:
+        if providers is not None:
+            self._egress_providers = [
+                str(p or "").strip().lower() for p in providers if str(p or "").strip()
+            ]
+        if strategy in ("fallback", "balance"):
+            self._egress_strategy = strategy
+        if isinstance(weights, dict):
+            self._egress_weights = {
+                str(k).strip().lower(): max(0, int(v))
+                for k, v in weights.items()
+                if str(k).strip()
+            }
+        self._egress_swrr.reset()
+
+    def _available_egress_providers(
+        self, excluded=None, model: str | None = None
+    ) -> list[str]:
+        out: list[str] = []
+        for name in self._egress_providers:
+            if name == "nordvpn":
+                if self.usable_station_count_excluding(excluded, model=model) > 0:
+                    out.append(name)
+            elif name in ("warp", "proxies"):
+                if self._socks5_provider_available(name, excluded):
+                    out.append(name)
+            elif name == "direct":
+                out.append(name)
+        return out
+
+    def _select_egress_provider(self, available: list[str]) -> str | None:
+        if not available:
+            return None
+        if self._egress_strategy != "balance" or len(available) == 1:
+            return available[0]
+        weights = normalize_weights(self._egress_weights, available)
+        return self._egress_swrr.pick(weights) or available[0]
+
+    def _egress_order_prefers_socks5(self) -> bool:
+        """Auto-Egress : WARP/proxys sont-ils prioritaires sur NordVPN ?
+
+        L'ordre GUI (`egress_providers`) est la priorité : si le premier
+        provider est WARP/proxys et que NordVPN est aussi coché, on tente
+        d'abord le backend SOCKS5, avec NordVPN en repli.
+        """
+        order = [
+            str(p or "").strip().lower()
+            for p in (getattr(self, "_egress_providers", None) or [])
+            if str(p or "").strip()
+        ]
+        return bool(order and order[0] in ("warp", "proxies") and "nordvpn" in order)
+
     async def on_request(
         self,
         forced_pool=None,
@@ -4147,7 +4312,7 @@ class FreeIPPool:
 
         await self.ensure_connected()
 
-        if self._vpn.proxy_mode == "socks5":
+        if self._vpn.proxy_mode in ("socks5", "auto_egress"):
             try:
                 logger.info(
                     "[warp-rotate] on_request enabled=%s mode=%s",
@@ -4174,7 +4339,25 @@ class FreeIPPool:
         if model:
             self._last_model = str(model)
 
-        mode = self._vpn.proxy_mode
+        runtime_mode = self._vpn.proxy_mode
+        mode = runtime_mode
+        preferred_socks: str | None = None
+        order = [
+            str(p or "").strip().lower()
+            for p in (getattr(self, "_egress_providers", None) or [])
+            if str(p or "").strip()
+        ]
+        if runtime_mode in ("vpn", "auto_egress") and order:
+            available = self._available_egress_providers(excluded, model=model)
+            chosen = self._select_egress_provider(available)
+            if chosen == "nordvpn":
+                mode = "vpn"
+                preferred_socks = None
+            elif chosen in ("warp", "proxies"):
+                mode = "socks5"
+                preferred_socks = chosen
+            elif chosen == "direct":
+                mode = "direct"
         if mode == "direct":
             # [proxy_mode] all free traffic goes direct (residential IP) —
             # uniform with muse-spark: no tunnel attempt. Debug-level to
@@ -4185,55 +4368,22 @@ class FreeIPPool:
             # [2026-11-06] Affinité par conversation ; le round-robin des
             # nouvelles conversations n'est actif que si la GUI le demande
             # (`_socks5_spread_enabled` : toggle SOCKS5 + free_parallel/routing).
-            ep = self._socks5_pick(excluded=excluded, conversation_key=conversation_key)
-            if ep is None:
+            ep = self._socks5_pick_for(
+                preferred_socks,
+                excluded=excluded,
+                conversation_key=conversation_key,
+            )
+            if ep is not None:
+                return await self._serve_socks5(ep, model)
+            if runtime_mode in ("vpn", "auto_egress") and order:
+                # Auto-Egress : le provider SOCKS5 prioritaire n'a rien donné
+                # → on retombe sur le provider suivant (NordVPN).
+                mode = runtime_mode
+            else:
                 return None, None
-            # [2026-11-06] Station IPv6 sans egress configuré : une seule
-            # sonde forcée IPv6 pour keyer le ledger sur le vrai /64. Un
-            # egress configuré (egress_ip) évite la sonde.
-            if (
-                getattr(ep, "ipv6", False)
-                and not getattr(ep, "_egress_probe_attempted", False)
-            ):
-                ep._egress_probe_attempted = True
-                try:
-                    await asyncio.to_thread(ep.refresh_egress, 6.0)
-                    if ep.egress_ip:
-                        logger.info("[free-ip] ipv6 egress resolved %s", ep.egress_ip)
-                except Exception:
-                    logger.debug(
-                        "[free-ip] ipv6 egress probe failed for %s", ep.pid, exc_info=True
-                    )
-            self._active_station = ep
-            per = self._per_station(ep)
-            # Hot-reload guard (CRITIC(11)): quota_per_ip changed via config
-            # → the counter refers to the OLD quota — reset lazily.
-            if per["last_quota_per_ip"] is not None and per["last_quota_per_ip"] != ep._quota_per_ip:
-                logger.info(
-                    "[free-ip] socks5 quota_per_ip changed %s → %s — resetting request counter",
-                    per["last_quota_per_ip"],
-                    ep._quota_per_ip,
-                )
-                per["request_count"] = 0
-            per["last_quota_per_ip"] = ep._quota_per_ip
-            async with self._pool_pick_lock:
-                per["request_count"] += 1
-            self._note_model_request(model, ep)
-            self._dirty_state = True
-            ep.note_free_request()
-            ip = ep.current_ip or ep.pid
-            if ip not in per["ip_stats"]:
-                per["ip_stats"][ip] = {
-                    "requests": 0,
-                    "start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "server": "socks5",
-                }
-            per["ip_stats"][ip]["requests"] += 1
-            self._socks5_current = ep
-            return ep.socks5_url, ep
 
         if (
-            mode == "vpn"
+            mode in ("vpn", "auto_egress")
             and self._socks5_fallback_enabled
             and forced_pool is None
             and self.usable_station_count_excluding(excluded, model=model) == 0
@@ -4252,7 +4402,7 @@ class FreeIPPool:
                 return ep.socks5_url, ep
 
         if (
-            mode == "vpn"
+            mode in ("vpn", "auto_egress")
             and self._https_fallback_enabled
             and forced_pool is None
             and self.usable_station_count_excluding(excluded, model=model) == 0
@@ -4268,7 +4418,7 @@ class FreeIPPool:
                 self._socks5_current = ep
                 return ep.socks5_url, ep
 
-        if mode == "vpn":
+        if mode in ("vpn", "auto_egress"):
             # [v6 P1-4] pick+increment race — lock <50µs, pas sur ensure_connected
             async with self._pool_pick_lock:
                 if excluded:
