@@ -13,6 +13,7 @@ def test_defaults_are_free_first_and_fail_closed():
     assert cfg.max_fallback_stations == 2
     assert cfg.fail_closed is True
     assert cfg.max_block_s == 0
+    assert cfg.park_window_s == 1800
 
 
 def test_order_filters_unknown_and_deduplicates():

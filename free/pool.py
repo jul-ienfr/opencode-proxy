@@ -2657,11 +2657,36 @@ class FreeIPPool:
             return False
         return rotator.request_rotation(endpoint, self, self._persist_socks5_egress)
 
+    def _other_managed_usable(self, endpoint, ledger) -> bool:
+        """Au moins un autre endpoint managé est encore servable.
+
+        Sert à la politique park : on ne parke pas si l'endpoint est le seul
+        disponible. Lecture seule, fail-open (True) en cas d'erreur.
+        """
+        try:
+            for other in self._socks5_enabled_eps():
+                if other is endpoint or not getattr(other, "managed", False):
+                    continue
+                if not self._socks5_usable(other, exclude_approaching=False):
+                    continue
+                try:
+                    ip = self._ledger_ip(other)
+                    if ip and ledger is not None and ledger.is_exhausted(ip, None):
+                        continue
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            return True
+        return False
+
     def rotate_exhausted_managed(self) -> int:
         """Déclenche la rotation des WARP managés dont le bucket est épuisé.
 
         Appelé avant la sélection : même si toutes les stations sont déjà
         marquées bad (donc aucune requête ne les touche), la rotation part.
+        Politique park : si le reset est proche et qu'un autre endpoint est
+        servable, on laisse le ledger parker le bloc au lieu de recréer.
         """
         if not self.socks5_mode:
             self._last_rotation_scan = []
@@ -2669,6 +2694,12 @@ class FreeIPPool:
         started = 0
         scan: list[dict[str, Any]] = []
         eps = self._socks5_enabled_eps()
+        try:
+            _fallback_cfg = _yaml_get("ip_rotation", "fallback", {}) or {}
+            _park_window = float(_fallback_cfg.get("park_window_s", 1800) or 1800)
+        except Exception:
+            _park_window = 1800.0
+        _now_wall = time.time()
         managed = [ep for ep in eps if getattr(ep, "managed", False)]
         logger.debug(
             "[warp-rotate] scan mode=%s eps=%d managed=%d",
@@ -2723,6 +2754,8 @@ class FreeIPPool:
         for ep in managed:
             trial_dead = str(getattr(ep, "label", "") or "") in _trial_dead_labels
             duplicate = str(getattr(ep, "label", "") or "") in duplicate_labels
+            ledger = None
+            raw = ""
             try:
                 ledger = self._get_ledger()
                 raw = self._ledger_ip(ep)
@@ -2745,6 +2778,18 @@ class FreeIPPool:
                 selectable = bool(self._socks5_usable(ep, exclude_approaching=False))
             except Exception:
                 selectable = True
+            reset_at = 0.0
+            parked = False
+            if exhausted and ledger is not None and raw:
+                try:
+                    reset_at = float(ledger.reset_at(raw, None) or 0.0)
+                except Exception:
+                    reset_at = 0.0
+                parked = bool(
+                    reset_at > _now_wall
+                    and (reset_at - _now_wall) <= _park_window
+                    and self._other_managed_usable(ep, ledger)
+                )
             logger.debug(
                 "[warp-rotate] candidate label=%s exhausted=%s model_blocked=%s "
                 "trial_dead=%s duplicate_block=%s selectable=%s bad_cause=%s",
@@ -2764,10 +2809,24 @@ class FreeIPPool:
                 "duplicate_block": bool(duplicate),
                 "selectable": bool(selectable),
                 "bad_cause": bad_cause,
+                "parked": bool(parked),
+                "reset_at": (
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset_at))
+                    if reset_at > 0
+                    else None
+                ),
+                "next_probe_at": (
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset_at))
+                    if parked and reset_at > 0
+                    else None
+                ),
                 "requested": False,
                 "cause": None,
             }
             scan.append(entry)
+            if parked:
+                entry["cause"] = "parked"
+                continue
             # [mimo 2026-11-06] ``rotation_rejected`` / ``post_rotation_probe``
             # signifient que la dernière IP a été refusée par la sonde quota.
             # Sans ce trigger, la station reste « selectable » sur un bloc dont

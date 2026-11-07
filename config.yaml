@@ -92,7 +92,7 @@ stations:
 ip_rotation:
   auto_flip_cooldown_min: 5
   auto_hetero_boot: false
-  auto_max_free_attempts: false
+  auto_max_free_attempts: true
   auto_mixed_stacks: false
   auto_ov_fail_threshold: 1
   auto_ov_return_min: 60
@@ -136,6 +136,22 @@ ip_rotation:
   egress_failure_tick_interval: 15.0
   enabled: true
   enforce_vpn_only: true
+  fallback:
+    cooldown_s: 900
+    fail_closed: true
+    max_block_s: 0
+    max_fallback_stations: 2
+    park_window_s: 1800
+    order:
+    - warp
+    - warp_alt
+    - isp_ipv6
+    - oracle
+    - proton
+    - windscribe
+    - vps_ipv6
+    probe_interval_s: 300
+    recovery_successes: 2
   free_exception_fallback: station-first
   free_model_spread: false
   free_parallel:
@@ -191,13 +207,13 @@ ip_rotation:
     soft_cooldown_sec: 600
     stream_metric: ttfb
     window: 20
-  max_free_attempts: 5
+  max_free_attempts: 1
   max_inflight_per_model_ip: 8
   model_global_429_min_ips: 3
   model_global_429_window_s: 60
   model_global_cooldown_s: 60
   model_slot_wait_s: 3
-  on_429_action: cooldown
+  on_429_action: rotate
   ov_auth_backoff_max_s: 600
   ov_auth_backoff_s: 90
   ov_auth_cascade_cooldown_min: 30
@@ -215,13 +231,13 @@ ip_rotation:
   pin_widen_resets: 6
   pin_widen_stagger_s: 60
   post_rotation_probe:
-    enabled: false
-    max_attempts: 2
-    max_tokens: 4
+    enabled: true
+    max_attempts: 1
+    max_tokens: 8
   proactive_tick_s: 60
   proxy_mode: socks5
   quality_preselection:
-    enabled: true
+    enabled: false
     fast_tps: 55.0
     max_load: 80
     slow_tps: 25.0
@@ -264,102 +280,102 @@ ip_rotation:
   socks5_auto_rotate: true
   socks5_fallback_enabled: false
   socks5_proxies:
-  - host: 127.0.0.1
-    port: 11080
-    username: null
-    password: null
-    enabled: true
-    label: warp-ipv4
-    ipv6: false
-    egress_ip: ''
-    managed: false
+  - block: ''
     container: ''
+    egress_ip: ''
+    enabled: false
+    host: 127.0.0.1
     image: ''
-    block: ''
-  - host: 127.0.0.1
+    ipv6: false
+    label: warp-ipv4
+    managed: false
+    password: null
     port: 11080
     username: null
-    password: null
-    enabled: true
-    label: warp-ipv6
-    ipv6: true
-    egress_ip: 2a09:bac5:32d7:1519::21a:22
-    managed: true
+  - block: 2a09:bac5:32d0:14dc::/64
     container: warp-test
+    egress_ip: 2a09:bac5:32d0:14dc::214:83
+    enabled: true
+    host: 127.0.0.1
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d7:1519::/64
-  - host: 127.0.0.1
+    ipv6: true
+    label: warp-ipv6
+    managed: true
+    password: null
+    port: 11080
+    username: null
+  - block: 2a09:bac5:32d6:26b4::/64
+    container: warp-test2
+    egress_ip: 2a09:bac5:32d6:26b4::3db:f
+    enabled: true
+    host: 127.0.0.1
+    image: caomingjun/warp:latest
+    ipv6: true
+    label: warp-ipv6-2
+    managed: true
+    password: null
     port: 11085
     username: null
-    password: null
+  - block: 2a09:bac5:32d4:14dc::/64
+    container: warp-test3
+    egress_ip: 2a09:bac5:32d4:14dc::214:bf
     enabled: true
-    label: warp-ipv6-2
-    ipv6: true
-    egress_ip: 2a09:bac5:32d3:be::13:277
-    managed: true
-    container: warp-test2
+    host: 127.0.0.1
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d3:be::/64
-  - host: 127.0.0.1
+    ipv6: true
+    label: warp-ipv6-3
+    managed: true
+    password: null
     port: 11086
     username: null
-    password: null
+  - block: 2a09:bac1:27a0:2060::/64
+    container: warp-test4
+    egress_ip: 2a09:bac1:27a0:2060::219:9e
     enabled: true
-    label: warp-ipv6-3
-    ipv6: true
-    egress_ip: 2a09:bac5:32d3:14e6::215:c9
-    managed: true
-    container: warp-test3
+    host: 127.0.0.1
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d3:14e6::/64
-  - host: 127.0.0.1
+    ipv6: true
+    label: warp-ipv6-4
+    managed: true
+    password: null
     port: 11087
     username: null
-    password: null
+  - block: 2a09:bac5:32d3:28a0::/64
+    container: warp-restore1
+    egress_ip: 2a09:bac5:32d3:28a0::40c:3a
     enabled: true
-    label: warp-ipv6-4
-    ipv6: true
-    egress_ip: 2a09:bac5:32d4:be::13:2c0
-    managed: true
-    container: warp-test4
+    host: 127.0.0.1
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d4:be::/64
-  - host: 127.0.0.1
+    ipv6: true
+    label: warp-restore1
+    managed: true
+    password: null
     port: 11103
     username: null
-    password: null
+  - block: 2a09:bac5:32d6:be::/64
+    container: warp-restore3
+    egress_ip: 2a09:bac5:32d6:be::13:283
     enabled: true
-    label: warp-restore1
-    ipv6: true
-    egress_ip: 2a09:bac1:27e0:2060::13:2c9
-    managed: true
-    container: warp-restore1
+    host: 127.0.0.1
     image: caomingjun/warp:latest
-    block: 2a09:bac1:27e0:2060::/64
-  - host: 127.0.0.1
+    ipv6: true
+    label: warp-restore3
+    managed: true
+    password: null
     port: 11105
     username: null
+  - block: ''
+    container: ''
+    egress_ip: ''
+    enabled: false
+    host: 127.0.0.1
+    image: ''
+    ipv6: false
+    label: direct
+    managed: false
     password: null
-    enabled: true
-    label: warp-restore3
-    ipv6: true
-    egress_ip: 104.28.230.203
-    managed: true
-    container: warp-restore3
-    image: caomingjun/warp:latest
-    block: 104.28.230.203/32
-  - host: 127.0.0.1
     port: 11084
     username: null
-    password: null
-    enabled: false
-    label: direct
-    ipv6: false
-    egress_ip: ''
-    managed: false
-    container: ''
-    image: ''
-    block: ''
   socks5_proxy_port: 1080
   socks5_proxy_port_2: 1081
   socks_catchup_s: 90
@@ -436,21 +452,6 @@ ip_rotation:
   wg_canary_poll_interval_s: 4
   wg_churn_fallback: true
   wg_return_enabled: true
-  fallback:
-    order:
-    - warp
-    - warp_alt
-    - isp_ipv6
-    - oracle
-    - proton
-    - windscribe
-    - vps_ipv6
-    max_fallback_stations: 2
-    probe_interval_s: 300
-    recovery_successes: 2
-    cooldown_s: 900
-    max_block_s: 0
-    fail_closed: true
 geo:
   enabled: true
   version: 1
@@ -1153,9 +1154,11 @@ models:
     protocol: gemini
   gemini-3.8-flash:
     protocol: gemini
-  pulse-alpha-free:
-    protocol: openai
   crouton-alpha-free:
     protocol: openai
   hy4:
+    protocol: openai
+  iceman-free:
+    protocol: openai
+  inkling-2-small-free:
     protocol: openai

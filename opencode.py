@@ -23180,6 +23180,18 @@ async def api_free_egress_diag():
             )
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+    # [feature 007] Expose l'état park/reset du dernier scan de rotation.
+    try:
+        _scan = {
+            str(item.get("label") or ""): item
+            for item in (pool.rotation_scan() if hasattr(pool, "rotation_scan") else [])
+        }
+        for row in rows:
+            item = _scan.get(str(row.get("label") or ""), {})
+            for key in ("parked", "reset_at", "next_probe_at"):
+                row[key] = item.get(key)
+    except Exception:
+        pass
     try:
         dead = sorted(str(getattr(st, "label", getattr(st, "_station", "?"))) for st in _trial_dead_stations(model))
     except Exception:

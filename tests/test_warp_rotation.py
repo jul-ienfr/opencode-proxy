@@ -253,6 +253,11 @@ class ProactivePool:
     def _ledger_ip(self, endpoint):
         return endpoint.egress_ip or ""
 
+    def _other_managed_usable(self, endpoint, ledger):
+        from free.pool import FreeIPPool
+
+        return FreeIPPool._other_managed_usable(self, endpoint, ledger)
+
     def _ledger_usable(self, model, endpoint):
         return False, "daily-bucket-exhausted"
 
@@ -302,6 +307,77 @@ def test_rotate_exhausted_managed_rotates_model_blocked_endpoint():
     count = FreeIPPool.rotate_exhausted_managed(pool)
     assert count == 1
     assert pool.calls == [("warp-restore1", "model_ip")]
+
+
+def test_rotate_exhausted_managed_parks_near_reset_with_other_usable():
+    from free.pool import FreeIPPool
+
+    class ParkPool(ProactivePool):
+        def _get_ledger(self):
+            class _Ledger:
+                def is_exhausted(self, raw, model):
+                    return str(raw).startswith("2a09:bac1:27a0")
+
+                def reset_at(self, raw, model):
+                    return time.time() + 600.0
+
+            return _Ledger()
+
+    first = _endpoint(label="warp-restore1", container="warp-restore1")
+    second = _endpoint(
+        label="warp-restore3",
+        container="warp-restore3",
+        index=1,
+        egress_ip="2a09:bac1:2780:2060::10:1",
+        block="2a09:bac1:2780:2060::/64",
+    )
+    pool = ParkPool([first, second])
+    count = FreeIPPool.rotate_exhausted_managed(pool)
+    assert count == 0
+    assert pool.calls == []
+    assert FreeIPPool.rotation_scan(pool)[0]["cause"] == "parked"
+
+
+def test_rotate_exhausted_managed_rotates_far_reset():
+    from free.pool import FreeIPPool
+
+    class FarPool(ProactivePool):
+        def _get_ledger(self):
+            class _Ledger:
+                def is_exhausted(self, raw, model):
+                    return True
+
+                def reset_at(self, raw, model):
+                    return time.time() + 7200.0
+
+            return _Ledger()
+
+    first = _endpoint(label="warp-restore1", container="warp-restore1")
+    pool = FarPool([first])
+    count = FreeIPPool.rotate_exhausted_managed(pool)
+    assert count == 1
+    assert pool.calls == [("warp-restore1", "exhausted")]
+
+
+def test_rotate_exhausted_managed_rotates_near_reset_without_other():
+    from free.pool import FreeIPPool
+
+    class AlonePool(ProactivePool):
+        def _get_ledger(self):
+            class _Ledger:
+                def is_exhausted(self, raw, model):
+                    return True
+
+                def reset_at(self, raw, model):
+                    return time.time() + 600.0
+
+            return _Ledger()
+
+    first = _endpoint(label="warp-restore1", container="warp-restore1")
+    pool = AlonePool([first])
+    count = FreeIPPool.rotate_exhausted_managed(pool)
+    assert count == 1
+    assert pool.calls == [("warp-restore1", "exhausted")]
 
 
 def test_rotate_exhausted_managed_retries_rejected_block():

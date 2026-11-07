@@ -67,17 +67,17 @@ absence d'utilisation avant reset, puis `200` sur un bloc frais.
 ### Tests for User Story 1
 
 - [ ] T015 [P] [US1] Test park strict : `tests/test_quota_park.py` — aucune utilisation avant `reset_at`, probe après reset.
-- [ ] T016 [P] [US1] Test rotation vs park : reset proche + autre bloc → park ; reset lointain + capacité manquante → rotate.
-- [ ] T017 [P] [US1] Test doublon WARP : `tests/test_warp_rotation.py` — deux endpoints même `/64`, un seul servi.
+- [X] T016 [P] [US1] Test rotation vs park : reset proche + autre bloc → park ; reset lointain + capacité manquante → rotate.
+- [X] T017 [P] [US1] Test doublon WARP : `tests/test_warp_rotation.py` — deux endpoints même `/64`, un seul servi.
 - [ ] T018 [P] [US1] Test non-régression : un `429` quota ne bloque pas les autres modèles si le bucket est par modèle (selon Phase 0).
 
 ### Implementation for User Story 1
 
-- [ ] T019 [US1] Implémenter la politique park/rotate dans `free/pool.py` (`rotate_exhausted_managed`, `_station_usable`) en lisant `reset_at`.
+- [X] T019 [US1] Implémenter la politique park/rotate dans `free/pool.py` (`rotate_exhausted_managed`, `_station_usable`) en lisant `reset_at`.
 - [ ] T020 [US1] Ajouter le park dans `free/quota_ledger.py` : `parked`, `reset_at`, `next_probe_at`, `max_block_s=0` par défaut.
 - [ ] T021 [US1] Brancher `WarpDockerProvider` sur `EgressProvider` dans `free/warp_rotation.py` sans changer le comportement existant.
 - [ ] T022 [US1] Faire respecter le reset dans la sélection `free/pool.py` : aucune station `parked` avant `reset_at`, même si `selectable` est vrai.
-- [ ] T023 [US1] Mettre à jour `dashboard/api.py` pour exposer `parked`, `reset_at`, `next_probe_at` (lecture seule).
+- [X] T023 [US1] Mettre à jour `dashboard/api.py` pour exposer `parked`, `reset_at`, `next_probe_at` (lecture seule).
 - [ ] T024 [US1] Documenter la preuve live park/rotate dans `docs/evidence/007-warp-park.md`.
 
 **Checkpoint**: US1 fonctionnelle et testable indépendamment.

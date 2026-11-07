@@ -66,6 +66,7 @@ class FallbackConfig:
     recovery_successes: int = 2
     cooldown_s: int = 900
     max_block_s: int = 0
+    park_window_s: int = 1800
     fail_closed: bool = True
 
     @classmethod
@@ -98,6 +99,9 @@ class FallbackConfig:
             max_block_s=max(
                 0, min(86400, _as_int(data.get("max_block_s", 0), 0))
             ),
+            park_window_s=max(
+                300, min(7200, _as_int(data.get("park_window_s", 1800), 1800))
+            ),
             fail_closed=_as_bool(data.get("fail_closed", True), True),
         )
 
@@ -109,6 +113,7 @@ class FallbackConfig:
             "recovery_successes": self.recovery_successes,
             "cooldown_s": self.cooldown_s,
             "max_block_s": self.max_block_s,
+            "park_window_s": self.park_window_s,
             "fail_closed": self.fail_closed,
         }
 
