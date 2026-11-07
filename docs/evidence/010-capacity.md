@@ -197,6 +197,20 @@ station 6 : openvpn-udp
 OpenVPN, les stations explicitement configurées ne basculent plus toutes en
 WireGuard et ne se bloquent plus sur `wireguard lease busy`.
 
+## Preuve egress WARP
+
+Probes SOCKS5 réels via `/api/vpn/socks5/test` :
+
+```text
+127.0.0.1:11080 -> 104.28.198.203  172 ms  ok
+127.0.0.1:11085 -> 104.28.230.202  172 ms  ok
+127.0.0.1:11105 -> 104.28.198.203  187 ms  ok
+```
+
+Les six endpoints WARP répondent, avec des IP d'egress Cloudflare distinctes
+ou des blocs IPv6 distincts selon l'endpoint. La capacité `6/6 OK` n'est donc
+pas seulement déclarative : l'egress est réellement joignable.
+
 ## GUI
 
 Carte `Capacité` dans `Modèles Gratuits > Egress & providers` :
