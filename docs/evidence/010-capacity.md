@@ -169,6 +169,8 @@ Exemple testé : `10, 10, 40` → médiane 10, l'endpoint à 40 est signalé
 
 Carte `Capacité` dans `Modèles Gratuits > Egress & providers` :
 
+- Chip `Capacité 6 / 6 OK` sur `Vue d’ensemble`, cliquable vers
+  `Egress & providers` ; couleur selon le verdict.
 - En-tête : titre + verdict (`OK`, `Dégradé`, `Insuffisant`).
 - Contrôles : cible `target_slots` (1–10), politique de réserve
   (`Redondance totale`, `Capacité partagée`, `Proportionnelle aux poids`),

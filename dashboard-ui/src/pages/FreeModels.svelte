@@ -42,11 +42,25 @@
     policy?: string;
   }
 
+  interface CapacitySummary {
+    target_slots?: number;
+    total_usable?: number;
+    verdict?: string;
+  }
+
   const inventoryQ = createQuery<FreeModelsResponse>({
     load: (signal) => apiGet<FreeModelsResponse>('/api/free-models', signal),
     tags: () => ['free_models'],
     initial: {}
   });
+
+  const capacityQ = createQuery<CapacitySummary>({
+    load: (signal) => apiGet<CapacitySummary>('/api/egress/capacity', signal),
+    tags: () => ['vpn'],
+    initial: {}
+  });
+
+  const capacity = $derived(capacityQ.data ?? {});
 
   const inv = $derived(inventoryQ.data ?? {});
   const counts = $derived(inv.counts ?? {});
@@ -121,6 +135,15 @@
 {/if}
 
 {#if active === 'overview'}
+<button
+  type="button"
+  class="capacity-chip capacity-chip--{capacity.verdict ?? 'insufficient'}"
+  onclick={() => navigateSub('egress')}
+>
+  <span class="capacity-chip-label">{t('free_models.capacity_title')}</span>
+  <strong>{capacity.total_usable ?? 0} / {capacity.target_slots ?? 6}</strong>
+  <span>{t(`free_models.capacity_verdict_${capacity.verdict ?? 'insufficient'}`)}</span>
+</button>
 <Card title={t('free_models.inventory')}>
   <div class="inventory-head">
     <p class="hint">{t('free_models.inventory_hint')}</p>
@@ -274,5 +297,52 @@
 
   .badge--unknown {
     color: var(--text-faint);
+  }
+
+  .capacity-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-3);
+    padding: var(--sp-2) var(--sp-3);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--text-dim);
+    font-size: var(--fs-xs);
+    cursor: pointer;
+  }
+
+  .capacity-chip strong {
+    color: var(--text);
+    font-size: var(--fs-sm);
+  }
+
+  .capacity-chip-label {
+    font-weight: 600;
+  }
+
+  .capacity-chip--ok {
+    border-color: var(--success);
+  }
+
+  .capacity-chip--ok strong {
+    color: var(--success);
+  }
+
+  .capacity-chip--degraded {
+    border-color: var(--warn);
+  }
+
+  .capacity-chip--degraded strong {
+    color: var(--warn);
+  }
+
+  .capacity-chip--insufficient {
+    border-color: var(--danger);
+  }
+
+  .capacity-chip--insufficient strong {
+    color: var(--danger);
   }
 </style>
