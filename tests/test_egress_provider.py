@@ -9,6 +9,7 @@ from free.egress_provider import (
     EgressRotationResult,
     block_for_egress,
     family_for_egress,
+    measure_egress,
 )
 
 
@@ -30,6 +31,38 @@ def test_family_for_egress():
     assert family_for_egress("2a09:bac5:32d3:14f0::1") == "ipv6"
     assert family_for_egress("104.28.1.2") == "ipv4"
     assert family_for_egress("socks5:warp-a") is None
+
+
+class _RefreshEndpoint:
+    def __init__(self, ip, *, ipv6=True, raise_error=False):
+        self._ip = ip
+        self.ipv6 = ipv6
+        self._raise = raise_error
+
+    def refresh_egress(self, timeout=6.0):
+        if self._raise:
+            raise RuntimeError("boom")
+        return self._ip
+
+
+def test_measure_egress_accepts_matching_family():
+    assert measure_egress(_RefreshEndpoint("2a09:bac5:32d3:14f0::1")) == "2a09:bac5:32d3:14f0::1"
+    assert measure_egress(_RefreshEndpoint("104.28.1.2", ipv6=False)) == "104.28.1.2"
+
+
+def test_measure_egress_rejects_wrong_family_and_logical_id():
+    assert measure_egress(_RefreshEndpoint("104.28.1.2", ipv6=True)) is None
+    assert measure_egress(_RefreshEndpoint("socks5:warp-a")) is None
+    assert measure_egress(_RefreshEndpoint("invalid")) is None
+
+
+def test_measure_egress_accepts_plain_egress_ip_and_fail_soft():
+    class Plain:
+        ipv6 = False
+        egress_ip = "104.28.1.2"
+
+    assert measure_egress(Plain()) == "104.28.1.2"
+    assert measure_egress(_RefreshEndpoint("", raise_error=True)) is None
 
 
 def test_rotation_result_shape():

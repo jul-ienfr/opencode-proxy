@@ -31,6 +31,33 @@ def family_for_egress(ip: str | None) -> str | None:
     return "ipv6" if parsed.version == 6 else "ipv4"
 
 
+def measure_egress(endpoint: Any, *, timeout_s: float = 6.0) -> str | None:
+    """Mesure l'egress réel d'un endpoint et vérifie sa famille.
+
+    Réutilise ``endpoint.refresh_egress`` quand il existe (WARP/SOCKS5) ; sinon
+    lit ``egress_ip``. Rejette ``socks5:<label>`` et une famille incorrecte.
+    Ne lève jamais.
+    """
+    try:
+        refresh = getattr(endpoint, "refresh_egress", None)
+        if callable(refresh):
+            ip = refresh(timeout=timeout_s)
+        else:
+            ip = getattr(endpoint, "egress_ip", None)
+    except Exception:
+        return None
+    value = str(ip or "").strip()
+    if not value or value.startswith("socks5:"):
+        return None
+    family = family_for_egress(value)
+    if family is None:
+        return None
+    expected = "ipv6" if bool(getattr(endpoint, "ipv6", False)) else "ipv4"
+    if family != expected:
+        return None
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class EgressRotationResult:
     """Résultat d'une rotation, commun à tous les providers."""
@@ -88,4 +115,5 @@ __all__ = [
     "EgressRotationResult",
     "block_for_egress",
     "family_for_egress",
+    "measure_egress",
 ]

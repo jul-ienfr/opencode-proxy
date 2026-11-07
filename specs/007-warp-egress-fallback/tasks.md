@@ -47,7 +47,7 @@ persistance et dédup. Bloque toutes les user stories.
 - [X] T008 Ajouter la migration `registry.db` (colonnes `provider`, `block_key`, `quota_axis`, `reset_at`) dans `rotation/infrastructure/db/migrate.py`, avec backup `VACUUM INTO` avant migration.
 - [X] T009 [P] Ajouter `EgressBlock` et `QuotaObservation` dans `free/quota_ledger.py` (ou un module voisin) ; `reset_at` vient uniquement du fournisseur.
 - [X] T010 [P] Ajouter le chargement/validation de `fallback.order`, `max_fallback_stations`, `probe_interval_s`, `recovery_successes`, `cooldown_s`, `max_block_s`, `fail_closed` dans `config/settings.py`.
-- [ ] T011 Implémenter `measure_egress(endpoint)` dans `free/egress_provider.py` : famille IPv6/IPv4, normalisation `/64`/`/32`, rejet `socks5:*`.
+- [X] T011 Implémenter `measure_egress(endpoint)` dans `free/egress_provider.py` : famille IPv6/IPv4, normalisation `/64`/`/32`, rejet `socks5:*`.
 - [X] T012 [P] Écrire `tests/test_error_taxonomy.py` : 403, 429 quota, 429 rate-limit, 5xx, account/global.
 - [X] T013 [P] Écrire `tests/test_egress_provider.py` : famille, bloc, doublon, `current_ip` jamais stale, probe `False`.
 - [X] T014 [P] Écrire `tests/test_endpoint_provider.py` : compatibilité config sans `provider`, migration des valeurs, validation des champs.
