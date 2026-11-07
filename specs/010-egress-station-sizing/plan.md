@@ -30,10 +30,10 @@ Hypothèse : `target_slots = 6`.
 ### Implementation note (MVP 2026-11-07)
 
 Le conseiller read-only est livré : `free/capacity.py`,
-`GET /api/egress/capacity`, `VpnCapacity.svelte` et les tests. Il lit les
-compteurs live (NordVPN via `usable_station_count`, WARP/proxys via
-`egress_endpoint_counts`) et n'arrête/démarre aucun conteneur. Les actions
-T016/T023–T029 restent différées.
+`GET /api/egress/capacity`, `POST /api/egress/capacity` (cible + politique),
+`VpnCapacity.svelte` et les tests. Il lit les compteurs live (NordVPN via
+`usable_station_count`, WARP/proxys via `egress_endpoint_counts`) et n'arrête/
+démarre aucun conteneur. Les actions T023–T029 restent différées.
 
 ### Fallback
 

@@ -362,6 +362,34 @@ def test_egress_capacity_endpoint_shared_3_3_warns(ctx, monkeypatch):
     assert any(w["code"] == "no_reserve" for w in data["warnings"])
 
 
+def test_egress_capacity_post_persists_target_and_policy(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    resp = _post(
+        fast,
+        "/api/egress/capacity",
+        {"target_slots": 8, "reserve_policy": "shared"},
+    )
+    assert resp == {
+        "ok": True,
+        "egress_capacity": {"target_slots": 8, "reserve_policy": "shared"},
+    }
+    assert persisted[-1] == {
+        "egress_capacity": {"target_slots": 8, "reserve_policy": "shared"}
+    }
+
+
+def test_egress_capacity_post_validates_bounds(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    assert "entre 1 et 10" in _post(
+        fast, "/api/egress/capacity", {"target_slots": 0}
+    )["error"]
+    assert "full|shared|proportional" in _post(
+        fast, "/api/egress/capacity", {"reserve_policy": "nope"}
+    )["error"]
+    assert "requis" in _post(fast, "/api/egress/capacity", {})["error"]
+    assert persisted == []
+
+
 def test_proxy_mode_invalid_is_error(ctx):
     fast, s1, s2, pool, cfg, persisted = ctx
     resp = _post(fast, "/api/vpn/proxy-mode", {"mode": "banana"})

@@ -7,9 +7,10 @@
    * n'est modifié ici.
    */
 
-  import { apiGet } from '$lib/api';
+  import { apiGet, apiPost } from '$lib/api';
   import { lang, t } from '$lib/i18n.svelte';
-  import { createQuery } from '$lib/query.svelte';
+  import { createQuery, invalidateTag } from '$lib/query.svelte';
+  import { showToast } from '$lib/toast.svelte';
 
   type ProviderName = 'nordvpn' | 'warp' | 'proxies' | 'direct';
 
@@ -75,6 +76,41 @@
   );
   const markerPct = $derived(((report?.target_slots ?? 6) / denom) * 100);
 
+  let targetDraft = $state(6);
+  let policyDraft = $state('full');
+  let initialized = $state(false);
+  let saving = $state(false);
+
+  $effect(() => {
+    if (!report || initialized) return;
+    targetDraft = report.target_slots;
+    policyDraft = report.requested_policy;
+    initialized = true;
+  });
+
+  async function saveCapacity(): Promise<void> {
+    const target = Math.max(1, Math.min(10, Number(targetDraft) || 6));
+    targetDraft = target;
+    saving = true;
+    try {
+      const res = await apiPost<{ ok?: boolean; error?: string }>(
+        '/api/egress/capacity',
+        { target_slots: target, reserve_policy: policyDraft }
+      );
+      if (res?.error) throw new Error(res.error);
+      await cap.refresh(true);
+      invalidateTag('vpn');
+      showToast(t('free_models.capacity_saved'), 'success');
+    } catch (error) {
+      showToast(
+        error instanceof Error ? error.message : t('free_models.capacity_save_error'),
+        'error'
+      );
+    } finally {
+      saving = false;
+    }
+  }
+
   const PROVIDER_KEYS: Record<ProviderName, string> = {
     nordvpn: 'free_models.mode_vpn',
     warp: 'free_models.mode_socks5',
@@ -118,6 +154,41 @@
       <span class="verdict verdict--{report.verdict}">{verdictLabel(report.verdict)}</span>
     {/if}
   </header>
+
+  {#if report}
+    <div class="capacity-controls">
+      <label>
+        <span>{t('free_models.capacity_target')}</span>
+        <input
+          type="number"
+          min="1"
+          max="10"
+          step="1"
+          value={targetDraft}
+          oninput={(event) => (targetDraft = Number(event.currentTarget.value))}
+        />
+      </label>
+      <label>
+        <span>{t('free_models.capacity_policy')}</span>
+        <select
+          value={policyDraft}
+          onchange={(event) => (policyDraft = event.currentTarget.value)}
+        >
+          <option value="full">{t('free_models.capacity_policy_full')}</option>
+          <option value="shared">{t('free_models.capacity_policy_shared')}</option>
+          <option value="proportional">
+            {t('free_models.capacity_policy_proportional')}
+          </option>
+        </select>
+      </label>
+      <button
+        type="button"
+        class="btn btn--sm"
+        disabled={saving}
+        onclick={saveCapacity}
+      >{t('free_models.capacity_apply')}</button>
+    </div>
+  {/if}
 
   {#if cap.loading && !report}
     <p class="muted">{t('free_models.capacity_loading')}</p>
@@ -297,6 +368,37 @@
     margin-top: var(--sp-2);
     font-size: var(--fs-xs);
     color: var(--text-dim);
+  }
+
+  .capacity-controls {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--sp-2);
+    flex-wrap: wrap;
+    margin-top: var(--sp-2);
+  }
+
+  .capacity-controls label {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    color: var(--text-dim);
+    font-size: var(--fs-xs);
+  }
+
+  .capacity-controls input,
+  .capacity-controls select {
+    min-height: 28px;
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--text);
+    font-size: var(--fs-sm);
+  }
+
+  .capacity-controls input {
+    width: 4.5rem;
   }
 
   .capacity-summary strong {

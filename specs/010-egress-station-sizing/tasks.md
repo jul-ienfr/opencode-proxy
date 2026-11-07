@@ -40,8 +40,9 @@
 - [x] T014 Endpoint séparé (pas de doublon dans `/api/vpn-status`) : le GUI
   interroge `/api/egress/capacity` et l'invalide avec le tag `vpn`.
 - [x] T015 Tests API : schéma, 6+6, 3+3, warning `no_reserve`.
-- [ ] T016 POST `/api/egress/capacity` (Phase 2) : persister `target_slots` et
-  `reserve_policy` uniquement.
+- [x] T016 POST `/api/egress/capacity` : persister `target_slots` et
+  `reserve_policy` uniquement ; le GUI expose les deux champs et un bouton
+  `Appliquer`. Aucun effet sur le routage.
 
 ## Phase 5: GUI (US2/US3)
 
@@ -85,10 +86,10 @@
 
 ## MVP
 
-1. T001–T015 (conseiller read-only + API GET).
-2. T017–T022 (carte GUI).
+1. T001–T017 (conseiller read-only + API GET/POST + carte GUI).
+2. T018–T022 (barre, i18n, check/build).
 3. Valider les scénarios 6+6, 6+3, 3+3, 4+2.
-4. T016 et T023–T029 sont différés après validation du conseiller.
+4. T023–T029 sont différés après validation du conseiller.
 
 ## Notes
 

@@ -1055,7 +1055,21 @@ def _persist_vpn_config(updates: dict):
                 ip_rot[_block] = _merged
                 _quality_changed = True
             updates = {k: v for k, v in updates.items() if k != _block}
-        changed = _fp_changed or _lr_changed or _quality_changed
+        # [010] egress_capacity : merge imbriqué pour ne pas perdre
+        # target_slots quand seul reserve_policy change.
+        _capacity_changed = False
+        if isinstance(updates.get("egress_capacity"), dict):
+            _existing_cap = (
+                ip_rot.get("egress_capacity")
+                if isinstance(ip_rot.get("egress_capacity"), dict)
+                else {}
+            )
+            _merged_cap = {**_existing_cap, **updates["egress_capacity"]}
+            if _merged_cap != _existing_cap:
+                ip_rot["egress_capacity"] = _merged_cap
+                _capacity_changed = True
+            updates = {k: v for k, v in updates.items() if k != "egress_capacity"}
+        changed = _fp_changed or _lr_changed or _quality_changed or _capacity_changed
         for key, yaml_key in key_map.items():
             if key in updates:
                 old_val = ip_rot.get(yaml_key)
@@ -4218,6 +4232,37 @@ def register_dashboard(
             reserve_policy=policy,
         )
         return report.to_dict()
+
+    @app.post("/api/egress/capacity")
+    async def set_egress_capacity(request: Request):
+        """Persiste la cible/conseil (target_slots, reserve_policy) — 010.
+
+        Ne touche pas au routage, ni à station_count, ni aux endpoints WARP.
+        """
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        body = await request.json()
+        updates: dict[str, int | str] = {}
+        if "target_slots" in body:
+            try:
+                target = int(body.get("target_slots"))
+            except (TypeError, ValueError):
+                return {"error": "target_slots doit être un entier entre 1 et 10"}
+            if not (1 <= target <= 10):
+                return {"error": "target_slots doit être entre 1 et 10"}
+            updates["target_slots"] = target
+        if "reserve_policy" in body:
+            policy = str(body.get("reserve_policy") or "").strip().lower()
+            if policy not in ("full", "shared", "proportional"):
+                return {"error": "reserve_policy doit être full|shared|proportional"}
+            updates["reserve_policy"] = policy
+        if not updates:
+            return {"error": "target_slots ou reserve_policy requis"}
+        err = _persist_vpn_config({"egress_capacity": updates})
+        if err:
+            return {"error": err}
+        return {"ok": True, "egress_capacity": updates}
 
     @app.post("/api/vpn-config")
     async def update_vpn_config(request: Request):

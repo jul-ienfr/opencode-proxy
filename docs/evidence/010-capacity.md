@@ -21,6 +21,11 @@ npm --prefix dashboard-ui run build -> OK
 `reserve_policy`, les compteurs `configured/enabled/usable` par provider,
 `required`, `per_endpoint`, le verdict et les messages FR/EN.
 
+`POST /api/egress/capacity` persiste uniquement
+`{"target_slots": 1..10, "reserve_policy": "full|shared|proportional"}`.
+Testé : `full` → `shared` → le requis passe de 18 à 6 endpoints, puis retour
+à `full`. Aucun conteneur ni endpoint n'est modifié.
+
 État live testé :
 
 ```json
@@ -68,6 +73,9 @@ affiché pour montrer la configuration demandée. Direct décoché n'affiche pas
 Carte `Capacité` dans `Modèles Gratuits > Egress & providers` :
 
 - En-tête : titre + verdict (`OK`, `Dégradé`, `Insuffisant`).
+- Contrôles : cible `target_slots` (1–10), politique de réserve
+  (`Redondance totale`, `Capacité partagée`, `Proportionnelle aux poids`),
+  bouton `Appliquer`.
 - Résumé : `6 / 6 stations`, `Requis : 18 endpoints`, déficit éventuel.
 - Tableau : Provider, Configurés, Activés, Utilisables, Poids,
   Charge/endpoint, Requis, Statut.
