@@ -16,6 +16,7 @@
   import Card from '$lib/components/Card.svelte';
   import Empty from '$lib/components/Empty.svelte';
   import SubTabs from '$lib/components/SubTabs.svelte';
+  import SettingsSearch from '$lib/components/SettingsSearch.svelte';
   import VpnStatus from './vpn/VpnStatus.svelte';
   import AllocatorStatus from './vpn/AllocatorStatus.svelte';
   import VpnRouting from './vpn/VpnRouting.svelte';
@@ -77,6 +78,18 @@
     tabs.some((tab) => tab.id === route.current.sub) ? route.current.sub : 'overview'
   );
 
+  let searchHint = $state('');
+
+  function selectFreeTab(id: string): void {
+    searchHint = '';
+    navigateSub(id);
+  }
+
+  function onSearchSelect(tab: string, label: string): void {
+    searchHint = label;
+    navigateSub(tab);
+  }
+
   // Normalise un hash inconnu vers le sous-onglet par défaut.
   $effect(() => {
     if (route.current.tab !== 'free-models') return;
@@ -94,12 +107,18 @@
   }
 </script>
 
+<SettingsSearch group="free-models" onSelect={onSearchSelect} />
+
 <SubTabs
   tabs={tabs}
   active={active}
   ariaLabel={t('free_models.tabs_label')}
-  onSelect={(id) => navigateSub(id)}
+  onSelect={selectFreeTab}
 />
+
+{#if searchHint}
+  <div class="search-hint" role="status">{t('search.found', { label: searchHint })}</div>
+{/if}
 
 {#if active === 'overview'}
 <Card title={t('free_models.inventory')}>
@@ -188,6 +207,17 @@
 {/if}
 
 <style>
+  .search-hint {
+    margin: 0 0 var(--sp-3);
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent, var(--text));
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--text-dim);
+    font-size: var(--fs-sm);
+  }
+
   .inventory-head {
     display: flex;
     align-items: flex-start;

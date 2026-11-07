@@ -120,8 +120,8 @@ sauvegarde.
 
 ### Implementation for User Story 4
 
-- [ ] T032 [US4] Ajouter l'index de recherche des réglages dans `dashboard-ui/src/lib/search.ts`. (non implémenté — voir debt D-009-1)
-- [ ] T033 [US4] Ajouter la barre de recherche + saut/highlight dans `dashboard-ui/src/lib/components/SubTabs.svelte` ou un composant dédié. (non implémenté — voir debt D-009-1)
+- [X] T032 Ajouter l'index statique des réglages (`searchSettings`) dans `dashboard-ui/src/lib/search.ts`.
+- [X] T033 Ajouter la barre de recherche `dashboard-ui/src/lib/components/SettingsSearch.svelte` (dropdown, Entrée/flèches, hint de section).
 - [X] T034 [US4] Brancher `useDirtyGuard` sur les formulaires de `dashboard-ui/src/pages/config/*` et `dashboard-ui/src/pages/free/*`.
 - [X] T035 Validation manuelle navigateur : dirty guard sauvegarder/annuler/quitter.
 

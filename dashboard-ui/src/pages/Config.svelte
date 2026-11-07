@@ -21,6 +21,7 @@
   import Empty from '$lib/components/Empty.svelte';
   import Spinner from '$lib/components/Spinner.svelte';
   import SubTabs from '$lib/components/SubTabs.svelte';
+  import SettingsSearch from '$lib/components/SettingsSearch.svelte';
 
   /** Délai d'affichage des messages de sauvegarde. */
   const STATUS_MS = 3000;
@@ -512,12 +513,19 @@
 
   /** Dirty guard : les brouillons ne partent qu'au bouton Sauvegarder. */
   let configDirty = $state(false);
+  let searchHint = $state('');
 
   function selectConfigTab(id: string): void {
     if (id === configTab) return;
     if (configDirty && !confirm(t('config.unsaved_confirm'))) return;
-    configDirty = false;
+    searchHint = '';
     navigateSub(id);
+  }
+
+  function onSearchSelect(tab: string, label: string): void {
+    if (configDirty && !confirm(t('config.unsaved_confirm'))) return;
+    searchHint = label;
+    navigateSub(tab);
   }
 
   $effect(() => {
@@ -538,12 +546,18 @@
   });
 </script>
 
+<SettingsSearch group="config" onSelect={onSearchSelect} />
+
 <SubTabs
   tabs={configTabs}
   active={configTab}
   ariaLabel={t('config.tabs_label')}
   onSelect={selectConfigTab}
 />
+
+{#if searchHint}
+  <div class="search-hint" role="status">{t('search.found', { label: searchHint })}</div>
+{/if}
 
 {#if !cfg}
   <Spinner />
@@ -1147,6 +1161,17 @@
 {/if}
 
 <style>
+  .search-hint {
+    margin: 0 0 var(--sp-3);
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent, var(--text));
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--text-dim);
+    font-size: var(--fs-sm);
+  }
+
   .status-row {
     display: flex;
     align-items: center;

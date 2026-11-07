@@ -21,12 +21,18 @@
   // Capitalisé : Svelte 5 rend un composant via un identifiant en majuscule.
   let Current = $state<Component<Record<string, never>> | null>(null);
   let loadError = $state<string | null>(null);
+  // Ne recharger la page que si l'onglet principal change : un changement de
+  // sous-onglet (#config/server → #config/models) ne doit pas remonter le
+  // composant et perdre ses brouillons/recherche.
+  let lastTab: TabId | null = null;
 
   // Chargement paresseux : une vue à la fois, réexécuté à chaque changement
   // d'onglet. Le cleanup invalide la promesse pour qu'un onglet cliqué puis
   // quitté très vite n'installe jamais le composant périmé.
   $effect(() => {
     const wanted = route.current.tab;
+    if (wanted === lastTab) return;
+    lastTab = wanted;
     let alive = true;
     Current = null;
     loadError = null;
