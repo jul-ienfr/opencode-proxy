@@ -390,6 +390,39 @@ def test_egress_capacity_post_validates_bounds(ctx):
     assert persisted == []
 
 
+def test_egress_capacity_includes_observed_share(ctx, monkeypatch):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    cfg.update(
+        {
+            "egress_providers": ["nordvpn", "warp"],
+            "egress_strategy": "balance",
+            "egress_weights": {"nordvpn": 50, "warp": 50},
+            "egress_capacity": {"target_slots": 6, "reserve_policy": "full"},
+        }
+    )
+    monkeypatch.setattr(
+        api,
+        "_egress_capacity_counts",
+        lambda: {
+            "nordvpn": {"configured": 6, "enabled": 6, "usable": 6},
+            "warp": {"configured": 6, "enabled": 6, "usable": 6},
+            "proxies": {"configured": 0, "enabled": 0, "usable": 0},
+            "direct": {"configured": 1, "enabled": 1, "usable": 1},
+        },
+    )
+    monkeypatch.setattr(
+        api,
+        "_egress_observed_counts",
+        lambda: {"nordvpn": 90, "warp": 10},
+    )
+    with TestClient(fast) as client:
+        data = client.get("/api/egress/capacity").json()
+    assert data["observed_requests"] == 100
+    assert data["providers"]["nordvpn"]["observed_share"] == 90.0
+    assert data["providers"]["warp"]["observed_share"] == 10.0
+    assert any(w["code"] == "observed_shift" for w in data["warnings"])
+
+
 def test_proxy_mode_invalid_is_error(ctx):
     fast, s1, s2, pool, cfg, persisted = ctx
     resp = _post(fast, "/api/vpn/proxy-mode", {"mode": "banana"})

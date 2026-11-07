@@ -23,6 +23,8 @@
     weight: number | null;
     expected_share: number | null;
     per_endpoint: number | null;
+    observed: number;
+    observed_share: number | null;
     required: number | null;
     deficit: number;
     status: string;
@@ -44,6 +46,7 @@
     selected: string[];
     total_usable: number;
     total_required: number;
+    observed_requests: number;
     deficit: number;
     verdict: 'ok' | 'degraded' | 'insufficient';
     warnings: Message[];
@@ -204,6 +207,9 @@
         {t('free_models.capacity_required')} : {report.total_required}
         {t('free_models.capacity_endpoints')}
       </span>
+      <span>
+        {t('free_models.capacity_observed_requests')} : {report.observed_requests}
+      </span>
       {#if report.deficit > 0}
         <span class="deficit">
           {t('free_models.capacity_deficit')} : {report.deficit}
@@ -219,6 +225,7 @@
             <th>{t('free_models.capacity_configured')}</th>
             <th>{t('free_models.capacity_enabled')}</th>
             <th>{t('free_models.capacity_usable')}</th>
+            <th>{t('free_models.capacity_observed')}</th>
             {#if showWeights}
               <th>{t('free_models.capacity_weight')}</th>
               <th>{t('free_models.capacity_per_endpoint')}</th>
@@ -237,6 +244,14 @@
               <td>{provider.enabled}</td>
               <td class:zero={provider.selected && provider.usable === 0}>
                 {provider.usable}
+              </td>
+              <td>
+                {#if provider.observed_share === null}
+                  —
+                {:else}
+                  {provider.observed_share.toFixed(1)} %
+                  <span class="observed-count">({provider.observed})</span>
+                {/if}
               </td>
               {#if showWeights}
                 <td>
@@ -447,6 +462,12 @@
   td.zero {
     color: var(--danger);
     font-weight: 600;
+  }
+
+  .observed-count {
+    color: var(--text-dim);
+    font-size: 0.9em;
+    margin-left: 2px;
   }
 
   .standby {

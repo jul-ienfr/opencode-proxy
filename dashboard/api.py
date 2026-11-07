@@ -1504,6 +1504,22 @@ def _dashboard_managers() -> list:
         return []
 
 
+def _egress_observed_counts() -> dict[str, int]:
+    """Requêtes assignées par provider (cumul pool) pour le conseiller 010."""
+    pool = _dashboard_pool()
+    if pool is not None and hasattr(pool, "provider_request_counts"):
+        try:
+            counts = pool.provider_request_counts()
+            if isinstance(counts, dict):
+                return {
+                    str(key): max(0, int(value or 0))
+                    for key, value in counts.items()
+                }
+        except Exception:
+            pass
+    return {}
+
+
 def _egress_capacity_counts() -> dict[str, dict[str, int]]:
     """Capacité configurée/activée/utilisable par provider (010).
 
@@ -4230,6 +4246,7 @@ def register_dashboard(
             weights=weights,
             target_slots=target,
             reserve_policy=policy,
+            observed=_egress_observed_counts(),
         )
         return report.to_dict()
 

@@ -117,6 +117,22 @@ Le provider indisponible est retiré du calcul de charge ; le poids reste
 affiché pour montrer la configuration demandée. Direct décoché n'affiche pas
 « Secours » (poids `null`, pas `0`).
 
+## Part observée
+
+`GET /api/egress/capacity` expose maintenant `observed_requests` et, par
+provider, `observed` + `observed_share` (cumul depuis le démarrage du pool).
+
+- 90/10 observé contre 50/50 attendu sur 100 requêtes → warning
+  `observed_shift`.
+- Sous 20 requêtes, aucun warning (échantillon trop petit).
+- Un provider décoché n'a pas de part observée (`null`), même s'il a un
+  compteur résiduel.
+- GUI : colonne `Observé` (`%` + nombre de requêtes) et ligne
+  `Trafic observé : N`.
+
+Test live après redémarrage : `observé = 0`, colonne affichée `—` ; la
+capacité reste `OK` (6/6 WARP).
+
 ## GUI
 
 Carte `Capacité` dans `Modèles Gratuits > Egress & providers` :

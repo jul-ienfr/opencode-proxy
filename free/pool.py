@@ -4219,6 +4219,26 @@ class FreeIPPool:
                 continue
         return out
 
+    def provider_request_counts(self) -> dict[str, int]:
+        """Requêtes assignées par provider (cumul depuis le démarrage).
+
+        Sert à comparer la part observée aux poids configurés. Ne déclenche
+        aucun probe ; lit les compteurs déjà tenus par le pool.
+        """
+        out = {"nordvpn": 0, "warp": 0, "proxies": 0, "direct": 0}
+        for station in list(getattr(self, "_stations", None) or []):
+            try:
+                out["nordvpn"] += int(self._per_station(station).get("request_count", 0) or 0)
+            except Exception:
+                continue
+        for endpoint in list(getattr(self, "_socks5_eps", None) or []):
+            name = "warp" if self._provider_matches(endpoint, "warp") else "proxies"
+            try:
+                out[name] += int(self._per_station(endpoint).get("request_count", 0) or 0)
+            except Exception:
+                continue
+        return out
+
     def _socks5_pick_for(
         self, provider: str | None, *, excluded=None, conversation_key: str | None = None
     ):

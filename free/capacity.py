@@ -161,6 +161,8 @@ class ProviderCapacity:
     weight: int | None = None
     expected_share: float | None = None
     per_endpoint: float | None = None
+    observed: int = 0
+    observed_share: float | None = None
     required: int | None = None
     deficit: int = 0
     status: str = "disabled"
@@ -175,6 +177,8 @@ class ProviderCapacity:
             "weight": self.weight,
             "expected_share": self.expected_share,
             "per_endpoint": self.per_endpoint,
+            "observed": self.observed,
+            "observed_share": self.observed_share,
             "required": self.required,
             "deficit": self.deficit,
             "status": self.status,
@@ -191,6 +195,7 @@ class CapacityReport:
     selected: list[str] = field(default_factory=list)
     total_usable: int = 0
     total_required: int = 0
+    observed_requests: int = 0
     deficit: int = 0
     verdict: str = "insufficient"
     warnings: list[dict[str, str]] = field(default_factory=list)
@@ -209,6 +214,7 @@ class CapacityReport:
             "selected": list(self.selected),
             "total_usable": self.total_usable,
             "total_required": self.total_required,
+            "observed_requests": self.observed_requests,
             "deficit": self.deficit,
             "verdict": self.verdict,
             "warnings": list(self.warnings),
@@ -252,6 +258,7 @@ def evaluate_capacity(
     weights: dict[str, int] | None = None,
     target_slots: int = DEFAULT_TARGET_SLOTS,
     reserve_policy: str = "full",
+    observed: dict[str, int] | None = None,
 ) -> CapacityReport:
     """Construit le rapport de capacité pour le GUI/API."""
     target = max(1, min(10, int(target_slots or DEFAULT_TARGET_SLOTS)))
@@ -275,6 +282,11 @@ def evaluate_capacity(
     )
 
     normalized = _normalized_weights(selected_names, weights) if normalized_strategy == "balance" else {}
+    observed_counts = observed if isinstance(observed, dict) else {}
+    observed_total = sum(
+        max(0, int(observed_counts.get(name, 0) or 0))
+        for name in selected_names
+    )
     allocation: dict[str, int] = {}
     if policy == "proportional":
         scalable = [name for name in selected_names if name not in FIXED_PROVIDERS]
@@ -316,6 +328,14 @@ def evaluate_capacity(
             expected_share = float(weight)
             if counts["usable"] > 0:
                 per_endpoint = round(float(weight) / counts["usable"], 2)
+        observed_count = (
+            max(0, int(observed_counts.get(name, 0) or 0)) if is_selected else 0
+        )
+        observed_share = (
+            round(observed_count * 100.0 / observed_total, 1)
+            if observed_total and is_selected
+            else None
+        )
         report.providers[name] = ProviderCapacity(
             name=name,
             configured=counts["configured"],
@@ -325,12 +345,15 @@ def evaluate_capacity(
             weight=weight,
             expected_share=expected_share,
             per_endpoint=per_endpoint,
+            observed=observed_count,
+            observed_share=observed_share,
             required=required,
             deficit=deficit,
             status=status,
         )
 
     report.total_usable = sum(report.providers[name].usable for name in selected_names)
+    report.observed_requests = observed_total
     if policy == "full":
         report.total_required = sum(
             report.providers[name].required or 0 for name in selected_names
@@ -413,6 +436,28 @@ def evaluate_capacity(
                 "warn",
             )
         )
+
+    if normalized_strategy == "balance" and observed_total >= 20:
+        shifted = []
+        for name in selected_names:
+            provider = report.providers[name]
+            expected = float(provider.expected_share or 0.0)
+            if expected <= 0 or provider.observed_share is None:
+                continue
+            if abs(provider.observed_share - expected) > 20.0:
+                shifted.append(
+                    f"{provider_label(name)} {provider.observed_share:.0f} % "
+                    f"(attendu {expected:.0f} %)"
+                )
+        if shifted:
+            warnings.append(
+                _message(
+                    "observed_shift",
+                    "Part observée éloignée des poids : " + ", ".join(shifted) + ".",
+                    "Observed share differs from weights: " + ", ".join(shifted) + ".",
+                    "warn",
+                )
+            )
 
     if policy == "shared":
         if normalized_strategy == "fallback" and len(selected_names) > 1:

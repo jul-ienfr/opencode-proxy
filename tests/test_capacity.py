@@ -198,3 +198,34 @@ def test_unavailable_provider_warning():
     report = _report(providers=_counts(6, 0))
     assert report.providers["warp"].status == "unavailable"
     assert any(w["code"] == "unavailable_warp" for w in report.warnings)
+
+
+def test_observed_share_and_warning():
+    report = _report(
+        strategy="balance",
+        observed={"nordvpn": 90, "warp": 10},
+    )
+    assert report.observed_requests == 100
+    assert report.providers["nordvpn"].observed_share == 90.0
+    assert report.providers["warp"].observed_share == 10.0
+    assert any(w["code"] == "observed_shift" for w in report.warnings)
+
+
+def test_observed_no_warning_under_sample():
+    report = _report(
+        strategy="balance",
+        observed={"nordvpn": 9, "warp": 1},
+    )
+    assert report.observed_requests == 10
+    assert not any(w["code"] == "observed_shift" for w in report.warnings)
+
+
+def test_observed_ignores_unselected_provider():
+    report = _report(
+        selected=["nordvpn"],
+        observed={"nordvpn": 10, "warp": 90},
+    )
+    assert report.observed_requests == 10
+    assert report.providers["nordvpn"].observed_share == 100.0
+    assert report.providers["warp"].observed == 0
+    assert report.providers["warp"].observed_share is None
