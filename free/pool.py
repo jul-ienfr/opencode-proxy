@@ -869,6 +869,14 @@ class FreeIPPool:
             self._warp_rotator = WarpRotator()
         except Exception:
             self._warp_rotator = None
+        try:
+            from free.fallback import FallbackConfig, FallbackPolicy
+
+            _fb_cfg = _yaml_get("ip_rotation", "fallback", {}) or {}
+            self._fallback_policy = FallbackPolicy(FallbackConfig.from_mapping(_fb_cfg))
+        except Exception:
+            self._fallback_policy = None
+        self._last_fallback_decision: dict[str, Any] = {}
 
         # [free_parallel] Deux routings découplés — (B) Stations free
         # enabled=false → pas de parallélisation (sticky), routing
@@ -2657,6 +2665,28 @@ class FreeIPPool:
             return False
         return rotator.request_rotation(endpoint, self, self._persist_socks5_egress)
 
+    def _available_fallback_providers(self) -> set[str]:
+        """Providers de repli réellement servables (hors WARP/static)."""
+        out: set[str] = set()
+        try:
+            for ep in self._socks5_enabled_eps():
+                provider = str(getattr(ep, "provider", "") or "").strip().lower()
+                if provider in ("", "warp", "static"):
+                    continue
+                try:
+                    if not self._socks5_usable(ep, exclude_approaching=False):
+                        continue
+                except Exception:
+                    pass
+                out.add(provider)
+        except Exception:
+            return set()
+        return out
+
+    def fallback_snapshot(self) -> dict[str, Any]:
+        policy = getattr(self, "_fallback_policy", None)
+        return policy.snapshot() if policy is not None else {}
+
     def _other_managed_usable(self, endpoint, ledger) -> bool:
         """Au moins un autre endpoint managé est encore servable.
 
@@ -2851,6 +2881,26 @@ class FreeIPPool:
                 else:
                     cause = "exhausted"
                 entry["cause"] = cause
+                # [feature 007] Si un repli gratuit est disponible, on le
+                # laisse servir au lieu de recréer WARP : la politique décide
+                # et l'endpoint de repli est déjà dans le pool.
+                if cause == "exhausted" and getattr(self, "_fallback_policy", None) is not None:
+                    try:
+                        from free.fallback import FallbackTrigger
+
+                        _decision = self._fallback_policy.evaluate(
+                            entry["label"],
+                            FallbackTrigger.QUOTA,
+                            self._available_fallback_providers(),
+                            now=time.time(),
+                        )
+                        self._last_fallback_decision = _decision.as_dict()
+                        entry["fallback"] = _decision.as_dict()
+                        if _decision.action == "fallback":
+                            entry["cause"] = "fallback"
+                            continue
+                    except Exception:
+                        pass
                 if self._request_warp_rotation(ep, cause):
                     entry["requested"] = True
                     started += 1

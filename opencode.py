@@ -23269,6 +23269,9 @@ async def api_free_egress_diag():
         "rotation_scan": (
             pool.rotation_scan() if hasattr(pool, "rotation_scan") else []
         ),
+        "fallback": (
+            pool.fallback_snapshot() if hasattr(pool, "fallback_snapshot") else {}
+        ),
         "endpoints": rows,
     }
 

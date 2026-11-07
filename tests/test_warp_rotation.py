@@ -270,9 +270,24 @@ class ProactivePool:
         self._socks5_eps = endpoints
         self._vpn = self._Vpn()
         self.calls = []
+        self._fallback_policy = None
+        self._last_fallback_decision = {}
 
     def _socks5_enabled_eps(self):
         return list(self._socks5_eps)
+
+    def _socks5_usable(self, endpoint, *, exclude_approaching=False):
+        return True
+
+    def _available_fallback_providers(self):
+        return {
+            str(getattr(ep, "provider", "") or "")
+            for ep in self._socks5_eps
+            if str(getattr(ep, "provider", "") or "") not in ("", "warp", "static")
+        }
+
+    def fallback_snapshot(self):
+        return self._fallback_policy.snapshot() if self._fallback_policy else {}
 
     def _get_ledger(self):
         class _Ledger:
@@ -406,6 +421,64 @@ def test_rotate_exhausted_managed_rotates_near_reset_without_other():
 
     first = _endpoint(label="warp-restore1", container="warp-restore1")
     pool = AlonePool([first])
+    count = FreeIPPool.rotate_exhausted_managed(pool)
+    assert count == 1
+    assert pool.calls == [("warp-restore1", "exhausted")]
+
+
+def test_rotate_exhausted_managed_prefers_available_free_fallback():
+    from free.fallback import FallbackConfig, FallbackPolicy
+    from free.pool import FreeIPPool
+
+    class FallbackPool(ProactivePool):
+        def _get_ledger(self):
+            class _Ledger:
+                def is_exhausted(self, raw, model):
+                    return True
+
+                def reset_at(self, raw, model):
+                    return time.time() + 7200.0
+
+            return _Ledger()
+
+    warp = _endpoint(label="warp-restore1", container="warp-restore1", provider="warp")
+    proton = _endpoint(
+        label="proton-1",
+        container=None,
+        managed=False,
+        provider="proton",
+        index=1,
+        egress_ip="104.28.9.9",
+        block="104.28.9.9/32",
+    )
+    pool = FallbackPool([warp, proton])
+    pool._fallback_policy = FallbackPolicy(FallbackConfig.from_mapping({}))
+    count = FreeIPPool.rotate_exhausted_managed(pool)
+    assert count == 0
+    assert pool.calls == []
+    scan = FreeIPPool.rotation_scan(pool)
+    assert scan[0]["cause"] == "fallback"
+    assert pool.fallback_snapshot()["active"] == {"warp-restore1": "proton"}
+
+
+def test_rotate_exhausted_managed_no_fallback_still_rotates():
+    from free.fallback import FallbackConfig, FallbackPolicy
+    from free.pool import FreeIPPool
+
+    class NoFallbackPool(ProactivePool):
+        def _get_ledger(self):
+            class _Ledger:
+                def is_exhausted(self, raw, model):
+                    return True
+
+                def reset_at(self, raw, model):
+                    return time.time() + 7200.0
+
+            return _Ledger()
+
+    warp = _endpoint(label="warp-restore1", container="warp-restore1", provider="warp")
+    pool = NoFallbackPool([warp])
+    pool._fallback_policy = FallbackPolicy(FallbackConfig.from_mapping({}))
     count = FreeIPPool.rotate_exhausted_managed(pool)
     assert count == 1
     assert pool.calls == [("warp-restore1", "exhausted")]

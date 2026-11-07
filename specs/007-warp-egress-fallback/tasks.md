@@ -103,8 +103,8 @@ WARP après deux succès.
 - [X] T028 [US2] Créer `free/fallback.py` : `FallbackPolicy`, `evaluate()`, `select_provider()`, `should_return_to_warp()`, journalisation de la cause.
 - [ ] T029 [US2] Créer `free/warp_alt_provider.py` : support MicroWARP/usque (HTTP/SOCKS5), même pool, santé et rotation.
 - [ ] T030 [US2] Créer `free/gluetun_provider.py` : Proton Free (1 station), Windscribe/Privado en option, health/rotation via contrôle gluetun.
-- [ ] T031 [US2] Brancher `fallback.py` dans `free/pool.py` (`_request_egress_rotation`, `rotate_exhausted_managed`) avec dispatch provider.
-- [ ] T032 [US2] Ajouter les déclencheurs seuils dans `config.yaml` et le statut `fallback_active` dans `dashboard/api.py`.
+- [X] T031 [US2] Brancher `fallback.py` dans `free/pool.py` (`_request_egress_rotation`, `rotate_exhausted_managed`) avec dispatch provider.
+- [X] T032 [US2] Ajouter les déclencheurs seuils dans `config.yaml` et le statut `fallback_active` dans `dashboard/api.py`.
 - [ ] T033 [US2] Implémenter le drain avant bascule : aucune requête en vol interrompue (`free/pool.py`).
 - [ ] T034 [US2] Ajouter le retour WARP après `recovery_successes` probes `200` et `cooldown_s` dans `free/fallback.py` et `free/pool.py`.
 - [ ] T035 [US2] Documenter la preuve live fallback/retour dans `docs/evidence/007-fallback.md`.
