@@ -2,7 +2,7 @@
 
 **Feature Branch**: `010-egress-station-sizing`
 **Created**: 2026-11-07
-**Status**: Draft
+**Status**: Implemented (MVP 2026-11-07)
 **Input**: « Combien de stations faut-il si j'active NordVPN et WARP ? En fallback, six de chaque ? En répartition, trois et trois ? »
 
 ## Clarifications
