@@ -126,6 +126,15 @@ dashboard-ui/src/
 une couche de navigation (`SubTabs`) + des coquilles de page. Les gros
 composants sont déplacés, pas réécrits.
 
+### Implementation note (MVP 2026-11-07)
+
+Le MVP livré garde `FreeModels.svelte` et `Config.svelte` comme coquilles et
+rend les sections **conditionnellement** (`{#if active === …}`) au lieu de
+créer 10 nouveaux fichiers. L'UX, les URLs, les alias et le dirty guard sont
+identiques. L'extraction en composants est différée (voir `debt.md`) parce que
+l'état et les handlers de `Config.svelte` sont partagés : les extraire d'un
+bloc aurait dupliqué la logique de sauvegarde.
+
 ## Phase 0 — Audit et cartographie
 
 1. Inventorier chaque section/réglage des pages `FreeModels.svelte` et

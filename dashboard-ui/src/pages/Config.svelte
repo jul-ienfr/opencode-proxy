@@ -15,11 +15,12 @@
   import { getErrorDetails } from '$lib/format';
   import { t } from '$lib/i18n.svelte';
   import { createQuery } from '$lib/query.svelte';
-  import { param, setParams } from '$lib/router.svelte';
+  import { navigate, navigateSub, param, route, setParams } from '$lib/router.svelte';
   import { showToast } from '$lib/toast.svelte';
   import Card from '$lib/components/Card.svelte';
   import Empty from '$lib/components/Empty.svelte';
   import Spinner from '$lib/components/Spinner.svelte';
+  import SubTabs from '$lib/components/SubTabs.svelte';
 
   /** Délai d'affichage des messages de sauvegarde. */
   const STATUS_MS = 3000;
@@ -321,6 +322,7 @@
       });
       needsRestart = !!result.needs_restart;
       flash('save', 'ok', result.message || t('config.saved'));
+      configDirty = false;
       await reloadConfig();
     } catch (e) {
       flash('save', 'error', t('status.error'));
@@ -388,6 +390,7 @@
     try {
       await apiPost('/api/config/custom-routes', routes);
       flash('cr', 'ok', t('config.cr_saved'));
+      configDirty = false;
       await reloadConfig();
     } catch (e) {
       flash('cr', 'error', t('status.error'));
@@ -440,6 +443,7 @@
     try {
       await apiPost('/api/config/api-keys', { api_keys: keys, replace: true });
       flash('key', 'ok', t('config.ak_saved'));
+      configDirty = false;
       await reloadConfig();
     } catch (e) {
       flash('key', 'error', t('status.error'));
@@ -459,6 +463,7 @@
         via_vpn: wsViaVpn === 'true'
       });
       flash('ws', 'ok', t('config.cr_saved'));
+      configDirty = false;
     } catch (e) {
       flash('ws', 'error', t('status.error'));
       showToast(errorMessage(e), 'error');
@@ -476,6 +481,7 @@
         via_vpn: wfViaVpn === 'true'
       });
       wfStatus = { kind: 'ok', message: t('config.cr_saved') };
+      configDirty = false;
       window.setTimeout(() => (wfStatus = null), STATUS_MS);
     } catch (e) {
       wfStatus = { kind: 'error', message: t('status.error') };
@@ -491,12 +497,60 @@
   const showWsModel = $derived(wsMode !== 'duckduckgo');
   const showWfModel = $derived(wfMode !== 'direct');
   const modelList = $derived(webToolQ.data?.available_models ?? []);
+
+  const configTabs = $derived([
+    { id: 'server', label: t('config.tab_server'), testid: 'tab-config-server' },
+    { id: 'models', label: t('config.tab_models'), testid: 'tab-config-models' },
+    { id: 'keys', label: t('config.tab_keys'), testid: 'tab-config-keys' },
+    { id: 'web', label: t('config.tab_web'), testid: 'tab-config-web' },
+    { id: 'maintenance', label: t('config.tab_maintenance'), testid: 'tab-config-maintenance' }
+  ]);
+
+  const configTab = $derived(
+    configTabs.some((tab) => tab.id === route.current.sub) ? route.current.sub : 'server'
+  );
+
+  /** Dirty guard : les brouillons ne partent qu'au bouton Sauvegarder. */
+  let configDirty = $state(false);
+
+  function selectConfigTab(id: string): void {
+    if (id === configTab) return;
+    if (configDirty && !confirm(t('config.unsaved_confirm'))) return;
+    configDirty = false;
+    navigateSub(id);
+  }
+
+  $effect(() => {
+    if (route.current.tab !== 'config') return;
+    if (!configTabs.some((tab) => tab.id === route.current.sub)) {
+      navigateSub('server', true);
+    }
+  });
+
+  $effect(() => {
+    if (!configDirty) return;
+    const handler = (event: BeforeUnloadEvent): void => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    addEventListener('beforeunload', handler);
+    return () => removeEventListener('beforeunload', handler);
+  });
 </script>
+
+<SubTabs
+  tabs={configTabs}
+  active={configTab}
+  ariaLabel={t('config.tabs_label')}
+  onSelect={selectConfigTab}
+/>
 
 {#if !cfg}
   <Spinner />
 {:else}
+<div class="config-body" oninput={() => (configDirty = true)} onchange={() => (configDirty = true)}>
   <!-- ── Paramètres serveur ── -->
+  {#if configTab === 'server'}
   <Card title={t('config.server')}>
     <div class="status-row">
       <div class="status">
@@ -595,8 +649,10 @@
     </div>
     <p class="hint">{t('config.debug_desc')}</p>
   </Card>
+  {/if}
 
   <!-- ── Mapping de modèles ── -->
+  {#if configTab === 'models'}
   <Card title={t('config.model_mapping')}>
     <p class="hint">{t('config.mapping_desc')}</p>
 
@@ -731,8 +787,10 @@
       {/if}
     </div>
   </Card>
+  {/if}
 
   <!-- ── Recherche web ── -->
+  {#if configTab === 'web'}
   <Card title={t('config.web_search_title')}>
     <p class="hint">{t('config.web_search_desc')}</p>
 
@@ -855,8 +913,10 @@
       {/if}
     </div>
   </Card>
+  {/if}
 
   <!-- ── Clés API ── -->
+  {#if configTab === 'keys'}
   <Card title={t('config.api_keys')}>
     <p class="hint">{t('config.api_keys_desc')}</p>
 
@@ -944,8 +1004,10 @@
       {/if}
     </div>
   </Card>
+  {/if}
 
   <!-- ── Modèles disponibles ── -->
+  {#if configTab === 'models'}
   <Card title={t('config.models')}>
     {#if ids.length === 0}
       <Empty title={t('config.no_models')} />
@@ -1070,6 +1132,18 @@
       {/if}
     {/if}
   </Card>
+  {/if}
+
+  {#if configTab === 'maintenance'}
+  <Card title={t('config.maintenance')}>
+    <p class="hint">{t('config.maintenance_hint')}</p>
+    <div class="actions">
+      <a class="btn btn--sm" href="#logs">{t('config.view_logs')}</a>
+      <a class="btn btn--sm" href="#debug">{t('config.view_debug')}</a>
+    </div>
+  </Card>
+  {/if}
+</div>
 {/if}
 
 <style>

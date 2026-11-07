@@ -16,6 +16,9 @@
   import Card from '$lib/components/Card.svelte';
   import Toggle from '$lib/components/Toggle.svelte';
 
+  /** `quality` = uniquement les probes/qualité ; `advanced` = le reste. */
+  let { section = 'all' }: { section?: 'all' | 'quality' | 'advanced' } = $props();
+
   interface QualityPreselection {
     enabled?: boolean;
     fast_tps?: number;
@@ -403,6 +406,7 @@
   }
 </script>
 
+{#if section !== 'quality'}
 <Card title={t('vpn.advanced')}>
   <div class="grid">
     <div class="field">
@@ -519,7 +523,9 @@
     {/if}
   </div>
 </Card>
+{/if}
 
+{#if section !== 'advanced'}
 <Card title={t('vpn.quality_title')} hint={t('vpn.quality_hint')}>
   <div class="quality-section">
     <div class="quality-head">
@@ -747,7 +753,9 @@
   </div>
   {/if}
 </Card>
+{/if}
 
+{#if section !== 'quality'}
 {#if proxyMode === 'vpn'}
 <Card title={t('free_models.https_title')} hint={t('free_models.https_hint')}>
   <div class="row">
@@ -936,6 +944,7 @@
         .join('\n')}</pre>
   {/if}
 </Card>
+{/if}
 
 <style>
   .grid {

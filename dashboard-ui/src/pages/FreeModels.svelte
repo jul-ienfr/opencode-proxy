@@ -12,9 +12,10 @@
   import { apiGet } from '$lib/api';
   import { t } from '$lib/i18n.svelte';
   import { createQuery } from '$lib/query.svelte';
-  import { navigate } from '$lib/router.svelte';
+  import { navigate, navigateSub, route } from '$lib/router.svelte';
   import Card from '$lib/components/Card.svelte';
   import Empty from '$lib/components/Empty.svelte';
+  import SubTabs from '$lib/components/SubTabs.svelte';
   import VpnStatus from './vpn/VpnStatus.svelte';
   import AllocatorStatus from './vpn/AllocatorStatus.svelte';
   import VpnRouting from './vpn/VpnRouting.svelte';
@@ -64,6 +65,26 @@
     )
   );
 
+  const tabs = $derived([
+    { id: 'overview', label: t('free_models.tab_overview'), testid: 'tab-free-overview' },
+    { id: 'egress', label: t('free_models.tab_egress'), testid: 'tab-free-egress' },
+    { id: 'routing', label: t('free_models.tab_routing'), testid: 'tab-free-routing' },
+    { id: 'quality', label: t('free_models.tab_quality'), testid: 'tab-free-quality' },
+    { id: 'advanced', label: t('free_models.tab_advanced'), testid: 'tab-free-advanced' }
+  ]);
+
+  const active = $derived(
+    tabs.some((tab) => tab.id === route.current.sub) ? route.current.sub : 'overview'
+  );
+
+  // Normalise un hash inconnu vers le sous-onglet par défaut.
+  $effect(() => {
+    if (route.current.tab !== 'free-models') return;
+    if (!tabs.some((tab) => tab.id === route.current.sub)) {
+      navigateSub('overview', true);
+    }
+  });
+
   function statusClass(status: string | undefined): string {
     if (status === 'served') return 'free';
     if (status === 'dead' || status === 'not_free') return 'warn';
@@ -73,6 +94,14 @@
   }
 </script>
 
+<SubTabs
+  tabs={tabs}
+  active={active}
+  ariaLabel={t('free_models.tabs_label')}
+  onSelect={(id) => navigateSub(id)}
+/>
+
+{#if active === 'overview'}
 <Card title={t('free_models.inventory')}>
   <div class="inventory-head">
     <p class="hint">{t('free_models.inventory_hint')}</p>
@@ -138,13 +167,25 @@
     </div>
   {/if}
 </Card>
+{/if}
 
-<VpnStatus />
+{#if active === 'egress'}
+  <VpnStatus />
+  <VpnServers />
+  <AllocatorStatus />
+{/if}
 
-<AllocatorStatus />
-<VpnRouting />
-<VpnServers />
-<VpnAdvanced />
+{#if active === 'routing'}
+  <VpnRouting />
+{/if}
+
+{#if active === 'quality'}
+  <VpnAdvanced section="quality" />
+{/if}
+
+{#if active === 'advanced'}
+  <VpnAdvanced section="advanced" />
+{/if}
 
 <style>
   .inventory-head {
