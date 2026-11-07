@@ -4283,6 +4283,8 @@ class FreeIPPool:
         for fallback_index, endpoint in enumerate(
             list(getattr(self, "_socks5_eps", None) or [])
         ):
+            if isinstance(endpoint, HttpsProxyEndpoint):
+                continue
             try:
                 index = -1 - int(getattr(endpoint, "_station", -1))
             except (TypeError, ValueError):

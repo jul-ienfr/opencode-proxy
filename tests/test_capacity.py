@@ -270,12 +270,13 @@ def test_endpoint_hotspot_ignores_unselected_provider():
 
 
 def test_endpoint_inventory_maps_toggle_indices():
-    from free.pool import FreeIPPool, Socks5Endpoint
+    from free.pool import FreeIPPool, HttpsProxyEndpoint, Socks5Endpoint
 
     pool = object.__new__(FreeIPPool)
     pool._socks5_eps = [
         Socks5Endpoint("127.0.0.1", 11080, index=0, label="w1", provider="warp"),
         Socks5Endpoint("127.0.0.1", 1080, index=1, label="p1", provider="static"),
+        HttpsProxyEndpoint("https.example", 89, index=2, label="h1"),
     ]
     inventory = pool.endpoint_inventory()
     assert [row["index"] for row in inventory] == [0, 1]
@@ -295,3 +296,15 @@ def test_single_provider_warns_no_redundancy():
 def test_two_providers_no_single_provider_warning():
     report = _report()
     assert not any(w["code"] == "single_provider" for w in report.warnings)
+
+
+def test_disabled_endpoint_warning_only_when_deficit():
+    providers = _counts(6, 6)
+    providers["warp"]["configured"] = 7
+    report = _report(providers=providers)
+    assert not any(w["code"] == "disabled_warp" for w in report.warnings)
+
+    providers = _counts(6, 5)
+    providers["warp"]["configured"] = 6
+    report = _report(providers=providers)
+    assert any(w["code"] == "disabled_warp" for w in report.warnings)

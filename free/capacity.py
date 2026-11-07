@@ -394,16 +394,17 @@ def evaluate_capacity(
     for name in selected_names:
         provider = report.providers[name]
         if provider.configured > 0 and provider.enabled < provider.configured:
-            warnings.append(
-                _message(
-                    f"disabled_{name}",
-                    f"{provider_label(name)} : "
-                    f"{provider.configured - provider.enabled} endpoint(s) désactivé(s).",
-                    f"{provider_label(name)}: "
-                    f"{provider.configured - provider.enabled} endpoint(s) disabled.",
-                    "warn",
+            if provider.deficit > 0 or report.total_usable < target:
+                warnings.append(
+                    _message(
+                        f"disabled_{name}",
+                        f"{provider_label(name)} : "
+                        f"{provider.configured - provider.enabled} endpoint(s) désactivé(s).",
+                        f"{provider_label(name)}: "
+                        f"{provider.configured - provider.enabled} endpoint(s) disabled.",
+                        "warn",
+                    )
                 )
-            )
         if provider.usable <= 0:
             warnings.append(
                 _message(
