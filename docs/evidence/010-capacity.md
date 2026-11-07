@@ -179,6 +179,24 @@ C'est le cas live WARP-only : `6/6 OK` avec WARP, mais pas de secours
 inter-provider. Pour une vraie redondance, il faut un second provider
 sélectionné (NordVPN ou proxys) avec sa propre capacité.
 
+## Transports multi-station
+
+Le projet utilise une clé NordLynx partagée : un seul endpoint WireGuard peut
+être actif à la fois. La configuration live répartit donc :
+
+```text
+station 1 : openvpn-udp
+station 2 : openvpn-udp
+station 3 : openvpn-tcp
+station 4 : openvpn-udp
+station 5 : wireguard
+station 6 : openvpn-udp
+```
+
+`allocator.auth_fallback_transport` est volontairement vide : sur AUTH
+OpenVPN, les stations explicitement configurées ne basculent plus toutes en
+WireGuard et ne se bloquent plus sur `wireguard lease busy`.
+
 ## GUI
 
 Carte `Capacité` dans `Modèles Gratuits > Egress & providers` :
