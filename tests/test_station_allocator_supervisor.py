@@ -96,6 +96,28 @@ def test_scope_honours_station_count_and_operator_disabled(monkeypatch):
     assert module._scope() == [1, 3, 4]
 
 
+def test_nordvpn_selected_reads_live_config(monkeypatch):
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_live_ip_rotation",
+        lambda: {"egress_providers": ["warp"]},
+    )
+    assert module._nordvpn_selected() is False
+    monkeypatch.setattr(
+        module,
+        "_live_ip_rotation",
+        lambda: {"egress_providers": ["warp", "nordvpn"]},
+    )
+    assert module._nordvpn_selected() is True
+    monkeypatch.setattr(
+        module,
+        "_live_ip_rotation",
+        lambda: {"proxy_mode": "vpn"},
+    )
+    assert module._nordvpn_selected() is True
+
+
 def test_manager_repair_enabled_reads_live_config(monkeypatch):
     module = _module()
     monkeypatch.setattr(

@@ -450,6 +450,21 @@ def _live_ip_rotation() -> dict:
         return {}
 
 
+def _nordvpn_selected() -> bool:
+    """True si NordVPN fait partie des egress providers sélectionnés.
+
+    En mode WARP-only, le superviseur NordVPN n'a rien à réparer : continuer
+    à scanner fait tourner six chaînes pour des stations absentes du statut.
+    """
+    live = _live_ip_rotation()
+    providers = live.get("egress_providers")
+    if isinstance(providers, (list, tuple)):
+        names = [str(item or "").strip().lower() for item in providers]
+        if any(names):
+            return "nordvpn" in names
+    return str(live.get("proxy_mode") or "").strip().lower() in ("vpn", "auto_egress")
+
+
 def _manager_repair_enabled() -> bool:
     """True when the proxy watchdog parks/repairs stations by itself.
 
@@ -1203,6 +1218,7 @@ def _supervise() -> None:
     last_cycle_log = 0.0
     zero_functional_polls = 0
     observe_logged: dict[int, str] = {}
+    nordvpn_idle_logged = False
     while True:
         poll = INTERVAL_S
         try:
@@ -1217,6 +1233,13 @@ def _supervise() -> None:
                 last_mode = "off"
                 time.sleep(poll)
                 continue
+            if not _nordvpn_selected():
+                if not nordvpn_idle_logged:
+                    log("NordVPN non sélectionné — supervisor idle")
+                    nordvpn_idle_logged = True
+                time.sleep(poll)
+                continue
+            nordvpn_idle_logged = False
             now_heartbeat = time.time()
             if now_heartbeat - last_heartbeat >= 60.0:
                 last_heartbeat = now_heartbeat
