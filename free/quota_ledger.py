@@ -163,6 +163,91 @@ class BucketState:
             return None
 
 
+@dataclass
+class EgressBlock:
+    """Bloc d'egress provider-aware (feature 007).
+
+    Distinct de ``BucketState`` : le bucket est journalier et lié au modèle,
+    le bloc décrit la ressource d'egress (provider, reset, preuve).
+    """
+
+    block: str
+    provider: str = ""
+    first_seen_at: float = 0.0
+    last_seen_at: float = 0.0
+    reset_at: float = 0.0
+    exhausted: bool = False
+    source: str = "observed"
+    last_error: str = ""
+    evidence_ref: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "block": self.block,
+            "provider": self.provider,
+            "first_seen_at": self.first_seen_at,
+            "last_seen_at": self.last_seen_at,
+            "reset_at": self.reset_at,
+            "exhausted": self.exhausted,
+            "source": self.source,
+            "last_error": self.last_error,
+            "evidence_ref": self.evidence_ref,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> EgressBlock | None:
+        if not isinstance(raw, dict):
+            return None
+        block = str(raw.get("block") or "").strip()
+        if not block:
+            return None
+        def _num(name: str) -> float:
+            try:
+                return max(0.0, float(raw.get(name, 0.0) or 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        return cls(
+            block=block,
+            provider=str(raw.get("provider") or ""),
+            first_seen_at=_num("first_seen_at"),
+            last_seen_at=_num("last_seen_at"),
+            reset_at=_num("reset_at"),
+            exhausted=bool(raw.get("exhausted", False)),
+            source=str(raw.get("source") or "observed"),
+            last_error=str(raw.get("last_error") or ""),
+            evidence_ref=str(raw.get("evidence_ref") or ""),
+        )
+
+
+@dataclass
+class QuotaObservation:
+    """Observation append-only d'un quota (feature 007)."""
+
+    model: str
+    block: str
+    provider: str = ""
+    status: int = 0
+    error_class: str = ""
+    retry_after_s: float = 0.0
+    reset_at: float = 0.0
+    observed_at: float = 0.0
+    evidence_ref: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "block": self.block,
+            "provider": self.provider,
+            "status": self.status,
+            "error_class": self.error_class,
+            "retry_after_s": self.retry_after_s,
+            "reset_at": self.reset_at,
+            "observed_at": self.observed_at,
+            "evidence_ref": self.evidence_ref,
+        }
+
+
 def is_free_usage_error(error_type: str, body: Any) -> bool:
     et = str(error_type or "").strip().lower()
     if et in (

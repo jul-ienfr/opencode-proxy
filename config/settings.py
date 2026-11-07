@@ -368,6 +368,18 @@ def yaml_get(section: str, key: str = None, default=None):
     return default
 
 
+def fallback_config() -> dict[str, Any]:
+    """Lit/valide ``ip_rotation.fallback`` (feature 007).
+
+    Le mapping reste dans ``config.yaml`` ; la validation et les bornes vivent
+    dans ``free.fallback.FallbackConfig`` (pur, testable sans I/O).
+    """
+    from free.fallback import FallbackConfig
+
+    raw = yaml_get("ip_rotation", "fallback", {}) or {}
+    return FallbackConfig.from_mapping(raw).as_dict()
+
+
 def yaml_set(section: str, key: str, value):
     """Write a value to the YAML config and persist."""
     if section not in _yaml_data or not isinstance(_yaml_data.get(section), dict):

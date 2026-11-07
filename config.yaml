@@ -436,6 +436,21 @@ ip_rotation:
   wg_canary_poll_interval_s: 4
   wg_churn_fallback: true
   wg_return_enabled: true
+  fallback:
+    order:
+    - warp
+    - warp_alt
+    - isp_ipv6
+    - oracle
+    - proton
+    - windscribe
+    - vps_ipv6
+    max_fallback_stations: 2
+    probe_interval_s: 300
+    recovery_successes: 2
+    cooldown_s: 900
+    max_block_s: 0
+    fail_closed: true
 geo:
   enabled: true
   version: 1

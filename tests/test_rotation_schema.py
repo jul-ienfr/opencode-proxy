@@ -45,9 +45,9 @@ def _seed_server(conn):
 
 
 def test_schema_is_idempotent_and_versioned(db):
-    assert current_version(db) == 1
+    assert current_version(db) == 2
     apply_schema(db, now=1001.0)
-    assert current_version(db) == 1
+    assert current_version(db) == 2
     tables = {
         row[0]
         for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -70,6 +70,15 @@ def test_schema_is_idempotent_and_versioned(db):
         "station_state",
         "score_snapshots",
     }.issubset(tables)
+
+
+def test_egress_provider_columns(db):
+    egress_cols = {row[1] for row in db.execute("PRAGMA table_info(egress_ips)")}
+    assert {"provider", "block_key", "quota_axis"} <= egress_cols
+    obs_cols = {row[1] for row in db.execute("PRAGMA table_info(observations)")}
+    assert "provider" in obs_cols
+    quota_cols = {row[1] for row in db.execute("PRAGMA table_info(quota_buckets)")}
+    assert "provider" in quota_cols
 
 
 def test_foreign_keys_and_check_constraints(db):

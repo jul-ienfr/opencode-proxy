@@ -44,9 +44,9 @@ persistance et dédup. Bloque toutes les user stories.
 - [X] T005 Étendre `core/errors.py` avec `GATE_403`, `QUOTA_429`, `RATE_LIMIT_429`, `TRANSIENT_5XX`, `ACCOUNT_OR_GLOBAL`, `AUTH` et `classify_free_error(status, body, headers)` ; réutiliser `free_quota_scope`, `is_free_quota_failure` et `classify_upstream_error` (pas de `free/errors.py` dupliqué).
 - [X] T006 [P] Créer `free/egress_provider.py` avec le protocole `EgressProvider` et `EgressRotationResult` conformes à `contracts/egress-provider.md`.
 - [X] T007 [P] Étendre `Socks5Endpoint` dans `free/pool.py` avec `provider`, `block_key`, `quota_axis`, `reset_at`, en gardant `provider=warp` par défaut si absent.
-- [ ] T008 Ajouter la migration `registry.db` (colonnes `provider`, `block_key`, `quota_axis`, `reset_at`) dans `rotation/infrastructure/db/migrate.py`, avec backup `VACUUM INTO` avant migration.
-- [ ] T009 [P] Ajouter `EgressBlock` et `QuotaObservation` dans `free/quota_ledger.py` (ou un module voisin) ; `reset_at` vient uniquement du fournisseur.
-- [ ] T010 [P] Ajouter le chargement/validation de `fallback.order`, `max_fallback_stations`, `probe_interval_s`, `recovery_successes`, `cooldown_s`, `max_block_s`, `fail_closed` dans `config/settings.py`.
+- [X] T008 Ajouter la migration `registry.db` (colonnes `provider`, `block_key`, `quota_axis`, `reset_at`) dans `rotation/infrastructure/db/migrate.py`, avec backup `VACUUM INTO` avant migration.
+- [X] T009 [P] Ajouter `EgressBlock` et `QuotaObservation` dans `free/quota_ledger.py` (ou un module voisin) ; `reset_at` vient uniquement du fournisseur.
+- [X] T010 [P] Ajouter le chargement/validation de `fallback.order`, `max_fallback_stations`, `probe_interval_s`, `recovery_successes`, `cooldown_s`, `max_block_s`, `fail_closed` dans `config/settings.py`.
 - [ ] T011 Implémenter `measure_egress(endpoint)` dans `free/egress_provider.py` : famille IPv6/IPv4, normalisation `/64`/`/32`, rejet `socks5:*`.
 - [X] T012 [P] Écrire `tests/test_error_taxonomy.py` : 403, 429 quota, 429 rate-limit, 5xx, account/global.
 - [X] T013 [P] Écrire `tests/test_egress_provider.py` : famille, bloc, doublon, `current_ip` jamais stale, probe `False`.
