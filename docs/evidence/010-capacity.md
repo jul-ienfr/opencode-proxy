@@ -160,6 +160,10 @@ Exemple testé : `10, 10, 40` → médiane 10, l'endpoint à 40 est signalé
   confirmation avant de démarrer/arrêter des conteneurs.
 - Aucune création/suppression de conteneur n'est déclenchée par un toggle
   d'endpoint.
+- Audit append-only : `logs/egress_audit.jsonl` reçoit `capacity_config`,
+  `egress_mode`, `station_count`, `socks5_toggle/add/remove`. Le toggle
+  `warp-ipv6` a produit deux lignes avec `label/managed/provider` et aucun
+  username/password.
 
 ## GUI
 

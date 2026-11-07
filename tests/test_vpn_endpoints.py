@@ -154,6 +154,8 @@ def ctx(tmp_path, monkeypatch):
     # Persist recorder — never touches config.yaml.
     persisted = []
     monkeypatch.setattr(api, "_persist_vpn_config", lambda u: (persisted.append(dict(u)), None)[1])
+    # Audit recorder — no test should write the real logs/egress_audit.jsonl.
+    monkeypatch.setattr(api, "_egress_audit", lambda *a, **k: None)
     return fast, s1, s2, pool, cfg, persisted
 
 
@@ -421,6 +423,28 @@ def test_egress_capacity_includes_observed_share(ctx, monkeypatch):
     assert data["providers"]["nordvpn"]["observed_share"] == 90.0
     assert data["providers"]["warp"]["observed_share"] == 10.0
     assert any(w["code"] == "observed_shift" for w in data["warnings"])
+
+
+def test_egress_capacity_post_writes_audit(ctx, monkeypatch):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    records: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        api,
+        "_egress_audit",
+        lambda action, details: records.append((action, dict(details))),
+    )
+    resp = _post(
+        fast,
+        "/api/egress/capacity",
+        {"target_slots": 7, "reserve_policy": "shared"},
+    )
+    assert resp["ok"] is True
+    assert records == [
+        (
+            "capacity_config",
+            {"egress_capacity": {"target_slots": 7, "reserve_policy": "shared"}},
+        )
+    ]
 
 
 def test_proxy_mode_invalid_is_error(ctx):

@@ -67,6 +67,8 @@
 - [x] T025 Confirmation explicite pour le redimensionnement NordVPN ; les
   toggles d'endpoints ne créent/suppriment aucun conteneur. Les métadonnées
   WARP (`label`, `managed`, `provider`, `container`, `block`) sont préservées.
+  Audit append-only dans `logs/egress_audit.jsonl` (`capacity_config`,
+  `egress_mode`, `station_count`, `socks5_toggle/add/remove`), sans secret.
 - [x] T026 Santé réelle : `usable_station_count` pour NordVPN et
   `_socks5_usable` pour WARP/proxys.
 

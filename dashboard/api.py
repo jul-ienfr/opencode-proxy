@@ -1620,7 +1620,28 @@ def _as_index(value) -> int:
     return idx
 
 
-def _apply_socks5_rows(rows: list) -> dict | None:
+def _egress_audit(action: str, details: dict) -> None:
+    """Journal append-only des actions capacité/egress (T025).
+
+    Ne doit contenir aucun secret (jamais mot de passe/username). Best-effort :
+    un échec disque ne casse pas l'action opérateur.
+    """
+    try:
+        root = os.path.dirname(__CONFIG_YAML_PATH)
+        path = os.path.join(root, "logs", "egress_audit.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        record = {
+            "ts": datetime.now(UTC).isoformat(),
+            "action": str(action),
+            **details,
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _apply_socks5_rows(rows: list, *, action: str = "socks5_update") -> dict | None:
     """Validate + persist the socks5 list, then push it to the pool.
     Returns an error dict on invalid input, None on success."""
     cleaned = []
@@ -1657,6 +1678,23 @@ def _apply_socks5_rows(rows: list) -> dict | None:
         )
     err = _persist_vpn_config({"socks5_proxies": cleaned})
     if not err:
+        _egress_audit(
+            action,
+            {
+                "count": len(cleaned),
+                "rows": [
+                    {
+                        "host": row["host"],
+                        "port": row["port"],
+                        "enabled": row["enabled"],
+                        "label": row.get("label", ""),
+                        "managed": row.get("managed", False),
+                        "provider": row.get("provider", ""),
+                    }
+                    for row in cleaned
+                ],
+            },
+        )
         try:
             import shared_state
 
@@ -4318,6 +4356,7 @@ def register_dashboard(
         err = _persist_vpn_config({"egress_capacity": updates})
         if err:
             return {"error": err}
+        _egress_audit("capacity_config", {"egress_capacity": dict(updates)})
         return {"ok": True, "egress_capacity": updates}
 
     @app.post("/api/vpn-config")
@@ -4505,6 +4544,7 @@ def register_dashboard(
             # no proxy restart). Short-circuits when the count did not
             # actually change; _apply_station_count persists config.yaml
             # LAST (coherent on mid-failure).
+            _requested_station_count: int | None = None
             if "station_count" in body:
                 _raw_n = body["station_count"]
                 try:
@@ -4520,6 +4560,7 @@ def register_dashboard(
                         content={"error": f"station_count doit être un entier entre 1 et 10, reçu {_raw_n!r}"},
                     )
                 body.pop("station_count")  # consumed — never fanned out
+                _requested_station_count = _new_n
                 if _new_n != len(managers):
                     try:
                         from opencode import _apply_station_count
@@ -4555,6 +4596,11 @@ def register_dashboard(
                             content={"error": f"échec resync station_count : {e}"},
                         )
                     managers = getattr(shared_state, "vpn_managers", None) or []
+            if _requested_station_count is not None:
+                _egress_audit(
+                    "station_count",
+                    {"station_count": int(_requested_station_count)},
+                )
             for mgr in managers:
                 await mgr.update_config(body)
             # [plan] E: new ip_rotation timings drive the free-IP pool too
@@ -5268,7 +5314,7 @@ def register_dashboard(
                 "password": body.get("password"),
             }
         )
-        err = _apply_socks5_rows(rows)
+        err = _apply_socks5_rows(rows, action="socks5_add")
         if err:
             return err
         return {"ok": True, "proxies": _socks5_payload(pool)}
@@ -5286,7 +5332,7 @@ def register_dashboard(
         if not (0 <= idx < len(rows)):
             return {"error": f"proxy index hors bornes: {idx!r}"}
         del rows[idx]
-        err = _apply_socks5_rows(rows)
+        err = _apply_socks5_rows(rows, action="socks5_remove")
         if err:
             return err
         return {"ok": True, "proxies": _socks5_payload(pool)}
@@ -5305,7 +5351,7 @@ def register_dashboard(
             return {"error": f"proxy index hors bornes: {idx!r}"}
         rows[idx] = dict(rows[idx])
         rows[idx]["enabled"] = bool(body.get("enabled", True))
-        err = _apply_socks5_rows(rows)
+        err = _apply_socks5_rows(rows, action="socks5_toggle")
         if err:
             return err
         return {"ok": True}
@@ -5562,6 +5608,15 @@ def register_dashboard(
                 "egress_strategy": strategy,
                 "egress_weights": weights,
             }
+        )
+        _egress_audit(
+            "egress_mode",
+            {
+                "providers": list(providers),
+                "strategy": strategy,
+                "weights": dict(weights),
+                "runtime_mode": runtime_mode,
+            },
         )
         if mode == "auto_egress":
             # WARP/proxys servent de repli quand NordVPN n'a plus de station.
