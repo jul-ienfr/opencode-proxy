@@ -94,13 +94,13 @@ WARP après deux succès.
 
 ### Tests for User Story 2
 
-- [ ] T025 [P] [US2] `tests/test_fallback_policy.py` : ordre, max 2 stations, déclencheurs, non-déclencheurs 403/429 court/5xx.
-- [ ] T026 [P] [US2] `tests/test_fallback_return.py` : retour après 2 succès + cooldown, pas de flapping.
-- [ ] T027 [P] [US2] `tests/test_fallback_fail_closed.py` : pool vide → `degraded`, aucun direct silencieux.
+- [X] T025 [P] [US2] `tests/test_fallback_policy.py` : ordre, max 2 stations, déclencheurs, non-déclencheurs 403/429 court/5xx.
+- [X] T026 [P] [US2] `tests/test_fallback_return.py` : retour après 2 succès + cooldown, pas de flapping.
+- [X] T027 [P] [US2] `tests/test_fallback_fail_closed.py` : pool vide → `degraded`, aucun direct silencieux.
 
 ### Implementation for User Story 2
 
-- [ ] T028 [US2] Créer `free/fallback.py` : `FallbackPolicy`, `evaluate()`, `select_provider()`, `should_return_to_warp()`, journalisation de la cause.
+- [X] T028 [US2] Créer `free/fallback.py` : `FallbackPolicy`, `evaluate()`, `select_provider()`, `should_return_to_warp()`, journalisation de la cause.
 - [ ] T029 [US2] Créer `free/warp_alt_provider.py` : support MicroWARP/usque (HTTP/SOCKS5), même pool, santé et rotation.
 - [ ] T030 [US2] Créer `free/gluetun_provider.py` : Proton Free (1 station), Windscribe/Privado en option, health/rotation via contrôle gluetun.
 - [ ] T031 [US2] Brancher `fallback.py` dans `free/pool.py` (`_request_egress_rotation`, `rotate_exhausted_managed`) avec dispatch provider.
