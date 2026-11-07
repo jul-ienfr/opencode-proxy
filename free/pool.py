@@ -4273,6 +4273,47 @@ class FreeIPPool:
             )
         return out
 
+    def endpoint_inventory(self) -> list[dict[str, Any]]:
+        """Inventaire des endpoints WARP/proxys pour la carte Capacité.
+
+        ``index`` est l'index de la ligne dans ``_socks5_proxies``, donc
+        directement utilisable par ``/api/vpn/socks5/toggle``.
+        """
+        out: list[dict[str, Any]] = []
+        for fallback_index, endpoint in enumerate(
+            list(getattr(self, "_socks5_eps", None) or [])
+        ):
+            try:
+                index = -1 - int(getattr(endpoint, "_station", -1))
+            except (TypeError, ValueError):
+                index = fallback_index
+            if index < 0:
+                index = fallback_index
+            provider = "warp" if self._provider_matches(endpoint, "warp") else "proxies"
+            usable = False
+            try:
+                usable = bool(self._socks5_usable(endpoint, exclude_approaching=False))
+            except Exception:
+                usable = bool(getattr(endpoint, "enabled", False))
+            out.append(
+                {
+                    "index": index,
+                    "provider": provider,
+                    "label": str(
+                        getattr(endpoint, "label", "")
+                        or getattr(endpoint, "pid", "")
+                        or ""
+                    ),
+                    "host": str(getattr(endpoint, "host", "") or ""),
+                    "port": int(getattr(endpoint, "port", 0) or 0),
+                    "enabled": bool(getattr(endpoint, "enabled", False)),
+                    "usable": usable,
+                    "egress_ip": str(getattr(endpoint, "egress_ip", "") or ""),
+                    "managed": bool(getattr(endpoint, "managed", False)),
+                }
+            )
+        return out
+
     def _socks5_pick_for(
         self, provider: str | None, *, excluded=None, conversation_key: str | None = None
     ):

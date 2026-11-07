@@ -37,6 +37,18 @@
     en: string;
   }
 
+  interface EndpointInventory {
+    index: number;
+    provider: string;
+    label: string;
+    host: string;
+    port: number;
+    enabled: boolean;
+    usable: boolean;
+    egress_ip: string;
+    managed: boolean;
+  }
+
   interface CapacityReport {
     target_slots: number;
     strategy: 'fallback' | 'balance';
@@ -51,6 +63,7 @@
     verdict: 'ok' | 'degraded' | 'insufficient';
     warnings: Message[];
     recommendations: Message[];
+    endpoints: EndpointInventory[];
   }
 
   const cap = createQuery<CapacityReport>({
@@ -78,11 +91,24 @@
       }))
   );
   const markerPct = $derived(((report?.target_slots ?? 6) / denom) * 100);
+  const endpointRows = $derived(
+    (report?.endpoints ?? []).filter((endpoint) => {
+      const provider = String(
+        endpoint.provider || (endpoint.managed ? 'warp' : 'proxies')
+      ).toLowerCase();
+      return provider === 'warp'
+        ? !!report?.providers.warp?.selected
+        : !!report?.providers.proxies?.selected;
+    })
+  );
+
+  let endpointBusy = $state<number | null>(null);
 
   let targetDraft = $state(6);
   let policyDraft = $state('full');
   let initialized = $state(false);
   let saving = $state(false);
+  let applyingStations = $state(false);
 
   $effect(() => {
     if (!report || initialized) return;
@@ -111,6 +137,52 @@
       );
     } finally {
       saving = false;
+    }
+  }
+
+  async function applyNordvpnStations(): Promise<void> {
+    const target = Math.max(1, Math.min(10, Number(targetDraft) || 6));
+    const confirmed = window.confirm(
+      t('free_models.capacity_station_confirm', { n: target })
+    );
+    if (!confirmed) return;
+    applyingStations = true;
+    try {
+      const res = await apiPost<{ error?: string }>('/api/vpn-config', {
+        station_count: target
+      });
+      if (res?.error) throw new Error(res.error);
+      await cap.refresh(true);
+      invalidateTag('vpn');
+      showToast(t('free_models.capacity_station_applied'), 'success');
+    } catch (error) {
+      showToast(
+        error instanceof Error ? error.message : t('free_models.capacity_save_error'),
+        'error'
+      );
+    } finally {
+      applyingStations = false;
+    }
+  }
+
+  async function toggleEndpoint(index: number, enabled: boolean): Promise<void> {
+    endpointBusy = index;
+    try {
+      const res = await apiPost<{ error?: string }>('/api/vpn/socks5/toggle', {
+        index,
+        enabled
+      });
+      if (res?.error) throw new Error(res.error);
+      await cap.refresh(true);
+      invalidateTag('vpn');
+      showToast(t('free_models.capacity_endpoint_updated'), 'success');
+    } catch (error) {
+      showToast(
+        error instanceof Error ? error.message : t('free_models.capacity_save_error'),
+        'error'
+      );
+    } finally {
+      endpointBusy = null;
     }
   }
 
@@ -190,6 +262,14 @@
         disabled={saving}
         onclick={saveCapacity}
       >{t('free_models.capacity_apply')}</button>
+      {#if report.providers.nordvpn.selected && report.providers.nordvpn.configured !== targetDraft}
+        <button
+          type="button"
+          class="btn btn--sm btn--ghost"
+          disabled={applyingStations}
+          onclick={applyNordvpnStations}
+        >{t('free_models.capacity_apply_nordvpn', { n: targetDraft })}</button>
+      {/if}
     </div>
   {/if}
 
@@ -281,6 +361,26 @@
         </tbody>
       </table>
     </div>
+
+    {#if endpointRows.length > 0}
+      <details class="endpoints">
+        <summary>{t('free_models.capacity_endpoints_title')} ({endpointRows.length})</summary>
+        {#each endpointRows as row (row.index)}
+          <label class="endpoint-row">
+            <input
+              type="checkbox"
+              checked={row.enabled}
+              disabled={endpointBusy === row.index}
+              onchange={(event) => toggleEndpoint(row.index, event.currentTarget.checked)}
+            />
+            <span class="endpoint-label">
+              {row.label || `${row.host}:${row.port}`}
+            </span>
+            <span class="endpoint-ip">{row.egress_ip || row.host}</span>
+          </label>
+        {/each}
+      </details>
+    {/if}
 
     <div class="endpoint-bar">
       <div class="endpoint-track">
@@ -497,6 +597,39 @@
 
   .endpoint-bar {
     margin-top: var(--sp-3);
+  }
+
+  .endpoints {
+    margin-top: var(--sp-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: var(--sp-2);
+    background: var(--surface-2);
+  }
+
+  .endpoints summary {
+    cursor: pointer;
+    color: var(--text-dim);
+    font-size: var(--fs-xs);
+    font-weight: 600;
+  }
+
+  .endpoint-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-top: var(--sp-1);
+    font-size: var(--fs-xs);
+  }
+
+  .endpoint-label {
+    flex: 1;
+    color: var(--text);
+  }
+
+  .endpoint-ip {
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
   }
 
   .endpoint-track {

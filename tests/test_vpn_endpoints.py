@@ -451,6 +451,14 @@ def test_socks5_add_persists_cleaned_row(ctx):
                     "enabled": True,
                     "username": "u1",
                     "password": "s3cr3t",
+                    "label": "",
+                    "ipv6": False,
+                    "egress_ip": "",
+                    "managed": False,
+                    "container": "",
+                    "image": "",
+                    "block": "",
+                    "provider": "",
                 },
                 {
                     "host": "p2.example.com",
@@ -458,6 +466,14 @@ def test_socks5_add_persists_cleaned_row(ctx):
                     "enabled": False,
                     "username": None,
                     "password": None,
+                    "label": "",
+                    "ipv6": False,
+                    "egress_ip": "",
+                    "managed": False,
+                    "container": "",
+                    "image": "",
+                    "block": "",
+                    "provider": "",
                 },
                 {
                     "host": "p3.example.com",
@@ -465,6 +481,14 @@ def test_socks5_add_persists_cleaned_row(ctx):
                     "enabled": True,
                     "username": "u3",
                     "password": "pw3",
+                    "label": "",
+                    "ipv6": False,
+                    "egress_ip": "",
+                    "managed": False,
+                    "container": "",
+                    "image": "",
+                    "block": "",
+                    "provider": "",
                 },
             ]
         }
@@ -475,6 +499,32 @@ def test_socks5_add_persists_cleaned_row(ctx):
         assert "password" not in p
     assert resp["proxies"][2]["host"] == "p3.example.com"
     assert resp["proxies"][2]["has_password"] is True
+
+
+def test_socks5_toggle_preserves_warp_metadata(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    pool._socks5_proxies.append(
+        {
+            "host": "127.0.0.1",
+            "port": 11080,
+            "enabled": True,
+            "label": "warp-ipv6",
+            "managed": True,
+            "provider": "warp",
+            "ipv6": True,
+            "egress_ip": "2a09:bac5:32d0:14dc::214:83",
+            "container": "warp-test",
+            "image": "caomingjun/warp:latest",
+            "block": "2a09:bac5:32d0:14dc::/64",
+        }
+    )
+    resp = _post(fast, "/api/vpn/socks5/toggle", {"index": 2, "enabled": False})
+    assert resp["ok"] is True
+    row = persisted[0]["socks5_proxies"][2]
+    assert row["enabled"] is False
+    assert row["managed"] is True
+    assert row["provider"] == "warp"
+    assert row["label"] == "warp-ipv6"
 
 
 def test_socks5_add_invalid_port_is_error(ctx):

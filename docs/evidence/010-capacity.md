@@ -8,7 +8,7 @@
 
 ```text
 python -m pytest tests/test_capacity.py tests/test_vpn_endpoints.py
-  -> 71 passed
+  -> 73 passed
 python -m ruff check free/capacity.py free/pool.py dashboard/api.py tests/...
   -> OK
 npm --prefix dashboard-ui run check -> 0 errors, 0 warnings
@@ -145,6 +145,21 @@ conseiller calcule la médiane des endpoints sélectionnés (≥ 3 endpoints) et
 
 Exemple testé : `10, 10, 40` → médiane 10, l'endpoint à 40 est signalé
 (4×). `10, 10, 15` → aucun signalement. Un provider décoché est ignoré.
+
+## Actions capacité (T023–T026)
+
+- La carte affiche une liste `Endpoints (7)` avec une case à cocher par
+  endpoint WARP/proxy.
+- Test live : décocher `warp-ipv6` → `5/6`, verdict `insufficient` ;
+  recocher → `6/6`, verdict `ok`.
+- Les métadonnées WARP sont préservées après le toggle :
+  `label=warp-ipv6`, `managed=true`, `provider=warp`, `container=warp-test`,
+  `block=2a09:...`.
+- Le bouton `Appliquer {n} stations NordVPN` n'apparaît que si NordVPN est
+  sélectionné et que `station_count` diffère de la cible ; il demande
+  confirmation avant de démarrer/arrêter des conteneurs.
+- Aucune création/suppression de conteneur n'est déclenchée par un toggle
+  d'endpoint.
 
 ## GUI
 

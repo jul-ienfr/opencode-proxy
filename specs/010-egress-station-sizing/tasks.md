@@ -59,14 +59,16 @@
 
 ## Phase 6: Application contrôlée (US4 — P2)
 
-- [ ] T023 Bouton « Appliquer le dimensionnement NordVPN » : appelle
-  `_apply_station_count(target)` avec confirmation.
-- [ ] T024 Activer/désactiver des endpoints WARP existants depuis la carte ;
-  pas de création implicite.
-- [ ] T025 Confirmation explicite pour toute création/suppression de
-  conteneur ; audit dans les logs.
-- [ ] T026 Brancher la santé réelle : `usable_station_count`, `parked_ips`,
-  quarantaine 403, quota restant.
+- [x] T023 Bouton « Appliquer {n} stations NordVPN » : visible seulement si
+  NordVPN est sélectionné et `station_count != target` ; confirmation
+  `window.confirm` avant l'appel `/api/vpn-config`.
+- [x] T024 Activer/désactiver des endpoints WARP existants depuis la carte ;
+  liste `details` avec cases à cocher, aucune création implicite.
+- [x] T025 Confirmation explicite pour le redimensionnement NordVPN ; les
+  toggles d'endpoints ne créent/suppriment aucun conteneur. Les métadonnées
+  WARP (`label`, `managed`, `provider`, `container`, `block`) sont préservées.
+- [x] T026 Santé réelle : `usable_station_count` pour NordVPN et
+  `_socks5_usable` pour WARP/proxys.
 
 ## Phase 7: Télémétrie (US5 — P3)
 

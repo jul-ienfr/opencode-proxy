@@ -267,3 +267,17 @@ def test_endpoint_hotspot_ignores_unselected_provider():
         ],
     )
     assert not any(w["code"] == "endpoint_hotspot" for w in report.warnings)
+
+
+def test_endpoint_inventory_maps_toggle_indices():
+    from free.pool import FreeIPPool, Socks5Endpoint
+
+    pool = object.__new__(FreeIPPool)
+    pool._socks5_eps = [
+        Socks5Endpoint("127.0.0.1", 11080, index=0, label="w1", provider="warp"),
+        Socks5Endpoint("127.0.0.1", 1080, index=1, label="p1", provider="static"),
+    ]
+    inventory = pool.endpoint_inventory()
+    assert [row["index"] for row in inventory] == [0, 1]
+    assert [row["provider"] for row in inventory] == ["warp", "proxies"]
+    assert inventory[0]["label"] == "w1"

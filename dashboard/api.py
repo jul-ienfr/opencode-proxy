@@ -1533,6 +1533,19 @@ def _egress_endpoint_observed() -> list[dict]:
     return []
 
 
+def _egress_endpoint_inventory() -> list[dict]:
+    """Inventaire WARP/proxys pour les cases à cocher de la carte Capacité."""
+    pool = _dashboard_pool()
+    if pool is not None and hasattr(pool, "endpoint_inventory"):
+        try:
+            rows = pool.endpoint_inventory()
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+        except Exception:
+            pass
+    return []
+
+
 def _egress_capacity_counts() -> dict[str, dict[str, int]]:
     """Capacité configurée/activée/utilisable par provider (010).
 
@@ -1630,6 +1643,16 @@ def _apply_socks5_rows(rows: list) -> dict | None:
                 "enabled": bool(r.get("enabled", True)),
                 "username": str(r.get("username") or "").strip() or None,
                 "password": str(r.get("password") or "").strip() or None,
+                # [010] préserver les métadonnées WARP : un toggle GUI ne doit
+                # pas transformer un endpoint managé en proxy statique.
+                "label": str(r.get("label") or "").strip(),
+                "ipv6": bool(r.get("ipv6", False)),
+                "egress_ip": str(r.get("egress_ip") or "").strip(),
+                "managed": bool(r.get("managed", False)),
+                "container": str(r.get("container") or "").strip(),
+                "image": str(r.get("image") or "").strip(),
+                "block": str(r.get("block") or "").strip(),
+                "provider": str(r.get("provider") or "").strip(),
             }
         )
     err = _persist_vpn_config({"socks5_proxies": cleaned})
@@ -4262,7 +4285,9 @@ def register_dashboard(
             observed=_egress_observed_counts(),
             endpoint_observed=_egress_endpoint_observed(),
         )
-        return report.to_dict()
+        payload = report.to_dict()
+        payload["endpoints"] = _egress_endpoint_inventory()
+        return payload
 
     @app.post("/api/egress/capacity")
     async def set_egress_capacity(request: Request):
