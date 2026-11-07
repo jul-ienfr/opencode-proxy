@@ -367,6 +367,18 @@ def evaluate_capacity(
     warnings: list[dict[str, str]] = []
     recommendations: list[dict[str, str]] = []
 
+    if len(selected_names) == 1:
+        warnings.append(
+            _message(
+                "single_provider",
+                "Un seul provider est sélectionné : aucune redondance inter-provider. "
+                "Une panne de ce provider laisse 0 station.",
+                "Only one provider is selected: no cross-provider redundancy. "
+                "An outage of this provider leaves 0 stations.",
+                "warn",
+            )
+        )
+
     if coerced:
         warnings.append(
             _message(

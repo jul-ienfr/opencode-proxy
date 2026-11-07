@@ -281,3 +281,17 @@ def test_endpoint_inventory_maps_toggle_indices():
     assert [row["index"] for row in inventory] == [0, 1]
     assert [row["provider"] for row in inventory] == ["warp", "proxies"]
     assert inventory[0]["label"] == "w1"
+
+
+def test_single_provider_warns_no_redundancy():
+    report = _report(
+        providers=_counts(0, 6),
+        selected=["warp"],
+    )
+    assert report.verdict == "ok"
+    assert any(w["code"] == "single_provider" for w in report.warnings)
+
+
+def test_two_providers_no_single_provider_warning():
+    report = _report()
+    assert not any(w["code"] == "single_provider" for w in report.warnings)

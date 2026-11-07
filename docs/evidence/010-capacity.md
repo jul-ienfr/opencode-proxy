@@ -165,6 +165,20 @@ Exemple testé : `10, 10, 40` → médiane 10, l'endpoint à 40 est signalé
   `warp-ipv6` a produit deux lignes avec `label/managed/provider` et aucun
   username/password.
 
+## Redondance inter-provider
+
+Un seul provider sélectionné donne `verdict=ok` si sa capacité couvre la cible,
+mais la carte émet un warning `single_provider` :
+
+```text
+Un seul provider est sélectionné : aucune redondance inter-provider.
+Une panne de ce provider laisse 0 station.
+```
+
+C'est le cas live WARP-only : `6/6 OK` avec WARP, mais pas de secours
+inter-provider. Pour une vraie redondance, il faut un second provider
+sélectionné (NordVPN ou proxys) avec sa propre capacité.
+
 ## GUI
 
 Carte `Capacité` dans `Modèles Gratuits > Egress & providers` :
