@@ -256,6 +256,10 @@ Tous les principes restent **PASS**. Points à surveiller :
 
 ## Next Step
 
+> **Voir aussi** : `specs/009-dashboard-ia-reorg/` pour la réorganisation des
+> onglets Modèles Gratuits/Configuration, qui fournit la section de cases à
+> cocher des providers.
+
 Exécuter `/speckit.tasks` puis démarrer par la Phase 1 (mode enum + pool
 unifié) et la Phase 2 (GUI/persistance). Le mode peut être livré en MVP avec
 NordVPN + WARP, puis étendu aux proxys.
