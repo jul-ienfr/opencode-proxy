@@ -10,10 +10,16 @@ mode utilise uniquement les providers déjà configurés (NordVPN, WARP, proxys)
 
 ## Summary
 
-Ajouter un quatrième mode, **Auto-Egress** (`auto_egress`), qui construit un
-pool unifié à partir de tous les providers activés — stations NordVPN,
-endpoints WARP, proxys SOCKS5/HTTPS — et sélectionne automatiquement le
-meilleur egress pour chaque requête.
+Remplacer le choix exclusif du GUI par une section **« Egress providers »**
+avec des cases à cocher : NordVPN, WARP, Proxys SOCKS5/HTTPS, Direct.
+L'opérateur coche un ou plusieurs providers ; le moteur **Auto-Egress**
+(`auto_egress`) agrège tous les providers cochés et sélectionne automatiquement
+le meilleur egress pour chaque requête.
+
+- Une seule case cochée → comportement legacy exact (`vpn`, `socks5`,
+  `direct`).
+- Plusieurs cases cochées → pool unifié Auto-Egress.
+- Aucune case cochée → refus explicite, pas de fallback silencieux.
 
 Le parallélisme est **inter-requêtes** et **par hedge** : une requête utilise
 un seul egress, mais plusieurs requêtes/tentatives utilisent des providers
@@ -111,7 +117,7 @@ free/
 opencode.py                    # _free_proxy_mode, sélection free, mode switch
 dashboard/api.py               # mode endpoint, statut providers, attribution
 dashboard-ui/src/pages/vpn/
-├── VpnStatus.svelte           # 4e mode + providers + attribution
+├── VpnStatus.svelte           # cases à cocher providers + attribution
 └── VpnAdvanced.svelte         # poids, caps, hedge, direct, sticky
 
 config.yaml                    # auto_egress.providers/weights/caps
@@ -129,15 +135,18 @@ l'abstraction 007.
 
 ## Phase 0 — Research & decisions
 
-1. Nom et contrat UI : Auto-Egress (`auto_egress`) vs Hybride/Multi-Egress.
-2. Définir le périmètre du parallélisme : inter-requêtes + hedge, pas bonding.
-3. Définir les poids par défaut : WARP 60 %, NordVPN 30 %, proxys 10 %.
-4. Définir les caps : `max_concurrent` par provider, `hedge_delay_ms`,
+1. Contrat UI : section de cases à cocher (NordVPN, WARP, Proxys, Direct),
+   pas un quatrième bouton radio. `auto_egress` est le moteur d'agrégation.
+2. Définir le mode dérivé : une case = legacy (`vpn`/`socks5`/`direct`),
+   plusieurs cases = `auto_egress`; zéro case = refus.
+3. Définir le périmètre du parallélisme : inter-requêtes + hedge, pas bonding.
+4. Définir les poids par défaut : WARP 60 %, NordVPN 30 %, proxys 10 %.
+5. Définir les caps : `max_concurrent` par provider, `hedge_delay_ms`,
    `hedge_max_attempts`.
-5. Définir la politique de diversité : douce, jamais une porte dure.
-6. Définir le comportement direct : `allow_direct=false` par défaut,
-   `fail_closed=true`.
-7. Vérifier la compatibilité avec `free_parallel` existant.
+6. Définir la politique de diversité : douce, jamais une porte dure.
+7. Définir le comportement direct : `allow_direct=false` par défaut,
+   `fail_closed=true`, case explicite avec avertissement.
+8. Vérifier la compatibilité avec `free_parallel` existant.
 
 **Sortie**: `research.md` avec les décisions et alternatives.
 
@@ -156,16 +165,20 @@ l'abstraction 007.
 **Critère**: mode sélectionnable en interne, pool unifié construit, sélection
 déterministe avec des providers factices.
 
-## Phase 2 — US1 (mode GUI/persistance)
+## Phase 2 — US1 (cases à cocher/persistance)
 
-1. Ajouter le 4e bouton dans `VpnStatus.svelte` + locales (`Auto-Egress`).
-2. Étendre `POST /api/vpn/proxy-mode` à `auto_egress`.
-3. Persister/restaurer le mode dans `config.yaml`.
-4. Drain au changement de mode.
-5. Tests UI/API/persistance.
+1. Remplacer le radio group par une section de cases à cocher dans
+   `VpnStatus.svelte` + locales (`Egress providers`).
+2. Étendre `POST /api/vpn/proxy-mode` pour accepter une liste
+   `egress.providers` et dériver `vpn`/`socks5`/`direct`/`auto_egress`.
+3. Persister/restaurer la liste dans `config.yaml` ; lire le legacy
+   `proxy_mode` si la liste est absente.
+4. Refuser zéro provider avec un message explicite.
+5. Drain au changement de sélection.
+6. Tests UI/API/persistance/backward-compat.
 
-**Critère**: mode visible, sélectionnable, persistant, changement sans
-interruption.
+**Critère**: cases visibles, une ou plusieurs cochées, zéro refusée,
+persistance et mode dérivé corrects.
 
 ## Phase 3 — US2 (sélection multi-provider)
 

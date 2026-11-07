@@ -38,7 +38,10 @@
 
 ## Notes
 
+- The GUI is a **checkbox section** (`NordVPN`, `WARP`, `Proxys`, `Direct`),
+  not a fourth radio mode. One checked = legacy; multiple = Auto-Egress; zero
+  = refused.
 - "Parallel" means inter-request and hedged attempts, not per-request
-  multi-link bonding. This is explicit in FR-003 and the plan.
+  multi-link bonding. This is explicit in FR-004 and the plan.
 - NordVPN is used only if already configured; no new subscription is created.
 - The mode is fail-closed by default (`allow_direct=false`).

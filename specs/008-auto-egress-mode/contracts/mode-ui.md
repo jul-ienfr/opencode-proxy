@@ -1,24 +1,28 @@
 # Contract — Mode UI
 
-## Sélecteur
+## Section « Egress providers »
 
-Quatre modes, dans cet ordre :
+Cases à cocher, dans cet ordre :
 
 ```text
-NordVPN | WARP | Direct | Auto-Egress
+[ ] NordVPN
+[ ] WARP
+[ ] Proxys SOCKS5/HTTPS
+[ ] Direct (local)  ⚠️ expose l'IP résidentielle
 ```
 
-- `Auto-Egress` est un bouton radio, pas un menu caché.
-- Le libellé reste « Auto-Egress » en FR et EN (nom produit).
-- Sous-titre : « NordVPN + WARP + proxys, sélection automatique ».
-- L'état sélectionné est persisté dans `config.yaml`.
-- Au reload/restart, le mode est restauré.
+- L'opérateur peut cocher 1 à 4 providers.
+- Une seule case cochée → comportement legacy exact.
+- Plusieurs cases cochées → moteur `auto_egress`.
+- Zéro case cochée → sauvegarde refusée avec « au moins un provider ».
+- La sélection est persistée comme liste (`egress.providers`).
+- Au reload/restart, la sélection est restaurée.
 
-## Panneau Auto-Egress
+## Panneau Auto-Egress (si ≥2 providers)
 
 Affiche :
 
-- providers inclus (WARP, NordVPN, proxys) avec toggle ;
+- providers cochés avec poids ;
 - poids (somme 100, validation) ;
 - `max_concurrent` par provider ;
 - hedge delay/attempts ;
@@ -30,8 +34,8 @@ Affiche :
 
 | Option | Clé | Consommateur | Effet | Test |
 |---|---|---|---|---|
-| Activer Auto-Egress | `auto_egress.enabled` | `_free_proxy_mode` | pool unifié | `test_auto_egress_mode` |
-| Provider WARP | `providers` | `build_pool` | inclus/exclu | `test_provider_selector` |
+| Cocher NordVPN/WARP/Proxys/Direct | `egress.providers` | `_free_proxy_mode` / `build_pool` | pool unifié ou legacy | `test_auto_egress_mode` |
+| Provider coché | `selected_providers` | `build_pool` | inclus/exclu | `test_provider_selector` |
 | Poids | `weights` | `provider_selector` | répartition | `test_auto_egress_weights` |
 | Cap concurrence | `max_concurrent` | sémaphores | limite | `test_auto_egress_caps` |
 | Hedge | `hedge_*` | retry | tentatives | `test_auto_egress_hedge` |

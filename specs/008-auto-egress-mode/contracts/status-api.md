@@ -7,6 +7,8 @@ Ajouts :
 ```json
 {
   "proxy_mode": "auto_egress",
+  "selected_providers": ["warp", "nordvpn"],
+  "derived_mode": "auto_egress",
   "auto_egress": {
     "enabled": true,
     "degraded": false,

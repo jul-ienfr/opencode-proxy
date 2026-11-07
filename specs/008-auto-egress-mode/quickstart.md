@@ -16,16 +16,17 @@ python -m pytest tests/test_auto_egress_mode.py tests/test_provider_selector.py 
 python -m ruff check .
 ```
 
-## 2. Activer le mode
+## 2. Cocher les providers
 
-GUI : `Modèles Gratuits` → `Mode d'egress` → **Auto-Egress**.
+GUI : `Modèles Gratuits` → section **Egress providers** → cocher **WARP** et
+**NordVPN** (laisser Proxys/Direct décochés).
 
 API :
 
 ```powershell
 curl.exe -sS -X POST http://127.0.0.1:4000/api/vpn/proxy-mode `
   -H "Content-Type: application/json" `
-  -d '{\"mode\":\"auto_egress\"}'
+  -d '{\"providers\":[\"warp\",\"nordvpn\"]}'
 ```
 
 Vérifier :
@@ -34,7 +35,8 @@ Vérifier :
 python -c "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:4000/api/vpn-status')); print(d['proxy_mode'], d.get('auto_egress'))"
 ```
 
-Attendu : `auto_egress`, providers listés, `degraded=false`.
+Attendu : `selected_providers=["warp","nordvpn"]`, `derived_mode=auto_egress`,
+providers listés, `degraded=false`.
 
 ## 3. Répartition multi-provider
 
@@ -88,7 +90,8 @@ Attendu : répartition à ±10 points, caps respectés.
 
 Redémarrer le proxy.
 
-Attendu : mode `auto_egress`, providers/poids/caps restaurés.
+Attendu : `selected_providers` restaurés, `derived_mode=auto_egress`,
+providers/poids/caps restaurés.
 
 ## 9. Tests complets
 

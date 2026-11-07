@@ -4,6 +4,23 @@
 **But**: figer le nom, la sémantique du parallélisme et les règles de
 sélection avant l'implémentation.
 
+## D0 — UX : cases à cocher, pas un quatrième mode
+
+**Decision**: le GUI expose une section **« Egress providers »** avec des cases
+à cocher (NordVPN, WARP, Proxys, Direct). Une case = mode legacy ; plusieurs
+cases = moteur Auto-Egress ; zéro case = refus.
+
+**Rationale**: l'opérateur veut composer son pool directement (WARP + NordVPN,
+ou WARP + proxy), sans passer par un mode « Auto » opaque. Les cases rendent la
+sélection visible, réversible et persistante. Le moteur `auto_egress` reste le
+nom interne de l'agrégation quand plusieurs cases sont cochées.
+
+**Alternatives considérées**:
+- Quatrième bouton radio « Auto-Egress » : ne permet pas de voir/composer les
+  providers ; l'opérateur doit deviner ce que le mode inclut.
+- Multi-select dans un menu déroulant : moins lisible, plus de clics.
+- Un toggle par provider dans une page séparée : moins direct.
+
 ## D1 — Nom : Auto-Egress
 
 **Decision**: nom UI **Auto-Egress**, valeur interne `auto_egress`.

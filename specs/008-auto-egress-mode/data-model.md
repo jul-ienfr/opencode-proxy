@@ -7,8 +7,10 @@
 
 | Champ | Type | Défaut | Contrainte |
 |---|---|---|---|
-| `enabled` | bool | false | mode activé |
-| `providers` | list[str] | `[warp, nordvpn, proxies]` | providers existants |
+| `enabled` | bool | false | moteur activé |
+| `selected_providers` | list[str] | `[warp]` | 1–4 providers cochés |
+| `derived_mode` | enum | `socks5` | `vpn`/`socks5`/`direct`/`auto_egress` |
+| `providers` | list[str] | `[warp, nordvpn, proxies]` | providers disponibles |
 | `weights` | map[str,int] | `{warp:60, nordvpn:30, proxies:10}` | somme 100, chaque ≥0 |
 | `max_concurrent` | map[str,int] | `{warp:4, nordvpn:2, proxies:2}` | 1–16 |
 | `hedge_delay_ms` | int | 1500 | 100–10000 |
@@ -23,6 +25,22 @@
 - somme des poids = 100 (sinon normalisation avec warning).
 - un provider non configuré est ignoré, pas d'erreur fatale.
 - `allow_direct=true` exige une confirmation explicite dans le GUI.
+
+## EgressSelection
+
+| Champ | Type | Contrainte |
+|---|---|---|
+| `selected` | list[str] | `["nordvpn","warp","proxies","direct"]` sous-ensemble |
+| `derived_mode` | enum | `vpn` si `["nordvpn"]`, `socks5` si `["warp"]`, `direct` si `["direct"]`, sinon `auto_egress` |
+| `updated_at` | float | timestamp |
+| `updated_by` | string | `gui`, `api`, `migration` |
+
+**Règles**:
+- `selected` ne peut pas être vide (validation GUI/API).
+- `direct` est désactivé par défaut et affiché avec un avertissement.
+- Une sélection legacy (`proxy_mode`) est convertie en liste au chargement.
+- Le mode dérivé est recalculé à chaque changement, jamais stocké en double
+  source de vérité (la liste est l'autorité).
 
 ## UnifiedEndpoint
 

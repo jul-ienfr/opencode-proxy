@@ -24,7 +24,7 @@ Aucun nouvel abonnement payant, aucun direct silencieux.
 **Purpose**: préparer la config, les libellés et les fixtures.
 
 - [ ] T001 Ajouter la section `ip_rotation.auto_egress` (providers, weights, caps, hedge, direct, diversity, sticky) dans `config.yaml`.
-- [ ] T002 [P] Ajouter les libellés `free_models.mode_auto_egress` et le sous-titre dans `dashboard-ui/src/lib/locales.ts` (FR + EN).
+- [ ] T002 [P] Ajouter les libellés de la section « Egress providers » (NordVPN, WARP, Proxys, Direct, avertissement, zéro provider) dans `dashboard-ui/src/lib/locales.ts` (FR + EN).
 - [ ] T003 [P] Créer les fixtures providers (`warp`, `nordvpn`, `proxy`, `down`, `403`, `429`) dans `tests/fixtures/auto_egress_providers.py`.
 
 ---
@@ -51,23 +51,25 @@ Aucun nouvel abonnement payant, aucun direct silencieux.
 
 ## Phase 3: User Story 1 - Activer Auto-Egress depuis le GUI (Priority: P1) 🎯 MVP
 
-**Goal**: 4e mode visible, sélectionnable, persistant, switch sans interruption.
+**Goal**: section de cases à cocher, multi-sélection, persistance, switch sans
+interruption.
 
-**Independent Test**: sélectionner Auto-Egress, reload, restart, vérifier le mode
-et les providers listés.
+**Independent Test**: cocher WARP + NordVPN, vérifier que les deux servent ;
+décocher NordVPN, vérifier qu'il ne sert plus ; reload/restart, vérifier la
+sélection.
 
 ### Tests for User Story 1
 
-- [ ] T013 [P] [US1] `tests/test_auto_egress_ui.py` : bouton visible, valeur `auto_egress`, sélection persistée.
-- [ ] T014 [P] [US1] `tests/test_auto_egress_mode_switch.py` : changement de mode avec requête en vol, 0 interruption.
+- [ ] T013 [P] [US1] `tests/test_auto_egress_ui.py` : cases NordVPN/WARP/Proxys/Direct visibles, multi-sélection, zéro refusée.
+- [ ] T014 [P] [US1] `tests/test_auto_egress_mode_switch.py` : changement de sélection avec requête en vol, 0 interruption.
 
 ### Implementation for User Story 1
 
-- [ ] T015 [US1] Ajouter le bouton Auto-Egress dans `dashboard-ui/src/pages/vpn/VpnStatus.svelte` (à côté de NordVPN/WARP/Direct).
-- [ ] T016 [US1] Étendre `POST /api/vpn/proxy-mode` à `auto_egress` dans `dashboard/api.py` et `opencode.py`.
-- [ ] T017 [US1] Persister/restaurer le mode dans `config.yaml` et au boot.
-- [ ] T018 [US1] Implémenter le drain des requêtes en vol avant bascule dans `free/pool.py`.
-- [ ] T019 [US1] Vérifier le rendu FR/EN et l'absence de select vide dans `dashboard-ui/src/pages/vpn/VpnStatus.svelte`.
+- [ ] T015 [US1] Remplacer le radio group par une section de cases à cocher dans `dashboard-ui/src/pages/vpn/VpnStatus.svelte`.
+- [ ] T016 [US1] Étendre `POST /api/vpn/proxy-mode` pour accepter `providers: [...]` et dériver `vpn`/`socks5`/`direct`/`auto_egress` dans `dashboard/api.py` et `opencode.py`.
+- [ ] T017 [US1] Persister/restaurer `egress.providers` dans `config.yaml` ; convertir le legacy `proxy_mode` en liste au boot.
+- [ ] T018 [US1] Implémenter le drain des requêtes en vol avant changement de sélection dans `free/pool.py`.
+- [ ] T019 [US1] Valider zéro provider (refus GUI/API) et afficher un avertissement sur Direct dans `dashboard-ui/src/pages/vpn/VpnStatus.svelte`.
 
 **Checkpoint**: US1 livrable seule (mode activable, sans sélection multi-provider complète).
 
@@ -180,7 +182,10 @@ répartition et les caps.
 - [ ] T055 `python -m pytest -k "not docker" -q`, `python -m ruff check .`, `npm --prefix dashboard-ui run check` : exit 0.
 - [ ] T056 Exécuter `quickstart.md` de bout en bout et consigner les résultats.
 - [ ] T057 Soak 24 h avec providers réels, 403/429/down injectés, preuves dans `docs/evidence/008-auto-egress.md`.
-- [ ] T058 Commit final et push ; mettre à jour `.specify/feature.json` si nécessaire.
+- [ ] T058 [P] Test du mode dérivé : `["nordvpn"]→vpn`, `["warp"]→socks5`, `["direct"]→direct`, `["warp","nordvpn"]→auto_egress`, `[]→refus` dans `tests/test_auto_egress_mode.py`.
+- [ ] T059 [P] Test de compatibilité legacy : `proxy_mode` existant converti en liste au boot dans `tests/test_auto_egress_mode.py`.
+- [ ] T060 [P] Test Direct explicite : case désactivée par défaut, avertissement, coché seul = direct, coché avec d'autres = provider dans `tests/test_auto_egress_direct.py`.
+- [ ] T061 Commit final et push ; mettre à jour `.specify/feature.json` si nécessaire.
 
 ---
 

@@ -1,21 +1,28 @@
 # Contract — Auto-Egress Policy
 
-## Mode values
+## Mode dérivé
+
+La sélection est une **liste de providers cochés** ; le mode est dérivé :
 
 ```text
-vpn         → NordVPN seul
-socks5      → WARP seul
-direct      → direct seul
-auto_egress → pool unifié (WARP + NordVPN + proxys)
+["nordvpn"]              → vpn
+["warp"]                 → socks5
+["direct"]               → direct
+["nordvpn","warp"]       → auto_egress
+["warp","proxies"]       → auto_egress
+[]                       → refus (au moins un provider)
 ```
 
-`auto_egress` est un mode explicite, jamais un fallback silencieux de
-`vpn`/`socks5`.
+`auto_egress` n'est jamais un fallback silencieux : il n'est actif que si
+plusieurs providers sont cochés.
 
 ## Configuration
 
 ```yaml
 ip_rotation:
+  egress:
+    selected_providers: [warp]   # liste cochée
+    derived_mode: socks5         # calculé, jamais saisi
   auto_egress:
     enabled: false
     providers: [warp, nordvpn, proxies]

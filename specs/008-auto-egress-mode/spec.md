@@ -1,4 +1,4 @@
-# Feature Specification: Auto-Egress — mode multi-provider automatique
+# Feature Specification: Auto-Egress — sélection multi-provider par cases à cocher
 
 **Feature Branch**: `008-auto-egress-mode`
 
@@ -6,48 +6,59 @@
 
 **Status**: Draft
 
-**Input**: Demande opérateur : ajouter un mode qui utilise en parallèle tout ce
-qui est disponible et utilisable — NordVPN, WARP, proxys SOCKS5/HTTPS — avec
-sélection automatique, sans achat supplémentaire et sans bascule silencieuse
-vers le direct.
+**Input**: Demande opérateur : dans le GUI, remplacer le choix exclusif
+NordVPN/WARP/Direct par une **section de cases à cocher**. L'opérateur coche
+un ou plusieurs providers (NordVPN, WARP, proxys, direct) ; le proxy utilise
+tous les providers cochés en parallèle. Décocher un provider le retire du
+pool. Aucun achat supplémentaire, aucun direct silencieux.
 
 ## Nom retenu
 
-**Auto-Egress** (interne : `auto_egress`, libellé UI : « Auto-Egress »).
+**Auto-Egress** (interne : `auto_egress`) désigne le **moteur d'agrégation**
+quand plusieurs providers sont cochés. Le GUI n'a pas un quatrième bouton
+radio : il affiche une section **« Egress providers »** avec des cases à
+cocher.
 
 Pourquoi ce nom :
 
-- **Auto** : le mode choisit seul le meilleur egress disponible, sans que
-  l'opérateur choisisse NordVPN, WARP ou un proxy.
-- **Egress** : le mot décrit exactement ce qui est mutualisé (les sorties
-  réseau), pas le transport ni le compte.
+- **Auto** : le moteur choisit seul le meilleur egress parmi les providers
+  cochés.
+- **Egress** : décrit exactement ce qui est mutualisé (les sorties réseau),
+  pas le transport ni le compte.
 - « Hybride » a été écarté car il évoque le split-tunneling ; « Multi-Egress »
   est descriptif mais moins clair sur l'automatisation ; « Pool » entre en
   collision avec le pool d'IP existant.
 
 ## User Scenarios & Testing *(mandatory)*
 
-### User Story 1 - Activer Auto-Egress depuis le GUI (Priority: P1)
+### User Story 1 - Cocher un ou plusieurs providers dans le GUI (Priority: P1)
 
-L'opérateur voit un quatrième mode à côté de NordVPN, WARP et Direct. Il
-sélectionne **Auto-Egress**, le mode persiste après redémarrage, et le proxy
-utilise automatiquement tous les providers activés.
+L'opérateur voit une section **« Egress providers »** avec des cases à cocher :
+NordVPN, WARP, Proxys SOCKS5/HTTPS, Direct. Il peut en cocher une seule
+(comportement actuel), plusieurs (agrégation Auto-Egress), ou en décocher une
+pour la retirer du pool.
 
-**Why this priority**: sans un mode visible et persistant, la fonctionnalité
-n'existe pas pour l'opérateur.
+**Why this priority**: c'est le cœur de l'UX demandée ; sans sélection
+multi-provider visible et persistante, la fonctionnalité n'existe pas.
 
-**Independent Test**: sélectionner Auto-Egress, recharger le dashboard,
-redémarrer le proxy, vérifier que le mode est toujours actif et que les
-providers sont listés.
+**Independent Test**: cocher WARP + NordVPN, vérifier que les deux servent ;
+décocher NordVPN, vérifier qu'il ne sert plus ; recharger et redémarrer, vérifier
+que la sélection est restaurée.
 
 **Acceptance Scenarios**:
 
-1. **Given** les modes NordVPN/WARP/Direct existants, **When** le GUI est
-   ouvert, **Then** Auto-Egress est visible et sélectionnable.
-2. **Given** Auto-Egress sélectionné, **When** le proxy redémarre, **Then** le
-   mode est restauré et les providers activés sont utilisés.
-3. **Given** Auto-Egress actif, **When** un provider est désactivé dans le
-   GUI, **Then** il sort du pool sans interrompre les requêtes en vol.
+1. **Given** le GUI ouvert, **When** l'opérateur regarde la section egress,
+   **Then** NordVPN, WARP, Proxys et Direct sont des cases à cocher.
+2. **Given** WARP + NordVPN cochés, **When** les requêtes arrivent, **Then**
+   les deux providers servent en parallèle.
+3. **Given** NordVPN décoché, **When** les requêtes suivantes arrivent,
+   **Then** NordVPN ne sert plus et WARP continue.
+4. **Given** une seule case cochée, **When** le proxy sert, **Then** le
+   comportement est identique au mode legacy correspondant.
+5. **Given** aucune case cochée, **When** l'opérateur tente de sauvegarder,
+   **Then** le GUI refuse avec « au moins un provider ».
+6. **Given** une sélection multi-provider, **When** le proxy redémarre,
+   **Then** la sélection est restaurée.
 
 ---
 
@@ -143,8 +154,8 @@ répartition et le provider de chaque requête récente.
 
 **Acceptance Scenarios**:
 
-1. **Given** Auto-Egress actif, **When** le dashboard est ouvert, **Then** les
-   providers actifs, leur état et leur poids sont visibles.
+1. **Given** une sélection multi-provider active, **When** le dashboard est
+   ouvert, **Then** les providers cochés, leur état et leur poids sont visibles.
 2. **Given** une requête servie, **When** l'historique est consulté, **Then**
    le provider et le bloc utilisés sont visibles.
 3. **Given** un provider en `degraded`, **When** le dashboard est ouvert,
@@ -169,11 +180,16 @@ répartition et le provider de chaque requête récente.
 
 ### Functional Requirements
 
-- **FR-001** Le mode `auto_egress` DOIT être visible dans le GUI à côté de
-  NordVPN, WARP et Direct, et persister après redémarrage.
-- **FR-002** Auto-Egress DOIT inclure tous les providers **activés et
-  configurés** : stations NordVPN, endpoints WARP, proxys SOCKS5/HTTPS.
-- **FR-003** Chaque requête DOIT utiliser **un seul** egress ; le parallélisme
+- **FR-001** Le GUI DOIT remplacer le choix exclusif par une section
+  **« Egress providers »** avec des cases à cocher : NordVPN, WARP, Proxys
+  SOCKS5/HTTPS, Direct.
+- **FR-002** L'opérateur DOIT pouvoir cocher **un ou plusieurs** providers ;
+  le proxy utilise tous les providers cochés. Décocher un provider le retire
+  du pool.
+- **FR-003** Une seule case cochée DOIT reproduire exactement le mode legacy
+  correspondant (`vpn`, `socks5` ou `direct`) ; plusieurs cases cochées
+  activent le moteur `auto_egress`.
+- **FR-004** Chaque requête DOIT utiliser **un seul** egress ; le parallélisme
   est inter-requêtes et par hedge, jamais un bonding multi-lien d'une même
   requête.
 - **FR-004** La sélection DOIT être automatique, basée sur la santé, le quota,
@@ -222,11 +238,20 @@ répartition et le provider de chaque requête récente.
 - **FR-024** Les tests DOIVENT couvrir : sélection multi-provider, provider
   down, 403, 429 quota, 429 court, direct fail-closed, caps de concurrence,
   sticky, changement de mode sans interruption.
+- **FR-025** Aucune case cochée DOIT être refusée par le GUI/API avec un
+  message explicite ; le proxy ne doit jamais retomber silencieusement sur un
+  provider non coché.
+- **FR-026** La sélection DOIT être persistée comme une liste
+  (`egress.providers`) et restaurée au reload/redémarrage ; la configuration
+  legacy `proxy_mode` reste lisible et se traduit en liste.
+- **FR-027** Direct DOIT être une case explicite, désactivée par défaut, avec
+  un avertissement ; coché seul il reproduit le mode direct, coché avec
+  d'autres il est traité comme un provider à part entière.
 
 ### Key Entities
 
-- **AutoEgressConfig** : providers activés, poids, caps, hedge, direct,
-  diversité, sticky.
+- **AutoEgressConfig** : providers cochés (`selected_providers`), mode dérivé
+  (`single` ou `auto_egress`), poids, caps, hedge, direct, diversité, sticky.
 - **UnifiedEndpoint** : endpoint d'un provider (NordVPN station, WARP endpoint,
   proxy) avec provider, bloc, santé, quota, poids.
 - **ProviderState** : santé, dernier probe, dernier succès/échec, quota,
@@ -259,6 +284,8 @@ répartition et le provider de chaque requête récente.
 
 ## Assumptions
 
+- Le GUI expose une section de cases à cocher, pas un quatrième bouton radio.
+  Une seule case cochée = mode legacy ; plusieurs cases = Auto-Egress.
 - NordVPN, WARP et les proxys sont déjà configurés et utilisables ; le mode
   n'achète rien.
 - WARP reste le provider gratuit prioritaire ; NordVPN/proxys sont utilisés
