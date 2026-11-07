@@ -11,7 +11,7 @@
   import { apiGet, apiPost } from '$lib/api';
   import { onMount } from 'svelte';
   import { t } from '$lib/i18n.svelte';
-  import { createQuery } from '$lib/query.svelte';
+  import { createQuery, invalidateTag } from '$lib/query.svelte';
   import { showToast } from '$lib/toast.svelte';
   import Card from '$lib/components/Card.svelte';
   import Toggle from '$lib/components/Toggle.svelte';
@@ -294,6 +294,7 @@
       username = '';
       password = '';
       await socksQ.refresh(true);
+      invalidateTag('vpn');
       return res;
     });
   }
@@ -303,6 +304,7 @@
       const res = await apiPost<{ error?: string }>('/api/vpn/socks5/remove', { index });
       if (res?.error) throw new Error(res.error);
       await socksQ.refresh(true);
+      invalidateTag('vpn');
       return res;
     });
   }
@@ -312,6 +314,7 @@
       const res = await apiPost<{ error?: string }>('/api/vpn/socks5/toggle', { index, enabled });
       if (res?.error) throw new Error(res.error);
       await socksQ.refresh(true);
+      invalidateTag('vpn');
       return res;
     });
   }
@@ -340,6 +343,7 @@
       httpsUser = '';
       httpsPass = '';
       await httpsQ.refresh(true);
+      invalidateTag('vpn');
       return res;
     });
   }
@@ -349,6 +353,7 @@
       const res = await apiPost<{ error?: string }>('/api/vpn/https-proxies/remove', { index });
       if (res?.error) throw new Error(res.error);
       await httpsQ.refresh(true);
+      invalidateTag('vpn');
       return res;
     });
   }
@@ -361,6 +366,7 @@
       });
       if (res?.error) throw new Error(res.error);
       await httpsQ.refresh(true);
+      invalidateTag('vpn');
       return res;
     });
   }

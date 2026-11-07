@@ -27,6 +27,14 @@ La capacité n'est **pas** déduite des poids. Un poids de 50 % ne veut pas dire
 
 Hypothèse : `target_slots = 6`.
 
+### Implementation note (MVP 2026-11-07)
+
+Le conseiller read-only est livré : `free/capacity.py`,
+`GET /api/egress/capacity`, `VpnCapacity.svelte` et les tests. Il lit les
+compteurs live (NordVPN via `usable_station_count`, WARP/proxys via
+`egress_endpoint_counts`) et n'arrête/démarre aucun conteneur. Les actions
+T016/T023–T029 restent différées.
+
 ### Fallback
 
 | NordVPN | WARP | Politique | Verdict | Bascule |

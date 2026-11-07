@@ -18,6 +18,7 @@
   import { showToast } from '$lib/toast.svelte';
   import Card from '$lib/components/Card.svelte';
   import Toggle from '$lib/components/Toggle.svelte';
+  import VpnCapacity from './VpnCapacity.svelte';
 
   type ProxyMode = 'vpn' | 'socks5' | 'direct' | 'auto_egress';
   type ProviderId = 'nordvpn' | 'warp' | 'proxies' | 'direct';
@@ -607,6 +608,7 @@
         </div>
       {/each}
     </div>
+    <VpnCapacity />
     {#if egressStrategy === 'balance'}
       <div class="share-preview" role="img" aria-label={t('free_models.strategy_balance')}>
         {#each selectedProviders as id (id)}

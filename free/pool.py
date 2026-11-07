@@ -4195,6 +4195,30 @@ class FreeIPPool:
                 return True
         return False
 
+    def egress_endpoint_counts(self) -> dict[str, dict[str, int]]:
+        """Compte les endpoints WARP/proxys pour le conseiller de capacité.
+
+        Lecture seule : ``configured`` inclut les endpoints désactivés,
+        ``enabled`` les endpoints activés, ``usable`` ceux qui passent les
+        marques bad/quota existantes. Aucun probe réseau n'est lancé.
+        """
+        out = {
+            "warp": {"configured": 0, "enabled": 0, "usable": 0},
+            "proxies": {"configured": 0, "enabled": 0, "usable": 0},
+        }
+        for endpoint in list(getattr(self, "_socks5_eps", None) or []):
+            name = "warp" if self._provider_matches(endpoint, "warp") else "proxies"
+            out[name]["configured"] += 1
+            if not getattr(endpoint, "enabled", True):
+                continue
+            out[name]["enabled"] += 1
+            try:
+                if self._socks5_usable(endpoint, exclude_approaching=False):
+                    out[name]["usable"] += 1
+            except Exception:
+                continue
+        return out
+
     def _socks5_pick_for(
         self, provider: str | None, *, excluded=None, conversation_key: str | None = None
     ):

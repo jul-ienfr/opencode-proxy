@@ -303,6 +303,65 @@ def test_proxy_mode_balance_four_providers_including_direct(ctx):
     }
 
 
+def test_egress_capacity_endpoint_full_6_6(ctx, monkeypatch):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    cfg.update(
+        {
+            "station_count": 6,
+            "egress_providers": ["nordvpn", "warp"],
+            "egress_strategy": "fallback",
+            "egress_weights": {},
+            "egress_capacity": {"target_slots": 6, "reserve_policy": "full"},
+        }
+    )
+    monkeypatch.setattr(
+        api,
+        "_egress_capacity_counts",
+        lambda: {
+            "nordvpn": {"configured": 6, "enabled": 6, "usable": 6},
+            "warp": {"configured": 6, "enabled": 6, "usable": 6},
+            "proxies": {"configured": 0, "enabled": 0, "usable": 0},
+            "direct": {"configured": 1, "enabled": 1, "usable": 1},
+        },
+    )
+    with TestClient(fast) as client:
+        data = client.get("/api/egress/capacity").json()
+    assert data["target_slots"] == 6
+    assert data["reserve_policy"] == "full"
+    assert data["verdict"] == "ok"
+    assert data["total_usable"] == 12
+    assert data["total_required"] == 12
+    assert data["providers"]["nordvpn"]["required"] == 6
+    assert data["providers"]["warp"]["required"] == 6
+
+
+def test_egress_capacity_endpoint_shared_3_3_warns(ctx, monkeypatch):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    cfg.update(
+        {
+            "egress_providers": ["nordvpn", "warp"],
+            "egress_strategy": "balance",
+            "egress_weights": {"nordvpn": 50, "warp": 50},
+            "egress_capacity": {"target_slots": 6, "reserve_policy": "shared"},
+        }
+    )
+    monkeypatch.setattr(
+        api,
+        "_egress_capacity_counts",
+        lambda: {
+            "nordvpn": {"configured": 3, "enabled": 3, "usable": 3},
+            "warp": {"configured": 3, "enabled": 3, "usable": 3},
+            "proxies": {"configured": 0, "enabled": 0, "usable": 0},
+            "direct": {"configured": 1, "enabled": 1, "usable": 1},
+        },
+    )
+    with TestClient(fast) as client:
+        data = client.get("/api/egress/capacity").json()
+    assert data["verdict"] == "ok"
+    assert data["total_usable"] == 6
+    assert any(w["code"] == "no_reserve" for w in data["warnings"])
+
+
 def test_proxy_mode_invalid_is_error(ctx):
     fast, s1, s2, pool, cfg, persisted = ctx
     resp = _post(fast, "/api/vpn/proxy-mode", {"mode": "banana"})

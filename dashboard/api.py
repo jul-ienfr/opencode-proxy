@@ -1490,6 +1490,70 @@ def _dashboard_managers() -> list:
         return []
 
 
+def _egress_capacity_counts() -> dict[str, dict[str, int]]:
+    """Capacité configurée/activée/utilisable par provider (010).
+
+    Lecture seule, sans Docker/probe réseau. NordVPN vient de
+    ``station_count`` + du pool ; WARP/proxys du pool quand il est initialisé,
+    sinon des lignes ``socks5_proxies`` du config.
+    """
+    from config.loader import resolved_station_count
+
+    cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+    managers = _dashboard_managers()
+    configured = resolved_station_count(cfg)
+    enabled = sum(1 for manager in managers if getattr(manager, "enabled", True))
+    configured = max(configured, enabled)
+    usable = enabled
+    pool = _dashboard_pool()
+    if pool is not None and hasattr(pool, "usable_station_count"):
+        try:
+            usable = int(pool.usable_station_count())
+        except Exception:
+            usable = enabled
+    usable = min(max(0, usable), enabled)
+
+    counts: dict[str, dict[str, int]] = {
+        "nordvpn": {
+            "configured": configured,
+            "enabled": enabled,
+            "usable": usable,
+        },
+        "warp": {"configured": 0, "enabled": 0, "usable": 0},
+        "proxies": {"configured": 0, "enabled": 0, "usable": 0},
+        "direct": {"configured": 1, "enabled": 1, "usable": 1},
+    }
+
+    endpoint_counts = None
+    if pool is not None and hasattr(pool, "egress_endpoint_counts"):
+        try:
+            endpoint_counts = pool.egress_endpoint_counts()
+        except Exception:
+            endpoint_counts = None
+    if isinstance(endpoint_counts, dict):
+        for name in ("warp", "proxies"):
+            raw = endpoint_counts.get(name)
+            if isinstance(raw, dict):
+                counts[name] = {
+                    "configured": max(0, int(raw.get("configured", 0) or 0)),
+                    "enabled": max(0, int(raw.get("enabled", 0) or 0)),
+                    "usable": max(0, int(raw.get("usable", 0) or 0)),
+                }
+    else:
+        rows = cfg.get("socks5_proxies") or []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                provider = str(row.get("provider") or "").strip().lower()
+                name = "warp" if row.get("managed") or provider == "warp" else "proxies"
+                counts[name]["configured"] += 1
+                if row.get("enabled", True):
+                    counts[name]["enabled"] += 1
+                    counts[name]["usable"] += 1
+    return counts
+
+
 def _as_index(value) -> int:
     """Index int strict — -1 sur toute valeur non-indexable (les bornes
     sont vérifiées par l'appelant)."""
@@ -4130,6 +4194,30 @@ def register_dashboard(
         for mgr in getattr(shared_state, "vpn_managers", None) or []:
             info["stations"][str(mgr._station)] = mgr.stack_info()
         return info
+
+    @app.get("/api/egress/capacity")
+    async def get_egress_capacity():
+        """Conseiller de capacité 010 — lecture seule, sans routage."""
+        from free.auto_egress import providers_from_mode
+        from free.capacity import capacity_config, evaluate_capacity
+
+        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+        selected = cfg.get("egress_providers")
+        if not isinstance(selected, list) or not selected:
+            selected = providers_from_mode(str(cfg.get("proxy_mode") or "vpn"))
+        strategy = str(cfg.get("egress_strategy") or "fallback")
+        raw_weights = cfg.get("egress_weights")
+        weights = dict(raw_weights) if isinstance(raw_weights, dict) else {}
+        target, policy = capacity_config(cfg.get("egress_capacity"))
+        report = evaluate_capacity(
+            providers=_egress_capacity_counts(),
+            selected=list(selected),
+            strategy=strategy,
+            weights=weights,
+            target_slots=target,
+            reserve_policy=policy,
+        )
+        return report.to_dict()
 
     @app.post("/api/vpn-config")
     async def update_vpn_config(request: Request):

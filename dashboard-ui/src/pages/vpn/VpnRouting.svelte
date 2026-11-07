@@ -11,7 +11,7 @@
 
   import { apiGet, apiPost } from '$lib/api';
   import { t } from '$lib/i18n.svelte';
-  import { createQuery } from '$lib/query.svelte';
+  import { createQuery, invalidateTag } from '$lib/query.svelte';
   import { showToast } from '$lib/toast.svelte';
   import Card from '$lib/components/Card.svelte';
 
@@ -101,6 +101,8 @@
       const res = await apiPost<VpnConfigResponse>('/api/vpn-config', payload);
       if (res.error) throw new Error(res.error);
       await vpnQ.refresh(true);
+      // La carte Capacité dépend aussi de station_count.
+      invalidateTag('vpn');
     } catch (e) {
       showToast(e instanceof Error ? e.message : String(e), 'error');
     } finally {
