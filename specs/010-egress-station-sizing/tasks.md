@@ -80,6 +80,8 @@
   (colonne `Observé`, warning `observed_shift` > 20 points).
 - [x] T029 Alerte si un endpoint dépasse 2× la médiane ; proposer un
   reweight, jamais appliquer silencieusement.
+- [x] T030 Warning `single_provider` : un seul provider sélectionné donne un
+  verdict `ok` mais rappelle l'absence de redondance inter-provider.
 
 ## Dependencies & Execution Order
 
