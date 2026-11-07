@@ -1461,6 +1461,7 @@ def _socks5_payload(pool) -> list:
                 "block": r.get("block", ""),
                 "managed": bool(r.get("managed", False)),
                 "container": r.get("container", ""),
+                "provider": r.get("provider", ""),
             }
         )
     return out

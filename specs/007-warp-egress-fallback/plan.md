@@ -117,7 +117,8 @@ free/
 ├── warp_rotation.py           # WarpDockerProvider (existant, à abstraire)
 ├── quota_ledger.py            # blocs, reset_at, park, observations
 ├── egress_provider.py         # NOUVEAU : protocole + EgressRotationResult
-├── errors.py                  # NOUVEAU : GATE_403/QUOTA_429/RATE_LIMIT_429/...
+core/
+└── errors.py                  # ÉTENDU : classify_free_error (GATE_403/QUOTA_429/...)
 ├── fallback.py                # NOUVEAU : politique, triggers, retour WARP
 ├── gluetun_provider.py        # NOUVEAU : Proton/Windscribe/Privado
 └── ipv6_provider.py           # NOUVEAU : client du gateway VPS
@@ -171,7 +172,9 @@ capacité.
    `Socks5Endpoint` et au schéma de config.
 2. Extraire `EgressProvider` (protocole) et `EgressRotationResult`.
 3. `WarpDockerProvider` = wrapper de `WarpRotator` (comportement actuel).
-4. Dispatch `_request_egress_rotation` + `free/errors.py`.
+4. Dispatch `_request_egress_rotation` + extension de `core/errors.py`
+   (`classify_free_error`, réutilisation de `free_quota_scope` / 
+   `is_free_quota_failure` / `classify_upstream_error`).
 5. Dédup d'egress mesuré après rotation (ne pas croire le rapport du
    rotateur) ; rejeter une famille IPv4 sur un endpoint `ipv6`.
 6. Sticky session/egress : conserver le même bloc tant qu'un probe 200 passe.

@@ -734,7 +734,93 @@ def is_credit_exhaustion(body: object) -> bool:
     return _m is not None and bool(_m[2])
 
 
+# ─────────── [feature 007] taxonomie free : 403 ≠ 429 ───────────
+
+FREE_ERROR_OK = "OK"
+FREE_ERROR_GATE_403 = "GATE_403"
+FREE_ERROR_QUOTA_429 = "QUOTA_429"
+FREE_ERROR_RATE_LIMIT_429 = "RATE_LIMIT_429"
+FREE_ERROR_TRANSIENT = "TRANSIENT_5XX"
+FREE_ERROR_ACCOUNT_OR_GLOBAL = "ACCOUNT_OR_GLOBAL"
+FREE_ERROR_AUTH = "AUTH"
+
+
+def classify_free_error(status: object, body: object = "", headers: object = None) -> str:
+    """Classe un résultat free pour le pool/ledger.
+
+    Distingue explicitement :
+    - ``GATE_403`` : forme, geo, version, 4xx client — **aucune rotation** ;
+    - ``AUTH`` : 401/403 d'authentification — aucune rotation ;
+    - ``QUOTA_429`` : quota journalier par IP — park/rotate ;
+    - ``RATE_LIMIT_429`` : fenêtre courte — attendre, pas de park ;
+    - ``TRANSIENT_5XX`` : 5xx/timeout/429 de surcharge — retry borné ;
+    - ``ACCOUNT_OR_GLOBAL`` : billing/quota de compte — pas de gain par IP.
+
+    ``headers`` est accepté pour l'interface (futur Retry-After) mais n'est
+    pas requis : la classification reste pure et déterministe.
+    """
+    s = _coerce_status(status)
+    if s is None:
+        return FREE_ERROR_TRANSIENT
+    if 200 <= s < 300:
+        return FREE_ERROR_OK
+    if s == 401:
+        return FREE_ERROR_AUTH
+    if s == 402:
+        return FREE_ERROR_ACCOUNT_OR_GLOBAL
+    hay = body if isinstance(body, str) else ""
+    if not hay and isinstance(body, (bytes, bytearray)):
+        hay = bytes(body).decode("utf-8", "replace")
+    low = hay.lower()
+    nospace = low.replace(" ", "").replace("_", "").replace("-", "")
+
+    if s == 403:
+        if (
+            "invalidapikey" in nospace
+            or "incorrectapikey" in nospace
+            or "authentication" in low
+            or "unauthorized" in low
+            or "permissiondenied" in nospace
+        ):
+            return FREE_ERROR_AUTH
+        return FREE_ERROR_GATE_403
+
+    if s == 429:
+        if "freeusagelimiterror" in nospace or "free usage limit" in low:
+            return FREE_ERROR_QUOTA_429
+        if "ratelimiterror" in nospace or "rate limit" in low or "too many requests" in low:
+            return FREE_ERROR_RATE_LIMIT_429
+        if (
+            "insufficient_quota" in nospace
+            or "insufficientquota" in nospace
+            or "usage_not_included" in nospace
+            or "usagenotincluded" in nospace
+            or "quota exceeded" in low
+            or "daily limit" in low
+        ):
+            return FREE_ERROR_QUOTA_429
+        if "endpoint is unavailable" in low or "overloaded" in low or "try again" in low:
+            return FREE_ERROR_TRANSIENT
+        # 429 sans corps exploitable : lecture conservatrice historique
+        # (quota présumé) pour ne pas réutiliser une IP au mur.
+        return FREE_ERROR_QUOTA_429
+
+    if s == 408 or s == 409 or s == 425 or s >= 500:
+        return FREE_ERROR_TRANSIENT
+    if 400 <= s < 500:
+        # 400/404/413/422… : défaut de forme/version/route, pas un quota.
+        return FREE_ERROR_GATE_403
+    return FREE_ERROR_TRANSIENT
+
+
 __all__ = [
+    "FREE_ERROR_ACCOUNT_OR_GLOBAL",
+    "FREE_ERROR_AUTH",
+    "FREE_ERROR_GATE_403",
+    "FREE_ERROR_OK",
+    "FREE_ERROR_QUOTA_429",
+    "FREE_ERROR_RATE_LIMIT_429",
+    "FREE_ERROR_TRANSIENT",
     "FreeQuotaExhausted",
     "FreeRefusal",
     "ModelOutOfScope",
@@ -742,6 +828,7 @@ __all__ = [
     "_anthropic_error",
     "_openai_error",
     "anthropic_error",
+    "classify_free_error",
     "classify_upstream_error",
     "extract_upstream_error_type",
     "free_refusal_response",

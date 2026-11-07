@@ -52,6 +52,7 @@ from contextlib import asynccontextmanager
 from typing import Any, cast
 
 from free.best_ip import BestIpSelector
+from free.egress_provider import block_for_egress, family_for_egress
 from free.ip_quota import IpQuotaRegistry, QuotaProfile
 from free.quota_ledger import QuotaLedger, bucket_for, is_free_usage_error
 from free.reliability_canary import CanaryConfig, CanaryRouter
@@ -282,6 +283,7 @@ class Socks5Endpoint:
         container=None,
         image=None,
         block=None,
+        provider=None,
     ):
         self.host = str(host)
         self.port = int(port)
@@ -299,6 +301,12 @@ class Socks5Endpoint:
         self.container = str(container or "").strip() or None
         self.image = str(image or "").strip() or None
         self.block = str(block or "").strip() or None
+        # [feature 007] Provider logique : WARP par défaut pour un endpoint
+        # managé, `static` pour un proxy configuré à la main.
+        self.provider = str(provider or ("warp" if self.managed else "static")).strip().lower()
+        self.block_key = self.block or block_for_egress(self.egress_ip)
+        self.quota_axis = family_for_egress(self.egress_ip) or ("ipv6" if self.ipv6 else "ipv4")
+        self.reset_at = 0.0
         self._station = -1 - int(index)  # negative — never a docker station
         self.pid = self.label or f"{self.host}:{self.port}"
         self._quota_per_ip = 0  # filled by set_socks5_proxies / update_config
@@ -3840,6 +3848,7 @@ class FreeIPPool:
                     "container": str(row.get("container") or "").strip(),
                     "image": str(row.get("image") or "").strip(),
                     "block": str(row.get("block") or "").strip(),
+                    "provider": str(row.get("provider") or "").strip(),
                 }
             )
         # Un label vide est autorisé (pid host:port historique), mais deux
@@ -3911,6 +3920,7 @@ class FreeIPPool:
                 container=row.get("container"),
                 image=row.get("image"),
                 block=row.get("block"),
+                provider=row.get("provider"),
             )
             ep._quota_per_ip = getattr(self._vpn, "_quota_per_ip", 0)
             old = old_by_pid.get(pid)
