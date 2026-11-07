@@ -8,12 +8,61 @@
 
 ```text
 python -m pytest tests/test_capacity.py tests/test_vpn_endpoints.py
-  -> 62 passed
+  -> 64 passed
 python -m ruff check free/capacity.py free/pool.py dashboard/api.py tests/...
   -> OK
 npm --prefix dashboard-ui run check -> 0 errors, 0 warnings
 npm --prefix dashboard-ui run build -> OK
 ```
+
+## État final validé — WARP seul
+
+Après les tests, le provider actif est revenu à **WARP seul** (`proxy_mode=socks5`,
+`egress_providers=["warp"]`) : c'est l'état stable qui sert réellement les six
+stations.
+
+```json
+{
+  "target_slots": 6,
+  "strategy": "fallback",
+  "reserve_policy": "full",
+  "verdict": "ok",
+  "total_usable": 6,
+  "total_required": 6
+}
+```
+
+| Provider | Configurés | Activés | Utilisables | Requis | Statut |
+|---|---:|---:|---:|---:|---|
+| NordVPN | 6 | 6 | 0 | — | Décoché |
+| WARP | 6 | 6 | 6 | 6 | OK |
+| Proxys | 2 | 0 | 0 | — | Décoché |
+| Direct | 1 | 1 | 1 | — | Décoché |
+
+Résultat GUI :
+
+```text
+6 / 6 stations
+Requis : 6 endpoints
+Verdict : OK
+Redondance totale : WARP 6. Chaque provider peut couvrir seul 6 stations.
+```
+
+NordVPN reste visible avec `0` utilisable, mais **décoché** : il ne dégrade pas
+le verdict. C'est exactement la sémantique attendue — un provider non coché
+n'est ni une erreur ni une capacité requise.
+
+### Cas dégradé (test précédent)
+
+Avec `NordVPN + WARP + Proxys` cochés et NordVPN à 0/6 :
+
+```text
+Verdict : Dégradé
+Requis : 18 endpoints (3 providers × 6)
+```
+
+La carte distingue donc bien « 6 stations couvertes maintenant » de
+« redondance complète ».
 
 ## API
 

@@ -91,6 +91,13 @@
 3. Valider les scénarios 6+6, 6+3, 3+3, 4+2.
 4. T023–T029 sont différés après validation du conseiller.
 
+## Validation live
+
+- WARP seul : 6/6 stations utilisables, `verdict=ok`, requis 6.
+- NordVPN décoché à 0/6 : n'affecte pas le verdict.
+- `full` avec 3 providers dont NordVPN 0/6 : `degraded`, requis 18.
+- `shared` : requis 6, avertissement si aucune réserve.
+
 ## Notes
 
 - Aucun provider payant, aucun second compte, aucune attente.
