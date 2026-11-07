@@ -61,6 +61,27 @@ async def test_stop_station_excludes_and_clears_state():
     assert m.current_ip is None
 
 
+class _WatchdogMgr(_Mgr):
+    def __init__(self, sid, status="disconnected", ip="1.1.1.1"):
+        super().__init__(sid, status=status, ip=ip)
+        self.watchdog_started = False
+
+    def ensure_watchdog(self):
+        self.watchdog_started = True
+
+
+@pytest.mark.asyncio
+async def test_connect_all_starts_watchdog_on_hot_created_station():
+    m = _WatchdogMgr(4)
+    ctl = FleetController([m])
+
+    out = await ctl.connect_all()
+
+    assert out["ok"] is True
+    assert m.connected is True
+    assert m.watchdog_started is True
+
+
 @pytest.mark.asyncio
 async def test_heal_and_connect_all_skip_disabled_station():
     m = _Mgr(3, status="disconnected")

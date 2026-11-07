@@ -2146,6 +2146,19 @@ class VPNManager:
         if self._update_enabled and not self._update_task and int(getattr(self, "_station", 1)) == 1:
             self._update_task = asyncio.create_task(self._updater_loop())
 
+    def ensure_watchdog(self) -> None:
+        """Garantit que la boucle watchdog tourne pour cette station.
+
+        Les managers créés à chaud (``station_count`` 1→6) peuvent être
+        connectés via ``FleetController.connect_all()`` sans passer par
+        ``start()``. Sans ce garde-fou, la machine à états santé ne reçoit
+        jamais ses probes et la station reste ``probing`` indéfiniment.
+        """
+        if self._watchdog_event is None:
+            self._watchdog_event = asyncio.Event()
+        if not self._watchdog_task or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
     async def _startup_connect(self) -> None:
         """Background boot connect (see start()). Failure is recorded by
         connect() itself (ERROR status, circuit/backoff) — the server stays

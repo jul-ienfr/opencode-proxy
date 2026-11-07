@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import requests
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -29,6 +30,8 @@ sys.path.insert(0, str(ROOT))
 from config.settings import yaml_get  # noqa: E402
 from free.chain_state import (  # noqa: E402
     load_state as _load_chain_state,
+)
+from free.chain_state import (  # noqa: E402
     save_state as _save_chain_state,
 )
 from free.ip_registry.config import load_registry_config  # noqa: E402
@@ -253,8 +256,10 @@ def _reconcile_registry(stations: dict[int, dict]) -> None:
         from free.ip_registry.registry_db import (
             assign_observed,
             assigned_for_station,
-            reconcile as reconcile_leases,
             release_station,
+        )
+        from free.ip_registry.registry_db import (
+            reconcile as reconcile_leases,
         )
     except Exception as exc:  # noqa: BLE001
         log(f"registry reconcile unavailable: {type(exc).__name__}: {exc}")
@@ -429,6 +434,22 @@ def _need_rank(station: dict) -> int:
     return 2
 
 
+def _live_ip_rotation() -> dict:
+    """Lit ``config.yaml`` sans dépendre du cache ``_yaml_data`` du process.
+
+    Le superviseur est un process séparé : il démarre avec une photo de la
+    config et ne voit pas les changements ``station_count`` faits par le GUI
+    (1→6). Sans cette lecture live, il ne répare que l'ancien périmètre.
+    """
+    try:
+        with open(ROOT / "config.yaml", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+        section = data.get("ip_rotation")
+        return section if isinstance(section, dict) else {}
+    except Exception:
+        return {}
+
+
 def _manager_repair_enabled() -> bool:
     """True when the proxy watchdog parks/repairs stations by itself.
 
@@ -437,6 +458,9 @@ def _manager_repair_enabled() -> bool:
     10-minute one.
     """
 
+    repair = _live_ip_rotation().get("station_repair")
+    if isinstance(repair, dict) and "enabled" in repair:
+        return bool(repair.get("enabled"))
     try:
         return bool(yaml_get("ip_rotation", "station_repair.enabled", True))
     except Exception:
@@ -1140,11 +1164,12 @@ def _clear_stale_pins(stations: dict[int, dict]) -> None:
 def _scope() -> list[int]:
     """Stations the allocator may repair (station_count minus operator opt-outs)."""
 
+    live = _live_ip_rotation()
     try:
-        count = max(1, int(yaml_get("ip_rotation", "station_count", 6) or 6))
+        count = max(1, int(live.get("station_count", yaml_get("ip_rotation", "station_count", 6)) or 6))
     except Exception:
         count = 6
-    raw_disabled = yaml_get("ip_rotation", "disabled_stations", []) or []
+    raw_disabled = live.get("disabled_stations", yaml_get("ip_rotation", "disabled_stations", [])) or []
     disabled: set[int] = set()
     if isinstance(raw_disabled, (list, tuple, set)):
         for value in raw_disabled:

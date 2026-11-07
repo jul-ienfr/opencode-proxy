@@ -88,16 +88,28 @@ def test_exhaustion_pause_requires_sustained_zero_usable_polls():
 
 def test_scope_honours_station_count_and_operator_disabled(monkeypatch):
     module = _module()
-
-    def _fake_yaml_get(section, key, default=None):
-        if (section, key) == ("ip_rotation", "station_count"):
-            return 4
-        if (section, key) == ("ip_rotation", "disabled_stations"):
-            return [2]
-        return default
-
-    monkeypatch.setattr(module, "yaml_get", _fake_yaml_get)
+    monkeypatch.setattr(
+        module,
+        "_live_ip_rotation",
+        lambda: {"station_count": 4, "disabled_stations": [2]},
+    )
     assert module._scope() == [1, 3, 4]
+
+
+def test_manager_repair_enabled_reads_live_config(monkeypatch):
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_live_ip_rotation",
+        lambda: {"station_repair": {"enabled": False}},
+    )
+    assert module._manager_repair_enabled() is False
+    monkeypatch.setattr(
+        module,
+        "_live_ip_rotation",
+        lambda: {"station_repair": {"enabled": True}},
+    )
+    assert module._manager_repair_enabled() is True
 
 
 def test_need_rank_prefers_tunnel_up_quota_station():

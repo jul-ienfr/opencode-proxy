@@ -40,6 +40,16 @@ class FleetController:
         except Exception:
             pass
 
+    @staticmethod
+    def _ensure_watchdog(manager: Any) -> None:
+        """Démarre le watchdog d'une station créée à chaud (010/six stations)."""
+        starter = getattr(manager, "ensure_watchdog", None)
+        if callable(starter):
+            try:
+                starter()
+            except Exception:
+                pass
+
     async def set_enabled_all(self, enabled: bool) -> dict:
         """Active/désactive la flotte entière, pas seulement la station 1."""
         enabled = bool(enabled)
@@ -74,6 +84,7 @@ class FleetController:
                         await asyncio.wait_for(m.connect(), timeout=timeout)
                     else:
                         await m.connect()
+                    self._ensure_watchdog(m)
                 except Exception as e:
                     errors.append(f"s{getattr(m, '_station', '?')}: {e}")
 
@@ -117,6 +128,7 @@ class FleetController:
                 try:
                     m._desired_connected = True
                     await m.connect()
+                    self._ensure_watchdog(m)
                     healed.append(int(getattr(m, "_station", -1)))
                 except Exception as e:
                     errors.append(f"s{getattr(m, '_station', '?')}: {e}")
@@ -184,6 +196,7 @@ class FleetController:
             m.enabled = True
             m._desired_connected = True
             await m.connect()
+            self._ensure_watchdog(m)
             return {"ok": True, "station": int(sid), "ip": getattr(m, "current_ip", None)}
         except Exception as e:
             return {"ok": False, "station": int(sid), "error": str(e)[:200]}
