@@ -217,6 +217,20 @@ def test_logical_socks5_bucket_is_ignored_on_load(tmp_path):
     assert ledger.earliest_reset() is None
 
 
+def test_parked_ips_only_returns_near_reset():
+    ledger = QuotaLedger(persist=False, clock=lambda: NOW)
+    ledger.note_result(
+        "10.0.0.20",
+        MODEL,
+        429,
+        error_type="FreeUsageLimitError",
+        retry_after=600.0,
+    )
+    assert ledger.parked_ips(now=NOW, window_s=1800) == {"10.0.0.20"}
+    assert ledger.parked_ips(now=NOW, window_s=60) == set()
+    assert ledger.parked_ips(now=NOW + 601, window_s=1800) == set()
+
+
 def test_snapshot_shape():
     ledger = QuotaLedger(persist=False, clock=lambda: NOW)
     ledger.note_result(

@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 
 from free.pool import Socks5Endpoint
-from free.warp_rotation import WarpRotator, block_for_ip
+from free.warp_rotation import WarpDockerProvider, WarpRotator, block_for_ip
 
 
 class FakePool:
@@ -79,6 +79,37 @@ def test_rotate_restart_then_new_block(monkeypatch):
     assert result.new_ip == "2a09:bac1:2780:2060::216:7f"
     assert result.block == "2a09:bac1:2780:2060::/64"
     assert calls[0] == ["restart", "warp-restore1"]
+
+
+def test_warp_docker_provider_converts_result(monkeypatch):
+    from free.warp_rotation import WarpRotationResult
+
+    rotator = WarpRotator()
+    monkeypatch.setattr(
+        rotator,
+        "rotate",
+        lambda endpoint, *, forbidden_blocks=None, probe=None: WarpRotationResult(
+            label="warp-a",
+            ok=True,
+            old_ip="2a09:bac1:27a0:2060::1",
+            new_ip="2a09:bac1:2780:2060::1",
+            block="2a09:bac1:2780:2060::/64",
+            attempts=1,
+            reason="rotated",
+        ),
+    )
+    result = WarpDockerProvider(rotator).rotate(_endpoint())
+    assert result.provider == "warp"
+    assert result.ok is True
+    assert result.block == "2a09:bac1:2780:2060::/64"
+
+
+def test_warp_docker_provider_health_and_refresh():
+    provider = WarpDockerProvider()
+    assert provider.health()["name"] == "warp"
+    ep = _endpoint()
+    ep.refresh_egress = lambda timeout=6.0: "2a09:bac1:2780:2060::1"
+    assert provider.refresh_egress(ep) == "2a09:bac1:2780:2060::1"
 
 
 def test_rotate_recreates_when_block_is_same(monkeypatch):

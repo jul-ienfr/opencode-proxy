@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from free.egress_provider import EgressRotationResult
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_IMAGE = "caomingjun/warp:latest"
@@ -408,4 +410,55 @@ class WarpRotator:
         return None
 
 
-__all__ = ["WarpRotator", "WarpRotationResult", "block_for_ip", "block_for_ledger_key"]
+class WarpDockerProvider:
+    """Adapter ``EgressProvider`` historique autour de ``WarpRotator``.
+
+    Aucun changement de comportement : c'est la même rotation Docker, exposée
+    via le contrat commun de la feature 007.
+    """
+
+    name = "warp"
+
+    def __init__(self, rotator: WarpRotator | None = None) -> None:
+        self.rotator = rotator or WarpRotator()
+
+    def rotate(
+        self,
+        endpoint,
+        *,
+        forbidden_blocks: set[str] | None = None,
+        probe=None,
+    ) -> EgressRotationResult:
+        result = self.rotator.rotate(
+            endpoint,
+            forbidden_blocks=forbidden_blocks,
+            probe=probe,
+        )
+        return EgressRotationResult(
+            label=result.label,
+            ok=result.ok,
+            old_ip=result.old_ip,
+            new_ip=result.new_ip,
+            block=result.block,
+            attempts=result.attempts,
+            reason=result.reason,
+            provider=self.name,
+        )
+
+    def refresh_egress(self, endpoint) -> str | None:
+        try:
+            return endpoint.refresh_egress()
+        except Exception:
+            return None
+
+    def health(self) -> dict[str, Any]:
+        return {"name": self.name, "ok": True, "provider": "warp"}
+
+
+__all__ = [
+    "WarpDockerProvider",
+    "WarpRotator",
+    "WarpRotationResult",
+    "block_for_ip",
+    "block_for_ledger_key",
+]

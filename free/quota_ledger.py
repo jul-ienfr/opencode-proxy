@@ -527,6 +527,27 @@ class QuotaLedger:
                     out.add(state.ip)
         return out
 
+    def parked_ips(
+        self, now: float | None = None, *, window_s: float = 1800.0
+    ) -> set[str]:
+        """IPs épuisées dont le reset est proche (park plutôt que rotation)."""
+        ts = self._now(now)
+        try:
+            window = max(1.0, float(window_s))
+        except (TypeError, ValueError):
+            window = 1800.0
+        out: set[str] = set()
+        with self._lock:
+            for state in self._items.values():
+                self._refresh(state, ts)
+                if (
+                    state.exhausted
+                    and state.reset_at > ts
+                    and (state.reset_at - ts) <= window
+                ):
+                    out.add(state.ip)
+        return out
+
     def snapshot(self, limit: int = 80, now: float | None = None) -> list[dict[str, Any]]:
         ts = self._now(now)
         with self._lock:
