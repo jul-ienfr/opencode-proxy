@@ -13,7 +13,13 @@ from free.station_identity import (
 )
 from opencode import _ChatToolCallHealer, _heal_tool_call_paths
 from streaming.tool_path_healing import ToolPathHealingMiddleware
-from streaming.tool_paths import heal_openai_payload, heal_sse_data_line
+from streaming.tool_paths import (
+    CLIENT_TOOL_NAMES,
+    heal_openai_payload,
+    heal_sse_data_line,
+    heal_tool_name,
+    set_client_tool_names,
+)
 
 REAL = r"C:\Users\julie\Downloads\qwenproxy"
 FAKE = "/workspace/oc-warp-ipv6-2"
@@ -208,4 +214,42 @@ def test_tool_path_middleware_heals_split_sse_lines() -> None:
     args = payload["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
     assert json.loads(args)["path"] == "a.txt"
     assert "filePath" not in args
+
+
+def test_heal_tool_name_maps_official_placeholder() -> None:
+    token = CLIENT_TOOL_NAMES.set(frozenset({"shell", "read", "edit"}))
+    try:
+        assert heal_tool_name("bash") == "shell"
+        assert heal_tool_name("read") == "read"
+        assert heal_tool_name("unknown") == "unknown"
+    finally:
+        CLIENT_TOOL_NAMES.reset(token)
+
+
+def test_heal_openai_payload_renames_bash_to_shell() -> None:
+    set_client_tool_names(["shell", "read", "edit"])
+    try:
+        payload = {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": '{"command":"git status"}',
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        assert heal_openai_payload(payload)
+        fn = payload["choices"][0]["delta"]["tool_calls"][0]["function"]
+        assert fn["name"] == "shell"
+    finally:
+        set_client_tool_names([])
 

@@ -7797,6 +7797,24 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
             body["messages"] = _clean_messages
             _log(f"  [free] rôle(s) de message normalisé(s) : {_changed_messages}")
     tools = body.get("tools")
+    try:
+        from streaming.tool_paths import set_client_tool_names
+
+        _client_names = []
+        for _tool in tools if isinstance(tools, list) else []:
+            if not isinstance(_tool, dict):
+                continue
+            _fn = (
+                _tool.get("function")
+                if isinstance(_tool.get("function"), dict)
+                else _tool
+            )
+            _name = str(_fn.get("name") or "").strip()
+            if _name:
+                _client_names.append(_name)
+        set_client_tool_names(_client_names)
+    except Exception:
+        pass
     if isinstance(tools, list):
         if is_chat:
             have = {
