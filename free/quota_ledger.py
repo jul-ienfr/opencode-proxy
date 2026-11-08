@@ -20,6 +20,7 @@ Aucun réseau, aucun import projet : le pool pousse les résultats réels.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import sqlite3
@@ -59,6 +60,30 @@ def server_ip_key(raw: Any) -> str:
     if ":" in s:
         return ":".join(s.split(":")[:4]) or _UNKNOWN_IP
     return s
+
+
+def quota_block(raw: Any) -> str | None:
+    """Normalise une IP d'egress en bucket de quota.
+
+    IPv6 → ``/64``, IPv4 → ``/32``. Accepte aussi les clés ledger tronquées
+    (``a:b:c:d``) produites par ``server_ip_key``. Une valeur invalide retourne
+    ``None`` ; aucun appelant ne doit inventer un bucket.
+    """
+    s = str(raw or "").strip().strip('"').strip("'")
+    if not s or s == _UNKNOWN_IP:
+        return None
+    if s.startswith("[") and "]" in s:
+        s = s[1 : s.index("]")]
+    try:
+        if ":" in s:
+            if s.count(":") == 3 and "::" not in s:
+                s = f"{s}::"
+            parsed = ipaddress.ip_address(s)
+            return str(ipaddress.ip_network(f"{parsed}/64", strict=False))
+        parsed = ipaddress.ip_address(s)
+        return str(ipaddress.ip_network(f"{parsed}/32", strict=False))
+    except ValueError:
+        return None
 
 
 def is_logical_proxy_key(raw: Any) -> bool:

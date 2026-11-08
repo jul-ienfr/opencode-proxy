@@ -30,7 +30,7 @@ routing:
   aliases:
     nimo: mimo
 free_model_map:
-  mimo-v2.5: deepseek-v4-flash-free
+  mimo-v2.5: mimo-v2.6-flash-free
   qwen3.7-max: mimo-v2.6-flash-free
   glm-5.1: mimo-v2.6-flash-free
   kimi-k2.6: mimo-v2.6-flash-free
@@ -139,9 +139,11 @@ ip_rotation:
   egress_failure_tick_interval: 15.0
   egress_providers:
   - warp
+  - nordvpn
   egress_strategy: fallback
   egress_weights:
     warp: 100
+    nordvpn: 0
   enabled: true
   enforce_vpn_only: true
   fallback:
@@ -149,6 +151,7 @@ ip_rotation:
     fail_closed: true
     max_block_s: 0
     max_fallback_stations: 2
+    max_rotations_per_scan: 2
     order:
     - warp
     - warp_alt
@@ -243,7 +246,7 @@ ip_rotation:
     max_attempts: 1
     max_tokens: 8
   proactive_tick_s: 60
-  proxy_mode: socks5
+  proxy_mode: auto_egress
   quality_preselection:
     enabled: false
     fast_tps: 55.0
@@ -288,110 +291,110 @@ ip_rotation:
   socks5_auto_rotate: true
   socks5_fallback_enabled: true
   socks5_proxies:
-  - block: ''
-    container: ''
-    egress_ip: ''
+  - host: 127.0.0.1
+    port: 11080
+    username: null
+    password: null
     enabled: false
-    host: 127.0.0.1
-    image: ''
-    ipv6: false
     label: warp-ipv4
-    managed: false
-    password: null
-    port: 11080
-    provider: warp
-    username: null
-  - block: 2a09:bac5:32d0:14dc::/64
-    container: warp-test
-    egress_ip: 2a09:bac5:32d0:14dc::214:83
-    enabled: true
-    host: 127.0.0.1
-    image: caomingjun/warp:latest
-    ipv6: true
-    label: warp-ipv6
-    managed: true
-    password: null
-    port: 11080
-    provider: warp
-    username: null
-  - block: 2a09:bac5:32d6:26b4::/64
-    container: warp-test2
-    egress_ip: 2a09:bac5:32d6:26b4::3db:f
-    enabled: true
-    host: 127.0.0.1
-    image: caomingjun/warp:latest
-    ipv6: true
-    label: warp-ipv6-2
-    managed: true
-    password: null
-    port: 11085
-    provider: warp
-    username: null
-  - block: 2a09:bac5:32d4:14dc::/64
-    container: warp-test3
-    egress_ip: 2a09:bac5:32d4:14dc::214:bf
-    enabled: true
-    host: 127.0.0.1
-    image: caomingjun/warp:latest
-    ipv6: true
-    label: warp-ipv6-3
-    managed: true
-    password: null
-    port: 11086
-    provider: warp
-    username: null
-  - block: 2a09:bac1:27a0:2060::/64
-    container: warp-test4
-    egress_ip: 2a09:bac1:27a0:2060::219:9e
-    enabled: true
-    host: 127.0.0.1
-    image: caomingjun/warp:latest
-    ipv6: true
-    label: warp-ipv6-4
-    managed: true
-    password: null
-    port: 11087
-    provider: warp
-    username: null
-  - block: 2a09:bac5:32d3:28a0::/64
-    container: warp-restore1
-    egress_ip: 2a09:bac5:32d3:28a0::40c:3a
-    enabled: true
-    host: 127.0.0.1
-    image: caomingjun/warp:latest
-    ipv6: true
-    label: warp-restore1
-    managed: true
-    password: null
-    port: 11103
-    provider: warp
-    username: null
-  - block: 2a09:bac5:32d6:be::/64
-    container: warp-restore3
-    egress_ip: 2a09:bac5:32d6:be::13:283
-    enabled: true
-    host: 127.0.0.1
-    image: caomingjun/warp:latest
-    ipv6: true
-    label: warp-restore3
-    managed: true
-    password: null
-    port: 11105
-    provider: warp
-    username: null
-  - block: ''
-    container: ''
-    egress_ip: ''
-    enabled: false
-    host: 127.0.0.1
-    image: ''
     ipv6: false
-    label: direct
+    egress_ip: ''
     managed: false
-    password: null
-    port: 11084
-    provider: static
+    container: ''
+    image: ''
+    block: ''
+    provider: warp
+  - host: 127.0.0.1
+    port: 11080
     username: null
+    password: null
+    enabled: true
+    label: warp-ipv6
+    ipv6: true
+    egress_ip: 2a09:bac1:2780:2060::3db:4e
+    managed: true
+    container: warp-test
+    image: caomingjun/warp:latest
+    block: 2a09:bac1:2780:2060::/64
+    provider: warp
+  - host: 127.0.0.1
+    port: 11085
+    username: null
+    password: null
+    enabled: true
+    label: warp-ipv6-2
+    ipv6: true
+    egress_ip: 2a09:bac5:32d5:14e6::215:70
+    managed: true
+    container: warp-test2
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d5:14e6::/64
+    provider: warp
+  - host: 127.0.0.1
+    port: 11086
+    username: null
+    password: null
+    enabled: true
+    label: warp-ipv6-3
+    ipv6: true
+    egress_ip: 2a09:bac5:32d3:28a0::40c:17
+    managed: true
+    container: warp-test3
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d3:28a0::/64
+    provider: warp
+  - host: 127.0.0.1
+    port: 11087
+    username: null
+    password: null
+    enabled: true
+    label: warp-ipv6-4
+    ipv6: true
+    egress_ip: 2a09:bac5:32d6:1c82::2d7:cf
+    managed: true
+    container: warp-test4
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d6:1c82::/64
+    provider: warp
+  - host: 127.0.0.1
+    port: 11103
+    username: null
+    password: null
+    enabled: true
+    label: warp-restore1
+    ipv6: true
+    egress_ip: 2a09:bac5:32d2:1c82::2d7:c
+    managed: true
+    container: warp-restore1
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d2:1c82::/64
+    provider: warp
+  - host: 127.0.0.1
+    port: 11105
+    username: null
+    password: null
+    enabled: true
+    label: warp-restore3
+    ipv6: true
+    egress_ip: 2a09:bac5:32d7:28b4::40e:36
+    managed: true
+    container: warp-restore3
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d7:28b4::/64
+    provider: warp
+  - host: 127.0.0.1
+    port: 11084
+    username: null
+    password: null
+    enabled: false
+    label: direct
+    ipv6: false
+    egress_ip: ''
+    managed: false
+    container: ''
+    image: ''
+    block: ''
+    provider: static
   socks5_proxy_port: 1080
   socks5_proxy_port_2: 1081
   socks_catchup_s: 90
@@ -771,15 +774,16 @@ protocol:
 timeouts:
   request_budget_s: 240
 retry_until_success:
-  enabled: false
-  max_wait_s: 900
+  enabled: true
+  max_wait_s: 180
   base_delay_s: 1.0
-  max_delay_s: 60.0
+  max_delay_s: 15.0
   keepalive_interval_s: 10
   buffer_max_bytes: 10485760
 free:
   station_identity: true
   cooldown_cap_s: 1200
+  preflight_inline_wait_s: 30
   max_wire_bytes: 900000
   max_client_system_chars: 4096
   max_client_tools: 9
@@ -890,7 +894,7 @@ ip_registry:
     settle_s: 8
     egress_wait_s: 35
     egress_poll_s: 2
-    auth_fallback_transport: wireguard
+    auth_fallback_transport: ''
     probe_validate_sse: true
     stop_after_429: true
     fast_discovery: true

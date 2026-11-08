@@ -268,6 +268,12 @@ Apports : classification quota structurée (`upstream_quota_exhausted` vs
 qui confirme que le prompt/tools du backend sont la signature du free. Non
 adopté : architecture lourde, session par requête, tools émulés dans le prompt.
 
+**Complément** : l'analyse des 12 dépôts « OpenCode Unlimited » (dont
+`ebouther`, `Tazmyan`, `ngynlaam`, `Nirusaki`, `hansputera`) est dans
+[`docs/REPOS_12_UNLIMITED_2026-11-06.md`](REPOS_12_UNLIMITED_2026-11-06.md).
+Elle confirme le quota par bloc, documente les faux leviers (device ID, session)
+et les limites de la rotation WARP.
+
 ## 7.2 Roadmap capacité — six blocs, pas six sessions
 
 Le quota est par bloc ; le nombre de stations utiles est donc le nombre de

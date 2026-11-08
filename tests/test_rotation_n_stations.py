@@ -70,7 +70,7 @@ def test_free_stations_exhausted_with_socks5(monkeypatch):
     fake_pool = types.SimpleNamespace(
         socks5_mode=True,
         _socks5_enabled_eps=lambda: ["socks5:proxy1:1080"],
-        _socks5_usable=lambda ep, exclude_approaching=False: True,
+        _socks5_usable=lambda ep, exclude_approaching=False, model=None: True,
         _stations=[],
         any_rotation_in_flight=lambda: False,
     )

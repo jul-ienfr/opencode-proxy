@@ -5482,6 +5482,25 @@ class VPNManager:
             cu_path = os.path.join(os.path.dirname(self._compose_file_path()), str(custom_ovpn).replace("/", os.sep))
             if os.path.isfile(cu_path):
                 env["OPENVPN_CUSTOM_CONFIG"] = f"/vpn-custom/{os.path.basename(cu_path)}"
+        # [011] Garder `.env` synchronisé avec le stack réellement passé à
+        # compose : le reconcile de boot lit ce fichier. Sans cette écriture,
+        # un flip mémoire pouvait laisser `.env` stale et recréer une boucle
+        # de divergence (F-01/G2).
+        try:
+            from ops.env_store import update_env
+
+            _env_path = os.path.join(
+                os.path.dirname(self._compose_file_path()), ".env"
+            )
+            update_env(
+                _env_path,
+                {
+                    f"VPN_TYPE_STATION{s}": stack
+                    for s in (stations or [self._station])
+                },
+            )
+        except Exception:
+            pass
         return env
 
     async def _await_rotation_ops_drained(self) -> None:
@@ -11277,6 +11296,19 @@ async def reconcile_orphan_containers(managers: list, runner=None) -> list[str]:
         if m is None:
             continue
         vpn_type = _env_value_from_inspect(info or {}, "VPN_TYPE")
+        # [011] Ne jamais détruire une station vivante au boot sur simple
+        # divergence de stack : le reconcile desired-state la recréera une
+        # seule fois si nécessaire. Sans cette garde, une flotte dont le
+        # .env/mémoire divergent était rm -f toutes les ~10 min.
+        _running = bool((info or {}).get("State", {}).get("Running"))
+        if _running and vpn_type in ("openvpn", "wireguard"):
+            logger.warning(
+                "[vpn] boot reconcile: %s running stack=%s — conservé "
+                "(station vivante, reconcile non destructif)",
+                name,
+                vpn_type,
+            )
+            continue
         # [plan v10 §14.1.1] stack attendue = .env PERSISTÉ par station, pas
         # l'heuristique fichier-clé recalculée au boot : une flotte basculée
         # OpenVPN avec wireguard.env encore présent voyait tous ses tunnels

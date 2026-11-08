@@ -356,52 +356,13 @@ class Socks5Endpoint:
         failed request.
         """
         try:
-            from curl_cffi import CurlOpt
-            from curl_cffi import requests as curl_requests
+            from free.egress_probe import resolve_egress
 
-            proxy = self.socks5_url
-            if proxy.startswith("socks5://"):
-                proxy = "socks5h://" + proxy[len("socks5://") :]
-            if self.ipv6:
-                # [2026-11-06] Endpoint IPv6 forcé : CURL_IPRESOLVE_V6=2.
-                # `curl_options` est une option de SESSION (pas de requête),
-                # d'où la Session dédiée. api64.ipify.org renvoie l'adresse
-                # IPv6 ; cloudflare/cdn-cgi/trace sert de repli.
-                session = curl_requests.Session(
-                    curl_options={CurlOpt.IPRESOLVE: 2}
-                )
-                try:
-                    response = session.get(
-                        "https://api64.ipify.org",
-                        proxy=proxy,
-                        timeout=float(timeout),
-                    )
-                finally:
-                    session.close()
-                ip = str(getattr(response, "text", "") or "").strip()
-                if not ip:
-                    session = curl_requests.Session(
-                        curl_options={CurlOpt.IPRESOLVE: 2}
-                    )
-                    try:
-                        response = session.get(
-                            "https://cloudflare.com/cdn-cgi/trace",
-                            proxy=proxy,
-                            timeout=float(timeout),
-                        )
-                    finally:
-                        session.close()
-                    for line in str(getattr(response, "text", "") or "").splitlines():
-                        if line.startswith("ip="):
-                            ip = line[3:].strip()
-                            break
-            else:
-                response = curl_requests.get(
-                    "https://api.ipify.org",
-                    proxies={"http": proxy, "https": proxy},
-                    timeout=float(timeout),
-                )
-                ip = str(getattr(response, "text", "") or "").strip()
+            ip = resolve_egress(
+                proxy_url=self.socks5_url,
+                ipv6=bool(self.ipv6),
+                timeout_s=float(timeout),
+            ) or ""
         except Exception:
             return ""
         if ip:
@@ -417,6 +378,24 @@ class Socks5Endpoint:
 
     def get_status(self) -> dict:
         return {
+            "provider": self.provider,
+            "slot_id": self._station,
+            "generation": 0,
+            "state": "connected" if self.enabled else "disabled",
+            "client_usable": bool(self.enabled and self.egress_ip),
+            "egress_ip": self.egress_ip,
+            "block": self.block_key or self.block,
+            "quota_state": "unknown",
+            "reset_at": self.reset_at,
+            "last_evidence": None,
+            "reason": None,
+            "next_action": "none",
+            "provider_details": {
+                "container": self.container,
+                "managed": self.managed,
+                "ipv6": self.ipv6,
+                "label": self.label,
+            },
             "pid": self.pid,
             "host": self.host,
             "port": self.port,
@@ -425,7 +404,6 @@ class Socks5Endpoint:
             "quota_per_ip": self._quota_per_ip,
             "label": self.label,
             "ipv6": self.ipv6,
-            "egress_ip": self.egress_ip,
         }
 
 
@@ -865,11 +843,16 @@ class FreeIPPool:
         # bad-mark or the manual rotate endpoint).
         self._socks5_auto_rotate = True
         try:
-            from free.warp_rotation import WarpRotator
+            from free.warp_rotation import RotationBudgetStore, WarpRotator
 
-            self._warp_rotator = WarpRotator()
+            self._warp_rotator = WarpRotator(budget_store=RotationBudgetStore())
         except Exception:
-            self._warp_rotator = None
+            try:
+                from free.warp_rotation import WarpRotator
+
+                self._warp_rotator = WarpRotator()
+            except Exception:
+                self._warp_rotator = None
         try:
             from free.fallback import FallbackConfig, FallbackPolicy
 
@@ -1217,7 +1200,19 @@ class FreeIPPool:
 
     def capacity_snapshot(self) -> dict:
         """Vue capacité légère pour ``/health`` (sans get_status lourd)."""
-        if getattr(self, "socks5_mode", False):
+        _providers = {
+            str(p).strip().lower()
+            for p in (getattr(self, "_egress_providers", None) or [])
+            if str(p).strip()
+        }
+        # [011] En auto_egress/vpn avec WARP/proxies sélectionnés, la capacité
+        # réelle est celle des endpoints SOCKS5, pas celle des conteneurs
+        # NordVPN. Sans cette branche, /api/vpn-status affichait 0/6 alors que
+        # six stations WARP servaient le client (F-32).
+        _socks_capacity = bool(_providers & {"warp", "proxies"}) and bool(
+            self._socks5_enabled_eps()
+        )
+        if getattr(self, "socks5_mode", False) or _socks_capacity:
             # [fiab 2026-11-06] En SOCKS5, la capacité suit les endpoints
             # statiques, pas les `_stations` Docker (vides). Sans cette
             # branche, /health restait `degraded` avec « 0/1 stations usable »
@@ -1229,6 +1224,7 @@ class FreeIPPool:
             quota_ips: set[str] = set()
             with_quota = 0
             repairing = 0
+            parked = 0
             now = time.monotonic()
             model = str(getattr(self, "_last_model", None) or "")
             probe_models = _yaml_get("ip_registry", "allocator.probe_models", []) or []
@@ -1245,12 +1241,15 @@ class FreeIPPool:
                         repairing += 1
                 except Exception:
                     pass
+                health = None
                 try:
-                    if self._socks5_usable(
-                        ep,
-                        exclude_approaching=False,
-                        ignore_latency_cool=True,
-                    ):
+                    health = self._station_health.get(int(getattr(ep, "_station", 0)))
+                except Exception:
+                    health = None
+                if health is not None and health.state == "parked":
+                    parked += 1
+                try:
+                    if self._socks5_client_usable(ep):
                         usable += 1
                         ip = str(getattr(ep, "current_ip", "") or "")
                         if ip and ip != "unknown" and not ip.startswith("socks5:"):
@@ -1266,9 +1265,22 @@ class FreeIPPool:
                                 quota_ips.add(ip)
                 except Exception:
                     continue
-            degraded = configured > 0 and usable < configured
-            reason = f"{usable}/{configured} endpoints usable" if degraded else None
-            if not degraded and configured > 0 and models and with_quota < configured:
+            duplicate_groups = self.duplicate_egress_groups(eps)
+            duplicate_stations = sum(
+                max(0, len(labels) - 1) for labels in duplicate_groups.values()
+            )
+            unique_buckets = self.unique_egress_buckets(eps)
+            degraded = configured > 0 and (
+                usable < configured
+                or duplicate_stations > 0
+                or unique_buckets < configured
+            )
+            reason = None
+            if duplicate_stations > 0:
+                reason = f"{duplicate_stations} endpoint(s) partagent un bucket"
+            elif degraded:
+                reason = f"{usable}/{configured} endpoints usable"
+            elif configured > 0 and models and with_quota < configured:
                 degraded = True
                 reason = f"{with_quota}/{configured} IP avec quota"
             return {
@@ -1276,15 +1288,16 @@ class FreeIPPool:
                 "stations_total": configured,
                 "usable_stations": usable,
                 "unique_usable_ips": len(usable_ips),
+                "unique_buckets": unique_buckets,
                 "active_stations_with_quota": with_quota,
                 "unique_ips_with_quota": len(quota_ips),
-                "duplicate_ip_groups": 0,
-                "duplicate_stations": 0,
+                "duplicate_ip_groups": len(duplicate_groups),
+                "duplicate_stations": duplicate_stations,
                 "warm_spare_ready": False,
                 "spare_station": None,
                 "spare_promoted": False,
                 "repairing_stations": repairing,
-                "parked_stations": 0,
+                "parked_stations": parked,
                 "capacity_degraded": degraded,
                 "capacity_reason": reason,
             }
@@ -1546,6 +1559,17 @@ class FreeIPPool:
                 for st in (getattr(self, "_stations", None) or [])
                 if self._station_usable(st, exclude_approaching=False, model=None)
             ]
+            # [011] En mode mixte (auto_egress/vpn), les endpoints SOCKS5 WARP
+            # sont aussi des buckets. Les ignorer faisait dire « tous les
+            # buckets épuisés » alors que WARP avait encore du quota.
+            try:
+                stations.extend(
+                    ep
+                    for ep in self._socks5_enabled_eps()
+                    if self._socks5_usable(ep, exclude_approaching=False)
+                )
+            except Exception:
+                pass
         except Exception:
             return False
         if not stations:
@@ -2647,7 +2671,10 @@ class FreeIPPool:
                     )
                 except Exception:
                     pass
-            if cause in ("rate_limit", "quota") and getattr(target, "managed", False):
+            if getattr(target, "managed", False) and (
+                cause in ("rate_limit", "quota")
+                or (bool(getattr(self, "socks5_mode", False)) and cause == "timeout")
+            ):
                 try:
                     self._request_warp_rotation(target, cause)
                 except Exception:
@@ -2740,7 +2767,13 @@ class FreeIPPool:
         Politique park : si le reset est proche et qu'un autre endpoint est
         servable, on laisse le ledger parker le bloc au lieu de recréer.
         """
-        if not self.socks5_mode:
+        if not self._socks5_enabled_eps():
+            self._last_rotation_scan = []
+            return 0
+        if not (
+            self.socks5_mode
+            or str(getattr(self._vpn, "proxy_mode", "")) in ("vpn", "auto_egress")
+        ):
             self._last_rotation_scan = []
             return 0
         started = 0
@@ -2749,8 +2782,12 @@ class FreeIPPool:
         try:
             _fallback_cfg = _yaml_get("ip_rotation", "fallback", {}) or {}
             _park_window = float(_fallback_cfg.get("park_window_s", 1800) or 1800)
+            _rotation_cap = max(
+                1, int(_fallback_cfg.get("max_rotations_per_scan", 2) or 2)
+            )
         except Exception:
             _park_window = 1800.0
+            _rotation_cap = 2
         _now_wall = time.time()
         managed = [ep for ep in eps if getattr(ep, "managed", False)]
         logger.debug(
@@ -2780,27 +2817,11 @@ class FreeIPPool:
         # on tourne les suivants.
         duplicate_labels: set[str] = set()
         try:
-            from free.warp_rotation import block_for_ip as _block_for_ip
+            from free.egress_reconcile import duplicate_bucket_groups
 
-            _by_block: dict[str, list[str]] = {}
-            for ep in managed:
-                _blk = str(getattr(ep, "block", "") or "").strip()
-                if not _blk:
-                    _ip = str(
-                        getattr(ep, "egress_ip", None)
-                        or getattr(ep, "current_ip", "")
-                        or ""
-                    ).strip()
-                    if _ip:
-                        _blk = _block_for_ip(_ip) or ""
-                if not _blk:
-                    continue
-                _label = str(getattr(ep, "label", "") or "")
-                if _label:
-                    _by_block.setdefault(_blk, []).append(_label)
-            for _labels in _by_block.values():
-                if len(_labels) > 1:
-                    duplicate_labels.update(_labels[1:])
+            _groups = duplicate_bucket_groups(list(managed))
+            for _labels in _groups.values():
+                duplicate_labels.update(_labels[1:])
         except Exception:
             duplicate_labels = set()
         for ep in managed:
@@ -2923,6 +2944,13 @@ class FreeIPPool:
                             continue
                     except Exception:
                         pass
+                # [011] Ne jamais lancer toute la flotte en rotation sur un
+                # même scan : chaque rotation recrée un conteneur et le rend
+                # momentanément suspect. Deux au plus par scan, le reste part
+                # au scan suivant une fois les premiers revenus sains.
+                if started >= _rotation_cap:
+                    entry["cause"] = f"{cause}_deferred"
+                    continue
                 if self._request_warp_rotation(ep, cause):
                     entry["requested"] = True
                     started += 1
@@ -3667,7 +3695,8 @@ class FreeIPPool:
         return [ep for ep in self._socks5_eps if ep.enabled]
 
     def _socks5_usable(
-        self, ep, *, exclude_approaching: bool, ignore_latency_cool: bool = False
+        self, ep, *, exclude_approaching: bool, ignore_latency_cool: bool = False,
+        model: str | None = None,
     ) -> bool:
         """Like ``_station_usable`` but for a static SOCKS5 endpoint — same
         counters and bad-until checks keyed by its negative sid.
@@ -3683,7 +3712,32 @@ class FreeIPPool:
             ep,
             exclude_approaching=exclude_approaching,
             ignore_latency_cool=ignore_latency_cool,
+            model=model,
         )
+
+    def _socks5_client_usable(self, endpoint) -> bool:
+        """WARP/proxy client-usable : sélection + egress réel + santé non parkée.
+
+        Le health strict 2-probes est pensé pour les tunnels Docker. Pour un
+        endpoint SOCKS5, la preuve d'egress réelle est la mesure `egress_ip` ;
+        on refuse seulement un endpoint en réparation/park ou sans IP.
+        """
+        try:
+            if not self._socks5_usable(endpoint, exclude_approaching=False):
+                return False
+        except Exception:
+            return False
+        egress = str(getattr(endpoint, "egress_ip", "") or "").strip()
+        try:
+            health = self._station_health.get(int(getattr(endpoint, "_station", 0)))
+        except Exception:
+            health = None
+        if health is None:
+            # Pas encore de preuve : la sélection reste l'autorité (compat).
+            return True
+        if not egress:
+            return False
+        return str(getattr(health, "state", "")) in ("usable", "probing")
 
     def pin_socks5_conversation(self, key: str | None, endpoint) -> None:
         """Épingle le gagnant d'un hedge SOCKS5 à sa conversation.
@@ -3718,7 +3772,7 @@ class FreeIPPool:
             return False
         return str(getattr(self, "_free_parallel_routing", "round-robin")) == "round-robin"
 
-    def _socks5_least_loaded(self, excluded=None) -> Socks5Endpoint | None:
+    def _socks5_least_loaded(self, excluded=None, model: str | None = None) -> Socks5Endpoint | None:
         """Endpoint usable le moins chargé (mode `load-balance` de la GUI).
 
         Trois passes : seuil de rotation, admission au seuil, puis admission
@@ -3745,6 +3799,7 @@ class FreeIPPool:
                     ep,
                     exclude_approaching=exclude_approaching,
                     ignore_latency_cool=ignore_latency_cool,
+                    model=model,
                 ):
                     continue
                 try:
@@ -3761,7 +3816,7 @@ class FreeIPPool:
                 return chosen[4]
         return None
 
-    def _socks5_pick(self, excluded=None, conversation_key: str | None = None):
+    def _socks5_pick(self, excluded=None, conversation_key: str | None = None, model: str | None = None):
         """Choisit un endpoint SOCKS5 avec affinité de conversation.
 
         Une clé de conversation déjà épinglée réutilise la même station tant
@@ -3789,7 +3844,11 @@ class FreeIPPool:
                         for candidate in self._socks5_enabled_eps()
                         if candidate.pid == pid
                         and candidate not in (excluded or set())
-                        and self._socks5_usable(candidate, exclude_approaching=False)
+                        and self._socks5_usable(
+                            candidate,
+                            exclude_approaching=False,
+                            model=model,
+                        )
                     ),
                     None,
                 )
@@ -3806,9 +3865,9 @@ class FreeIPPool:
             # 1,2,3…, load-balance/hedge = station la moins chargée.
             self._socks5_sticky = None
             if str(getattr(self, "_free_parallel_mode", "load-balance")) == "strict":
-                ep = self._socks5_next(excluded=excluded)
+                ep = self._socks5_next(excluded=excluded, model=model)
             else:
-                ep = self._socks5_least_loaded(excluded=excluded)
+                ep = self._socks5_least_loaded(excluded=excluded, model=model)
         else:
             # Failover / parallélisation désactivée / rotation SOCKS5 off :
             # sticky sur le primaire dédié, jamais déplacé par une ancienne
@@ -3819,9 +3878,11 @@ class FreeIPPool:
                 ep is None
                 or ep not in enabled_eps
                 or ep in (excluded or set())
-                or not self._socks5_usable(ep, exclude_approaching=False)
+                or not self._socks5_usable(
+                    ep, exclude_approaching=False, model=model
+                )
             ):
-                ep = self._socks5_next(excluded=excluded)
+                ep = self._socks5_next(excluded=excluded, model=model)
                 self._socks5_sticky = ep
         if ep is None and excluded:
             ep = self._socks5_next()
@@ -3843,7 +3904,7 @@ class FreeIPPool:
                     self._socks5_affinity.pop(stale, None)
         return ep
 
-    def _socks5_next(self, excluded=None) -> Socks5Endpoint | None:
+    def _socks5_next(self, excluded=None, model: str | None = None) -> Socks5Endpoint | None:
         """Next static proxy in round-robin order.
 
         Two passes (like ``_best_station_excluding``): the preferred pass
@@ -3875,6 +3936,7 @@ class FreeIPPool:
                     ep,
                     exclude_approaching=exclude_approaching,
                     ignore_latency_cool=ignore_latency_cool,
+                    model=model,
                 ):
                     self._socks5_rr = idx
                     return ep
@@ -4195,6 +4257,59 @@ class FreeIPPool:
                 return True
         return False
 
+    def duplicate_egress_groups(self, endpoints: list | None = None) -> dict[str, list[str]]:
+        """Buckets partagés par plusieurs endpoints actifs (WARP/proxys)."""
+        from free.egress_reconcile import duplicate_bucket_groups
+
+        eps = list(endpoints if endpoints is not None else self._socks5_enabled_eps())
+        return duplicate_bucket_groups(eps)
+
+    def unique_egress_buckets(self, endpoints: list | None = None) -> int:
+        """Nombre de buckets d'egress uniques (pas d'endpoints)."""
+        from free.egress_reconcile import unique_bucket_count
+
+        eps = list(endpoints if endpoints is not None else self._socks5_enabled_eps())
+        return unique_bucket_count(eps)
+
+    def refresh_socks5_egress(self, *, force: bool = False, timeout_s: float = 6.0) -> list[dict]:
+        """Réconcilie l'egress live des endpoints WARP/proxys managés.
+
+        Throttlé à 300 s sauf ``force``. Ne touche pas aux endpoints non
+        managés (proxys statiques dont l'IP peut être fixe).
+        """
+        now = time.monotonic()
+        last = float(getattr(self, "_last_socks5_egress_refresh", 0.0) or 0.0)
+        if not force and now - last < 300.0:
+            return []
+        self._last_socks5_egress_refresh = now
+        from free.egress_reconcile import reconcile_endpoint
+
+        results: list[dict] = []
+        for endpoint in list(getattr(self, "_socks5_eps", None) or []):
+            if not bool(getattr(endpoint, "enabled", True)):
+                continue
+            if not bool(getattr(endpoint, "managed", False)):
+                continue
+            try:
+                result = reconcile_endpoint(
+                    endpoint,
+                    persist=self._persist_socks5_egress,
+                    timeout_s=timeout_s,
+                )
+                if result.get("ok") and result.get("reason") == "changed":
+                    try:
+                        health = self._station_health.get(
+                            int(getattr(endpoint, "_station", 0))
+                        )
+                        if health is not None:
+                            health.repair_succeeded()
+                    except Exception:
+                        pass
+                results.append(result)
+            except Exception:
+                continue
+        return results
+
     def egress_endpoint_counts(self) -> dict[str, dict[str, int]]:
         """Compte les endpoints WARP/proxys pour le conseiller de capacité.
 
@@ -4203,9 +4318,10 @@ class FreeIPPool:
         marques bad/quota existantes. Aucun probe réseau n'est lancé.
         """
         out = {
-            "warp": {"configured": 0, "enabled": 0, "usable": 0},
-            "proxies": {"configured": 0, "enabled": 0, "usable": 0},
+            "warp": {"configured": 0, "enabled": 0, "usable": 0, "unique_buckets": 0},
+            "proxies": {"configured": 0, "enabled": 0, "usable": 0, "unique_buckets": 0},
         }
+        blocks: dict[str, set[str]] = {"warp": set(), "proxies": set()}
         for endpoint in list(getattr(self, "_socks5_eps", None) or []):
             name = "warp" if self._provider_matches(endpoint, "warp") else "proxies"
             out[name]["configured"] += 1
@@ -4213,10 +4329,23 @@ class FreeIPPool:
                 continue
             out[name]["enabled"] += 1
             try:
-                if self._socks5_usable(endpoint, exclude_approaching=False):
+                block = str(getattr(endpoint, "block_key", "") or "").strip()
+                if not block:
+                    block = str(getattr(endpoint, "block", "") or "").strip()
+                if not block:
+                    from free.egress_provider import block_for_egress
+
+                    block = block_for_egress(
+                        getattr(endpoint, "egress_ip", None)
+                    ) or str(getattr(endpoint, "pid", "") or "")
+                if block:
+                    blocks[name].add(block)
+                if self._socks5_client_usable(endpoint):
                     out[name]["usable"] += 1
             except Exception:
                 continue
+        for name in ("warp", "proxies"):
+            out[name]["unique_buckets"] = len(blocks[name])
         return out
 
     def provider_request_counts(self) -> dict[str, int]:
@@ -4317,18 +4446,19 @@ class FreeIPPool:
         return out
 
     def _socks5_pick_for(
-        self, provider: str | None, *, excluded=None, conversation_key: str | None = None
+        self, provider: str | None, *, excluded=None, conversation_key: str | None = None,
+        model: str | None = None,
     ):
         """Choisit un endpoint SOCKS5 du provider demandé (warp/proxies)."""
         if provider not in ("warp", "proxies"):
             return self._socks5_pick(
-                excluded=excluded, conversation_key=conversation_key
+                excluded=excluded, conversation_key=conversation_key, model=model
             )
         key = str(conversation_key or "").strip()
         excluded_set = set(excluded or ())
         for _ in range(len(self._socks5_enabled_eps()) + 1):
             ep = self._socks5_pick(
-                excluded=excluded_set, conversation_key=conversation_key
+                excluded=excluded_set, conversation_key=conversation_key, model=model
             )
             if ep is None:
                 return None
@@ -4433,7 +4563,7 @@ class FreeIPPool:
 
         await self.ensure_connected()
 
-        if self._vpn.proxy_mode in ("socks5", "auto_egress"):
+        if self._vpn.proxy_mode in ("socks5", "auto_egress", "vpn"):
             try:
                 logger.info(
                     "[warp-rotate] on_request enabled=%s mode=%s",
@@ -4493,6 +4623,7 @@ class FreeIPPool:
                 preferred_socks,
                 excluded=excluded,
                 conversation_key=conversation_key,
+                model=model,
             )
             if ep is not None:
                 return await self._serve_socks5(ep, model)
@@ -6940,6 +7071,67 @@ class FreeIPPool:
             1 for _s in _active_rows if (_s.get("health") or {}).get("state") in ("repairing", "probing")
         )
         _parked_n = sum(1 for _s in _active_rows if (_s.get("health") or {}).get("state") == "parked")
+        # [011] En auto_egress/vpn avec WARP/proxies, la capacité réelle est
+        # celle des endpoints SOCKS5. Les agrégats ci-dessus ne voient que les
+        # conteneurs NordVPN et affichaient 0/6 alors que six stations WARP
+        # servaient le client (F-32).
+        _status_providers = {
+            str(p).strip().lower()
+            for p in (getattr(self, "_egress_providers", None) or [])
+            if str(p).strip()
+        }
+        _socks_capacity = bool(_status_providers & {"warp", "proxies"}) and bool(
+            self._socks5_enabled_eps()
+        )
+        if _socks_capacity:
+            _eps = self._socks5_enabled_eps()
+            _models_for_quota = [
+                str(m).strip()
+                for m in dict.fromkeys(
+                    [getattr(self, "_last_model", None), *_probe_models]
+                )
+                if str(m or "").strip()
+            ]
+            _configured = len(_eps)
+            _usable_eps = [ep for ep in _eps if self._socks5_client_usable(ep)]
+            _usable_n = len(_usable_eps)
+            _quota_eps = []
+            for _ep in _eps:
+                try:
+                    if not _models_for_quota or any(
+                        self.model_usable(_m, _ep)[0] for _m in _models_for_quota
+                    ):
+                        _quota_eps.append(_ep)
+                except Exception:
+                    _quota_eps.append(_ep)
+            _with_quota_n = len(_quota_eps)
+            _usable_ips = {
+                str(getattr(_ep, "egress_ip", "") or getattr(_ep, "current_ip", "") or "")
+                for _ep in _usable_eps
+            } - {""}
+            _quota_ips = {
+                str(getattr(_ep, "egress_ip", "") or getattr(_ep, "current_ip", "") or "")
+                for _ep in _quota_eps
+            } - {""}
+            try:
+                _duplicate_groups = self.duplicate_egress_groups()
+            except Exception:
+                _duplicate_groups = {}
+            _duplicate_stations = sum(
+                max(0, len(_v) - 1) for _v in _duplicate_groups.values()
+            )
+            _repairing_n = 0
+            _parked_n = 0
+            for _ep in _eps:
+                try:
+                    _h = self._station_health.get(self._station_id(_ep))
+                except Exception:
+                    _h = None
+                _state = getattr(_h, "state", None)
+                if _state in ("repairing", "probing"):
+                    _repairing_n += 1
+                elif _state == "parked":
+                    _parked_n += 1
         _auth_failures_30m = 0
         _repair_attempts_n = 0
         _repair_success_n = 0
@@ -7096,11 +7288,11 @@ class FreeIPPool:
                 per = self._per_station(ep)
                 bad_until = per.get("bad_until")
                 bad_remaining = max(0.0, float(bad_until) - now) if bad_until else 0.0
-                usable = bool(
-                    self._socks5_usable(
-                        ep, exclude_approaching=False, ignore_latency_cool=True
-                    )
-                )
+                try:
+                    health = self._station_health.get(int(getattr(ep, "_station", 0)))
+                except Exception:
+                    health = None
+                usable = bool(self._socks5_client_usable(ep))
                 if bad_remaining > 0:
                     repairing += 1
                 raw_ip = str(getattr(ep, "current_ip", "") or "")
@@ -7157,7 +7349,13 @@ class FreeIPPool:
                             0, int(ep._quota_per_ip or 0) - int(per.get("request_count", 0) or 0)
                         ),
                         "quota_estimate": int(ep._quota_per_ip or 0),
-                        "health": {"state": "healthy" if usable else "repairing"},
+                        "health": {
+                            "state": (
+                                getattr(health, "state", None)
+                                if health is not None
+                                else ("healthy" if usable else "repairing")
+                            )
+                        },
                         "wire_identity": {},
                         "vpn": ep.get_status() if hasattr(ep, "get_status") else {},
                     }
@@ -7168,8 +7366,27 @@ class FreeIPPool:
             if current not in eps:
                 current = usable_eps[0] if usable_eps else (eps[0] if eps else None)
             current_per = self._per_station(current) if current is not None else {}
-            degraded = configured > 0 and usable_n < configured
-            if degraded:
+            duplicate_groups = self.duplicate_egress_groups(eps)
+            duplicate_stations = sum(
+                max(0, len(labels) - 1) for labels in duplicate_groups.values()
+            )
+            unique_buckets = self.unique_egress_buckets(eps)
+            parked_n = 0
+            for ep in eps:
+                try:
+                    health = self._station_health.get(int(getattr(ep, "_station", 0)))
+                except Exception:
+                    health = None
+                if health is not None and health.state == "parked":
+                    parked_n += 1
+            degraded = configured > 0 and (
+                usable_n < configured
+                or duplicate_stations > 0
+                or unique_buckets < configured
+            )
+            if duplicate_stations > 0:
+                _reason = f"{duplicate_stations} endpoint(s) partagent un bucket"
+            elif degraded:
                 _reason = f"{usable_n}/{configured} endpoints usable"
             elif configured > 0 and with_quota < configured:
                 degraded = True
@@ -7188,15 +7405,16 @@ class FreeIPPool:
                     "stations_total": configured,
                     "usable_stations": usable_n,
                     "unique_usable_ips": len(real_ips),
+                    "unique_buckets": unique_buckets,
                     "active_stations_with_quota": with_quota,
                     "unique_ips_with_quota": len(quota_ips),
-                    "duplicate_ip_groups": 0,
-                    "duplicate_stations": 0,
+                    "duplicate_ip_groups": len(duplicate_groups),
+                    "duplicate_stations": duplicate_stations,
                     "warm_spare_ready": False,
                     "spare_station": None,
                     "spare_promoted": False,
                     "repairing_stations": repairing,
-                    "parked_stations": 0,
+                    "parked_stations": parked_n,
                     "capacity_degraded": degraded,
                     "capacity_reason": _reason,
                     "status": "connected" if usable_n else "error",

@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
 import secrets
+import stat
+import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -32,7 +36,9 @@ PROJECT_LEN = 40
 TRACE_LEN = 32
 SECRET_LEN = 32
 CONV_LRU_MAX = 128
-ENV_PREFIX = "/workspace/"
+ENV_PREFIX = "/workspace/oc-"
+ALIAS_ROOT = "/workspace/"
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 DEFAULT_SECRET_PATH = Path(__file__).resolve().parent.parent / "logs" / "identity_secret"
 
 _ENV_RE = re.compile(r"<env>.*?</env>", re.DOTALL)
@@ -42,6 +48,7 @@ _INSTRUCTIONS_RE = re.compile(
     re.DOTALL,
 )
 _WIN_USER_PATH_RE = re.compile(r"[A-Za-z]:[\\/]Users[\\/][^\s`\"'<>|]+(?:[\\/][^\s`\"'<>|]+)*")
+_ENV_CWD_RE = re.compile(r"<env>\s*Working directory:\s*([^\n<]+)")
 _LABEL_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 _HEX32_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -104,6 +111,148 @@ def sanitize_text(text: str, env_cwd: str) -> str:
     return _WIN_USER_PATH_RE.sub(lambda _match: env_cwd, out)
 
 
+def workspace_root_from_messages(messages) -> str:
+    """Extrait le vrai ``Working directory`` du prompt client.
+
+    Le corps envoyé au provider est templaté (``/workspace/oc-<station>``) pour
+    cacher le nom d'utilisateur. Pour que les tool_calls du modèle restent
+    exécutables, le proxy doit connaître le chemin réel et le remapper au
+    retour. On lit le premier bloc ``<env>`` des messages système du client.
+    """
+    for message in messages or []:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+        if not isinstance(content, str):
+            continue
+        match = _ENV_CWD_RE.search(content)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value
+    return ""
+
+
+def translate_paths(
+    text: str,
+    mapping: dict[str, str],
+    *,
+    json_escape: bool = False,
+) -> str:
+    """Remplace les racines factices par les racines réelles.
+
+    ``json_escape=True`` échappe les backslashes Windows pour que le résultat
+    reste un fragment JSON valide dans ``tool_calls[].arguments``.
+    """
+    out = str(text or "")
+    for fake, real in (mapping or {}).items():
+        fake_s = str(fake or "")
+        real_s = str(real or "")
+        if not fake_s or not real_s:
+            continue
+        target = (
+            json.dumps(real_s, ensure_ascii=False)[1:-1]
+            if json_escape
+            else real_s
+        )
+        out = out.replace(fake_s, target)
+        # La racine factice est en style Unix ; le suffixe doit prendre les
+        # séparateurs Windows de la racine réelle (C:\...\file, pas C:\.../file).
+        if re.match(r"^[A-Za-z]:[\\/]", real_s):
+            sep = "\\\\" if json_escape else "\\"
+            while target + "/" in out:
+                out = out.replace(target + "/", target + sep)
+    return out
+
+
+def ensure_workspace_alias(
+    fake_root: str,
+    real_root: str,
+    *,
+    root: str | Path | None = None,
+) -> bool:
+    """Crée ``C:\\workspace\\oc-<label>`` comme jonction vers le vrai workspace.
+
+    Le modèle reçoit ``/workspace/oc-<station>`` ; sur Windows, le client
+    résout ce chemin en ``C:\\workspace\\oc-<station>``. Sans cette jonction,
+    chaque ``read``/``edit`` échoue avec « C:\\workspace does not exist ».
+    Le préfixe ``oc-`` évite les collisions avec un vrai dossier
+    ``C:\\workspace\\<label>`` déjà présent sur la machine.
+    """
+    if os.name != "nt":
+        return False
+    fake = str(fake_root or "").strip().replace("\\", "/")
+    if not fake.startswith(ALIAS_ROOT):
+        return False
+    segment = safe_label(fake[len(ALIAS_ROOT):].strip("/"))
+    try:
+        real = Path(str(real_root or "")).expanduser()
+    except Exception:
+        return False
+    if not segment or not real.is_dir():
+        return False
+    base = Path(root) if root is not None else Path("C:/workspace")
+    link = base / segment
+    try:
+        if link.exists():
+            try:
+                same = os.path.normcase(os.path.realpath(str(link))) == os.path.normcase(
+                    os.path.realpath(str(real))
+                )
+            except Exception:
+                same = False
+            if same:
+                return True
+            # Le label a déjà servi un autre workspace : la jonction doit
+            # suivre la requête courante, sinon le modèle lit les fichiers du
+            # mauvais projet. On ne supprime qu'une jonction/symlink, jamais un
+            # vrai dossier utilisateur.
+            try:
+                attrs = getattr(os.lstat(link), "st_file_attributes", 0)
+            except Exception:
+                attrs = 0
+            if not (attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                return False
+            try:
+                os.rmdir(link)
+            except OSError:
+                return False
+        base.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(real)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return proc.returncode == 0 and link.exists()
+    except Exception:
+        return False
+
+
+def workspace_env_cwd(identity: StationIdentity, real_root: str) -> str:
+    """Racine factice stable par (station, workspace réel).
+
+    Le label seul ne suffit pas : deux projets ouverts sur la même station
+    partageraient la même jonction ``C:\\workspace\\oc-...`` et le second
+    écraserait la cible du premier. Le suffixe hash garde une cible distincte
+    par workspace sans révéler le chemin réel.
+    """
+    base = str(getattr(identity, "env_cwd", "") or "")
+    real = str(real_root or "").strip()
+    if not base or not real:
+        return base
+    digest = hashlib.sha256(real.encode("utf-8")).hexdigest()[:8]
+    return f"{base}-{digest}"
+
+
 def render_system_prompt(
     base: str,
     env_cwd: str,
@@ -151,7 +300,11 @@ def template_official_body(
     """Copie le corps, nettoie tous les chemins et remplace le prompt système
     par sa version templatée. Les messages utilisateur/outils sont conservés
     après sanitation."""
-    out = _sanitize_value(body, identity.env_cwd)
+    real_root = workspace_root_from_messages(
+        body.get("messages") if isinstance(body, dict) else None
+    )
+    env_cwd = workspace_env_cwd(identity, real_root)
+    out = _sanitize_value(body, env_cwd)
     messages = out.get("messages") if isinstance(out, dict) else None
     if not isinstance(messages, list):
         return out
@@ -159,7 +312,7 @@ def template_official_body(
         if isinstance(message, dict) and message.get("role") == "system":
             content = str(message.get("content") or "")
             if "<env>" in content or "Today's date:" in content or "Instructions from:" in content:
-                message["content"] = identity.prompt(content, now=now)
+                message["content"] = identity.prompt(content, now=now, env_cwd=env_cwd)
             break
     return out
 
@@ -205,8 +358,14 @@ class StationIdentity:
     def new_msg(self) -> str:
         return _mint("msg", "ascending", self._id_state)
 
-    def prompt(self, base: str, *, now: datetime | None = None) -> str:
-        return render_system_prompt(base, self.env_cwd, now=now)
+    def prompt(
+        self,
+        base: str,
+        *,
+        now: datetime | None = None,
+        env_cwd: str | None = None,
+    ) -> str:
+        return render_system_prompt(base, env_cwd or self.env_cwd, now=now)
 
     def headers(
         self,
@@ -445,9 +604,13 @@ __all__ = [
     "audit_identity",
     "audit_prompt",
     "audit_station_set",
+    "ensure_workspace_alias",
     "load_or_create_secret",
     "render_system_prompt",
     "safe_label",
     "sanitize_text",
     "template_official_body",
+    "translate_paths",
+    "workspace_env_cwd",
+    "workspace_root_from_messages",
 ]

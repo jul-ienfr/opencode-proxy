@@ -586,6 +586,12 @@ if DEBUG:
 # matters most). Handlers are rotation-aware (see dashboard.display).
 attach_module_logger("vpn_manager")
 attach_module_logger("free_ip_pool")
+# [011] Rotation/réparation WARP et ledger : les logs doivent survivre à
+# DEBUG=false. Sans ces handlers, `[warp-rotate]` n'était écrit nulle part.
+attach_module_logger("free.pool")
+attach_module_logger("free.warp_rotation")
+attach_module_logger("free.quota_ledger")
+attach_module_logger("station_repair")
 # Gate de warmup : journalisé même quand DEBUG=false (debug.log), pour
 # diagnostiquer après coup un 503 « vpn_warming » et savoir s'il a attendu.
 attach_module_logger("vpn_gate")
@@ -848,6 +854,14 @@ _current_client_ip: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 # Value: {"ip": str, "identity": str} — identity = profile impersonate (fingerprint).
 _current_free_attempt: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "_current_free_attempt", default=None
+)
+
+# [path-map 2026-11-08] Le prompt free est templaté (`/workspace/oc-<station>`)
+# pour cacher le nom d'utilisateur Windows au provider. Les tool_calls du
+# modèle reviennent avec cette racine factice : on les remappe vers la racine
+# réelle avant de les livrer au client. Valeur : {fake_root: real_root}.
+_free_path_map: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "_free_path_map", default=None
 )
 
 # [V8.1] Refus amont d'un modèle free, porté jusqu'au logging d'usage.
@@ -5274,6 +5288,14 @@ app.add_middleware(
     on_empty=lambda reason: _note_empty_stream("?", f"choke:{reason}"),
 )
 
+# [tool-paths 2026-11-08] Le prompt free est templaté (`/workspace/oc-...`)
+# et le modèle écrit parfois `filePath` au lieu de `path`. Ce middleware
+# réécrit les lignes SSE de tool_calls pour que le client reçoive un appel
+# exécutable, quel que soit le handler qui a produit le flux.
+from streaming.tool_path_healing import ToolPathHealingMiddleware  # noqa: E402
+
+app.add_middleware(ToolPathHealingMiddleware)
+
 # [RetryUntilSuccess] Retry transparent côté proxy : le client ne voit ni 429
 # ni 502 pour une erreur récupérable. Placé APRÈS EmptyGuard (donc à
 # l'extérieur) pour pouvoir rejouer le 502 qu'il produit, et AVANT
@@ -7655,6 +7677,61 @@ def _free_is_title_request(body) -> bool:
         return False
 
 
+def _sanitize_free_messages(messages):
+    """Normalise les rôles de messages pour l'upstream free.
+
+    OpenAI accepte ``system/user/assistant/tool``. Certains clients envoient
+    ``developer`` ou des messages ``tool`` orphelins (sans ``tool_call_id``) :
+    l'upstream répond alors ``InvalidParameter: invalid message role`` et le
+    flux est vide. On convertit les rôles inconnus en ``user`` et les tool
+    orphelins en ``user``, sans toucher au corps client d'origine.
+
+    Retourne ``(messages, changed)``.
+    """
+    if not isinstance(messages, list):
+        return messages, 0
+    allowed = {"system", "user", "assistant", "tool"}
+    out = []
+    changed = 0
+    for raw in messages:
+        if not isinstance(raw, dict):
+            changed += 1
+            continue
+        msg = dict(raw)
+        role = str(msg.get("role") or "").strip().lower()
+        if role == "developer":
+            role = "system"
+            changed += 1
+        if role not in allowed:
+            content = msg.get("content")
+            if content not in (None, ""):
+                out.append({"role": "user", "content": content})
+            changed += 1
+            continue
+        msg["role"] = role
+        if role == "tool" and not msg.get("tool_call_id"):
+            content = msg.get("content")
+            out.append({"role": "user", "content": content if content is not None else ""})
+            changed += 1
+            continue
+        if role == "assistant":
+            calls = msg.get("tool_calls")
+            if isinstance(calls, list):
+                valid = [
+                    call
+                    for call in calls
+                    if isinstance(call, dict)
+                    and call.get("id")
+                    and isinstance(call.get("function"), dict)
+                    and call["function"].get("name")
+                ]
+                if len(valid) != len(calls):
+                    msg["tool_calls"] = valid
+                    changed += 1
+        out.append(msg)
+    return out, changed
+
+
 def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = None):
     """Copie d'envoi jambe free : copie officielle + stream (±prompt_cache_key).
 
@@ -7713,6 +7790,12 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         body = dict(body)
         body["tools"] = _filtered_tools
         _log(f"  [free] outil(s) retiré(s) avant envoi (non autorisés upstream) : {', '.join(sorted(set(_removed_tools)))}")
+    if is_chat and isinstance(body.get("messages"), list):
+        _clean_messages, _changed_messages = _sanitize_free_messages(body["messages"])
+        if _changed_messages:
+            body = dict(body)
+            body["messages"] = _clean_messages
+            _log(f"  [free] rôle(s) de message normalisé(s) : {_changed_messages}")
     tools = body.get("tools")
     if isinstance(tools, list):
         if is_chat:
@@ -8371,6 +8454,22 @@ def _chat_chunk_has_payload(chunk) -> bool:
     return False
 
 
+_PATH_TOOL_NAMES = frozenset(
+    {"edit", "read", "write", "patch", "multiedit", "create", "delete", "move", "copy"}
+)
+_PATH_ARG_ALIASES = ("filePath", "file_path", "filepath", "filename", "file")
+
+
+def _heal_tool_call_paths(name: str, arguments: str, path_map: dict[str, str]) -> str:
+    """Remappe les racines factices et les alias de chemin vers ``path``."""
+    try:
+        from streaming.tool_paths import heal_tool_arguments
+
+        return heal_tool_arguments(name, arguments, path_map)
+    except Exception:
+        return str(arguments or "")
+
+
 class _ChatToolCallHealer:
     """Répare les ``tool_calls`` OpenAI sans nom/id avant le client.
 
@@ -8393,8 +8492,9 @@ class _ChatToolCallHealer:
         le flux vide déclenche le retry existant sur une station fraîche.
     """
 
-    def __init__(self, tools):
+    def __init__(self, tools, path_map: dict[str, str] | None = None):
         self._tools = tools if isinstance(tools, list) else []
+        self._path_map = dict(path_map or {})
         self._states: dict[int, dict] = {}
         self._template = None
         self.used_names: list[str] = []
@@ -8461,6 +8561,7 @@ class _ChatToolCallHealer:
         for st in self._states.values():
             if not st["pending"]:
                 continue
+            st["args"] = _heal_tool_call_paths(st["name"], st["args"], self._path_map)
             if not st["name"]:
                 if final:
                     # Fin de flux : ne pas fabriquer un appel aux arguments
@@ -8525,6 +8626,11 @@ class _ChatToolCallHealer:
                     st["args"] += args
                 elif isinstance(args, dict):
                     st["args"] += _json_dumps_str(args)
+                st["args"] = _heal_tool_call_paths(
+                    st["name"] or str(fn.get("name") or "").strip(),
+                    st["args"],
+                    self._path_map,
+                )
                 # [2026-10-26] Flux dsh : l'ouverture ``{"`` manque. On la
                 # restaure AVANT l'inférence, sinon le premier fragment part
                 # tel quel et le reste du flux produit un JSON invalide.
@@ -8535,6 +8641,10 @@ class _ChatToolCallHealer:
                     st["name"] = name.strip()
                 if not st["name"]:
                     st["name"] = _infer_tool_name_from_arguments(st["args"], self._tools)
+                if st["name"]:
+                    st["args"] = _heal_tool_call_paths(
+                        st["name"], st["args"], self._path_map
+                    )
                 if not st["name"]:
                     # Nom inconnu : on retient le delta, jamais de tool_call vide.
                     st["pending"] = True
@@ -8714,6 +8824,9 @@ def _collect_chat_completion(lines, model, tools=None) -> dict | None:
                 )
                 continue
             fn["name"] = fn["name"].strip()
+            fn["arguments"] = _heal_tool_call_paths(
+                fn["name"], fn["arguments"], _free_path_map.get() or {}
+            )
             tc["function"] = fn
             if not tc.get("id"):
                 tc["id"] = f"call_free_{int(time.time() * 1000):x}{fn['name'][:6]}"
@@ -9942,6 +10055,38 @@ def _station_free_body(body, runtime, client_body=None):
     return build_body(body, runtime, client_body=client_body)
 
 
+def _set_free_path_map(body, station_runtime) -> None:
+    """Mémorise la racine factice → la racine réelle pour ce corps free."""
+    identity = getattr(station_runtime, "identity", None) if station_runtime is not None else None
+    base_fake = str(getattr(identity, "env_cwd", "") or "")
+    real_root = ""
+    fake_root = base_fake
+    if base_fake:
+        try:
+            from free.station_identity import (
+                workspace_env_cwd,
+                workspace_root_from_messages,
+            )
+
+            real_root = workspace_root_from_messages(
+                body.get("messages") if isinstance(body, dict) else None
+            )
+            fake_root = workspace_env_cwd(identity, real_root) if real_root else base_fake
+        except Exception:
+            real_root = ""
+            fake_root = base_fake
+    _free_path_map.set(
+        {fake_root: real_root} if fake_root and real_root else {}
+    )
+    if fake_root and real_root:
+        try:
+            from free.station_identity import ensure_workspace_alias
+
+            ensure_workspace_alias(fake_root, real_root)
+        except Exception:
+            pass
+
+
 async def _do_free_request_curl_cffi(
     body: dict,
     headers: dict,
@@ -10020,6 +10165,7 @@ async def _do_free_request_curl_cffi(
     wire_body, _force_wire_stream = _free_wire_body(body, force_stream=True, egress_ip=_egress_ip)
     if _station_runtime is not None:
         wire_body = _station_free_body(wire_body, _station_runtime, body)
+    _set_free_path_map(body, _station_runtime)
 
     # Pooled session — [A1 perf] checkout/checkin SANS verrou pendant le
     # transfert : le POST non-streaming ne sérialise plus la station.
@@ -12757,6 +12903,7 @@ async def _open_free_stream(
                 wire_body, _ = _free_wire_body(body, force_stream=True, egress_ip=_egress_ip_s or None)
                 if _station_runtime is not None:
                     wire_body = _station_free_body(wire_body, _station_runtime, body)
+                _set_free_path_map(body, _station_runtime)
                 # [P1.1 perf] timeout posé AU NIVEAU DE LA FACTORY
                 # de session poolée (_curl_timeout : connect 10 + read config
                 # upstream.timeout.read) : le POST ci-dessous n'a plus besoin
@@ -14372,6 +14519,53 @@ def _free_preflight_response(wait_s: float, *, anthropic: bool):
     except Exception:
         pass
     return resp
+
+
+def _free_preflight_inline_wait_s() -> float:
+    """Budget d'attente interne du preflight (secondes).
+
+    Un 429 « quota épuisé, retry dans 50 s » n'aide pas un client desktop qui
+    affiche l'erreur immédiatement. Quand le délai est court, le proxy attend
+    lui-même puis réessaie : le client ne voit ni 429 ni attente imposée.
+    """
+    try:
+        value = yaml_get("free", "preflight_inline_wait_s", 30)
+        return max(0.0, min(120.0, float(value)))
+    except Exception:
+        return 30.0
+
+
+async def _free_preflight_gate(model_id: str, *, route: str):
+    """Preflight free : attend les cooldowns courts, 429 seulement au-delà.
+
+    Retourne une ``Response`` 429 quand aucune station ne peut servir dans le
+    budget d'attente interne, sinon ``None`` (la requête continue).
+    """
+    wait = _free_preflight_retry_after(model_id)
+    if wait is None:
+        return None
+    budget = _free_preflight_inline_wait_s()
+    deadline = time.monotonic() + budget
+    while budget > 0:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or wait > max(1.0, remaining):
+            break
+        _log(
+            f"  [free-preflight] {route} : attente interne {wait:.0f}s "
+            f"au lieu d'un 429 client (model={model_id!r})"
+        )
+        await asyncio.sleep(wait + 0.25)
+        wait = _free_preflight_retry_after(model_id)
+        if wait is None:
+            _log(f"  [free-preflight] {route} : station disponible après attente interne")
+            return None
+    if wait is None:
+        return None
+    _log(
+        f"  [free-preflight] {route} 429 : aucune station libre "
+        f"(retry {wait:.0f}s) model={model_id!r}"
+    )
+    return _free_preflight_response(wait, anthropic=(route == "messages"))
 
 
 def _mark_free_stations_429(
@@ -17201,6 +17395,17 @@ async def _free_stream_refuse_bytes(
     except Exception:
         _cap = ""
     _debug(f"  [free-400-stream] req_id={req_id} leg=free {free_model!r} status={_status} body={_cap[:512]!r}")
+    try:
+        import logging as _logging
+
+        _logging.getLogger("vpn_gate").warning(
+            "[free-400-stream] status=%s model=%r body=%r",
+            _status,
+            free_model,
+            _cap[:512],
+        )
+    except Exception:
+        pass
     _retry_after = (resp.headers.get("retry-after", "") or "").strip()
     # [fix faux-429 stream] Miroir de free_refusal_response (non-stream) : on ne
     # brandit « quota épuisé » que pour un VRAI quota (motif dans le corps).
@@ -18807,11 +19012,12 @@ async def messages(request: Request):
     _debug(f"[messages] route: {original_model!r} → {model_id} | {protocol} | endpoint={endpoint}")
 
     # [2026-10-25] Vrai 429 avant ouverture du flux (cf. _free_preflight_retry_after).
+    # [2026-11-07] Les cooldowns courts sont attendus en interne : le client
+    # desktop ne doit plus voir « Request quota exhausted » pour 20-50 s.
     if bool(body.get("stream")) and not _is_compaction:
-        _pf_wait = _free_preflight_retry_after(model_id)
-        if _pf_wait is not None:
-            _log(f"  [free-preflight] messages 429 : aucune station libre (retry {_pf_wait:.0f}s) model={model_id!r}")
-            return _free_preflight_response(_pf_wait, anthropic=True)
+        _pf_resp = await _free_preflight_gate(model_id, route="messages")
+        if _pf_resp is not None:
+            return _pf_resp
 
     # [V8.5] Mauvais protocole : `jev-*` et consorts ne sont pas des modèles de
     # chat, ils vivent sur `/inference/v1/systemone` (questions + state). Les
@@ -24651,11 +24857,12 @@ async def chat_completions(request: Request):
     # [2026-10-25] Refus de quota AVANT d'ouvrir le flux : un vrai 429 lisible
     # au lieu d'un 200 + data:{"error":…}. No-op dès qu'une station peut servir
     # (voir _free_preflight_retry_after : warmup, rotation, repli payant).
+    # [2026-11-07] Les cooldowns courts sont attendus en interne : le client
+    # desktop ne doit plus voir « Request quota exhausted » pour 20-50 s.
     if is_stream and not _is_compaction:
-        _pf_wait = _free_preflight_retry_after(model_id)
-        if _pf_wait is not None:
-            _log(f"  [free-preflight] chat 429 : aucune station libre (retry {_pf_wait:.0f}s) model={model_id!r}")
-            return _free_preflight_response(_pf_wait, anthropic=False)
+        _pf_resp = await _free_preflight_gate(model_id, route="chat")
+        if _pf_resp is not None:
+            return _pf_resp
 
     thinking_raw = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
     thinking_type = thinking_raw.get("type", "none") if isinstance(thinking_raw, dict) and thinking_raw else "none"
@@ -25678,7 +25885,9 @@ async def chat_completions(request: Request):
                         # [2026-10-26] Répare les tool_calls amont sans nom/id
                         # AVANT tout yield (cf. _ChatToolCallHealer). Le client
                         # harness refuse ensuite de rejouer le tour.
-                        _tool_healer = _ChatToolCallHealer(body.get("tools"))
+                        _tool_healer = _ChatToolCallHealer(
+                            body.get("tools"), path_map=_free_path_map.get()
+                        )
 
                         def _sync_healer() -> None:
                             """Reporte les appels réellement émis dans le tracking."""
@@ -28650,11 +28859,12 @@ async def responses(request: Request):
     _log(f"→ {original_model!r} → {model_id} | {protocol} | responses | stream={is_stream} | ip={client_ip}")
 
     # [2026-10-25] Vrai 429 avant ouverture du flux (cf. _free_preflight_retry_after).
+    # [2026-11-07] Les cooldowns courts sont attendus en interne : le client
+    # desktop ne doit plus voir « Request quota exhausted » pour 20-50 s.
     if is_stream and not _is_compaction:
-        _pf_wait = _free_preflight_retry_after(model_id)
-        if _pf_wait is not None:
-            _log(f"  [free-preflight] responses 429 : aucune station libre (retry {_pf_wait:.0f}s) model={model_id!r}")
-            return _free_preflight_response(_pf_wait, anthropic=False)
+        _pf_resp = await _free_preflight_gate(model_id, route="responses")
+        if _pf_resp is not None:
+            return _pf_resp
 
     # [Compaction garde opt-in] voir handler messages (warn log / deny 413).
     _huge_level, _huge_msg = _huge_context_verdict(body, body_bytes)
@@ -30635,3 +30845,4 @@ async def _resp_json_hors_boucle(resp):
     if not resp.headers.get("content-type", "").startswith("application/json"):
         return {}
     return await asyncio.to_thread(resp.json)
+

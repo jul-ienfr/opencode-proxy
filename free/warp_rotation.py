@@ -8,8 +8,9 @@ config. Il ne touche jamais un proxy non `managed`.
 
 from __future__ import annotations
 
-import ipaddress
 import logging
+import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -18,6 +19,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from free.egress_provider import EgressRotationResult
+from free.quota_ledger import quota_block
+from ops.lifecycle_evidence import Evidence, log_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -30,17 +33,101 @@ EGRESS_TIMEOUT_S = 30.0
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 INFLIGHT: set[str] = set()
 LAST_ROTATION: dict[str, float] = {}
+ROTATION_TIMES: dict[str, list[float]] = {}
 _LOCK = threading.Lock()
 _ROTATE_LOCK = threading.Lock()
 MIN_ROTATION_INTERVAL_S = 300.0
 # Un restart peut rendre le même /64 (WARP réutilise les blocs Cloudflare).
 # On retente la recréation pour trouver un bloc frais, sans boucler à l'infini.
 MAX_ROTATION_ATTEMPTS = 4
-# Egress forcé par famille : ifconfig.me renvoie l'IPv4 partagée WARP sur un
-# endpoint « ipv6 », ce qui faisait tracker la mauvaise IP et condamnait la
-# station pour le quota d'une autre famille.
-EGRESS_URL_V4 = "https://api.ipify.org"
-EGRESS_URL_V6 = "https://api6.ipify.org"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class RotationBudgetStore:
+    """Budget horaire de rotation persisté dans ``registry.db``.
+
+    Table légère ``rotation_jobs`` créée à la demande. Un enregistrement par
+    tentative acceptée ; les entrées de plus d'une heure sont purgées à la
+    lecture. Le store ne remplace pas le ledger de quota : il compte les
+    rotations, pas les requêtes.
+    """
+
+    def __init__(self, path: str | None = None) -> None:
+        self.path = path or os.path.join(ROOT, "logs", "registry.db")
+        self._lock = threading.Lock()
+        self._ensure()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def _ensure(self) -> None:
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS rotation_jobs (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            provider TEXT NOT NULL DEFAULT 'warp',
+                            label TEXT NOT NULL,
+                            trigger TEXT NOT NULL DEFAULT 'auto',
+                            result TEXT NOT NULL DEFAULT 'started',
+                            reason TEXT,
+                            started_at REAL NOT NULL
+                        )
+                        """
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_rotation_jobs_label_time "
+                        "ON rotation_jobs(label, started_at)"
+                    )
+            except Exception as exc:
+                logger.warning("[warp-rotate] budget store init failed: %s", exc)
+
+    def allow(self, label: str, max_per_hour: int) -> bool:
+        if max_per_hour <= 0:
+            return True
+        cutoff = time.time() - 3600.0
+        try:
+            with self._lock, self._connect() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM rotation_jobs "
+                    "WHERE label=? AND started_at>=?",
+                    (str(label), cutoff),
+                ).fetchone()
+                return int(row[0] if row else 0) < int(max_per_hour)
+        except Exception as exc:
+            logger.warning("[warp-rotate] budget check failed: %s", exc)
+            return True
+
+    def record(
+        self,
+        label: str,
+        *,
+        provider: str = "warp",
+        trigger: str = "auto",
+        result: str = "started",
+        reason: str | None = None,
+    ) -> None:
+        try:
+            with self._lock, self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO rotation_jobs "
+                    "(provider,label,trigger,result,reason,started_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        str(provider),
+                        str(label),
+                        str(trigger),
+                        str(result),
+                        reason,
+                        time.time(),
+                    ),
+                )
+        except Exception as exc:
+            logger.warning("[warp-rotate] budget record failed: %s", exc)
 
 
 def block_for_ledger_key(raw: str) -> str | None:
@@ -56,13 +143,7 @@ def block_for_ledger_key(raw: str) -> str | None:
 
 
 def block_for_ip(ip: str) -> str | None:
-    try:
-        parsed = ipaddress.ip_address(str(ip).strip())
-    except ValueError:
-        return None
-    if parsed.version == 6:
-        return str(ipaddress.ip_network(f"{parsed}/64", strict=False))
-    return str(ipaddress.ip_network(f"{parsed}/32", strict=False))
+    return quota_block(ip)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,10 +175,14 @@ class WarpRotator:
         image: str = DEFAULT_IMAGE,
         health_timeout_s: float = HEALTH_TIMEOUT_S,
         egress_timeout_s: float = EGRESS_TIMEOUT_S,
+        max_rotations_per_hour: int = 10,
+        budget_store: Any = None,
     ) -> None:
         self.image = image
         self.health_timeout_s = float(health_timeout_s)
         self.egress_timeout_s = float(egress_timeout_s)
+        self.max_rotations_per_hour = max(0, int(max_rotations_per_hour or 0))
+        self.budget_store = budget_store
 
     def request_rotation(self, endpoint, pool, persist) -> bool:
         label = str(getattr(endpoint, "label", "") or "").strip()
@@ -111,6 +196,30 @@ class WarpRotator:
             last = float(LAST_ROTATION.get(label, 0.0) or 0.0)
             if now - last < MIN_ROTATION_INTERVAL_S:
                 return False
+            recent = [
+                ts
+                for ts in ROTATION_TIMES.get(label, [])
+                if now - float(ts) < 3600.0
+            ]
+            if self.budget_store is not None:
+                if not self.budget_store.allow(label, self.max_rotations_per_hour):
+                    logger.warning(
+                        "[warp-rotate] %s: budget horaire atteint (store)",
+                        label,
+                    )
+                    return False
+            elif self.max_rotations_per_hour and len(recent) >= self.max_rotations_per_hour:
+                logger.warning(
+                    "[warp-rotate] %s: budget horaire atteint (%d/%d)",
+                    label,
+                    len(recent),
+                    self.max_rotations_per_hour,
+                )
+                return False
+            if self.budget_store is not None:
+                self.budget_store.record(label)
+            else:
+                ROTATION_TIMES[label] = [*recent, now]
             LAST_ROTATION[label] = now
             INFLIGHT.add(label)
         thread = threading.Thread(
@@ -172,6 +281,18 @@ class WarpRotator:
                     logger.warning("[warp-rotate] %s: %s", label, result.as_dict())
         except Exception as exc:
             logger.warning("[warp-rotate] %s failed: %s", label, exc)
+            log_evidence(
+                Evidence(
+                    provider="warp",
+                    slot=abs(int(getattr(endpoint, "_station", 0) or 0)),
+                    cause="rotation",
+                    action="rotate",
+                    result="failed",
+                    evidence=str(exc)[:200],
+                    extra={"label": label},
+                ),
+                level=logging.WARNING,
+            )
         finally:
             with _LOCK:
                 INFLIGHT.discard(label)
@@ -272,6 +393,19 @@ class WarpRotator:
             per["consec_429"] = 0
         except Exception:
             pass
+        # [011] La rotation a validé l'egress (et le quota via la sonde
+        # post-rotation) : remettre la station saine tout de suite. Sans cela
+        # elle reste « suspect/repairing » jusqu'au probe de fond et la
+        # capacité affichée tombe à 2/6 après une rotation de flotte.
+        try:
+            sid = pool._station_id(endpoint)
+            health = pool._station_health.get(sid)
+            if health is not None:
+                health.repair_succeeded()
+            pool._note_health_probe(endpoint, True, cause="rotation")
+            pool._note_health_probe(endpoint, True, cause="rotation")
+        except Exception:
+            pass
         try:
             persist(str(getattr(endpoint, "label", "") or ""), str(result.new_ip or ""), result.block or "")
         except Exception as exc:
@@ -280,6 +414,22 @@ class WarpRotator:
         # doit pouvoir rejeter un bloc et relancer la rotation). Ne pas le
         # rejouer ici : chaque probe consomme une requête free.
         logger.info("[warp-rotate] %s: %s", result.label, result.as_dict())
+        log_evidence(
+            Evidence(
+                provider="warp",
+                slot=abs(int(getattr(endpoint, "_station", 0) or 0)),
+                cause="rotation",
+                action="rotate",
+                result="ok",
+                evidence=f"{result.old_ip}->{result.new_ip}",
+                extra={
+                    "label": result.label,
+                    "old_block": quota_block(result.old_ip),
+                    "new_block": result.block,
+                    "attempts": result.attempts,
+                },
+            )
+        )
 
     def _apply_tracking(self, endpoint, pool, persist, result: WarpRotationResult) -> None:
         """Met à jour l'egress même quand le bloc est refusé.
@@ -314,6 +464,8 @@ class WarpRotator:
 
     def _recreate(self, container: str, port: int, endpoint) -> None:
         image = str(getattr(endpoint, "image", "") or self.image)
+        label = str(getattr(endpoint, "label", "") or container)
+        provider = str(getattr(endpoint, "provider", "") or "warp")
         self._docker(["rm", "-f", container], timeout=60)
         self._docker(
             [
@@ -324,9 +476,21 @@ class WarpRotator:
                 "--cap-add",
                 "NET_ADMIN",
                 "-p",
-                f"{port}:1080",
+                f"127.0.0.1:{port}:1080",
                 "--restart",
                 "unless-stopped",
+                "--memory",
+                "512m",
+                "--pids-limit",
+                "128",
+                "--label",
+                f"opencode.provider={provider}",
+                "--label",
+                f"opencode.label={label}",
+                "--label",
+                "opencode.managed=true",
+                "--env",
+                f"OPENCODE_STATION_LABEL={label}",
                 image,
             ],
             timeout=120,
@@ -366,47 +530,18 @@ class WarpRotator:
     def _resolve_egress(self, port: int, ipv6: bool) -> str | None:
         if port <= 0:
             return None
-        url = EGRESS_URL_V6 if ipv6 else EGRESS_URL_V4
+        from free.egress_probe import resolve_egress
+
         deadline = time.monotonic() + self.egress_timeout_s
         while time.monotonic() < deadline:
-            try:
-                from curl_cffi import CurlOpt
-                from curl_cffi import requests as curl_requests
-
-                kwargs: dict[str, Any] = {
-                    "proxy": f"socks5h://127.0.0.1:{port}",
-                    "impersonate": "chrome131",
-                    "timeout": 10,
-                }
-                if ipv6:
-                    kwargs["curl_options"] = {CurlOpt.IPRESOLVE: 2}
-                with curl_requests.Session(**kwargs) as session:
-                    response = session.get(url)
-                ip = str(getattr(response, "text", "") or "").strip()
-                parsed = ipaddress.ip_address(ip)
-                if bool(parsed.version == 6) != bool(ipv6):
-                    raise ValueError(f"egress family mismatch: {ip}")
+            ip = resolve_egress(
+                proxy_url=f"socks5h://127.0.0.1:{port}",
+                ipv6=bool(ipv6),
+                timeout_s=10.0,
+            )
+            if ip:
                 return ip
-            except Exception:
-                try:
-                    cmd = ["curl", "-s", "--max-time", "10", "--socks5-hostname", f"127.0.0.1:{port}"]
-                    if ipv6:
-                        cmd.insert(1, "-6")
-                    proc = subprocess.run(
-                        [*cmd, url],
-                        capture_output=True,
-                        text=True,
-                        timeout=15,
-                        check=False,
-                        creationflags=CREATE_NO_WINDOW,
-                    )
-                    ip = str(proc.stdout or "").strip()
-                    parsed = ipaddress.ip_address(ip)
-                    if bool(parsed.version == 6) != bool(ipv6):
-                        raise ValueError(f"egress family mismatch: {ip}")
-                    return ip
-                except Exception:
-                    time.sleep(3)
+            time.sleep(3)
         return None
 
 

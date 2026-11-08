@@ -169,7 +169,7 @@ def test_build_body_removes_local_paths_and_agents_block():
     assert "C:\\Users\\alice" not in serialized
     assert "SECRET_PROJECT_RULE" not in serialized
     assert "Instructions from:" not in serialized
-    assert "/workspace/warp-1" in serialized
+    assert "/workspace/oc-warp-1" in serialized
     assert body["messages"][1] == {"role": "user", "content": "ping"}
     assert BASE_BODY["messages"][0]["content"].startswith("You are an AI agent")
 
@@ -192,7 +192,7 @@ def test_build_body_1195_uses_11_tool_capture():
     assert len(body["tools"]) == 11
     serialized = json.dumps(body)
     assert "C:\\Users\\alice" not in serialized
-    assert "/workspace/warp-1" in serialized
+    assert "/workspace/oc-warp-1" in serialized
     assert body["stream"] is True
 
 
@@ -216,3 +216,4 @@ def test_opencode_station_runtime_uses_label_and_registry(monkeypatch):
     assert runtime.identity.label == "warp-1"
     assert runtime.profile is not None
     assert runtime.profile.profile_id == "oc-2.2.5-cli-13"
+

@@ -72,7 +72,7 @@ def test_build_request_uses_station_identity_and_templated_prompt():
     assert request.headers["x-opencode-request"].startswith("msg_")
     assert request.headers["Host"] == "example.test"
     system = request.body["messages"][0]["content"]
-    assert "Working directory: /workspace/warp-1" in system
+    assert "Working directory: /workspace/oc-warp-1" in system
     assert "C:\\Users\\alice" not in system
     assert "Platform:" not in system
     assert request.body["messages"][1] == {"role": "user", "content": "ping"}
@@ -146,3 +146,4 @@ def test_sender_does_not_reuse_conversation_session_across_profiles():
     assert sender(first, "block-a").verdict == VERDICT_PASS
     assert sender(second, "block-b").verdict == VERDICT_PASS
     assert sessions[0] != sessions[1]
+

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Supervise the fresh-IP chains for every station.
 
 Each broken station gets its own chain (shared catalog, exclusive hostname
@@ -17,6 +17,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,6 +39,8 @@ from free.ip_registry.config import load_registry_config  # noqa: E402
 from free.repair_queue import RepairQueue  # noqa: E402
 
 INTERVAL_S = 20.0
+PROXY_API = "http://127.0.0.1:4000"
+_HEALTH_PROBE_INFLIGHT = False
 HEALTH_GRACE_S = 600.0
 # When the allocator is the only repair owner (station_repair disabled), it
 # must not wait the watchdog's 10-minute grace: the station would stay out of
@@ -448,6 +451,54 @@ def _live_ip_rotation() -> dict:
         return section if isinstance(section, dict) else {}
     except Exception:
         return {}
+
+
+def _nordvpn_maintained() -> bool:
+    """True si la flotte NordVPN doit être maintenue, même non sélectionnée.
+
+    La sélection trafic (``egress_providers``) décide qui sert les requêtes ;
+    elle ne doit pas décider qui est réparé. Tant qu'il existe au moins une
+    station NordVPN non désactivée, le superviseur la maintient.
+    """
+    live = _live_ip_rotation()
+    try:
+        station_count = int(live.get("station_count") or 0)
+    except (TypeError, ValueError):
+        station_count = 0
+    disabled = live.get("disabled_stations") or []
+    if isinstance(disabled, (list, tuple, set)):
+        disabled_count = len({int(item) for item in disabled if str(item).isdigit()})
+    else:
+        disabled_count = 0
+    return station_count > 0 and disabled_count < station_count
+
+
+def _probe_health_async(stations: list[int]) -> None:
+    """Probe l'egress NordVPN en arrière-plan pour rafraîchir station_health.
+
+    Sans cela, une station dont le tunnel est redevenu sain restait marquée
+    `auth`/`repairing` jusqu'à une action manuelle.
+    """
+    global _HEALTH_PROBE_INFLIGHT
+    if _HEALTH_PROBE_INFLIGHT:
+        return
+    _HEALTH_PROBE_INFLIGHT = True
+
+    def _run() -> None:
+        global _HEALTH_PROBE_INFLIGHT
+        try:
+            for sid in stations:
+                try:
+                    requests.post(
+                        f"{PROXY_API}/api/vpn/station/{int(sid)}/probe",
+                        timeout=60,
+                    )
+                except Exception:
+                    continue
+        finally:
+            _HEALTH_PROBE_INFLIGHT = False
+
+    threading.Thread(target=_run, name="health-probe", daemon=True).start()
 
 
 def _nordvpn_selected() -> bool:
@@ -1086,7 +1137,7 @@ def _stop_chain(station: int, transport: str = "wireguard") -> None:
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/F"],
                 capture_output=True,
-                timeout=20,
+                timeout=60,
                 creationflags=_NO_WINDOW,
             )
         else:
@@ -1104,19 +1155,9 @@ def _stop_chain(station: int, transport: str = "wireguard") -> None:
 def _set_env(key: str, value: str) -> None:
     path = ROOT / ".env"
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except Exception:
-        lines = []
-    found = False
-    for index, line in enumerate(lines):
-        if line.strip().startswith(key + "="):
-            lines[index] = f"{key}={value}"
-            found = True
-            break
-    if not found:
-        lines.append(f"{key}={value}")
-    try:
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="")
+        from ops.env_store import update_env
+
+        update_env(path, {key: value})
     except Exception as exc:
         log(f"env update {key} failed: {type(exc).__name__}: {exc}")
 
@@ -1214,6 +1255,7 @@ def _supervise() -> None:
     stale_logged_at = 0.0
     last_alert_at = 0.0
     last_heartbeat = 0.0
+    last_health_probe = 0.0
     last_maintenance_at = time.time()
     last_cycle_log = 0.0
     zero_functional_polls = 0
@@ -1233,9 +1275,9 @@ def _supervise() -> None:
                 last_mode = "off"
                 time.sleep(poll)
                 continue
-            if not _nordvpn_selected():
+            if not _nordvpn_maintained():
                 if not nordvpn_idle_logged:
-                    log("NordVPN non sélectionné — supervisor idle")
+                    log("NordVPN non maintenu — supervisor idle")
                     nordvpn_idle_logged = True
                 time.sleep(poll)
                 continue
@@ -1244,6 +1286,12 @@ def _supervise() -> None:
             if now_heartbeat - last_heartbeat >= 60.0:
                 last_heartbeat = now_heartbeat
                 log(f"heartbeat: mode={mode}")
+            if now_heartbeat - last_health_probe >= 300.0:
+                last_health_probe = now_heartbeat
+                try:
+                    _probe_health_async([int(s) for s in _scope()])
+                except Exception:
+                    pass
             try:
                 maint_interval = float(
                     yaml_get("ip_registry", "maintenance_interval_s", 21600)

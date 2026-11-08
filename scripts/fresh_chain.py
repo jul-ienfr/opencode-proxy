@@ -24,7 +24,6 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -1261,32 +1260,15 @@ def _persist_env_pin(station: int, host: str, country: str) -> None:
     if not host:
         return
     path = ROOT / ".env"
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return
     values = {
         f"SERVER_HOSTNAMES_STATION{int(station)}": str(host).strip(),
         f"SERVER_COUNTRIES_STATION{int(station)}": str(country or "").strip(),
     }
-    seen: set[str] = set()
-    out: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        key = stripped.split("=", 1)[0] if "=" in stripped else ""
-        if key in values:
-            out.append(f"{key}={values[key]}")
-            seen.add(key)
-        else:
-            out.append(line)
-    for key, value in values.items():
-        if key not in seen:
-            out.append(f"{key}={value}")
     try:
-        tmp = path.with_name(".env.tmp")
-        tmp.write_text("\n".join(out) + "\n", encoding="utf-8", newline="")
-        os.replace(tmp, path)
-    except OSError:
+        from ops.env_store import update_env
+
+        update_env(path, values)
+    except Exception:
         return
     log(f"pin persisted to .env: station {station} {host} ({country})")
 
@@ -2191,7 +2173,6 @@ async def _run_claims(
 async def run(args) -> int:
     from free.ip_registry import (
         ComposeHostnameBinder,
-        DnsFallback,
         GluetunControlBinder,
         HybridBinder,
         StationEgress,

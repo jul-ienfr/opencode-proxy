@@ -158,6 +158,7 @@ class ProviderCapacity:
     configured: int = 0
     enabled: int = 0
     usable: int = 0
+    unique_buckets: int = 0
     selected: bool = False
     weight: int | None = None
     expected_share: float | None = None
@@ -174,6 +175,7 @@ class ProviderCapacity:
             "configured": self.configured,
             "enabled": self.enabled,
             "usable": self.usable,
+            "unique_buckets": self.unique_buckets,
             "selected": self.selected,
             "weight": self.weight,
             "expected_share": self.expected_share,
@@ -232,10 +234,16 @@ def _counts_for(name: str, counts: dict[str, dict[str, int]]) -> dict[str, int]:
     configured = max(0, int(raw.get("configured", 0) or 0))
     enabled = max(0, int(raw.get("enabled", 0) or 0))
     usable = max(0, int(raw.get("usable", enabled) or 0))
+    unique_buckets = max(0, int(raw.get("unique_buckets", usable) or 0))
+    if unique_buckets <= 0:
+        unique_buckets = usable
+    effective = min(usable, enabled, unique_buckets)
     return {
         "configured": configured,
         "enabled": enabled,
-        "usable": min(usable, enabled),
+        "endpoint_usable": min(usable, enabled),
+        "usable": effective,
+        "unique_buckets": effective,
     }
 
 
@@ -343,6 +351,7 @@ def evaluate_capacity(
             configured=counts["configured"],
             enabled=counts["enabled"],
             usable=counts["usable"],
+            unique_buckets=counts["unique_buckets"],
             selected=is_selected,
             weight=weight,
             expected_share=expected_share,
@@ -366,6 +375,22 @@ def evaluate_capacity(
 
     warnings: list[dict[str, str]] = []
     recommendations: list[dict[str, str]] = []
+
+    for name in selected_names:
+        raw_counts = _counts_for(name, providers)
+        if raw_counts["endpoint_usable"] > raw_counts["unique_buckets"]:
+            warnings.append(
+                _message(
+                    "duplicate_block",
+                    f"{provider_label(name)} : {raw_counts['endpoint_usable']} endpoints "
+                    f"pour {raw_counts['unique_buckets']} bucket(s) unique(s). "
+                    "Les endpoints en double ne ajoutent pas de quota.",
+                    f"{provider_label(name)}: {raw_counts['endpoint_usable']} endpoints "
+                    f"for {raw_counts['unique_buckets']} unique bucket(s). "
+                    "Duplicate endpoints add no quota.",
+                    "warn",
+                )
+            )
 
     if len(selected_names) == 1:
         warnings.append(

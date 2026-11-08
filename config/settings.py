@@ -312,7 +312,7 @@ def save_yaml_config():
     try:
         if lock is not None:
             lock.acquire()
-        tmp = CONFIG_PATH + ".tmp"
+        tmp = f"{CONFIG_PATH}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             yaml.dump(_yaml_for_disk(_yaml_data), f, default_flow_style=False, allow_unicode=True, sort_keys=False)
             f.flush()
@@ -320,7 +320,24 @@ def save_yaml_config():
                 os.fsync(f.fileno())
             except OSError:
                 pass
-        os.replace(tmp, CONFIG_PATH)
+        # Windows : os.replace échoue si un autre process (dashboard,
+        # antivirus, watcher) tient brièvement le fichier ouvert. On retente
+        # quelques fois avant d'abandonner, avec un tmp unique par process.
+        last_exc: OSError | None = None
+        for _attempt in range(5):
+            try:
+                os.replace(tmp, CONFIG_PATH)
+                last_exc = None
+                break
+            except OSError as exc:
+                last_exc = exc
+                time.sleep(0.1 * (_attempt + 1))
+        if last_exc is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise last_exc
         try:
             globals()["_config_yaml_mtime"] = os.path.getmtime(CONFIG_PATH)
         except OSError:

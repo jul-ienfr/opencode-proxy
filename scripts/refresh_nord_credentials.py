@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import shutil
 import time
 import urllib.error
@@ -68,7 +69,14 @@ def report(data: dict, status: int) -> dict:
     }
 
 
-def apply_credentials(user: str, password: str) -> dict:
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def apply_credentials(user: str, password: str, wireguard_key: str = "") -> dict:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     env_backup = ENV.with_name(f"credentials.env.bak-nord-{stamp}")
     if ENV.exists():
@@ -89,13 +97,42 @@ def apply_credentials(user: str, password: str) -> dict:
         lines.append(f"OPENVPN_USER={user}")
     if not seen_password:
         lines.append(f"OPENVPN_PASSWORD={password}")
-    ENV.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _atomic_write(ENV, "\n".join(lines) + "\n")
     src_backup = ""
     if SRC.exists():
         src_backup = str(SRC.with_name(f"credentials.txt.bak-nord-{stamp}"))
         shutil.copy2(SRC, src_backup)
-    SRC.write_text(f"{user}\n{password}\n", encoding="utf-8")
-    return {"env": str(ENV), "env_backup": str(env_backup), "source": str(SRC), "source_backup": src_backup}
+    _atomic_write(SRC, f"{user}\n{password}\n")
+    wg_result: dict[str, str] = {}
+    if wireguard_key:
+        wg = ROOT / "vpn_configs" / "wireguard.env"
+        wg_backup = ""
+        if wg.exists():
+            wg_backup = str(wg.with_name(f"wireguard.env.bak-nord-{stamp}"))
+            shutil.copy2(wg, wg_backup)
+        wg_lines: list[str] = []
+        seen_key = False
+        for line in (
+            wg.read_text(encoding="utf-8", errors="replace").splitlines()
+            if wg.exists()
+            else []
+        ):
+            if line.startswith("WIREGUARD_PRIVATE_KEY="):
+                wg_lines.append(f"WIREGUARD_PRIVATE_KEY={wireguard_key}")
+                seen_key = True
+            else:
+                wg_lines.append(line)
+        if not seen_key:
+            wg_lines.append(f"WIREGUARD_PRIVATE_KEY={wireguard_key}")
+        _atomic_write(wg, "\n".join(wg_lines) + "\n")
+        wg_result = {"wireguard": str(wg), "wireguard_backup": wg_backup}
+    return {
+        "env": str(ENV),
+        "env_backup": str(env_backup),
+        "source": str(SRC),
+        "source_backup": src_backup,
+        **wg_result,
+    }
 
 
 def main() -> int:
@@ -123,7 +160,18 @@ def main() -> int:
     if not result["ok"]:
         return 1
     if args.apply and not args.check:
-        print(json.dumps({"applied": apply_credentials(str(data["username"]), str(data["password"]))}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {
+                    "applied": apply_credentials(
+                        str(data["username"]),
+                        str(data["password"]),
+                        str(data.get("nordlynx_private_key") or ""),
+                    )
+                },
+                ensure_ascii=False,
+            )
+        )
     return 0
 
 

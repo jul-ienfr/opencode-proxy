@@ -60,7 +60,7 @@ def test_capacity_snapshot_counts_socks5_endpoints():
     third = Socks5Endpoint("127.0.0.1", 11086, label="warp-c", ipv6=True, index=2)
     pool._socks5_eps = [first, *pool._socks5_eps[1:], third]
     pool._socks5_usable = (
-        lambda endpoint, exclude_approaching=False, ignore_latency_cool=False: endpoint.pid
+        lambda endpoint, exclude_approaching=False, ignore_latency_cool=False, model=None: endpoint.pid
         != "warp-b"
     )
     cap = pool.capacity_snapshot()

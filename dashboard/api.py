@@ -1594,10 +1594,15 @@ def _egress_capacity_counts() -> dict[str, dict[str, int]]:
                     "configured": max(0, int(raw.get("configured", 0) or 0)),
                     "enabled": max(0, int(raw.get("enabled", 0) or 0)),
                     "usable": max(0, int(raw.get("usable", 0) or 0)),
+                    "unique_buckets": max(
+                        0,
+                        int(raw.get("unique_buckets", raw.get("usable", 0)) or 0),
+                    ),
                 }
     else:
         rows = cfg.get("socks5_proxies") or []
         if isinstance(rows, list):
+            blocks: dict[str, set[str]] = {"warp": set(), "proxies": set()}
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -1607,6 +1612,17 @@ def _egress_capacity_counts() -> dict[str, dict[str, int]]:
                 if row.get("enabled", True):
                     counts[name]["enabled"] += 1
                     counts[name]["usable"] += 1
+                    block = str(row.get("block") or "").strip()
+                    if not block:
+                        from free.egress_provider import block_for_egress
+
+                        block = block_for_egress(row.get("egress_ip")) or str(
+                            row.get("label") or row.get("port") or ""
+                        )
+                    if block:
+                        blocks[name].add(block)
+            for name in ("warp", "proxies"):
+                counts[name]["unique_buckets"] = len(blocks[name])
     return counts
 
 
@@ -4359,6 +4375,194 @@ def register_dashboard(
         _egress_audit("capacity_config", {"egress_capacity": dict(updates)})
         return {"ok": True, "egress_capacity": updates}
 
+    @app.get("/api/stations")
+    async def get_stations(request: Request):
+        """Vue consolidée des stations NordVPN et endpoints WARP (011)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        from free.capacity import capacity_config
+        from free.egress_reconcile import bucket_for_endpoint
+        from free.quota_ledger import quota_block
+
+        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
+        target, policy = capacity_config(cfg.get("egress_capacity"))
+        pool = _dashboard_pool()
+        health: dict = {}
+        if pool is not None and hasattr(pool, "_station_health"):
+            try:
+                health = pool._station_health.snapshot()
+            except Exception:
+                health = {}
+
+        def _health_for(sid: int) -> dict:
+            return health.get(sid) or health.get(str(sid)) or {}
+
+        rows: list[dict] = []
+        for manager in _dashboard_managers():
+            try:
+                status = manager.get_status()
+            except Exception:
+                status = {}
+            sid = int(getattr(manager, "_station", 0) or 0)
+            h = _health_for(sid)
+            rows.append(
+                {
+                    "provider": "nordvpn",
+                    "station": sid,
+                    "container": status.get("container") or getattr(manager, "_docker_container", ""),
+                    "generation": int(status.get("generation", 0) or 0),
+                    "state": h.get("state") or status.get("status") or "unknown",
+                    "client_usable": bool(h.get("usable", False)),
+                    "egress_ip": status.get("ip") or status.get("current_ip"),
+                    "block": quota_block(
+                        status.get("ip") or status.get("current_ip")
+                    ),
+                    "quota_state": "unknown",
+                    "reset_at": None,
+                    "last_evidence": None,
+                    "reason": h.get("last_error") or status.get("error"),
+                    "next_action": "none" if h.get("usable") else "repair",
+                    "provider_details": {
+                        "stack": status.get("assigned_stack") or status.get("stack"),
+                        "transport": status.get("ovpn_protocol_effective"),
+                        "hostname": status.get("current_host"),
+                    },
+                }
+            )
+        if pool is not None and hasattr(pool, "_socks5_enabled_eps"):
+            try:
+                endpoints = pool._socks5_enabled_eps()
+            except Exception:
+                endpoints = []
+            for endpoint in endpoints:
+                sid = int(getattr(endpoint, "_station", 0) or 0)
+                h = _health_for(sid)
+                egress = getattr(endpoint, "egress_ip", None)
+                try:
+                    endpoint_usable = bool(pool._socks5_client_usable(endpoint))
+                except Exception:
+                    endpoint_usable = bool(h.get("usable", False) and egress)
+                rows.append(
+                    {
+                        "provider": "warp",
+                        "station": sid,
+                        "container": getattr(endpoint, "container", None),
+                        "generation": 0,
+                        "state": "client_usable"
+                        if endpoint_usable
+                        else (h.get("state") or "degraded"),
+                        "client_usable": endpoint_usable,
+                        "egress_ip": egress,
+                        "block": bucket_for_endpoint(endpoint),
+                        "quota_state": "unknown",
+                        "reset_at": getattr(endpoint, "reset_at", None),
+                        "last_evidence": None,
+                        "reason": h.get("last_error"),
+                        "next_action": "none" if endpoint_usable else "repair",
+                        "provider_details": {
+                            "label": getattr(endpoint, "label", ""),
+                            "ipv6": bool(getattr(endpoint, "ipv6", False)),
+                            "managed": bool(getattr(endpoint, "managed", False)),
+                        },
+                    }
+                )
+        duplicate_groups = (
+            pool.duplicate_egress_groups() if pool is not None and hasattr(pool, "duplicate_egress_groups") else {}
+        )
+        return {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "target_slots": target,
+            "reserve_policy": policy,
+            "providers": _egress_capacity_counts(),
+            "stations": rows,
+            "duplicate_buckets": duplicate_groups,
+            "warnings": [
+                f"duplicate_block:{bucket}" for bucket in duplicate_groups
+            ],
+        }
+
+    @app.get("/api/stations/reconcile-plan")
+    async def get_stations_reconcile_plan(request: Request):
+        """Plan de reconcile read-only (desired vs actual), sans action."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        from ops.providers.nordvpn import NordVpnProvider
+        from ops.providers.warp import WarpProvider
+        from ops.reconciler import ActualSlot, reconcile
+
+        pool = _dashboard_pool()
+        managers = _dashboard_managers()
+        desired = list(NordVpnProvider(managers).specs())
+        actual: list[ActualSlot] = []
+        for manager in managers:
+            try:
+                status = manager.get_status()
+            except Exception:
+                status = {}
+            sid = int(getattr(manager, "_station", 0) or 0)
+            stack = str(status.get("assigned_stack") or status.get("stack") or "")
+            proto = str(status.get("ovpn_protocol_effective") or "")
+            transport = (
+                "wireguard"
+                if stack == "wireguard"
+                else (f"openvpn-{proto}" if proto in ("tcp", "udp") else proto)
+            )
+            actual.append(
+                ActualSlot(
+                    provider="nordvpn",
+                    slot_id=sid,
+                    container=str(status.get("container") or ""),
+                    generation=0,
+                    stack=stack,
+                    transport=transport,
+                    running=bool(status.get("ip") or status.get("current_ip")),
+                    health="healthy" if status.get("error") is None else "unhealthy",
+                    port=int(status.get("proxy_port") or 0),
+                )
+            )
+        endpoints: list = []
+        if pool is not None and hasattr(pool, "_socks5_enabled_eps"):
+            try:
+                endpoints = list(pool._socks5_enabled_eps())
+            except Exception:
+                endpoints = []
+        desired.extend(WarpProvider(endpoints).specs())
+        for endpoint in endpoints:
+            actual.append(
+                ActualSlot(
+                    provider="warp",
+                    slot_id=0,
+                    container=str(getattr(endpoint, "container", "") or ""),
+                    generation=0,
+                    stack="warp",
+                    transport="socks5",
+                    running=bool(getattr(endpoint, "egress_ip", None)),
+                    health="healthy" if getattr(endpoint, "egress_ip", None) else "unhealthy",
+                    port=int(getattr(endpoint, "port", 0) or 0),
+                    block=str(getattr(endpoint, "block_key", "") or "") or None,
+                )
+            )
+        decisions = reconcile(desired, actual)
+        return {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "read_only": True,
+            "decisions": [decision.as_dict() for decision in decisions],
+        }
+
+    @app.get("/api/stations/{provider}/{station}")
+    async def get_station(provider: str, station: int, request: Request):
+        """Détail d'une station (même vérité que /api/stations)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        payload = await get_stations(request)
+        for row in payload.get("stations", []):
+            if row.get("provider") == provider and int(row.get("station", 0)) == int(station):
+                return row
+        return {"error": "station inconnue", "provider": provider, "station": station}
+
     @app.post("/api/vpn-config")
     async def update_vpn_config(request: Request):
         """Update VPN configuration (hot-reload + persist to config.yaml)."""
@@ -4999,6 +5203,43 @@ def register_dashboard(
             return JSONResponse(status_code=502, content={"error": str(e)[:200]})
         return {"ok": bool(ok), "station": sid}
 
+    @app.post("/api/vpn/station/{sid}/probe")
+    async def probe_station(sid: int, request: Request):
+        """Probe l'egress réel d'une station et met à jour sa santé (011)."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        import shared_state
+
+        mgr = next(
+            (
+                m
+                for m in (getattr(shared_state, "vpn_managers", None) or [])
+                if getattr(m, "_station", None) == sid
+            ),
+            None,
+        )
+        if mgr is None:
+            return JSONResponse(
+                status_code=404, content={"error": f"station {sid} introuvable"}
+            )
+        try:
+            ip = await asyncio.wait_for(mgr.get_public_ip(), timeout=30)
+        except Exception as exc:
+            mgr._note_pool_health(False, cause="probe")
+            return {"ok": False, "station": sid, "error": str(exc)[:200]}
+        ok = bool(ip)
+        mgr._note_pool_health(ok, cause="probe")
+        if ok:
+            mgr._note_pool_health(True, cause="probe")
+            try:
+                mgr._error = None
+                mgr._auth_failed = False
+                mgr._set_status("connected")
+            except Exception:
+                pass
+        return {"ok": ok, "station": sid, "ip": ip}
+
     @app.post("/api/vpn/station/{sid}/restart")
     async def restart_station(sid: int, request: Request):
         """[v10 §9.4] Redémarre la station {id} (docker restart léger).
@@ -5275,6 +5516,26 @@ def register_dashboard(
             "enabled": bool(getattr(pool, "enabled", False)),
         }
 
+    @app.post("/api/vpn/socks5/refresh-egress")
+    async def refresh_vpn_socks5_egress(request: Request):
+        """Réconcilie l'egress live des endpoints WARP avec config/ledger."""
+        err = _check_dashboard_token(request)
+        if err:
+            return err
+        pool = _dashboard_pool()
+        if pool is None or not hasattr(pool, "refresh_socks5_egress"):
+            return {"ok": False, "error": "pool_unavailable"}
+        try:
+            results = await asyncio.to_thread(pool.refresh_socks5_egress, force=True)
+            duplicates = (
+                pool.duplicate_egress_groups()
+                if hasattr(pool, "duplicate_egress_groups")
+                else {}
+            )
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "results": results, "duplicates": duplicates}
+
     @app.post("/api/vpn/socks5/rotate-egress")
     async def rotate_vpn_socks5_egress(request: Request):
         """Force une rotation des WARP managés dont le bucket est épuisé."""
@@ -5391,9 +5652,30 @@ def register_dashboard(
             username, password = _stored_proxy_credentials(
                 pool, "_socks5_proxies", host, port
             )
-        return await _socks5_probe(
+        result = await _socks5_probe(
             host, port, username=username, password=password, ipv6=ipv6
         )
+        if result.get("opencode_ok") and pool is not None:
+            try:
+                endpoint = next(
+                    (
+                        ep
+                        for ep in pool._socks5_enabled_eps()
+                        if str(getattr(ep, "label", "")) == label
+                        or int(getattr(ep, "port", 0)) == int(port)
+                    ),
+                    None,
+                )
+                if endpoint is not None:
+                    sid = int(getattr(endpoint, "_station", 0))
+                    health = pool._station_health.get(sid)
+                    if health is not None:
+                        health.repair_succeeded()
+                    pool._station_health.observe(sid, True)
+                    pool._station_health.observe(sid, True)
+            except Exception:
+                pass
+        return result
 
     @app.post("/api/vpn/socks5/rotate")
     async def rotate_vpn_socks5(request: Request):

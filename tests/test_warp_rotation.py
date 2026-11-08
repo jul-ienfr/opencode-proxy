@@ -347,12 +347,48 @@ def test_rotate_exhausted_managed_rotates_model_blocked_endpoint():
         label="warp-restore3",
         container="warp-restore3",
         index=1,
+        egress_ip="2a09:bac1:2780:2060::216:7e",
         block="2a09:bac1:2780:2060::/64",
     )
     pool = ModelBadPool([managed, healthy])
     count = FreeIPPool.rotate_exhausted_managed(pool)
     assert count == 1
     assert pool.calls == [("warp-restore1", "model_ip")]
+
+
+def test_rotate_exhausted_managed_caps_rotations_per_scan():
+    from free.pool import FreeIPPool
+
+    class ManyModelBad(ProactivePool):
+        _model_ip_health = {("mimo-v2.6-flash-free", -1, "ip"): {}}
+
+        def _get_ledger(self):
+            class _Ledger:
+                def is_exhausted(self, raw, model):
+                    return False
+
+            return _Ledger()
+
+        def model_ip_bad(self, model, endpoint):
+            return True
+
+    endpoints = [
+        _endpoint(
+            label=f"warp-cap-{i}",
+            container=f"warp-cap-{i}",
+            port=11200 + i,
+            egress_ip=f"2a09:bac1:27a0:{0x2060 + i:04x}::{i + 1:02x}",
+            block=f"2a09:bac1:27a0:{0x2060 + i:04x}::/64",
+        )
+        for i in range(4)
+    ]
+    pool = ManyModelBad(endpoints)
+    count = FreeIPPool.rotate_exhausted_managed(pool)
+    assert count == 2
+    assert len(pool.calls) == 2
+    causes = [entry["cause"] for entry in FreeIPPool.rotation_scan(pool)]
+    assert causes.count("model_ip") == 2
+    assert causes.count("model_ip_deferred") == 2
 
 
 def test_rotate_exhausted_managed_parks_near_reset_with_other_usable():
@@ -521,6 +557,7 @@ def test_rotate_exhausted_managed_rotates_trial_dead_endpoint():
         label="warp-restore3",
         container="warp-restore3",
         index=1,
+        egress_ip="2a09:bac1:2780:2060::216:7e",
         block="2a09:bac1:2780:2060::/64",
     )
     pool = TrialDeadPool([managed, healthy])

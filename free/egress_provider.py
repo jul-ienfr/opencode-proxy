@@ -11,15 +11,9 @@ import ipaddress
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from free.quota_ledger import quota_block
 
-def block_for_egress(ip: str | None) -> str | None:
-    """Bloc de quota : ``/64`` IPv6, ``/32`` IPv4 ; ``None`` si invalide."""
-    try:
-        parsed = ipaddress.ip_address(str(ip or "").strip())
-    except ValueError:
-        return None
-    prefix = 64 if parsed.version == 6 else 32
-    return str(ipaddress.ip_network(f"{parsed}/{prefix}", strict=False))
+block_for_egress = quota_block
 
 
 def family_for_egress(ip: str | None) -> str | None:

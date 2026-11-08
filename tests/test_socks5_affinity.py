@@ -25,7 +25,7 @@ def _pool(count: int = 3) -> FreeIPPool:
     pool._free_parallel_enabled = True
     pool._free_parallel_routing = "round-robin"
     pool._free_parallel_mode = "load-balance"
-    pool._socks5_usable = lambda endpoint, exclude_approaching=False, ignore_latency_cool=False: True
+    pool._socks5_usable = lambda endpoint, exclude_approaching=False, ignore_latency_cool=False, model=None: True
     return pool
 
 
@@ -44,7 +44,7 @@ def test_affinity_failover_moves_and_updates_pin():
     pool = _pool(3)
     first = pool._socks5_pick(conversation_key="conv-a")
     assert first is not None
-    pool._socks5_usable = lambda endpoint, exclude_approaching=False, ignore_latency_cool=False: endpoint is not first
+    pool._socks5_usable = lambda endpoint, exclude_approaching=False, ignore_latency_cool=False, model=None: endpoint is not first
     moved = pool._socks5_pick(conversation_key="conv-a")
     assert moved is not None
     assert moved is not first
@@ -74,7 +74,7 @@ def test_affinity_ttl_expiry_reassigns_only_if_unusable():
     first = pool._socks5_pick(conversation_key="conv-a")
     assert first is not None
     pool._socks5_affinity["conv-a"] = (first.pid, 0.0)
-    pool._socks5_usable = lambda endpoint, exclude_approaching=False, ignore_latency_cool=False: endpoint is not first
+    pool._socks5_usable = lambda endpoint, exclude_approaching=False, ignore_latency_cool=False, model=None: endpoint is not first
     second = pool._socks5_pick(conversation_key="conv-a")
     assert second is not None
     assert second is not first
@@ -137,7 +137,7 @@ def test_latency_hard_cooled_fleet_still_yields_candidate():
 
     pool = _pool(2)
 
-    def _usable(endpoint, exclude_approaching=False, ignore_latency_cool=False):
+    def _usable(endpoint, exclude_approaching=False, ignore_latency_cool=False, model=None):
         return bool(ignore_latency_cool)
 
     pool._socks5_usable = _usable

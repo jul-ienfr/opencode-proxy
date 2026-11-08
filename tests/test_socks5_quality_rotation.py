@@ -58,7 +58,7 @@ def _pool(managed: bool):
     pool.latency_engine = None
     pool._quality_rotations = []
     pool._quality_rot_last_sid = {}
-    pool._socks5_usable = lambda endpoint, exclude_approaching=False, ignore_latency_cool=False: True
+    pool._socks5_usable = lambda endpoint, exclude_approaching=False, ignore_latency_cool=False, model=None: True
     calls = []
     pool._request_warp_rotation = lambda station, cause: (
         calls.append((station.pid, cause)) or True
