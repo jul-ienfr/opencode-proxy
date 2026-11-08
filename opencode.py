@@ -7797,24 +7797,6 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
             body["messages"] = _clean_messages
             _log(f"  [free] rôle(s) de message normalisé(s) : {_changed_messages}")
     tools = body.get("tools")
-    try:
-        from streaming.tool_paths import set_client_tool_names
-
-        _client_names = []
-        for _tool in tools if isinstance(tools, list) else []:
-            if not isinstance(_tool, dict):
-                continue
-            _fn = (
-                _tool.get("function")
-                if isinstance(_tool.get("function"), dict)
-                else _tool
-            )
-            _name = str(_fn.get("name") or "").strip()
-            if _name:
-                _client_names.append(_name)
-        set_client_tool_names(_client_names)
-    except Exception:
-        pass
     if isinstance(tools, list):
         if is_chat:
             have = {
@@ -18072,6 +18054,17 @@ def _extract_tool_names(body: dict) -> list:
     return names
 
 
+def _install_client_tool_schemas(body) -> None:
+    """Pose les schémas client (noms + clé de chemin) pour le middleware SSE."""
+    try:
+        from streaming.tool_paths import set_client_tool_schemas
+
+        tools = body.get("tools") if isinstance(body, dict) else None
+        set_client_tool_schemas(tools if isinstance(tools, list) else [])
+    except Exception:
+        pass
+
+
 # ── Web Search / Web Fetch Handler (v3.3) ───────────────────────────────
 
 
@@ -18990,6 +18983,7 @@ async def messages(request: Request):
     _mark_requested_model(original_model)
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
+    _install_client_tool_schemas(body)
     _debug(f"[messages] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
 
     # [Phase 1 compaction] Détection shape stricte sur le body ORIGINAL
@@ -24770,6 +24764,7 @@ async def chat_completions(request: Request):
     _mark_requested_model(original_model)
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
+    _install_client_tool_schemas(body)
     _debug(f"[chat] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
     # [Phase 1 compaction] Détection shape stricte sur le body ORIGINAL
     # (avant remap model / ensure_min_tokens) — miroir du handler messages.
@@ -28794,6 +28789,7 @@ async def responses(request: Request):
     _mark_requested_model(original_model)
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
+    _install_client_tool_schemas(body)
     # [Phase 1 compaction] Détection shape stricte sur le body ORIGINAL
     # (avant remap model / conversions) — miroir des handlers messages/chat.
     # Borne lue LIVE (hot-reload safe) via get_server_compaction, défaut 1000.

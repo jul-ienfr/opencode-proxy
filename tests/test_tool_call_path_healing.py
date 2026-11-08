@@ -15,10 +15,13 @@ from opencode import _ChatToolCallHealer, _heal_tool_call_paths
 from streaming.tool_path_healing import ToolPathHealingMiddleware
 from streaming.tool_paths import (
     CLIENT_TOOL_NAMES,
+    heal_anthropic_payload,
     heal_openai_payload,
     heal_sse_data_line,
+    heal_tool_arguments,
     heal_tool_name,
     set_client_tool_names,
+    set_client_tool_schemas,
 )
 
 REAL = r"C:\Users\julie\Downloads\qwenproxy"
@@ -214,6 +217,117 @@ def test_tool_path_middleware_heals_split_sse_lines() -> None:
     args = payload["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
     assert json.loads(args)["path"] == "a.txt"
     assert "filePath" not in args
+
+
+def test_heal_tool_arguments_uses_client_file_path_schema() -> None:
+    set_client_tool_schemas(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "edit",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                    },
+                },
+            }
+        ]
+    )
+    try:
+        healed = heal_tool_arguments(
+            "edit", '{"path":"a.txt","oldString":"a","newString":"b"}'
+        )
+        parsed = json.loads(healed)
+        assert parsed["file_path"] == "a.txt"
+        assert "path" not in parsed
+        # Déjà au bon nom : ne rien casser.
+        same = '{"file_path":"a.txt","oldString":"a","newString":"b"}'
+        assert heal_tool_arguments("edit", same) == same
+    finally:
+        set_client_tool_schemas([])
+
+
+def test_heal_anthropic_payload_uses_tool_name_state() -> None:
+    set_client_tool_schemas(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ]
+    )
+    try:
+        names: dict[int, str] = {}
+        start = {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "name": "write", "input": {}},
+        }
+        heal_anthropic_payload(start, names)
+        assert names[0] == "write"
+        delta = {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": '{"filePath":"x.txt",',
+            },
+        }
+        assert heal_anthropic_payload(delta, names)
+        assert '"path":"x.txt"' in delta["delta"]["partial_json"]
+    finally:
+        set_client_tool_schemas([])
+
+
+def test_heal_openai_payload_uses_client_file_path_schema() -> None:
+    set_client_tool_schemas(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                    },
+                },
+            }
+        ]
+    )
+    try:
+        payload = {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "name": "read",
+                                    "arguments": '{"path":"a.txt"}',
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        assert heal_openai_payload(payload)
+        args = payload["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+        assert json.loads(args)["file_path"] == "a.txt"
+    finally:
+        set_client_tool_schemas([])
 
 
 def test_heal_tool_name_maps_official_placeholder() -> None:

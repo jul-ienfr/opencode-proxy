@@ -30,12 +30,54 @@ CLIENT_TOOL_NAMES: contextvars.ContextVar[frozenset[str] | None] = contextvars.C
     "CLIENT_TOOL_NAMES", default=None
 )
 
+#: Propriété de chemin attendue par le schéma de chaque outil client.
+CLIENT_TOOL_PATH_KEYS: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "CLIENT_TOOL_PATH_KEYS", default=None
+)
+
+_CANDIDATE_PATH_KEYS = ("file_path", "filePath", "path", "filename", "file")
+
+
+def set_client_tool_schemas(tools) -> None:
+    """Mémorise noms et propriété de chemin réelle de chaque outil client."""
+    names: list[str] = []
+    keys: dict[str, str] = {}
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if not isinstance(fn, dict):
+            continue
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        names.append(name)
+        params = fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {}
+        props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+        for candidate in _CANDIDATE_PATH_KEYS:
+            if candidate in props:
+                keys[name] = candidate
+                break
+    CLIENT_TOOL_NAMES.set(frozenset(names) or None)
+    CLIENT_TOOL_PATH_KEYS.set(keys or None)
+
 
 def set_client_tool_names(names) -> None:
     cleaned = frozenset(
         str(name).strip() for name in (names or ()) if str(name).strip()
     )
     CLIENT_TOOL_NAMES.set(cleaned or None)
+
+
+def expected_path_key(name: str) -> str:
+    keys = CLIENT_TOOL_PATH_KEYS.get() or {}
+    key = keys.get(str(name or ""))
+    if key:
+        return key
+    # Repli pour les tests/appels hors requête : l'ancien comportement OpenCode.
+    if str(name or "") in PATH_TOOL_NAMES:
+        return "path"
+    return ""
 
 
 def heal_tool_name(name: str) -> str:
@@ -64,7 +106,7 @@ def heal_tool_arguments(
     arguments: str,
     path_map: dict[str, str] | None = None,
 ) -> str:
-    """Remappe les racines factices et renomme les alias de chemin en ``path``."""
+    """Remappe les racines factices et renomme vers la clé de chemin attendue."""
     text = str(arguments or "")
     if path_map:
         try:
@@ -73,14 +115,17 @@ def heal_tool_arguments(
             text = translate_paths(text, path_map, json_escape=True)
         except Exception:
             pass
-    if name and name not in PATH_TOOL_NAMES:
+    expected = expected_path_key(name)
+    if not expected:
         return text
-    if re.search(r'[{,]\s*"path"\s*:', text):
+    if re.search(rf'[{{,]\s*"{re.escape(expected)}"\s*:', text):
         return text
-    for alias in PATH_ARG_ALIASES:
+    for alias in (*PATH_ARG_ALIASES, "path", "file_path", "filePath"):
+        if alias == expected:
+            continue
         healed = re.sub(
             rf'([{{,]\s*)"{re.escape(alias)}"\s*:',
-            r'\1"path":',
+            rf'\1"{expected}":',
             text,
             count=1,
         )
@@ -128,7 +173,7 @@ def heal_openai_payload(payload) -> bool:
     return changed
 
 
-def heal_anthropic_payload(payload) -> bool:
+def heal_anthropic_payload(payload, tool_names: dict | None = None) -> bool:
     """Heal ``tool_use.input`` et ``input_json_delta.partial_json``."""
     if not isinstance(payload, dict):
         return False
@@ -142,11 +187,17 @@ def heal_anthropic_payload(payload) -> bool:
             if new_name != old_name:
                 block["name"] = new_name
                 changed = True
+            index = payload.get("index")
+            if tool_names is not None and isinstance(index, int):
+                tool_names[index] = new_name or old_name
             value = block.get("input")
-            if isinstance(value, dict) and "path" not in value:
-                for alias in PATH_ARG_ALIASES:
+            expected = expected_path_key(new_name or old_name) or "path"
+            if isinstance(value, dict) and expected not in value:
+                for alias in (*PATH_ARG_ALIASES, "path", "file_path", "filePath"):
+                    if alias == expected:
+                        continue
                     if alias in value:
-                        value["path"] = value.pop(alias)
+                        value[expected] = value.pop(alias)
                         changed = True
                         break
     elif ptype == "content_block_delta":
@@ -154,14 +205,18 @@ def heal_anthropic_payload(payload) -> bool:
         if isinstance(delta, dict) and delta.get("type") == "input_json_delta":
             partial = delta.get("partial_json")
             if isinstance(partial, str):
-                new_partial = heal_tool_arguments("", partial)
+                index = payload.get("index")
+                name = ""
+                if tool_names is not None and isinstance(index, int):
+                    name = str(tool_names.get(index) or "")
+                new_partial = heal_tool_arguments(name, partial)
                 if new_partial != partial:
                     delta["partial_json"] = new_partial
                     changed = True
     return changed
 
 
-def heal_sse_data_line(line: bytes) -> bytes:
+def heal_sse_data_line(line: bytes, tool_names: dict | None = None) -> bytes:
     """Réécrit une ligne SSE ``data: {...}`` si un alias de chemin est présent."""
     if not line.startswith(b"data:"):
         return line
@@ -172,7 +227,7 @@ def heal_sse_data_line(line: bytes) -> bytes:
         payload = json.loads(raw)
     except Exception:
         return line
-    changed = heal_openai_payload(payload) or heal_anthropic_payload(payload)
+    changed = heal_openai_payload(payload) or heal_anthropic_payload(payload, tool_names)
     if not changed:
         return line
     return b"data: " + json.dumps(payload, ensure_ascii=False).encode()
@@ -180,13 +235,17 @@ def heal_sse_data_line(line: bytes) -> bytes:
 
 __all__ = [
     "CLIENT_TOOL_NAMES",
+    "CLIENT_TOOL_PATH_KEYS",
     "PATH_ARG_ALIASES",
     "PATH_TOOL_NAMES",
     "TOOL_NAME_ALIASES",
+    "expected_path_key",
     "heal_anthropic_payload",
     "heal_openai_payload",
     "heal_sse_data_line",
     "heal_tool_arguments",
     "heal_tool_name",
     "set_client_tool_names",
+    "set_client_tool_schemas",
 ]
+

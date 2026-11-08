@@ -1,4 +1,4 @@
-"""Middleware SSE : guérit les alias de chemin des tool_calls.
+"""Middleware SSE : guérit les alias de chemin et de nom des tool_calls.
 
 Placé sur les routes d'inférence, il réécrit chaque ligne ``data: {...}``
 complète avant qu'elle ne parte au client. Il ne touche jamais aux lignes
@@ -48,6 +48,7 @@ class ToolPathHealingMiddleware:
 
         content_type = ""
         buffer = b""
+        tool_names: dict[int, str] = {}
 
         async def send_wrapper(message):
             nonlocal content_type, buffer
@@ -68,7 +69,9 @@ class ToolPathHealingMiddleware:
             lines = buffer.split(b"\n")
             buffer = lines.pop() if lines else b""
             if lines:
-                out = b"\n".join(heal_sse_data_line(line) for line in lines) + b"\n"
+                out = b"\n".join(
+                    heal_sse_data_line(line, tool_names) for line in lines
+                ) + b"\n"
                 await send(
                     {"type": "http.response.body", "body": out, "more_body": more or bool(buffer)}
                 )
@@ -78,7 +81,7 @@ class ToolPathHealingMiddleware:
                 await send(
                     {
                         "type": "http.response.body",
-                        "body": heal_sse_data_line(buffer) if buffer else b"",
+                        "body": heal_sse_data_line(buffer, tool_names) if buffer else b"",
                         "more_body": False,
                     }
                 )
