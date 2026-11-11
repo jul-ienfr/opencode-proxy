@@ -385,6 +385,38 @@ robustesse.
 6. **S4** : T032 → T038.
 7. **S5** : T039 → T042.
 
+## Statut Phase 0 — 2026-11-11 (commit `a3f6620`)
+
+Implémenté et testé (pytest complet + ruff verts) :
+
+- **T000** : `target_slots: 6`, `wg_canary_enabled: false`, clamp dur
+  `MAX_STATIONS=6` dans `_scope()` ; le warm pool ne crée que des IP.
+- **T002** : `WINNER_PROTECT_S=180` ; `_clear_stale_pins` et la boucle de
+  persistance conservent un winner frais pendant l'adoption par le manager.
+- **T003** : `_winner_for` retombe sur `_winner_any` après le transport effectif.
+- **T004** : `GlobalAuthGuard` à clés `(transport, scope)`, décroissance
+  `decay_s`, pause plafonnée à 60 s, `clear(transport=...)` sur un 200 réel.
+- **T005** : `repair_owner=supervisor` reste une porte dure (429 délégué).
+- **T007** : `no_egress_backoff_max_s=1800`, `auth_fallback_transport=wireguard`,
+  `auth_global_pause_s` câblé via `_configure_auth_guard()`.
+- **T008** : `max_fallback_models: 2` ; trois modèles de probe configurés.
+- **T009B** : `ALLOCATOR_ONLY_GRACE_S=5`, poll 5 s, stagger AUTH ramené à 5 s,
+  `max_parallel_repairs=3`.
+
+Reste à valider sur le live (gate Phase 0) :
+
+- 6/6 `client_usable` ≥ 95 % sur 1 h. Bloqué structurellement par le
+  `FreeUsageLimitError` (quota journalier par IP, reset ~00:00 UTC) : la
+  majeure partie des IP NordVPN est déjà brûlée le jour même ; la rotation
+  retrouve des IP fraîches mais lentement (une par station à la fois).
+- Mesure du temps « station down → chaîne démarrée » sur au moins 20
+  événements pour confirmer ≤ 5 s.
+
+T006 (ledger sans résurrection côté `registry_db`), T001 (échantillonneur SLO)
+et T009 (fail-closed `/api/vpn-status`) restent à faire : le superviseur
+proof-gate déjà ses assignations, mais le ledger et l'API-status n'ont pas
+encore leurs tests dédiés.
+
 ## Gates de phase
 
 - **Phase 0** : 0/6 < 2 min ; 6/6 ≥ 95 % sur 1 h ; aucune pause > 60 s ;
