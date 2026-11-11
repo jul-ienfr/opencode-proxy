@@ -94,11 +94,21 @@ def test_egress_success_unparks_egress_station(tmp_path):
 def test_decision_global_pause_when_another_probe_owns(tmp_path):
     mgr = FakeVPNManager(_repair_cfg(tmp_path), tmp_path=tmp_path)
     mgr._auth_failed = True
+    transport = mgr._auth_transport()
     vm._STATION_AUTH_GUARD.clear()
-    vm._STATION_AUTH_GUARD.note_failure("2", now=mgr._now_fn())
-    vm._STATION_AUTH_GUARD.note_failure("3", now=mgr._now_fn())
+    vm._STATION_AUTH_GUARD.note_failure(
+        "2", now=mgr._now_fn(), transport=transport
+    )
+    vm._STATION_AUTH_GUARD.note_failure(
+        "3", now=mgr._now_fn(), transport=transport
+    )
     # Une autre station possède la sonde.
-    assert vm._STATION_AUTH_GUARD.allow_probe("2", now=mgr._now_fn()) is True
+    assert (
+        vm._STATION_AUTH_GUARD.allow_probe(
+            "2", now=mgr._now_fn(), transport=transport
+        )
+        is True
+    )
     assert mgr._decide_watchdog_action("AUTH_FAILED")[0] == "global-pause"
     vm._STATION_AUTH_GUARD.clear()
 

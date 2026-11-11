@@ -288,60 +288,155 @@ class RepairState:
 
 
 @dataclass
-class GlobalAuthGuard:
-    """Garde auth globale : 2+ stations en échec -> une seule probe."""
+class _AuthScope:
+    """One independent AUTH pause bucket (global or per transport)."""
 
-    window_s: float = 60.0
-    min_stations: int = 2
-    pause_s: float = 300.0
-    max_pause_s: float = 900.0
-    events: deque[tuple[float, str]] = field(default_factory=lambda: deque(maxlen=128))
+    events: deque[tuple[float, str]] = field(
+        default_factory=lambda: deque(maxlen=128)
+    )
     pause_until: float = 0.0
     level: int = 0
     probe_owner: str | None = None
     last_trigger_at: float = 0.0
 
-    def note_failure(self, station: str | int, now: float | None = None) -> bool:
+
+@dataclass
+class GlobalAuthGuard:
+    """Garde auth : 2+ stations en échec -> une seule probe.
+
+    [P0 2026-11-11] The guard is transport scoped. An OpenVPN AUTH_FAILED
+    must not freeze WireGuard repairs: the two transports fail for different
+    reasons and NordVPN rate-limits them independently. Calls without
+    ``transport`` keep the historical global behaviour (dashboard, legacy
+    callers); calls with a transport only pause that transport.
+
+    ``decay_s`` forgets the escalation level after a quiet period so a single
+    old storm can never pin the fleet at the maximum pause forever. Any real
+    egress proof calls :meth:`clear` and drops the level immediately.
+    """
+
+    window_s: float = 60.0
+    min_stations: int = 2
+    pause_s: float = 300.0
+    max_pause_s: float = 900.0
+    decay_s: float = 300.0
+    global_scope: _AuthScope = field(default_factory=_AuthScope)
+    transports: dict[str, _AuthScope] = field(default_factory=dict)
+
+    # Read-only compatibility views of the historical flat fields.
+    @property
+    def events(self) -> deque[tuple[float, str]]:
+        return self.global_scope.events
+
+    @property
+    def pause_until(self) -> float:
+        return self.global_scope.pause_until
+
+    @property
+    def level(self) -> int:
+        return self.global_scope.level
+
+    @property
+    def probe_owner(self) -> str | None:
+        return self.global_scope.probe_owner
+
+    @property
+    def last_trigger_at(self) -> float:
+        return self.global_scope.last_trigger_at
+
+    def _scope(self, transport: str | None) -> _AuthScope:
+        if transport is None or not str(transport).strip():
+            return self.global_scope
+        key = str(transport).strip().lower()
+        return self.transports.setdefault(key, _AuthScope())
+
+    def note_failure(
+        self,
+        station: str | int,
+        now: float | None = None,
+        *,
+        transport: str | None = None,
+    ) -> bool:
         ts = _now(now)
-        self.events.append((ts, str(station)))
-        while self.events and ts - self.events[0][0] > max(1.0, self.window_s):
-            self.events.popleft()
-        distinct = {sid for t, sid in self.events if ts - t <= max(1.0, self.window_s)}
+        scope = self._scope(transport)
+        if (
+            scope.level
+            and self.decay_s > 0
+            and (ts - scope.last_trigger_at) >= float(self.decay_s)
+        ):
+            scope.level = 0
+        scope.events.append((ts, str(station)))
+        window = max(1.0, self.window_s)
+        while scope.events and ts - scope.events[0][0] > window:
+            scope.events.popleft()
+        distinct = {sid for t, sid in scope.events if ts - t <= window}
         if len(distinct) < max(2, int(self.min_stations)):
             return False
-        if ts < self.pause_until:
+        if ts < scope.pause_until:
             return False
-        self.level = min(2, int(self.level) + 1)
-        pause = float(self.pause_s) if self.level <= 1 else max(float(self.pause_s), float(self.max_pause_s))
-        self.pause_until = ts + pause
-        self.last_trigger_at = ts
-        self.probe_owner = None
+        scope.level = min(2, int(scope.level) + 1)
+        pause = (
+            float(self.pause_s)
+            if scope.level <= 1
+            else max(float(self.pause_s), float(self.max_pause_s))
+        )
+        scope.pause_until = ts + pause
+        scope.last_trigger_at = ts
+        scope.probe_owner = None
         return True
 
-    def remaining(self, now: float | None = None) -> float:
-        return max(0.0, self.pause_until - _now(now))
-
-    def allow_probe(self, station: str | int, now: float | None = None) -> bool:
+    def remaining(
+        self, now: float | None = None, *, transport: str | None = None
+    ) -> float:
         ts = _now(now)
-        if ts >= self.pause_until:
+        if transport is None or not str(transport).strip():
+            # No transport: report the worst active pause so the dashboard and
+            # the supervisor still see a storm, whatever transport caused it.
+            values = [self.global_scope.pause_until]
+            values.extend(scope.pause_until for scope in self.transports.values())
+            return max(0.0, max(values) - ts)
+        scope = self._scope(transport)
+        return max(0.0, scope.pause_until - ts)
+
+    def allow_probe(
+        self,
+        station: str | int,
+        now: float | None = None,
+        *,
+        transport: str | None = None,
+    ) -> bool:
+        ts = _now(now)
+        scope = self._scope(transport)
+        if ts >= scope.pause_until:
             return True
         sid = str(station)
-        if self.probe_owner is None:
-            self.probe_owner = sid
+        if scope.probe_owner is None:
+            scope.probe_owner = sid
             return True
-        return self.probe_owner == sid
+        return scope.probe_owner == sid
 
-    def clear(self) -> None:
-        self.pause_until = 0.0
-        self.level = 0
-        self.probe_owner = None
+    def clear(self, *, transport: str | None = None) -> None:
+        if transport is None or not str(transport).strip():
+            self.global_scope = _AuthScope()
+            self.transports.clear()
+            return
+        self.transports.pop(str(transport).strip().lower(), None)
 
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
+        ts = _now(now)
         return {
-            "pause_remaining_s": round(self.remaining(now), 1),
-            "level": self.level,
-            "probe_owner": self.probe_owner,
-            "events": len(self.events),
+            "pause_remaining_s": round(self.remaining(ts), 1),
+            "level": self.global_scope.level,
+            "probe_owner": self.global_scope.probe_owner,
+            "events": len(self.global_scope.events),
+            "transports": {
+                key: {
+                    "pause_remaining_s": round(max(0.0, scope.pause_until - ts), 1),
+                    "level": scope.level,
+                    "probe_owner": scope.probe_owner,
+                }
+                for key, scope in self.transports.items()
+            },
         }
 
 

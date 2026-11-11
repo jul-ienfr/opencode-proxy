@@ -136,7 +136,7 @@ ip_rotation:
   egress_allow_any_country: true
   egress_capacity:
     reserve_policy: shared
-    target_slots: 7
+    target_slots: 6
   egress_failure_tick_interval: 15.0
   egress_providers:
   - nordvpn
@@ -307,11 +307,11 @@ ip_rotation:
     enabled: true
     label: WARP 1
     ipv6: false
-    egress_ip: 104.28.198.204
+    egress_ip: 104.28.230.202
     managed: true
     container: warp-1
     image: caomingjun/warp:latest
-    block: 104.28.198.204/32
+    block: 104.28.230.202/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -321,11 +321,11 @@ ip_rotation:
     enabled: true
     label: WARP 1 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d7:be::13:29c
+    egress_ip: 2a09:bac5:32d4:26aa::3da:3c
     managed: true
     container: warp-1
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d7:be::/64
+    block: 2a09:bac5:32d4:26aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -349,11 +349,11 @@ ip_rotation:
     enabled: true
     label: WARP 2 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d5:14dc::214:a3
+    egress_ip: 2a09:bac5:32d7:26b4::3db:2d
     managed: true
     container: warp-2
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d5:14dc::/64
+    block: 2a09:bac5:32d7:26b4::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -377,11 +377,11 @@ ip_rotation:
     enabled: true
     label: WARP 3 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d1:26aa::3da:42
+    egress_ip: 2a09:bac5:32d4:150f::219:9
     managed: true
     container: warp-3
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d1:26aa::/64
+    block: 2a09:bac5:32d4:150f::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -405,11 +405,11 @@ ip_rotation:
     enabled: true
     label: WARP 4 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d2:26aa::3da:43
+    egress_ip: 2a09:bac5:32d2:28aa::40d:47
     managed: true
     container: warp-4
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d2:26aa::/64
+    block: 2a09:bac5:32d2:28aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -433,11 +433,11 @@ ip_rotation:
     enabled: true
     label: WARP 5 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d3:150f::219:f4
+    egress_ip: 2a09:bac5:32d4:14e6::215:ca
     managed: true
     container: warp-5
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d3:150f::/64
+    block: 2a09:bac5:32d4:14e6::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -461,11 +461,11 @@ ip_rotation:
     enabled: true
     label: WARP 6 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d4:1519::21a:91
+    egress_ip: 2a09:bac5:32d6:14f0::216:ad
     managed: true
     container: warp-6
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d4:1519::/64
+    block: 2a09:bac5:32d6:14f0::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -503,11 +503,11 @@ ip_rotation:
     enabled: true
     label: WARP 7 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d7:28a0::40c:44
+    egress_ip: 2a09:bac5:32d1:14dc::214:a6
     managed: true
     container: warp-7
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d7:28a0::/64
+    block: 2a09:bac5:32d1:14dc::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -531,11 +531,11 @@ ip_rotation:
     enabled: true
     label: WARP 8 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d1:14f0::216:a5
+    egress_ip: 2a09:bac1:2780:2060::3da:8
     managed: true
     container: warp-8
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d1:14f0::/64
+    block: 2a09:bac1:2780:2060::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -559,11 +559,11 @@ ip_rotation:
     enabled: true
     label: WARP 9 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d7:14dc::214:ad
+    egress_ip: 2a09:bac5:32d6:14e6::215:ab
     managed: true
     container: warp-9
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d7:14dc::/64
+    block: 2a09:bac5:32d6:14e6::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -587,11 +587,11 @@ ip_rotation:
     enabled: true
     label: WARP 10 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d2:1519::21a:6e
+    egress_ip: 2a09:bac5:32d3:14f0::216:c5
     managed: true
     container: warp-10
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d2:1519::/64
+    block: 2a09:bac5:32d3:14f0::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -615,11 +615,11 @@ ip_rotation:
     enabled: true
     label: WARP 11 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d0:be::13:298
+    egress_ip: 2a09:bac5:32d7:28aa::40d:5
     managed: true
     container: warp-11
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d0:be::/64
+    block: 2a09:bac5:32d7:28aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -643,11 +643,11 @@ ip_rotation:
     enabled: true
     label: WARP 12 IPv6
     ipv6: true
-    egress_ip: 2a09:bac1:27e0:2060::215:121
+    egress_ip: 2a09:bac5:32d4:1c82::2d7:c
     managed: true
     container: warp-12
     image: caomingjun/warp:latest
-    block: 2a09:bac1:27e0:2060::/64
+    block: 2a09:bac5:32d4:1c82::/64
     provider: warp
     transport_url: ''
   socks5_proxy_port: 1080
@@ -723,7 +723,7 @@ ip_rotation:
   watchdog_interval: 20
   watchdog_max_restarts_per_hour: 3
   wg_canary_countries: Switzerland,Germany,Netherlands
-  wg_canary_enabled: true
+  wg_canary_enabled: false
   wg_canary_fail_ttl_s: 90
   wg_canary_pass_ttl_s: 600
   wg_canary_poll_interval_s: 4
@@ -1260,7 +1260,7 @@ ip_registry:
   allocator:
     mode: enforce
     max_attempts_per_need: 20
-    max_parallel_repairs: 2
+    max_parallel_repairs: 3
     rebind_limit_per_min: 3
     winner_cooldown_s: 0
     winner_grace_s: 10
@@ -1268,11 +1268,11 @@ ip_registry:
     max_candidates_per_chain: 500
     host_429_cooldown_s: 600
     no_egress_backoff_s: 120
-    no_egress_backoff_max_s: 60
+    no_egress_backoff_max_s: 1800
     settle_s: 10
     egress_wait_s: 60
     egress_poll_s: 2
-    auth_fallback_transport: ''
+    auth_fallback_transport: wireguard
     probe_validate_sse: true
     stop_after_429: true
     fast_discovery: true
@@ -1284,14 +1284,7 @@ ip_registry:
     - deepseek-v4.1-flash-free
     - glm-5.3-flash-free
     - mimo-v2.6-flash-free
-    - beam-free
-    - crouton-alpha-free
-    - flint-40b-free
-    - iceman-contributor-free
-    - nemotron-3.5-lightning-free
-    - nemotron-3.5-super-vl-free
-    - pulse-alpha-free
-    - big-pickle
+    max_fallback_models: 2
     transports:
     - station: 1
       transport: auto
@@ -1314,7 +1307,7 @@ ip_registry:
     global_429_pause_s: 900
     exhausted_threshold: 5000
     exhausted_pause_s: 1800
-    poll_interval_s: 10
+    poll_interval_s: 5
   binder:
     mode: compose_hostname
   sources:

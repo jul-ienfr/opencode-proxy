@@ -355,6 +355,41 @@ def test_global_auth_guard_arms_one_probe_pause():
     assert guard.allow_probe("1", now=102.0) is True
 
 
+def test_global_auth_guard_is_transport_scoped():
+    """An OpenVPN AUTH storm must not freeze WireGuard repairs."""
+
+    guard = GlobalAuthGuard(window_s=60, min_stations=2, pause_s=30, max_pause_s=60)
+    assert guard.note_failure("1", now=100.0, transport="openvpn-udp") is False
+    assert guard.note_failure("2", now=101.0, transport="openvpn-udp") is True
+    assert guard.remaining(now=102.0, transport="openvpn-udp") == 29.0
+    # WireGuard keeps its own (empty) bucket.
+    assert guard.remaining(now=102.0, transport="wireguard") == 0.0
+    assert guard.allow_probe("1", now=102.0, transport="wireguard") is True
+    # The unscoped view still reports the storm for the dashboard.
+    assert guard.remaining(now=102.0) == 29.0
+    # Clearing a healthy transport leaves the other pause intact.
+    guard.clear(transport="wireguard")
+    assert guard.remaining(now=102.0, transport="openvpn-udp") == 29.0
+
+
+def test_global_auth_guard_level_decays_after_quiet_period():
+    guard = GlobalAuthGuard(
+        window_s=60, min_stations=2, pause_s=30, max_pause_s=60, decay_s=120
+    )
+    assert guard.note_failure("1", now=100.0) is False
+    assert guard.note_failure("2", now=101.0) is True
+    # A second storm after the pause expired escalates to the max.
+    assert guard.note_failure("1", now=140.0) is True
+    assert guard.remaining(now=140.0) == 60.0
+    # A quiet period longer than decay_s forgets the escalation.
+    assert guard.note_failure("1", now=400.0) is False
+    assert guard.note_failure("2", now=401.0) is True
+    assert guard.remaining(now=401.0) == 30.0
+    # A real egress proof clears everything.
+    guard.clear()
+    assert guard.remaining(now=401.0) == 0.0
+
+
 def test_repair_cause_classification_order():
     assert classify_repair_cause(credentials_suspect=True, auth_failed=True) == CREDENTIALS
     assert classify_repair_cause(auth_global=True, auth_failed=True) == AUTH_GLOBAL

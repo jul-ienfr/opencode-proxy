@@ -1158,12 +1158,33 @@ def station_container_names(names, station: int) -> list[str]:
     return [name for name in names if name == service or name.endswith("_" + service)]
 
 
+def stale_station_containers(names, station: int) -> list[str]:
+    """Orphan Compose containers owned by ``station``, never the canonical one.
+
+    A rotation must reuse the running container through Gluetun's control API
+    (``PUT /v1/vpn/settings``). Removing the canonical container first forced
+    every bind through ``docker compose up --force-recreate`` (~2 min) and
+    destroyed the tunnel the control API was about to reconfigure. Only the
+    hashed-prefix leftovers of a failed recreate are safe to delete.
+    """
+
+    canonical = "opencode-vpn" if int(station) == 1 else f"opencode-vpn-{int(station)}"
+    return [
+        name
+        for name in station_container_names(names, station)
+        if name != canonical
+    ]
+
+
 def _clean_station_container(station: int) -> None:
-    """Remove stale/duplicated Compose containers for THIS station only.
+    """Remove orphan/duplicated Compose containers for THIS station only.
 
     Failed `up --force-recreate` can leave hashed-prefix containers
     (``<id>_opencode-vpn-5``) that make the next compose call fail with
-    "Conflict. The container name ... is already in use".
+    "Conflict. The container name ... is already in use". The canonical
+    container is kept: the control-API binder reconfigures it in place and a
+    plain Docker restart (not a recreate) is enough when the control server is
+    unavailable.
     """
     try:
         out = subprocess.run(
@@ -1175,7 +1196,7 @@ def _clean_station_container(station: int) -> None:
     except Exception:
         return
     names = out.decode("utf-8", "ignore").splitlines()
-    for name in station_container_names(names, station):
+    for name in stale_station_containers(names, station):
         subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60, creationflags=_NO_WINDOW)
 
 
@@ -1664,7 +1685,12 @@ async def _restore_previous_host(
     log(f"  restoring previous host {host} ({snapshot.get('ip')})")
     transport = str(args.transport)
     if transport == "auto":
-        transport = _transport_order()[0]
+        # Reuse the live tunnel's transport so the rollback goes through the
+        # control API instead of a full compose recreate.
+        try:
+            transport = str(binder.current_transport(args.station) or "") or _transport_order()[0]
+        except Exception:
+            transport = _transport_order()[0]
     vpn_type, openvpn_protocol = _transport_parts(transport)
     bind = await binder.assign(
         args.station,
@@ -1894,15 +1920,18 @@ async def _run_claims(
                     continue
                 transports = [args.transport]
             # [2026-11-05] Try the transport already configured in the
-            # container first: the hybrid binder can switch its hostname via
-            # the control API in seconds instead of a ~2 min compose
-            # recreate. Only do that in fast-discovery mode; when the fleet is
-            # down the full configured order (WireGuard first) is the point.
+            # container first: the hybrid binder switches its hostname via the
+            # control API in seconds instead of a ~2 min compose recreate.
+            # [P0 2026-11-11] This is not limited to fast-discovery mode: the
+            # user-facing transport order must still be walked on failure, but
+            # the *first* attempt should reuse the live tunnel. Forcing
+            # WireGuard first meant every rotation recreated the container and
+            # never exercised the control API.
             try:
                 preferred = str(binder.current_transport(args.station) or "")
             except Exception:
                 preferred = ""
-            if fast_discovery and preferred and preferred in transports:
+            if preferred and preferred in transports:
                 transports = [preferred] + [
                     item for item in transports if item != preferred
                 ]
@@ -2429,11 +2458,18 @@ async def run(args) -> int:
     start = int(args.start if args.start is not None else state.get("index", 0))
     vpn_type = "openvpn" if args.transport.startswith("openvpn") else "wireguard"
     openvpn_protocol = args.transport.split("-", 1)[1] if vpn_type == "openvpn" else None
+    # [P0 2026-11-11] Probe budget: a 429 is keyed by (model, IP). Trying all
+    # eleven free buckets on one hostname burns the whole quota map before the
+    # chain can rotate. Two fallbacks are enough to tell "this model is
+    # burned" from "this IP is burned".
+    _max_fallbacks = max(
+        0, int(yaml_get("ip_registry", "allocator.max_fallback_models", 2) or 2)
+    )
     args.probe_models = [
         part.strip()
         for part in str(getattr(args, "models", "") or "").split(",")
         if part.strip() and part.strip() != args.model
-    ]
+    ][:_max_fallbacks]
     exhausted = _ledger_exhausted_ips(args.api_base)
     tested = 0
     snapshot = _station_snapshot(args.api_base, args.station)

@@ -43,10 +43,22 @@ INTERVAL_S = 20.0
 PROXY_API = "http://127.0.0.1:4000"
 _HEALTH_PROBE_INFLIGHT = False
 HEALTH_GRACE_S = 600.0
+# Hard sizing constraint: exactly six stations, never a seventh. The warm pool
+# is a reserve of egress IPs for these six stations, not extra stations.
+MAX_STATIONS = 6
+# A freshly proven winner/pin must survive the manager's adoption window. The
+# live incident cleared a winner 0 s after it was written because the tunnel
+# still showed the previous host; the station then re-bound to a dead server.
+WINNER_PROTECT_S = 180.0
+# A registry assignment clears the IP's 429 reset_at, so it may only be
+# written from a winner that a real 200 proved recently. A cached
+# ``station_usable`` flag is not a proof.
+PROOF_MAX_AGE_S = 600.0
 # When the allocator is the only repair owner (station_repair disabled), it
-# must not wait the watchdog's 10-minute grace: the station would stay out of
-# routing for nothing. A short grace still absorbs boot transitions.
-ALLOCATOR_ONLY_GRACE_S = 30.0
+# must not wait the watchdog's 10-minute grace. Rotation is per-station and
+# must start within one poll (~5 s) of the second negative probe / blocking
+# 429: a longer grace only extends the outage.
+ALLOCATOR_ONLY_GRACE_S = 5.0
 LOG = ROOT / "logs" / "fresh_chain_supervisor.log"
 EVENTS_LOG = ROOT / "logs" / "allocator_events.jsonl"
 LOCK = ROOT / "logs" / "fresh_chain_supervisor.lock"
@@ -235,6 +247,43 @@ def _winner_any(station: int) -> dict | None:
     return None
 
 
+def _winner_age_s(winner: dict | None, *, now: float | None = None) -> float | None:
+    """Age of a proven winner, or ``None`` when it carries no timestamp."""
+
+    if not isinstance(winner, dict):
+        return None
+    try:
+        winner_ts = float(winner.get("winner_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if winner_ts <= 0.0:
+        return None
+    current = time.time() if now is None else float(now)
+    return max(0.0, current - winner_ts)
+
+
+def _fresh_winner(
+    station: int,
+    *,
+    protect_s: float = WINNER_PROTECT_S,
+    now: float | None = None,
+) -> dict | None:
+    """Winner that is still inside the adoption window, else ``None``.
+
+    The supervisor persists a winner as soon as a real 200 proves it. The
+    manager may still report the previous host for a few seconds; clearing the
+    pin immediately destroyed the only proven egress (observed: station 1
+    cleared al46 at 11:43:28, still broken 128 s later). Keeping the fresh
+    winner for ``protect_s`` lets the control-API bind be adopted.
+    """
+
+    winner = _winner_any(station)
+    age = _winner_age_s(winner, now=now)
+    if age is None or age > max(0.0, float(protect_s)):
+        return None
+    return winner
+
+
 def _clear_winner(station: int, transport: str = "wireguard") -> None:
     """Drop a winner that the live tunnel contradicts.
 
@@ -307,15 +356,25 @@ def _reconcile_registry(stations: dict[int, dict]) -> None:
             )
             assigned = None
         winner = _winner_any(sid)
+        winner_age = _winner_age_s(winner)
         winner_host = str(winner.get("host") or "").strip() if winner else ""
         host = host or winner_host
         winner_ip = str(winner.get("ip") or "") if winner else ""
+        # Proof-gated assignment: never clear a 429 reset_at from a stale
+        # winner or a cached health flag. The chain writes ``winner_at`` only
+        # after a real 200 with content (see fresh_chain WINNER log).
+        proof_fresh = (
+            winner is not None
+            and winner_age is not None
+            and winner_age <= PROOF_MAX_AGE_S
+            and winner_ip == ip
+        )
         functional = bool(station.get("station_usable"))
         if (
             ip
             and host
             and functional
-            and (winner_ip in ("", ip))
+            and proof_fresh
             and (assigned is None or assigned_ip != ip)
         ):
             record = assign_observed(
@@ -1311,13 +1370,18 @@ def _env_value(key: str) -> str:
     return ""
 
 
-def _clear_stale_pins(stations: dict[int, dict]) -> None:
+def _clear_stale_pins(
+    stations: dict[int, dict], *, protect_s: float = WINNER_PROTECT_S
+) -> None:
     """Drop a compose pin that no longer matches the live tunnel.
 
     A pin is meant to preserve a proven egress.  When the station is broken or
     already serving a different host, keeping the old pin makes the next start
-    reconnect to the dead server first — exactly the loop that kept stations
+    reconnect to the dead server first - exactly the loop that kept stations
     unavailable.  The fresh chain will write a new winner.
+
+    A *fresh* winner is never cleared: the tunnel status can still show the
+    previous host while the control-API bind is settling.
     """
 
     for sid, station in stations.items():
@@ -1332,6 +1396,9 @@ def _clear_stale_pins(stations: dict[int, dict]) -> None:
                 _set_env(f"SERVER_COUNTRIES_STATION{int(sid)}", "")
                 log(f"station {sid} orphan country pin {orphan} cleared")
             continue
+        fresh = _fresh_winner(int(sid), protect_s=protect_s)
+        if fresh is not None:
+            continue
         vpn = station.get("vpn") if isinstance(station.get("vpn"), dict) else {}
         live_host = str(vpn.get("current_host") or "").strip()
         # A missing live host is not proof that the pin is wrong: the manager
@@ -1344,13 +1411,24 @@ def _clear_stale_pins(stations: dict[int, dict]) -> None:
 
 
 def _scope() -> list[int]:
-    """Stations the allocator may repair (station_count minus operator opt-outs)."""
+    """Stations the allocator may repair (station_count minus operator opt-outs).
+
+    The operator fixes the fleet at six stations. A larger value (stale config,
+    old state) is never honoured: the allocator must not create or repair a
+    seventh station.
+    """
 
     live = _live_ip_rotation()
     try:
         count = max(1, int(live.get("station_count", yaml_get("ip_rotation", "station_count", 6)) or 6))
     except Exception:
         count = 6
+    if count > MAX_STATIONS:
+        log(
+            f"station_count={count} exceeds the hard limit "
+            f"{MAX_STATIONS} - clamping to {MAX_STATIONS}"
+        )
+        count = MAX_STATIONS
     raw_disabled = live.get("disabled_stations", yaml_get("ip_rotation", "disabled_stations", [])) or []
     disabled: set[int] = set()
     if isinstance(raw_disabled, (list, tuple, set)):
@@ -1507,11 +1585,22 @@ def _supervise() -> None:
                 preferred = _preferred_transport(
                     stations.get(station_id, {}), configured, auth_fallback
                 )
-                return _winner(station_id, preferred)
+                winner = _winner(station_id, preferred)
+                if winner is None:
+                    # The transport may have changed (AUTH fallback, stack flip)
+                    # while the proven winner still lives in another transport's
+                    # state file. Use it rather than declaring the station
+                    # winner-less and burning a fresh bind.
+                    winner = _winner_any(station_id)
+                return winner
             rebind_limit = max(
                 1, int(alloc.get("rebind_limit_per_min", 4) or 4)
             )
             cooldown = max(0.0, float(alloc.get("winner_cooldown_s", 120) or 120))
+            winner_protect = max(
+                WINNER_PROTECT_S,
+                float(alloc.get("winner_protect_s", WINNER_PROTECT_S) or WINNER_PROTECT_S),
+            )
             refresh_enabled = bool(alloc.get("refresh_when_exhausted", True))
             refresh_cooldown = max(
                 60.0, float(alloc.get("refresh_cooldown_s", 900) or 900)
@@ -1577,7 +1666,7 @@ def _supervise() -> None:
             }
             if not observe_only:
                 _reconcile_registry(stations)
-                _clear_stale_pins(stations)
+                _clear_stale_pins(stations, protect_s=winner_protect)
             # [P0 2026-11-10] Auth pause globale : ne pas ajouter de binds qui
             # vont échouer et prolonger la cascade AUTH_FAILED. La pause
             # autorise UNE probe : on laisse le plafond effectif passer à 1.
@@ -1840,6 +1929,20 @@ def _supervise() -> None:
                 station = stations.get(sid, {})
                 live_ip = str(station.get("current_ip") or "").strip()
                 if live_ip and live_ip != str(winner.get("ip") or ""):
+                    age = _winner_age_s(winner)
+                    if age is not None and age <= winner_protect:
+                        # The manager has not reported the new egress yet. Keep
+                        # the proven pin instead of destroying it; the
+                        # control-API bind adopts it in seconds, whereas the
+                        # old code re-bound to a dead server within one poll.
+                        if pinned_winner.get(sid) != signature:
+                            _persist_pin(sid, winner)
+                            pinned_winner[sid] = signature
+                        log(
+                            f"station {sid} fresh winner {signature} kept "
+                            f"{int(age)}s while live={live_ip or '-'} adopts"
+                        )
+                        continue
                     # The station is already serving from another egress: the
                     # old winner file must not overwrite the live pin.
                     for _t in TRANSPORTS:
@@ -1980,16 +2083,18 @@ def _supervise() -> None:
                         f"station={sid} waits"
                     )
                     continue
-                # [P0 2026-11-11] Espacer les démarrages de 60 s quand un
-                # AUTH_FAILED récent existe : deux échecs dans la même fenêtre
-                # 60 s déclenchent la pause globale 5/15 min.
+                # [P0 2026-11-11] Espacer les démarrages d'un poll (5 s) quand
+                # un AUTH_FAILED récent existe. Un stagger de 60 s gelait la
+                # réparation à une station par minute : la guard AUTH est
+                # désormais bornée et par transport, donc le seul risque réel
+                # est le départ simultané de plusieurs chaînes.
                 if (
                     _auth_recent(stations)
-                    and time.time() - last_chain_started_at < 60.0
+                    and time.time() - last_chain_started_at < 5.0
                 ):
                     log(
                         "auth stagger hold: next chain in "
-                        f"{int(60 - (time.time() - last_chain_started_at))}s"
+                        f"{max(1, int(5 - (time.time() - last_chain_started_at)))}s"
                     )
                     break
                 configured_transport = transports.get(str(sid), "wireguard")

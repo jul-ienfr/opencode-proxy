@@ -213,6 +213,31 @@ def test_scope_honours_station_count_and_operator_disabled(monkeypatch):
     assert module._scope() == [1, 3, 4]
 
 
+def test_scope_never_creates_a_seventh_station(monkeypatch):
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_live_ip_rotation",
+        lambda: {"station_count": 7, "disabled_stations": []},
+    )
+    assert module._scope() == [1, 2, 3, 4, 5, 6]
+
+
+def test_fresh_winner_survives_the_adoption_window(monkeypatch):
+    module = _module()
+    now = 1_000_000.0
+    winner = {"host": "al46.nordvpn.com", "ip": "87.120.102.46", "winner_at": now - 30}
+    monkeypatch.setattr(module, "_winner_any", lambda sid: winner)
+    assert module._fresh_winner(1, now=now) == winner
+    # Older than the 180 s protection window: the live tunnel wins.
+    winner["winner_at"] = now - module.WINNER_PROTECT_S - 1
+    assert module._fresh_winner(1, now=now) is None
+    # A winner with no timestamp is stale by definition.
+    winner.pop("winner_at")
+    assert module._fresh_winner(1, now=now) is None
+
+
+
 def test_nordvpn_selected_reads_live_config(monkeypatch):
     module = _module()
     monkeypatch.setattr(
@@ -277,7 +302,7 @@ def test_manager_owned_repair_blocks_allocator(monkeypatch):
 
 
 def test_allocator_only_owner_repairs_after_short_grace(monkeypatch):
-    """With the watchdog repair disabled, waiting 10 min leaves the station dead."""
+    """With the watchdog repair disabled, a down station is repaired in ~5 s."""
 
     module = _module()
     monkeypatch.setattr(module, "_manager_repair_enabled", lambda: False)
@@ -286,15 +311,15 @@ def test_allocator_only_owner_repairs_after_short_grace(monkeypatch):
         "station_usable": False,
         "model_usable": False,
         "vpn_status": "connected",
-        "health": {"state": "repairing", "repairing_s": 10},
+        "health": {"state": "repairing", "repairing_s": 2},
     }
     assert module._needs_chain(station) is False
-    station["health"] = {"state": "repairing", "repairing_s": 31}
+    station["health"] = {"state": "repairing", "repairing_s": 6}
     assert module._needs_chain(station) is True
 
 
 def test_restored_repairing_state_without_timestamp_is_repairable(monkeypatch):
-    """A persisted ``repairing`` state has repairing_s=0: it cannot wait 30 s."""
+    """A persisted ``repairing`` state has repairing_s=0: it cannot wait long."""
 
     module = _module()
     monkeypatch.setattr(module, "_manager_repair_enabled", lambda: False)
@@ -312,7 +337,7 @@ def test_restored_repairing_state_without_timestamp_is_repairable(monkeypatch):
     assert module._needs_chain(station) is True
     # A repairing station that just probed well is left alone for the grace.
     station["vpn_status"] = "connected"
-    station["health"]["last_ok_age_s"] = 5.0
+    station["health"]["last_ok_age_s"] = 2.0
     assert module._needs_chain(station) is False
 
 

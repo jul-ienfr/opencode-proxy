@@ -1861,6 +1861,7 @@ class VPNManager:
         # pin dernier bon serveur -> recreate -> stack -> park 30 min.
         self._repair_policy: RepairPolicy = RepairPolicy.from_config(cfg)
         self._station_repair_enabled: bool = bool(self._repair_policy.enabled)
+        self._configure_auth_guard()
         # [2026-11-05] Who owns hostname rotation/repair:
         # "manager" (legacy/tests) or "supervisor" (live allocator).
         # Default manager keeps the existing unit contracts; production sets
@@ -3999,6 +4000,13 @@ class VPNManager:
         """
         ts = time.monotonic()
         self._last_effective_ok_at = ts
+        # [P0 2026-11-11] A real egress proof is the strongest possible
+        # success: drop the AUTH pause/escalation for this transport only. An
+        # OpenVPN storm must not keep a healthy WireGuard path paused.
+        try:
+            _STATION_AUTH_GUARD.clear(transport=self._auth_transport())
+        except Exception:
+            pass
         # [P2b] Une preuve d'egress réelle clôt la séquence de récupération.
         self._egress_dead_since = None
         self._egress_flip_done = False
@@ -4780,6 +4788,7 @@ class VPNManager:
             try:
                 self._repair_policy = RepairPolicy.from_config(self._config)
                 self._station_repair_enabled = bool(self._repair_policy.enabled)
+                self._configure_auth_guard()
                 if not self._station_repair_enabled:
                     _task = getattr(self, "_auth_repair_task", None)
                     if _task is not None and not _task.done():
@@ -8166,6 +8175,46 @@ class VPNManager:
         except Exception:
             pass
 
+    def _auth_transport(self) -> str:
+        """Transport key used to scope the AUTH guard.
+
+        OpenVPN UDP/TCP and WireGuard are rate-limited independently by
+        NordVPN; a pause on one must never freeze the others.
+        """
+
+        try:
+            stack = str(getattr(self, "_stack_effective", "openvpn") or "openvpn")
+            if stack == "wireguard":
+                return "wireguard"
+            proto = str(getattr(self, "_ovpn_protocol_effective", "udp") or "udp").lower()
+            return f"openvpn-{proto if proto in ('udp', 'tcp') else 'udp'}"
+        except Exception:
+            return "openvpn-udp"
+
+    def _configure_auth_guard(self) -> None:
+        """Apply the configured AUTH pause to the shared guard.
+
+        The guard is created at import time with 300/900 s defaults and used
+        to ignore ``auth_global_pause_s``. A 15-minute pause froze every
+        transport and kept the fleet at 0/6. The configured pause is capped at
+        60 s here: a longer pause can only lose uptime, since the per-IP 429
+        ledger already protects the quota.
+        """
+
+        try:
+            policy = self._repair_policy
+            pause = min(60.0, max(5.0, float(policy.auth_global_pause_s)))
+            _STATION_AUTH_GUARD.window_s = max(
+                5.0, float(policy.auth_global_window_s)
+            )
+            _STATION_AUTH_GUARD.min_stations = max(
+                2, int(policy.auth_global_min_stations)
+            )
+            _STATION_AUTH_GUARD.pause_s = pause
+            _STATION_AUTH_GUARD.max_pause_s = max(pause, min(60.0, pause * 2.0))
+        except Exception:
+            pass
+
     def _auth_global_pause_remaining(self) -> float:
         try:
             return float(_STATION_AUTH_GUARD.remaining(self._now_fn()))
@@ -8288,8 +8337,17 @@ class VPNManager:
                     wait = min(30.0, max(0.1, self._repair_state.next_retry_at - now))
                     await self._repair_sleep(wait)
                     continue
-                if not _STATION_AUTH_GUARD.allow_probe(self._station, now):
-                    wait = min(30.0, max(0.1, _STATION_AUTH_GUARD.remaining(now)))
+                _transport = self._auth_transport()
+                if not _STATION_AUTH_GUARD.allow_probe(
+                    self._station, now, transport=_transport
+                ):
+                    wait = min(
+                        30.0,
+                        max(
+                            0.1,
+                            _STATION_AUTH_GUARD.remaining(now, transport=_transport),
+                        ),
+                    )
                     await self._repair_sleep(wait)
                     continue
                 action = self._repair_state.plan(self._repair_policy, now)
@@ -8483,12 +8541,17 @@ class VPNManager:
             # [P2] Garde auth globale : 2+ stations dans la fenêtre → une
             # seule probe autorisée, pause 5 min puis 15 min.
             try:
-                if _STATION_AUTH_GUARD.note_failure(self._station, self._now_fn()):
-                    _pause = _STATION_AUTH_GUARD.remaining(self._now_fn())
+                if _STATION_AUTH_GUARD.note_failure(
+                    self._station, self._now_fn(), transport=self._auth_transport()
+                ):
+                    _pause = _STATION_AUTH_GUARD.remaining(
+                        self._now_fn(), transport=self._auth_transport()
+                    )
                     self._auth_global_pause_until = self._now_fn() + _pause
                     logger.warning(
-                        "[vpn] auth storm détectée — pause globale %.0fs, une seule probe autorisée (s%s)",
+                        "[vpn] auth storm détectée — pause %.0fs sur %s, une seule probe autorisée (s%s)",
                         _pause,
+                        self._auth_transport(),
                         self._station,
                     )
             except Exception:
@@ -8777,10 +8840,16 @@ class VPNManager:
                 if task is not None and not task.done():
                     return ("repairing", "auth-repair-in-flight")
                 try:
-                    if _STATION_AUTH_GUARD.remaining(now) > 0 and not _STATION_AUTH_GUARD.allow_probe(
-                        self._station, now
+                    _transport = self._auth_transport()
+                    if _STATION_AUTH_GUARD.remaining(
+                        now, transport=_transport
+                    ) > 0 and not _STATION_AUTH_GUARD.allow_probe(
+                        self._station, now, transport=_transport
                     ):
-                        return ("global-pause", f"{int(_STATION_AUTH_GUARD.remaining(now))}s")
+                        return (
+                            "global-pause",
+                            f"{int(_STATION_AUTH_GUARD.remaining(now, transport=_transport))}s",
+                        )
                 except Exception:
                     pass
                 return ("auth-repair", "auth-throttle")
