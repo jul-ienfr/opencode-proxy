@@ -184,6 +184,11 @@ def _release_supervisor_lock() -> None:
 
 
 TRANSPORTS = ("auto", "wireguard", "openvpn-udp", "openvpn-tcp")
+# [P0 2026-11-11] Une chaîne qui échoue depuis trop longtemps monopolise un
+# slot de réparation : les autres stations down attendent indéfiniment. Au-delà
+# de 20 min, le superviseur rend le slot et repart sur une tranche fraîche du
+# catalogue. Une chaîne qui gagne est arrêtée bien avant par _station_recovered.
+MAX_CHAIN_AGE_S = 1200.0
 # [2026-11-03 auto protocol change] A station that fails N consecutive
 # OpenVPN chains is stuck on the AUTH path, not on a bad hostname. Retrying
 # the same protocol burns candidates and leaves the station down; switch it
@@ -647,18 +652,36 @@ def _effective_max_parallel(
     return max(1, int(base))
 
 
-def _repair_holds(usable_now: int, active: int, *, refresh: bool) -> bool:
-    """[P0 2026-11-10] Faut-il retenir une réparation ?
+def _active_serving_count(
+    stations: dict[int, dict], running: dict[int, bool], scope: list[int]
+) -> int:
+    """Chaînes actives qui prennent une station actuellement usable.
+
+    Une chaîne sur une station déjà down ne consomme aucune réserve : elle ne
+    peut pas faire baisser le nombre d'usables. Seules les chaînes qui
+    immobilisent une station qui sert encore comptent.
+    """
+    return sum(
+        1
+        for sid in scope
+        if running.get(sid) and stations.get(sid, {}).get("model_usable")
+    )
+
+
+def _repair_holds(usable_now: int, active_serving: int, *, refresh: bool) -> bool:
+    """[P0 2026-11-11] Faut-il retenir une réparation ?
 
     Un refresh proactif ne doit jamais consommer la réserve de stations qui
     servent encore : sans ce garde, quatre refreshs simultanés ont laissé la
-    flotte à 0/6.  Une réparation d'une station déjà down ne réduit pas le
-    nombre d'usables, mais on garde toujours la dernière station debout.
+    flotte à 0/6. Une réparation d'une station déjà down ne réduit pas le
+    nombre d'usables : elle est toujours autorisée (les limites de parallélisme
+    et de rebind restent applicables).
     """
     if int(usable_now) <= 0:
         return False  # rien à protéger : réparer toutes les stations
-    reserve = 3 if refresh else 0
-    return int(usable_now) - int(active) <= reserve
+    if not refresh:
+        return False  # station déjà down : aucune réserve à consommer
+    return int(usable_now) - int(active_serving) <= 3
 
 
 def _needs_chain(station: dict) -> bool:
@@ -1220,7 +1243,18 @@ def _exhaustion_due(zero_polls: int, total_429: int, threshold: int) -> bool:
     return zero_polls >= 3 and total_429 >= max(1, int(threshold))
 
 
-def _stop_chain(station: int, transport: str = "wireguard") -> None:
+def _chain_expired(path: Path, *, now: float | None = None) -> bool:
+    """[P0 2026-11-11] La chaîne tourne-t-elle au-delà du budget de temps ?"""
+    try:
+        current = time.time() if now is None else float(now)
+        return current - path.stat().st_mtime >= MAX_CHAIN_AGE_S
+    except OSError:
+        return False
+
+
+def _stop_chain(
+    station: int, transport: str = "wireguard", *, reason: str = "station settled"
+) -> None:
     path, pid = _lock_state(station, transport)
     if not pid or not _pid_alive(pid, "fresh_chain.py"):
         return
@@ -1234,7 +1268,7 @@ def _stop_chain(station: int, transport: str = "wireguard") -> None:
             )
         else:
             os.kill(pid, 15)
-        log(f"station {station} chain stopped (station settled)")
+        log(f"station {station} chain stopped ({reason})")
         event("chain_stopped", station=station, pid=pid)
     except Exception as exc:
         log(f"station {station} chain stop failed: {type(exc).__name__}: {exc}")
@@ -1715,8 +1749,24 @@ def _supervise() -> None:
             running: dict[int, bool] = {}
             running_transport: dict[int, str] = {}
             for sid in scope:
-                transport, _path, pid = _live_lock(sid)
-                running[sid] = bool(pid and _pid_alive(pid, "fresh_chain.py"))
+                transport, path, pid = _live_lock(sid)
+                alive = bool(pid and _pid_alive(pid, "fresh_chain.py"))
+                # [P0 2026-11-11] Une chaîne qui n'a rien trouvé depuis 20 min
+                # monopolise un slot : on la coupe pour rendre la main aux
+                # stations down qui attendent. Le compteur d'échecs et le
+                # backoff sont traités par le bloc « chain ended » ci-dessous.
+                if alive and _chain_expired(path):
+                    log(
+                        f"station {sid} chain exceeded {int(MAX_CHAIN_AGE_S)}s "
+                        "— releasing repair slot"
+                    )
+                    _stop_chain(
+                        sid,
+                        transport,
+                        reason=f"max age {int(MAX_CHAIN_AGE_S)}s",
+                    )
+                    alive = False
+                running[sid] = alive
                 running_transport[sid] = transport
             if time.time() - last_cycle_log >= 60.0:
                 last_cycle_log = time.time()
@@ -1891,6 +1941,7 @@ def _supervise() -> None:
                 time.sleep(min(poll, max(5.0, paused_until - time.time())))
                 continue
             active = sum(1 for sid in scope if running.get(sid))
+            active_serving = _active_serving_count(stations, running, scope)
             for sid in broken:
                 if running.get(sid):
                     continue
@@ -1907,13 +1958,12 @@ def _supervise() -> None:
                 failed_ago = time.time() - last_failed_at.get(sid, 0.0)
                 if last_failed_at.get(sid) and failed_ago < failure_cooldown:
                     continue
-                # [P0 2026-11-10] Ne jamais prendre la réserve de stations qui
+                # [P0 2026-11-11] Ne jamais prendre la réserve de stations qui
                 # servent encore. Un refresh proactif doit laisser >=3 usables ;
-                # une réparation d'une station déjà down laisse la dernière.
+                # une réparation d'une station déjà down ne consomme aucune
+                # réserve et ne doit donc pas être retenue.
                 _station = stations.get(sid, {})
-                _refresh = sid in refresh_pending or bool(
-                    _station.get("model_usable")
-                )
+                _refresh = bool(_station.get("model_usable"))
                 _usable_now = sum(
                     1
                     for _s in stations.values()
@@ -1923,10 +1973,11 @@ def _supervise() -> None:
                     stations, max_parallel, auth_pause=auth_pause
                 ):
                     break
-                if _repair_holds(_usable_now, active, refresh=_refresh):
+                if _repair_holds(_usable_now, active_serving, refresh=_refresh):
                     log(
                         f"repair hold: usable={_usable_now} active={active} "
-                        f"refresh={_refresh} station={sid} waits"
+                        f"active_serving={active_serving} refresh={_refresh} "
+                        f"station={sid} waits"
                     )
                     continue
                 # [P0 2026-11-11] Espacer les démarrages de 60 s quand un
@@ -1970,6 +2021,9 @@ def _supervise() -> None:
                 running[sid] = True
                 running_transport[sid] = transport
                 active += 1
+                if _refresh:
+                    # La chaîne démarre : elle immobilise cette station serving.
+                    active_serving += 1
             last_mode = mode
             previous_running = dict(running)
         except Exception as exc:  # noqa: BLE001

@@ -55,12 +55,49 @@ def test_repair_holds_preserves_the_serving_reserve():
     assert module._repair_holds(6, 2, refresh=True) is False
     assert module._repair_holds(6, 3, refresh=True) is True
     assert module._repair_holds(4, 1, refresh=True) is True
-    # Réparation d'une station déjà down : autorisée tant qu'une sert.
+    # Réparation d'une station déjà down : toujours autorisée, même si une
+    # chaîne tourne ailleurs (elle ne consomme aucune réserve).
     assert module._repair_holds(1, 0, refresh=False) is False
-    assert module._repair_holds(1, 1, refresh=False) is True
+    assert module._repair_holds(1, 1, refresh=False) is False
+    # Un refresh de la dernière station serving reste retenu.
+    assert module._repair_holds(1, 1, refresh=True) is True
     # Flotte déjà à zéro : toutes les réparations sont autorisées.
     assert module._repair_holds(0, 0, refresh=False) is False
     assert module._repair_holds(0, 2, refresh=True) is False
+
+
+def test_active_serving_count_ignores_chains_on_down_stations():
+    """[P0 2026-11-11] Une chaîne sur une station down ne consomme pas la réserve."""
+    module = _module()
+    stations = {
+        1: {"model_usable": True},
+        2: {"model_usable": False},
+        3: {"model_usable": True},
+    }
+    running = {1: True, 2: True, 3: False}
+    assert module._active_serving_count(stations, running, [1, 2, 3]) == 1
+    assert module._active_serving_count(stations, {2: True}, [1, 2, 3]) == 0
+
+
+def test_chain_expiry_releases_a_stuck_repair_slot(tmp_path):
+    """[P0 2026-11-11] Une chaîne >20 min rend son slot de réparation."""
+    import os
+
+    module = _module()
+    lock = tmp_path / "fresh_chain_1_auto.lock"
+    lock.write_text('{"pid": 123}', encoding="utf-8")
+    now = 10_000_000.0
+    # Une chaîne fraîche n'expire pas.
+    assert module._chain_expired(lock, now=now) is False
+    # Juste sous le budget : encore vivante.
+    os.utime(lock, (now - module.MAX_CHAIN_AGE_S + 1,) * 2)
+    assert module._chain_expired(lock, now=now) is False
+    # Au-delà du budget : le slot est libéré.
+    os.utime(lock, (now - module.MAX_CHAIN_AGE_S,) * 2)
+    assert module._chain_expired(lock, now=now) is True
+    # Un lock disparu n'est jamais « expiré ».
+    lock.unlink()
+    assert module._chain_expired(lock, now=now) is False
 
 
 def test_healthy_station_never_gets_a_chain():
