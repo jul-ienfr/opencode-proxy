@@ -1665,6 +1665,85 @@ async def _probe_with_fallbacks(probe, station: int, primary: str, fallbacks: li
     return result, primary
 
 
+# A 429 that may clear on the same egress after a short pause. Daily caps carry
+# a long Retry-After; the provider sometimes omits it (ra=0), so an ambiguous
+# daily 429 still gets exactly one short re-probe before the IP is condemned.
+RETRYABLE_429_MAX_RA_S = 120.0
+RETRYABLE_429_DELAY_S = 8.0
+RETRYABLE_429_MAX_DELAY_S = 15.0
+
+
+def _retryable_429(result) -> bool:
+    """True when a short re-probe of the same IP is worth the request.
+
+    Rotating on every 429 burned a fresh bind (~2 min) even when the IP had
+    just served hundreds of requests and only hit a rolling rate limit. The
+    ledger keeps those IPs eligible (``ra=0``), so a single re-probe after a
+    short sleep can turn the 429 into a 200 without moving the tunnel.
+    """
+
+    try:
+        if int(getattr(result, "status", 0) or 0) != 429:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if not bool(getattr(result, "valid", True)):
+        return False
+    try:
+        ra = float(getattr(result, "retry_after_s", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        ra = 0.0
+    scope = str(getattr(result, "quota_scope", "") or "").strip().lower()
+    if scope in ("transient", "rate_limit"):
+        return True
+    return ra <= 0.0 or ra <= RETRYABLE_429_MAX_RA_S
+
+
+def _retry_429_delay_s(result) -> float:
+    try:
+        ra = float(getattr(result, "retry_after_s", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        ra = 0.0
+    delay = ra if ra > 0.0 else RETRYABLE_429_DELAY_S
+    return min(RETRYABLE_429_MAX_DELAY_S, max(3.0, delay))
+
+
+async def _retry_transient_429(
+    probe,
+    station: int,
+    result,
+    model: str,
+    *,
+    sleep=None,
+    log_fn=None,
+):
+    """Re-probe the same egress once after a retryable 429.
+
+    Returns the retry result when it is a 200; otherwise returns the original
+    (or the retry's) 429 so the caller keeps its normal ledger/rotation logic.
+    """
+
+    if not _retryable_429(result):
+        return result
+    delay = _retry_429_delay_s(result)
+    if log_fn is not None:
+        log_fn(
+            f"  transient 429 (ra={getattr(result, 'retry_after_s', 0)}s) - "
+            f"re-probe same IP in {delay:.0f}s"
+        )
+    await (sleep or asyncio.sleep)(delay)
+    retry = await probe.probe(station, model)
+    if log_fn is not None:
+        log_fn(
+            f"  retry status={retry.status} "
+            f"ra={getattr(retry, 'retry_after_s', 0)} "
+            f"model={model} valid={getattr(retry, 'valid', True)}"
+        )
+    if retry.status == 200 and getattr(retry, "valid", True):
+        return retry
+    return retry if retry.status == 429 else result
+
+
 async def _restore_previous_host(
     args, binder, snapshot: dict
 ) -> bool:
@@ -2033,6 +2112,15 @@ async def _run_claims(
                     continue
                 result, model_used = await _probe_with_fallbacks(
                     probe, args.station, args.model, args.probe_models
+                )
+                # A rolling 429 (or an ambiguous daily 429 without Retry-After)
+                # is often gone in seconds; re-probe before spending a bind.
+                result = await _retry_transient_429(
+                    probe,
+                    args.station,
+                    result,
+                    model_used or args.model,
+                    log_fn=log,
                 )
                 log(
                     f"  free status={result.status} ra={result.retry_after_s} "
@@ -2529,6 +2617,14 @@ async def run(args) -> int:
             continue
         result, model_used = await _probe_with_fallbacks(
             probe, args.station, args.model, args.probe_models
+        )
+        # A rolling 429 is often gone in seconds; re-probe before rotating.
+        result = await _retry_transient_429(
+            probe,
+            args.station,
+            result,
+            model_used or args.model,
+            log_fn=log,
         )
         log(
             f"  free status={result.status} ra={result.retry_after_s} "
