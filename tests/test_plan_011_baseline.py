@@ -32,11 +32,14 @@ def _config() -> dict:
     return yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8")) or {}
 
 
-def test_baseline_warp_is_primary_and_nordvpn_is_fallback() -> None:
+def test_baseline_nordvpn_is_primary_and_warp_is_fallback() -> None:
     ip_rotation = _config().get("ip_rotation") or {}
-    # [011] WARP reste primaire ; NordVPN est conservé en secours pour que le
-    # client desktop ne tombe pas à 0/6 quand un bucket WARP est épuisé.
-    assert ip_rotation.get("egress_providers") == ["warp", "nordvpn"]
+    # [014] NordVPN est le provider primaire du parc six stations ; WARP reste
+    # le secours pour ne pas tomber à 0/6 quand un bucket NordVPN est épuisé.
+    providers = ip_rotation.get("egress_providers") or []
+    assert providers[:2] == ["nordvpn", "warp"]
+    assert set(providers) <= {"warp", "nordvpn", "proxies", "direct"}
+    assert ip_rotation.get("egress_strategy") in ("fallback", "balance")
     assert ip_rotation.get("station_count") == 6
     assert ip_rotation.get("repair_owner") == "supervisor"
     assert (ip_rotation.get("station_repair") or {}).get("enabled") is False
@@ -50,7 +53,7 @@ def test_baseline_six_nordvpn_services_are_declared_in_compose() -> None:
         assert name in services, f"{name} absent du compose"
 
 
-def test_baseline_warp_config_blocks_are_statically_unique() -> None:
+def test_baseline_warp_config_has_dual_stack_stations() -> None:
     """La config statique est unique ; le doublon live vient d'ailleurs.
 
     C'est prÃ©cisÃ©ment le gap : aucun test statique ne peut voir que deux
@@ -61,12 +64,45 @@ def test_baseline_warp_config_blocks_are_statically_unique() -> None:
         for row in (_config().get("ip_rotation") or {}).get("socks5_proxies") or []
         if str(row.get("provider") or "").lower() == "warp"
         and bool(row.get("managed"))
-        and bool(row.get("enabled"))
     ]
-    assert len(rows) == 6
-    blocks = [str(row.get("block") or "") for row in rows]
-    assert all(blocks)
-    assert len(set(blocks)) == len(blocks)
+    enabled = [row for row in rows if bool(row.get("enabled"))]
+    # Chaque station expose IPv4 et IPv6 sur le même conteneur. Les /64 IPv6
+    # sont uniques par conteneur ; les egress IPv4 WARP peuvent partager une
+    # adresse NAT (/32), le ledger partage alors le bucket.
+    # [013] Le catalogue de rotation peut étendre WARP au-delà des six
+    # conteneurs d'origine : la baseline garantit au moins 6 conteneurs
+    # dual-stack, pas un plafond fixe.
+    assert len(rows) >= 12
+    assert len(enabled) >= 7
+    containers = {str(row.get("container") or "") for row in rows}
+    assert {f"warp-{station}" for station in range(1, 7)} <= containers
+    labels = [str(row.get("label") or "") for row in rows]
+    assert len(set(labels)) == len(labels)
+    v6 = [row for row in enabled if bool(row.get("ipv6"))]
+    v4 = [row for row in enabled if not bool(row.get("ipv6"))]
+    assert len(v6) >= 6 and len(v4) >= 1
+    assert any(str(row.get("label") or "") == "WARP 1" for row in v4)
+    assert sum(1 for row in rows if not bool(row.get("ipv6")) and not row.get("enabled")) >= 5
+    # Les egress sont réécrits à chaud par les rotations : on valide la forme
+    # des blocs, pas leur unicité live (rôle de duplicate_egress_groups).
+    import ipaddress
+
+    for row in v6:
+        block = str(row.get("block") or "")
+        assert block.endswith("/64"), block
+        ipaddress.ip_network(block)
+    for row in v4:
+        block = str(row.get("block") or "")
+        assert block.endswith("/32"), block
+        ipaddress.ip_network(block)
+    for container in {str(row.get("container") or "") for row in enabled}:
+        families = {
+            bool(row.get("ipv6"))
+            for row in enabled
+            if row.get("container") == container
+        }
+        expected = {False, True} if container == "warp-1" else {True}
+        assert families == expected
 
 
 def test_baseline_capacity_counts_unique_buckets() -> None:

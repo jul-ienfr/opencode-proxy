@@ -767,6 +767,80 @@ def test_https_fallback_toggle_persists_and_updates_pool(ctx):
         assert client.get("/api/vpn/https-proxies").json()["enabled"] is True
 
 
+def test_egress_adaptive_reports_effective_weights(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    pool._egress_adaptive = {
+        "enabled": True,
+        "min_samples": 3,
+        "recent_429_penalty": 0.25,
+        "min_weight_pct": 2,
+    }
+    pool._egress_weights = {"warp": 50, "nordvpn": 50}
+    pool._available_egress_providers = lambda: ["warp", "nordvpn"]
+    pool._adaptive_health = lambda available: {
+        "warp": {"ok": 0, "n429": 10, "recent_429": 10, "blocked_ratio": 1.0},
+        "nordvpn": {"ok": 10, "n429": 0, "recent_429": 0, "blocked_ratio": 0.0},
+    }
+    with TestClient(fast) as client:
+        payload = client.get("/api/egress/adaptive").json()
+    assert payload["enabled"] is True
+    assert payload["effective"]["warp"] == 0
+    assert payload["effective"]["nordvpn"] == 100
+
+
+def test_public_proxies_get_is_empty_and_never_exposes_transport_url(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    pool._public_https_proxies = [
+        {
+            "host": "1.2.3.4",
+            "port": 443,
+            "egress_ip": "1.2.3.4",
+            "provider": "public",
+            "enabled": True,
+            "transport_url": "http://p0:local-token@127.0.0.1:9999",
+        }
+    ]
+    with TestClient(fast) as client:
+        payload = client.get("/api/vpn/public-proxies").json()
+    assert payload["active"] == 1
+    assert payload["endpoints"][0]["egress_ip"] == "1.2.3.4"
+    assert "transport_url" not in str(payload)
+    assert "local-token" not in str(payload)
+
+
+def test_public_proxies_refresh_persists_and_reconfigures(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    calls = []
+
+    def _configure(new_cfg):
+        calls.append(dict(new_cfg))
+        pool._public_https_proxies = [{"host": "1.2.3.4", "port": 443, "egress_ip": "1.2.3.4"}]
+
+    pool.configure_public_proxies = _configure
+    resp = _post(
+        fast,
+        "/api/vpn/public-proxies/refresh",
+        {"enabled": True, "isolation": "container", "max_active": 3},
+    )
+    assert resp["ok"] is True
+    assert resp["isolation"] == "container"
+    assert persisted[-1]["public_proxies"]["enabled"] is True
+    assert persisted[-1]["public_proxies"]["max_active"] == 3
+    assert calls and calls[-1]["isolation"] == "container"
+
+
+def test_public_proxies_revalidate_delegates(ctx):
+    fast, s1, s2, pool, cfg, persisted = ctx
+    pool._public_https_proxies = [{"host": "1.2.3.4", "port": 443}]
+
+    async def _revalidate():
+        return 0
+
+    pool.revalidate_public_proxies = _revalidate
+    resp = _post(fast, "/api/vpn/public-proxies/revalidate", {})
+    assert resp == {"ok": True, "before": 1, "active": 0}
+
+
 def test_https_test_delegates_to_probe_with_stored_credentials(ctx, monkeypatch):
     fast, s1, s2, pool, cfg, persisted = ctx
     pool._https_proxies = [

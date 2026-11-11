@@ -47,3 +47,10 @@ def test_free_health_alerts_for_parked_and_bad_lease():
     assert any("station 5 action required" in a for a in alerts)
     assert any("model global backoff" in a for a in alerts)
     assert any("1 bad IP" in a for a in alerts)
+
+
+def test_free_health_alerts_on_slot_wait_pressure():
+    payload = {"slot_wait": {"p95_ms": 2500.0, "timeouts": 140}}
+    alerts = evaluate_free_health_payload(payload)
+    assert any("slot wait p95" in a for a in alerts)
+    assert any("slot timeout" in a for a in alerts)

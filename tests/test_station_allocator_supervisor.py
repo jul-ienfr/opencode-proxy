@@ -18,11 +18,91 @@ def _module():
     return module
 
 
+def test_effective_max_parallel_drops_to_one_after_auth_failure():
+    """[P0 2026-11-11] Pause AUTH → une probe ; sinon le parallélisme revient."""
+    module = _module()
+    assert module._effective_max_parallel(
+        {1: {"vpn": {"auth_fail_30min": 2}}}, 2
+    ) == 2
+    assert module._effective_max_parallel(
+        {1: {"vpn": {"auth_fail_30min": 0}}}, 2
+    ) == 2
+    assert module._effective_max_parallel({}, 3) == 3
+    # Pendant une pause AUTH, une seule probe est autorisée (comme le manager).
+    assert module._effective_max_parallel({}, 2, auth_pause=366.0) == 1
+    assert module._auth_recent({1: {"vpn": {"auth_fail_30min": 1}}}) is True
+    assert module._auth_recent({1: {"vpn": {"auth_fail_30min": 0}}}) is False
+
+
+def test_auth_pause_blocks_repairs():
+    """[P0 2026-11-10] Une pause AUTH globale gèle les nouvelles chaînes."""
+    module = _module()
+    assert module._auth_pause_remaining(
+        {1: {"vpn": {"auth_global_pause_remaining_s": 233.6}}}
+    ) == 233.6
+    assert module._auth_pause_remaining(
+        {1: {"vpn": {}}, 2: {"vpn": {"auth_global_pause_remaining_s": 12}}}
+    ) == 12.0
+    assert module._auth_pause_remaining({1: {"vpn": {}}}) == 0.0
+    assert module._auth_pause_remaining({}) == 0.0
+
+
+def test_repair_holds_preserves_the_serving_reserve():
+    """[P0 2026-11-10] Un refresh ne doit pas laisser la flotte à 0/6."""
+    module = _module()
+    # Refresh : garder >=3 stations utilisables.
+    assert module._repair_holds(6, 0, refresh=True) is False
+    assert module._repair_holds(6, 2, refresh=True) is False
+    assert module._repair_holds(6, 3, refresh=True) is True
+    assert module._repair_holds(4, 1, refresh=True) is True
+    # Réparation d'une station déjà down : autorisée tant qu'une sert.
+    assert module._repair_holds(1, 0, refresh=False) is False
+    assert module._repair_holds(1, 1, refresh=False) is True
+    # Flotte déjà à zéro : toutes les réparations sont autorisées.
+    assert module._repair_holds(0, 0, refresh=False) is False
+    assert module._repair_holds(0, 2, refresh=True) is False
+
+
 def test_healthy_station_never_gets_a_chain():
     module = _module()
     assert module._needs_chain(
         {"station_usable": True, "model_usable": True, "current_ip": "1.2.3.4"}
     ) is False
+
+
+def test_repair_request_for_a_previous_ip_is_stale():
+    """[P0 2026-11-10] Après rotation, la demande de l'ancienne IP est obsolète."""
+    module = _module()
+    assert module._repair_request_is_stale(
+        {"ip": "87.120.102.58"}, {"current_ip": "186.247.44.119"}
+    ) is True
+    assert module._repair_request_is_stale(
+        {"ip": "87.120.102.58"}, {"current_ip": "87.120.102.58"}
+    ) is False
+    # IP inconnue (bind en cours) : on ne jette pas la demande.
+    assert module._repair_request_is_stale({"ip": "1.2.3.4"}, {}) is False
+    assert module._repair_request_is_stale({}, {"current_ip": "1.2.3.4"}) is False
+
+
+def test_repair_request_is_dropped_when_the_model_is_already_usable():
+    """[P0 2026-11-10] Une demande à IP vide ne re-rotate pas une station saine."""
+    module = _module()
+    station = {
+        "station_usable": True,
+        "model_usable": True,
+        "model_usable_by_model": {
+            "deepseek-v4.1-flash-free": {"usable": True},
+            "glm-5.3-flash-free": {"usable": False},
+        },
+    }
+    assert module._repair_request_satisfied(
+        {"model": "deepseek-v4.1-flash-free", "ip": ""}, station
+    ) is True
+    # Un autre modèle en 429 n'est pas masqué par le verdict global.
+    assert module._repair_request_satisfied(
+        {"model": "glm-5.3-flash-free", "ip": ""}, station
+    ) is False
+    assert module._repair_request_satisfied({}, {}) is False
 
 
 def test_allocator_event_is_jsonl_and_correlated(tmp_path, monkeypatch):

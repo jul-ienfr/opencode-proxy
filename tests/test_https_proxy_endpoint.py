@@ -49,6 +49,45 @@ def test_https_endpoint_builds_a_tls_connect_url():
     assert ep.proxy_tls_verify is False
 
 
+def test_https_endpoint_can_use_isolated_worker_transport():
+    ep = fp.HttpsProxyEndpoint(
+        "37.203.35.42",
+        443,
+        egress_ip="37.203.35.42",
+        block="37.203.35.0/24",
+        provider="public",
+        transport_url="http://p1:token@127.0.0.1:9999",
+    )
+    assert ep.socks5_url == "http://p1:token@127.0.0.1:9999"
+    assert ep.get_status()["provider_details"]["transport"] == "worker"
+    assert ep.provider == "public"
+    assert ep.block == "37.203.35.0/24"
+
+
+def test_https_row_preserves_worker_transport_and_metadata():
+    pool = _pool()
+    pool.set_https_proxies(
+        [
+            {
+                "host": "37.203.35.42",
+                "port": 443,
+                "egress_ip": "37.203.35.42",
+                "block": "37.203.35.0/24",
+                "provider": "public",
+                "label": "public:37.203.35.42",
+                "transport_url": "http://p1:token@127.0.0.1:9999",
+            }
+        ]
+    )
+    ep = pool._https_next()
+    assert ep is not None
+    assert ep.socks5_url == "http://p1:token@127.0.0.1:9999"
+    assert ep.provider == "public"
+    assert ep.egress_ip == "37.203.35.42"
+    assert ep.block == "37.203.35.0/24"
+    assert ep.label == "public:37.203.35.42"
+
+
 def test_https_and_socks_lists_coexist_and_next_filters_https():
     pool = _pool()
     pool.set_socks5_proxies([{"host": "127.0.0.1", "port": 1080}])

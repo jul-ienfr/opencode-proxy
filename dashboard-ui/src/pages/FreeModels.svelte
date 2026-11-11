@@ -22,6 +22,8 @@
   import VpnRouting from './vpn/VpnRouting.svelte';
   import VpnServers from './vpn/VpnServers.svelte';
   import VpnAdvanced from './vpn/VpnAdvanced.svelte';
+  import QualificationStatus from './vpn/QualificationStatus.svelte';
+  import PublicProxies from './vpn/PublicProxies.svelte';
 
   interface FreeModelRow {
     id: string;
@@ -85,6 +87,7 @@
     { id: 'egress', label: t('free_models.tab_egress'), testid: 'tab-free-egress' },
     { id: 'routing', label: t('free_models.tab_routing'), testid: 'tab-free-routing' },
     { id: 'quality', label: t('free_models.tab_quality'), testid: 'tab-free-quality' },
+    { id: 'public', label: t('free_models.tab_public'), testid: 'tab-free-public' },
     { id: 'advanced', label: t('free_models.tab_advanced'), testid: 'tab-free-advanced' }
   ]);
 
@@ -222,7 +225,12 @@
 {/if}
 
 {#if active === 'quality'}
+  <QualificationStatus />
   <VpnAdvanced section="quality" />
+{/if}
+
+{#if active === 'public'}
+  <PublicProxies />
 {/if}
 
 {#if active === 'advanced'}

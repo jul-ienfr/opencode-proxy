@@ -13,6 +13,7 @@ from .adapters import (
 )
 from .allocator import AllocationOutcome, AllocationReport, IpAllocator, StationNeed
 from .catalog import NordVpnCatalog
+from .dns import DnsFallback
 from .domain import (
     BindResult,
     GeoFilter,
@@ -25,7 +26,6 @@ from .domain import (
     Server,
     can_transition,
 )
-from .dns import DnsFallback
 from .eligibility import EligibilityDecision, check_eligibility
 from .scoring import ScoreWeights, score_record
 from .sources import SourceManifest, SourceRegistry, SourceSnapshot

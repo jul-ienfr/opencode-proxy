@@ -23,7 +23,7 @@ class UnitOfWork(AbstractContextManager["UnitOfWork"]):
         self.repo = RegistryRepository(self._conn)
         self._now = time.time() if now is None else float(now)
 
-    def __enter__(self) -> "UnitOfWork":
+    def __enter__(self) -> UnitOfWork:
         self._conn.execute("BEGIN IMMEDIATE")
         return self
 

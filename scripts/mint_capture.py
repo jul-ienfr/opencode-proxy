@@ -25,8 +25,7 @@ import json
 import secrets
 import shutil
 import sys
-import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,7 +45,7 @@ SESSION_HEADERS = (
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def mint_session() -> str:
@@ -155,8 +154,9 @@ def write_capture(capture: dict) -> None:
 
 def verify(capture: dict) -> int:
     try:
-        import opencode as oc
         from curl_cffi import requests
+
+        import opencode as oc
     except Exception as exc:
         print(f"verify: import impossible: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 3

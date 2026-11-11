@@ -89,14 +89,66 @@ class TrayApp:
         finally:
             self._update_icon()
 
+    def _dashboard_reachable(self, timeout=0.3):
+        """Sonde le port : le dashboard répond-il vraiment ?"""
+        probe = getattr(self.server_manager, "is_listening", None)
+        if callable(probe):
+            try:
+                return bool(probe())
+            except Exception:
+                pass
+        import socket
+
+        host = (self.host or "").strip()
+        if host in ("", "0.0.0.0", "*"):
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        try:
+            with socket.create_connection((host, int(self.port)), timeout=timeout):
+                return True
+        except (OSError, ValueError):
+            return False
+
+    def _refresh_server_state(self):
+        """Réconcilie is_running avec l'état réel avant de décider."""
+        refresh = getattr(self.server_manager, "refresh_state", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                pass
+        elif not self.server_manager.is_running and self._dashboard_reachable():
+            # Manager sans refresh_state (test/ancien objet) : la sonde fait foi.
+            try:
+                self.server_manager.is_running = True
+            except Exception:
+                return False
+        return bool(self.server_manager.is_running)
+
     def _on_open_dashboard(self, icon, item):
         # [Phase 7] La fenêtre (pywebview, WebView2) coûte 1-3 s à froid et vit
         # dans un PROCESSUS séparé (gui/_webview_main.py) : le parent n'importe
         # jamais webview, rien à pré-chauffer ici. On avertit simplement si le
         # socket n'écoute pas encore, au lieu d'ouvrir une page d'erreur.
-        if not self.server_manager.is_running:
+        #
+        # [fix 10/11] Ne plus se fier au SEUL flag is_running : il peut être
+        # resté bloqué à False après un boot plus long que le délai d'attente
+        # de ServerManager.start(), alors que le socket écoute déjà. On
+        # réconcilie, puis on sonde le port : ouvrir une page qui répond vaut
+        # mieux qu'un « le proxy demarre encore » mensonger.
+        running = self._refresh_server_state()
+        if not running and not self._dashboard_reachable():
             self.notify("Le proxy demarre encore — reessayez dans quelques secondes.")
             return
+        if not running:
+            # Le port répond mais l'icône est restée rouge : corrige le flag
+            # pour que le tray redevienne vert immédiatement.
+            try:
+                self.server_manager.is_running = True
+            except Exception:
+                pass
+            self._update_icon()
         self._log_boot("webview launch requested")
         self.dashboard.open()
 
@@ -225,7 +277,9 @@ class TrayApp:
         docker_notified = False
         for _ in range(1800):  # ~30 min, puis on s'arrête (le tray reste juste)
             try:
-                running = bool(self.server_manager.is_running)
+                # Self-heal : corrige un flag resté à False après un boot lent
+                # (watchdog ServerManager) avant de peindre l'icône.
+                running = self._refresh_server_state()
                 if running != last_running:
                     last_running = running
                     self._update_icon()

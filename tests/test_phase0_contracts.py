@@ -237,10 +237,10 @@ def test_db_schema_columns_frozen():
 
 
 def test_db_insert_sql_placeholder_count():
-    """L'INSERT requests DOIT avoir 36 placeholders (tuple 36 colonnes)."""
+    """L'INSERT requests DOIT avoir 39 placeholders (tuple 39 colonnes)."""
     from app.db import _INSERT_REQUESTS_SQL
 
-    assert _INSERT_REQUESTS_SQL.count("?") == 36, (
+    assert _INSERT_REQUESTS_SQL.count("?") == 39, (
         f"INSERT requests: {_INSERT_REQUESTS_SQL.count('?')} placeholders ≠ 36"
     )
 

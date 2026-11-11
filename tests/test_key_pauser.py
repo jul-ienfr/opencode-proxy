@@ -10,9 +10,8 @@ import threading
 
 import pytest
 
-from core.keys import select_next_key
-
 import opencode as oc
+from core.keys import select_next_key
 
 
 class FakeClock:

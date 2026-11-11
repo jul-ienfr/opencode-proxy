@@ -18,7 +18,10 @@ FORBIDDEN = re.compile(
 
 
 def _string_literals(path: Path) -> list[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    # utf-8-sig : `ast.parse` refuse le BOM quand il parse une chaîne, alors
+    # que l'interpréteur Python l'accepte au chargement du fichier
+    # (`fresh_chain_supervisor.py` en porte un).
+    tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
     docstrings: set[int] = set()
     for node in ast.walk(tree):
         if isinstance(

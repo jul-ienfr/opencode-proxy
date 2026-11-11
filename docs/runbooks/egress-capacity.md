@@ -103,23 +103,17 @@ capacité : le quota free amont est épuisé pour ce fingerprint. Ne pas lancer
 six chaînes en boucle ; laisser WARP servir les six stations et réessayer plus
 tard avec un quota/fingerprint frais.
 
-### `wireguard lease busy`
+### Transports indépendants par station
 
-Le projet utilise une clé NordLynx partagée : un seul endpoint WireGuard à la
-fois. La config doit répartir les transports :
+Le bail global `wireguard lease busy` et `shared_wireguard_key` ont été
+**retirés** : chaque station peut utiliser WireGuard, OpenVPN UDP et OpenVPN
+TCP indépendamment, y compris plusieurs stations WireGuard en parallèle. Aucun
+verrou inter-stations ne limite un transport. La seule exclusivité globale est
+l'IP d'egress (principe V de la constitution).
 
-```yaml
-ip_registry:
-  allocator:
-    auth_fallback_transport: ''
-    transports:
-      - {station: 1, transport: openvpn-udp}
-      - {station: 2, transport: openvpn-udp}
-      - {station: 3, transport: openvpn-tcp}
-      - {station: 4, transport: openvpn-udp}
-      - {station: 5, transport: wireguard}
-      - {station: 6, transport: openvpn-udp}
-```
+Le cycle de qualification continue d'essayer les trois transports par
+hostname, puis revient à WireGuard. Une réparation peut forcer n'importe
+lequel des trois avec `fresh_chain.py --transport ...`.
 
 ### Endpoints WARP classés « proxies »
 

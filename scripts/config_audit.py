@@ -120,6 +120,18 @@ def _fichiers_python() -> list[Path]:
     return sortie
 
 
+def _lire_source(chemin: Path) -> str:
+    """Lit un source Python en neutralisant le BOM UTF-8.
+
+    L'interpréteur Python accepte un BOM en tête de fichier, mais
+    ``ast.parse()`` sur une **chaîne** le refuse (``invalid non-printable
+    character U+FEFF``). Sans ce décodage, tout fichier avec BOM était
+    silencieusement ignoré par l'audit — c'était le cas de
+    ``scripts/fresh_chain_supervisor.py`` et de ses clés ``ip_registry.*``.
+    """
+    return chemin.read_text(encoding="utf-8-sig", errors="replace")
+
+
 def cles_du_fichier(chemin: Path | None = None) -> dict[str, Any]:
     """Aplatit `config.yaml` en `section.sous_cle` → valeur (les dynamiques exclues).
 
@@ -169,7 +181,7 @@ def _litteraux_yaml_get() -> set[str]:
         if chemin.name == "config_audit.py":
             continue
         try:
-            arbre = ast.parse(chemin.read_text(encoding="utf-8", errors="replace"))
+            arbre = ast.parse(_lire_source(chemin))
         except (OSError, SyntaxError):
             continue
         for noeud in ast.walk(arbre):
@@ -211,7 +223,7 @@ def _source_complete() -> str:
         morceaux = []
         for chemin in _fichiers_python():
             try:
-                morceaux.append(chemin.read_text(encoding="utf-8", errors="replace"))
+                morceaux.append(_lire_source(chemin))
             except OSError:
                 continue
         _SOURCE_CACHE = "\n".join(morceaux)

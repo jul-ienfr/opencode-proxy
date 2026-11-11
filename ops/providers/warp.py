@@ -41,15 +41,22 @@ class WarpProvider:
 
     def specs(self) -> list[DesiredEndpointSpec]:
         specs: list[DesiredEndpointSpec] = []
+        seen_containers: set[str] = set()
         for endpoint in self.endpoints:
             label = str(getattr(endpoint, "label", "") or "")
             if not label:
                 continue
+            # IPv4 et IPv6 d'une même station partagent le conteneur : le
+            # desired state décrit le conteneur physique, une seule fois.
+            container = str(getattr(endpoint, "container", "") or label)
+            if container in seen_containers:
+                continue
+            seen_containers.add(container)
             specs.append(
                 DesiredEndpointSpec(
                     provider="warp",
                     label=label,
-                    container=str(getattr(endpoint, "container", "") or label),
+                    container=container,
                     port=int(getattr(endpoint, "port", 0) or 0),
                     enabled=bool(getattr(endpoint, "enabled", True)),
                     host=str(getattr(endpoint, "host", "127.0.0.1") or "127.0.0.1"),

@@ -369,8 +369,7 @@ class FakeSSEResponse(FakeResponse):
         self._frames = list(frames)
 
     def iter_content(self, chunk_size: int = 1024):
-        for frame in self._frames:
-            yield frame
+        yield from self._frames
 
 
 async def test_probe_200_accepts_the_first_content_frame():

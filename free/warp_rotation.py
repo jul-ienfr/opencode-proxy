@@ -75,10 +75,19 @@ class RotationBudgetStore:
                             trigger TEXT NOT NULL DEFAULT 'auto',
                             result TEXT NOT NULL DEFAULT 'started',
                             reason TEXT,
-                            started_at REAL NOT NULL
+                            started_at REAL NOT NULL,
+                            finished_at REAL
                         )
                         """
                     )
+                    cols = {
+                        str(row[1])
+                        for row in conn.execute("PRAGMA table_info(rotation_jobs)")
+                    }
+                    if "finished_at" not in cols:
+                        conn.execute(
+                            "ALTER TABLE rotation_jobs ADD COLUMN finished_at REAL"
+                        )
                     conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_rotation_jobs_label_time "
                         "ON rotation_jobs(label, started_at)"
@@ -110,10 +119,10 @@ class RotationBudgetStore:
         trigger: str = "auto",
         result: str = "started",
         reason: str | None = None,
-    ) -> None:
+    ) -> int | None:
         try:
             with self._lock, self._connect() as conn:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO rotation_jobs "
                     "(provider,label,trigger,result,reason,started_at) "
                     "VALUES (?,?,?,?,?,?)",
@@ -126,8 +135,24 @@ class RotationBudgetStore:
                         time.time(),
                     ),
                 )
+                return int(cur.lastrowid) if cur.lastrowid is not None else None
         except Exception as exc:
             logger.warning("[warp-rotate] budget record failed: %s", exc)
+            return None
+
+    def finish(self, job_id: int | None, result: str, reason: str | None = None) -> None:
+        """Clôt un job de rotation avec son résultat réel (ok/failed)."""
+        if job_id is None:
+            return
+        try:
+            with self._lock, self._connect() as conn:
+                conn.execute(
+                    "UPDATE rotation_jobs SET result=?, reason=?, finished_at=? "
+                    "WHERE id=?",
+                    (str(result), reason, time.time(), int(job_id)),
+                )
+        except Exception as exc:
+            logger.warning("[warp-rotate] budget finish failed: %s", exc)
 
 
 def block_for_ledger_key(raw: str) -> str | None:
@@ -176,12 +201,16 @@ class WarpRotator:
         health_timeout_s: float = HEALTH_TIMEOUT_S,
         egress_timeout_s: float = EGRESS_TIMEOUT_S,
         max_rotations_per_hour: int = 10,
+        min_interval_s: float | None = None,
         budget_store: Any = None,
     ) -> None:
         self.image = image
         self.health_timeout_s = float(health_timeout_s)
         self.egress_timeout_s = float(egress_timeout_s)
         self.max_rotations_per_hour = max(0, int(max_rotations_per_hour or 0))
+        self.min_interval_s = float(
+            MIN_ROTATION_INTERVAL_S if min_interval_s is None else min_interval_s
+        )
         self.budget_store = budget_store
 
     def request_rotation(self, endpoint, pool, persist) -> bool:
@@ -189,20 +218,28 @@ class WarpRotator:
         container = str(getattr(endpoint, "container", "") or "").strip()
         if not label or not container or not bool(getattr(endpoint, "managed", False)):
             return False
+        # La rotation d'un endpoint IPv4 WARP ne peut pas garantir un /32
+        # frais (pool NAT) et recrée inutilement le tunnel IPv6 de la station.
+        if not bool(getattr(endpoint, "ipv6", True)):
+            return False
+        # IPv4 et IPv6 d'une même station partagent le conteneur : le budget,
+        # le cooldown et l'inflight doivent être keyés sur le conteneur, sinon
+        # les deux familles déclenchent deux rotations pour un seul tunnel.
+        key = container
         with _LOCK:
-            if label in INFLIGHT:
+            if key in INFLIGHT:
                 return False
             now = time.monotonic()
-            last = float(LAST_ROTATION.get(label, 0.0) or 0.0)
-            if now - last < MIN_ROTATION_INTERVAL_S:
+            last = float(LAST_ROTATION.get(key, 0.0) or 0.0)
+            if now - last < self.min_interval_s:
                 return False
             recent = [
                 ts
-                for ts in ROTATION_TIMES.get(label, [])
+                for ts in ROTATION_TIMES.get(key, [])
                 if now - float(ts) < 3600.0
             ]
             if self.budget_store is not None:
-                if not self.budget_store.allow(label, self.max_rotations_per_hour):
+                if not self.budget_store.allow(key, self.max_rotations_per_hour):
                     logger.warning(
                         "[warp-rotate] %s: budget horaire atteint (store)",
                         label,
@@ -216,23 +253,26 @@ class WarpRotator:
                     self.max_rotations_per_hour,
                 )
                 return False
+            job_id: int | None = None
             if self.budget_store is not None:
-                self.budget_store.record(label)
+                job_id = self.budget_store.record(key)
             else:
-                ROTATION_TIMES[label] = [*recent, now]
-            LAST_ROTATION[label] = now
-            INFLIGHT.add(label)
+                ROTATION_TIMES[key] = [*recent, now]
+            LAST_ROTATION[key] = now
+            INFLIGHT.add(key)
         thread = threading.Thread(
             target=self._run,
-            args=(endpoint, pool, persist),
+            args=(endpoint, pool, persist, job_id),
             name=f"warp-rotate-{label}",
             daemon=True,
         )
         thread.start()
         return True
 
-    def _run(self, endpoint, pool, persist) -> None:
+    def _run(self, endpoint, pool, persist, job_id: int | None = None) -> None:
         label = str(getattr(endpoint, "label", "") or "")
+        outcome_result = "failed"
+        outcome_reason = "unknown"
         try:
             with _ROTATE_LOCK:
                 forbidden = set()
@@ -265,6 +305,8 @@ class WarpRotator:
                     forbidden_blocks=forbidden,
                     probe=probe,
                 )
+                outcome_result = "ok" if result.ok else "failed"
+                outcome_reason = str(result.reason or "") or None
                 # [fiab 2026-11-06] Appliquer l'egress SOUS le verrou global :
                 # sinon deux rotations concurrentes voyaient toutes deux
                 # l'ancien état et pouvaient choisir le même /64. Le probe
@@ -279,7 +321,12 @@ class WarpRotator:
                     if result.new_ip:
                         self._apply_tracking(endpoint, pool, persist, result)
                     logger.warning("[warp-rotate] %s: %s", label, result.as_dict())
+                # Une rotation recrée le tunnel : l'autre famille (IPv4/IPv6)
+                # de la même station a forcément une nouvelle IP, elle aussi.
+                self._refresh_siblings(endpoint, pool, persist)
         except Exception as exc:
+            outcome_result = "failed"
+            outcome_reason = f"exception:{type(exc).__name__}"
             logger.warning("[warp-rotate] %s failed: %s", label, exc)
             log_evidence(
                 Evidence(
@@ -294,8 +341,58 @@ class WarpRotator:
                 level=logging.WARNING,
             )
         finally:
+            if job_id is not None and self.budget_store is not None:
+                try:
+                    self.budget_store.finish(job_id, outcome_result, outcome_reason)
+                except Exception:
+                    pass
             with _LOCK:
-                INFLIGHT.discard(label)
+                INFLIGHT.discard(
+                    str(getattr(endpoint, "container", "") or label)
+                )
+
+    def _refresh_siblings(self, endpoint, pool, persist) -> None:
+        """Réconcilie les endpoints qui partagent le conteneur tourné.
+
+        WARP expose IPv4 et IPv6 sur le même tunnel : les deux egress changent
+        ensemble. Sans cette passe, la famille non tournée garde une IP et un
+        bucket périmés jusqu'au prochain refresh périodique.
+        """
+        container = str(getattr(endpoint, "container", "") or "")
+        if not container:
+            return
+        from free.egress_reconcile import reconcile_endpoint
+
+        try:
+            endpoints = list(pool._socks5_enabled_eps())
+        except Exception:
+            return
+        for other in endpoints:
+            if other is endpoint:
+                continue
+            if str(getattr(other, "container", "") or "") != container:
+                continue
+            try:
+                result = reconcile_endpoint(
+                    other,
+                    persist=persist,
+                    timeout_s=self.egress_timeout_s,
+                )
+                if result.get("ok"):
+                    try:
+                        health = pool._station_health.get(
+                            int(getattr(other, "_station", 0))
+                        )
+                        if health is not None:
+                            health.repair_succeeded()
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.debug(
+                    "[warp-rotate] sibling refresh %s failed: %s",
+                    getattr(other, "label", "?"),
+                    exc,
+                )
 
     def rotate(
         self,
@@ -339,8 +436,18 @@ class WarpRotator:
                 last_reason = "same_block"
                 continue
             if new_block and new_block in forbidden:
-                last_reason = "duplicate_block"
-                continue
+                if ipv6:
+                    last_reason = "duplicate_block"
+                    continue
+                # WARP IPv4 sort d'un petit pool NAT partagé : un /32 déjà
+                # utilisé par une autre station est normal, et le ledger
+                # partage le bucket. Recréer quatre fois pour chercher une
+                # adresse libre ne fait que churner le tunnel.
+                logger.info(
+                    "[warp-rotate] %s: shared IPv4 block %s accepted (NAT pool)",
+                    label,
+                    new_block,
+                )
             # Le probe quota (modèle réel) doit tourner AVANT d'accepter le
             # bloc : une IP fraîche peut déjà être épuisée upstream. On pose
             # l'egress candidat pour que le ledger et l'identité pointent sur
@@ -464,7 +571,6 @@ class WarpRotator:
 
     def _recreate(self, container: str, port: int, endpoint) -> None:
         image = str(getattr(endpoint, "image", "") or self.image)
-        label = str(getattr(endpoint, "label", "") or container)
         provider = str(getattr(endpoint, "provider", "") or "warp")
         self._docker(["rm", "-f", container], timeout=60)
         self._docker(
@@ -486,11 +592,11 @@ class WarpRotator:
                 "--label",
                 f"opencode.provider={provider}",
                 "--label",
-                f"opencode.label={label}",
+                f"opencode.label={container}",
                 "--label",
                 "opencode.managed=true",
                 "--env",
-                f"OPENCODE_STATION_LABEL={label}",
+                f"OPENCODE_STATION_LABEL={container}",
                 image,
             ],
             timeout=120,

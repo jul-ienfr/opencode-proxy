@@ -97,7 +97,7 @@ async def test_save_request_enqueues_raw_row(monkeypatch):
     assert raw.tools_used == ["read", "read", "grep"], "dédup effectué au writer, pas au caller"
 
     row = oc._materialize_db_row(raw)
-    assert len(row) == 36  # + server_host (présélection IP)
+    assert len(row) == 39  # + server_host + 3 colonnes T028
     assert row[0] == "req-d1"
     assert row[16] == json.dumps([{"name": "read"}])
     assert row[17] == json.dumps(["read", "grep"]), "tools_used dédupliqué"
@@ -105,6 +105,7 @@ async def test_save_request_enqueues_raw_row(monkeypatch):
     assert len(row[18]) <= oc.MAX_BODY_STORAGE + 64  # truncate appliqué
     assert row[30] is None and row[31] is None, "pas de fallback → NULL corrélés"
     assert row[35] is None, "pas de station → server_host NULL"
+    assert row[36] is None and row[37] is None and row[38] == 200
 
 
 @pytest.mark.asyncio
@@ -117,7 +118,7 @@ async def test_materialized_row_redacts_secrets():
     }
     raw = oc._DbRowRaw(
         ("id",) * 16,
-        (None,) * 16,  # tail 16 : + ttfb_ms/stop_reason/aborted/server_host
+        (None,) * 19,  # tail 19 : + ttfb/stop/aborted/server_host + 3 T028
         request_body=body,
         response_body=None,
         tools=None,
@@ -157,7 +158,7 @@ async def test_batch_writer_accepts_raw_rows_end_to_end(monkeypatch, tmp_path):
             geo_direct_ip TEXT, geo_via_vpn TEXT, geo_allowed TEXT, station TEXT,
             free_status INTEGER, paid_status INTEGER,
             ttfb_ms INTEGER, stop_reason TEXT, aborted INTEGER DEFAULT 0,
-            server_host TEXT
+            server_host TEXT, client_request_id TEXT, attempt_no INTEGER, final_status INTEGER
         )
         """
     )
@@ -311,7 +312,7 @@ async def test_mixed_batch_requests_and_free_usage(monkeypatch):
             geo_direct_ip TEXT, geo_via_vpn TEXT, geo_allowed TEXT, station TEXT,
             free_status INTEGER, paid_status INTEGER,
             ttfb_ms INTEGER, stop_reason TEXT, aborted INTEGER DEFAULT 0,
-            server_host TEXT
+            server_host TEXT, client_request_id TEXT, attempt_no INTEGER, final_status INTEGER
         )
         """
     )
@@ -320,7 +321,7 @@ async def test_mixed_batch_requests_and_free_usage(monkeypatch):
 
     raw_req = oc._DbRowRaw(
         ("id-mix", "2026-08-26T10:00:00Z", "glm-5.1") + (None,) * 13,
-        (None,) * 16,  # tail 16 : + ttfb_ms/stop_reason/aborted/server_host
+        (None,) * 19,  # tail 19 : + ttfb/stop/aborted/server_host + 3 T028
         request_body=None,
         response_body=None,
         tools=None,

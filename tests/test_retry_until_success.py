@@ -184,19 +184,76 @@ def test_request_body_is_replayed():
     assert all(call == b'{"stream":true,"messages":[{"role":"user","content":"x"}]}' for call in app.calls)
 
 
-def test_keepalive_is_sent_while_retrying():
+def test_no_200_before_the_first_content_chunk():
+    """Les retries sont silencieux, mais aucun 200 n'est figé avant le contenu."""
     app = _seq([_json_error(429), _sse(b'data: {"ok":1}\n\n', more=False)])
     sent = _run(_cfg(), app)
-    assert b": keepalive" in _bodies(sent)
+    starts = _starts(sent)
+    assert starts and starts[0]["status"] == 200
+    assert b": keepalive" not in _bodies(sent)
+    assert b'"ok":1' in _bodies(sent)
 
 
-def test_max_wait_ends_the_stream_with_an_error_event():
+def test_max_wait_returns_the_last_real_status():
     app = _seq([_json_error(429)])
     sent = _run(_cfg(max_wait_s=0.12, base_delay_s=0.05, max_delay_s=0.05), app)
-    body = _bodies(sent)
-    assert _starts(sent)[0]["status"] == 200
-    assert b"error" in body.lower()
+    starts = _starts(sent)
+    assert starts and starts[0]["status"] == 429
+    assert b"error" in _bodies(sent).lower()
     assert len(app.calls) >= 1
+
+
+def test_empty_stream_exhaustion_keeps_a_5xx():
+    """V5.1 : un flux vide épuisé ne doit pas être figé en 200."""
+    payload = json.dumps(
+        {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "Upstream produced no output (empty stream)",
+            },
+        }
+    ).encode()
+    app = _seq(
+        [
+            [
+                _start(502, [(b"content-type", b"application/json")]),
+                _body(payload),
+            ]
+        ]
+    )
+    sent = _run(_cfg(max_wait_s=0.05, base_delay_s=0.01, max_delay_s=0.01), app)
+    starts = _starts(sent)
+    assert starts and starts[0]["status"] == 502
+    assert not any(m.get("status") == 200 for m in starts)
+
+
+def test_empty_200_exhaustion_falls_back_to_502():
+    app = _seq([[_start(200, SSE), _body(b"")]])
+    sent = _run(_cfg(max_wait_s=0.05, base_delay_s=0.01, max_delay_s=0.01), app)
+    starts = _starts(sent)
+    assert starts and starts[0]["status"] == 502
+
+
+def test_retry_exposes_client_request_id_and_attempt_number():
+    """T028 : même id client, numéro de tentative incrémental."""
+    from streaming.retry_until_success import attempt_no_var, client_request_id_var
+
+    seen = []
+
+    async def app(scope, receive, send):
+        seen.append((client_request_id_var.get(), attempt_no_var.get()))
+        if len(seen) < 3:
+            await send(_start(500, [(b"content-type", b"application/json")]))
+            await send(_body(b'{"error":{"message":"temporary","type":"api_error"}}'))
+        else:
+            await send(_start(200, SSE))
+            await send(_body(b'data: {"ok":1}\n\n', more=False))
+
+    sent = _run(_cfg(max_wait_s=0.3, base_delay_s=0.01, max_delay_s=0.01), app)
+    assert [attempt for _cid, attempt in seen] == [1, 2, 3]
+    assert len({cid for cid, _attempt in seen}) == 1
+    assert _starts(sent)[0]["status"] == 200
 
 
 def test_disabled_is_a_pure_passthrough():

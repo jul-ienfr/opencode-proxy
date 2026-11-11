@@ -30,10 +30,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import opencode as oc  # noqa: E402
 from curl_cffi import requests  # noqa: E402
-
+from curl_cffi.const import CurlOpt  # noqa: E402
 from test_free_egress import CAPTURE, load_capture, post_once  # noqa: E402
+
+import opencode as oc  # noqa: E402
+from free.public_proxies import redact_proxy_url  # noqa: E402
 
 IPIFY = "https://api.ipify.org"
 OUT = ROOT / "logs" / "proxy_pool_results.json"
@@ -66,6 +68,11 @@ def egress_ip(proxy: str, timeout: float, impersonate: str | None, fp: dict | No
         kwargs["impersonate"] = impersonate
     if isinstance(fp, dict):
         kwargs.update(fp)
+    if proxy.startswith("https://"):
+        kwargs["curl_options"] = {
+            CurlOpt.PROXY_SSL_VERIFYPEER: 0,
+            CurlOpt.PROXY_SSL_VERIFYHOST: 0,
+        }
     response = requests.get(IPIFY, **kwargs)
     text = (response.text or "").strip()
     if response.status_code == 200 and text.count(".") == 3:
@@ -135,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
                 return {"proxy": proxy, "egress": egress, "status": "duplicate"}
             tested_egress.add(egress)
         result = post_once(proxy, args.model, args.timeout, capture=capture, reuse_session=False)
-        result["proxy"] = proxy
+        result["proxy"] = redact_proxy_url(proxy)
         result["egress"] = egress
         result["ms"] = round((time.time() - started) * 1000)
         return result

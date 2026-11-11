@@ -126,3 +126,15 @@ def test_ledger_fail_open_when_disabled():
 
 # Keep SimpleNamespace imported for future fake-VPN fixtures without lint noise.
 _ = SimpleNamespace
+
+
+def test_success_clears_ip_quota_block_for_the_model():
+    from free.ip_quota import IpQuotaRegistry
+
+    registry = IpQuotaRegistry()
+    station = _Station(3, "10.0.0.9")
+    registry.note_request(MODEL, station)
+    registry.note_429(MODEL, station, status=429)
+    assert registry.model_usable(MODEL, station)[0] is False
+    registry.note_success(MODEL, station)
+    assert registry.model_usable(MODEL, station) == (True, None)

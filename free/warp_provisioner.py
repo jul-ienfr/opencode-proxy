@@ -77,18 +77,43 @@ def _default_runner(args: list[str], timeout: int = 120) -> str:
 
 
 def _validate(desired: list[WarpEndpointSpec]) -> None:
-    labels = [spec.label for spec in desired if spec.enabled]
-    containers = [spec.container for spec in desired if spec.enabled]
-    ports = [int(spec.port) for spec in desired if spec.enabled]
-    blocks = [spec.block for spec in desired if spec.enabled and spec.block]
-    for name, values in (
-        ("label", labels),
-        ("container", containers),
-        ("port", ports),
-        ("block", blocks),
-    ):
-        if len(values) != len(set(values)):
-            raise ValueError(f"duplicate {name} in desired WARP endpoints")
+    enabled = [spec for spec in desired if spec.enabled]
+    labels = [spec.label for spec in enabled]
+    if len(labels) != len(set(labels)):
+        raise ValueError("duplicate label in desired WARP endpoints")
+    # Deux endpoints logiques (IPv4/IPv6) peuvent partager un conteneur et son
+    # port : c'est la même station physique. En revanche un conteneur ne peut
+    # pas écouter sur deux ports, et un port ne peut pas servir deux conteneurs.
+    ports_by_container: dict[str, int] = {}
+    containers_by_port: dict[int, str] = {}
+    for spec in enabled:
+        port = int(spec.port)
+        previous_port = ports_by_container.get(spec.container)
+        if previous_port is not None and previous_port != port:
+            raise ValueError("duplicate container in desired WARP endpoints")
+        previous_container = containers_by_port.get(port)
+        if previous_container is not None and previous_container != spec.container:
+            raise ValueError("duplicate port in desired WARP endpoints")
+        ports_by_container[spec.container] = port
+        containers_by_port[port] = spec.container
+    # IPv6 /64 sont uniques par tunnel. Les IPv4 WARP viennent d'un pool NAT
+    # partagé : deux stations peuvent légitimement avoir le même /32, le
+    # ledger partage alors le bucket.
+    v6_blocks = [spec.block for spec in enabled if spec.ipv6 and spec.block]
+    if len(v6_blocks) != len(set(v6_blocks)):
+        raise ValueError("duplicate block in desired WARP endpoints")
+
+
+def _physical(desired: list[WarpEndpointSpec]) -> list[WarpEndpointSpec]:
+    """Une spec par conteneur : les variantes IPv4/IPv6 partagent le tunnel."""
+    seen: set[str] = set()
+    physical: list[WarpEndpointSpec] = []
+    for spec in desired:
+        if not spec.enabled or spec.container in seen:
+            continue
+        seen.add(spec.container)
+        physical.append(spec)
+    return physical
 
 
 class WarpProvisioner:
@@ -109,9 +134,7 @@ class WarpProvisioner:
         _validate(desired)
         actual = actual or {}
         actions: list[ProvisionAction] = []
-        for spec in desired:
-            if not spec.enabled:
-                continue
+        for spec in _physical(desired):
             current = actual.get(spec.container)
             if current is None:
                 actions.append(
@@ -142,7 +165,7 @@ class WarpProvisioner:
         actions = self.plan(desired, actual)
         applied: list[dict[str, str]] = []
         try:
-            for action, spec in zip(actions, [d for d in desired if d.enabled]):
+            for action, spec in zip(actions, _physical(desired), strict=True):
                 if action.action == "noop":
                     applied.append(action.as_dict())
                     continue
@@ -183,11 +206,13 @@ class WarpProvisioner:
             "--label",
             f"opencode.provider={spec.provider}",
             "--label",
-            f"opencode.label={spec.label}",
+            f"opencode.label={spec.container}",
             "--label",
             "opencode.managed=true",
         ]
-        for key, value in sorted(spec.env.items()):
+        for key, value in sorted(
+            {"OPENCODE_STATION_LABEL": spec.container, **spec.env}.items()
+        ):
             args.extend(["--env", f"{key}={value}"])
         args.append(spec.image or self.image)
         return args

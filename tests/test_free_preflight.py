@@ -38,6 +38,26 @@ class _Pool:
         return self._rotating
 
 
+class _PublicPool(_Pool):
+    """Pool mixte : NordVPN en cooldown + un proxy public encore libre."""
+
+    def __init__(self, stations=(S1, S2), usable=True, rotating=False, public_ip="203.0.113.9"):
+        super().__init__(stations=stations, usable=usable, rotating=rotating)
+        self._egress_providers = ["warp", "nordvpn", "proxies"]
+        self._public = _Station(public_ip)
+        self._public.provider = "public"
+        self._public._station = -1
+
+    def _socks5_enabled_eps(self):
+        return [self._public]
+
+    def _socks5_usable(self, ep, exclude_approaching=False):
+        return True
+
+    def _provider_matches(self, ep, provider):
+        return provider in ("proxies", "public")
+
+
 MODEL = "deepseek-v4.1-flash-free"
 
 
@@ -105,6 +125,20 @@ def test_tout_en_cooldown_donne_un_delai(monkeypatch):
     wait = oc._free_preflight_retry_after(MODEL)
     assert wait is not None
     assert 50 <= wait <= 60
+
+
+def test_public_proxy_libre_evite_le_429_nordvpn(monkeypatch):
+    pool = _PublicPool()
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    monkeypatch.setattr(
+        oc,
+        "_vpn_manager",
+        type("_Vpn", (), {"proxy_mode": "vpn", "enabled": True})(),
+    )
+    oc._set_free_cooldown(MODEL, 60, S1)
+    oc._set_free_cooldown(MODEL, 60, S2)
+    assert oc._free_stations_exhausted(MODEL) is False
+    assert oc._free_preflight_retry_after(MODEL) is None
 
 
 def test_cooldown_qui_expire_bientot_laisse_tenter(monkeypatch):

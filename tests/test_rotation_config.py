@@ -8,7 +8,9 @@ from rotation.infrastructure.config import schema
 def test_default_config_is_valid():
     cfg = schema.load_rotation_config()
     assert cfg.selection.unique_ip is True
-    assert cfg.transport.mode == "auto"
+    # Le parc normal est en WireGuard (T018) ; `auto` reste le fallback
+    # uniquement quand `vpn_stack` est absent ou invalide.
+    assert cfg.transport.mode == "wireguard"
     assert cfg.transport.order == ("wireguard", "openvpn-udp", "openvpn-tcp")
     assert abs(sum(cfg.selection.weights.__dict__.values()) - 1.0) < 1e-9
 

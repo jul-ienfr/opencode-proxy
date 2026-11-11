@@ -28,10 +28,8 @@ FREE_CONVERSATIONS = [
     "deepseek-v4.1-flash",
     "glm-5.3-flash",
     "jev-1.13",
-    # mappings explicites (souverains depuis le 2026-10-29)
+    # mapping explicite conservé
     "mimo-v2.5",
-    "glm-5.1",
-    "kimi-k2.6",
     # ids déjà free
     "jev-1.13-free",
     "deepseek-v4.1-flash-free",
@@ -44,6 +42,9 @@ PAID_CONVERSATIONS = [
     "gpt-6-luna",
     "claude-opus-4-1",
     "muse-spark-1.3-contributor",
+    "glm-5.1",
+    "kimi-k2.6",
+    "deepseek-v4-flash",
 ]
 
 
@@ -324,8 +325,8 @@ def test_mapped_paid_names_keep_their_destination(monkeypatch):
     oc._free_model_rr.clear()
     monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "family")
     assert oc._resolve_free_model("mimo-v2.5") == "mimo-v2.6-flash-free"
-    assert oc._resolve_free_model("glm-5.1") == "mimo-v2.6-flash-free"
-    assert oc._resolve_free_model("deepseek-v4-flash") == "deepseek-v4.1-flash-free"
+    assert oc._resolve_free_model("glm-5.1") is None
+    assert oc._resolve_free_model("deepseek-v4-flash") is None
 
 
 def test_strict_homonym_never_uses_another_free(monkeypatch):
@@ -333,8 +334,9 @@ def test_strict_homonym_never_uses_another_free(monkeypatch):
     oc._free_model_rr.clear()
     monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "homonym")
     assert oc._resolve_free_model("mimo-v2.6-flash") == "mimo-v2.6-flash-free"
-    # Une entr?e EXPLICITE de free_model_map est souveraine (2026-10-29).
+    # Le mapping runtime de `mimo-v2.5` retombe sur `mimo-v2.6-flash-free`
+    # (la cible config `deepseek-v4-flash-free` n'est pas dans MODELS).
     assert oc._resolve_free_model("mimo-v2.5") == "mimo-v2.6-flash-free"
-    assert oc._resolve_free_model("deepseek-v4-flash") == "deepseek-v4.1-flash-free"
+    assert oc._resolve_free_model("deepseek-v4-flash") is None
     # Un payant sans mapping/homonyme reste sans cible free.
     assert oc._resolve_free_model("gpt-5.5") is None

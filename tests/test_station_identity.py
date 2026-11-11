@@ -180,7 +180,7 @@ def test_prompt_template_removes_real_path_and_keeps_official_marker():
     identity = _identity("warp-1")
     prompt = identity.prompt(BASE_PROMPT, now=datetime(2026, 11, 6, tzinfo=UTC))
     assert "You are an AI agent running in OpenCode" in prompt
-    assert "Working directory: /workspace/warp-1" in prompt
+    assert "Working directory: /workspace/oc-warp-1" in prompt
     assert "Today's date: Fri Nov 06 2026" in prompt
     for marker in FORBIDDEN:
         assert marker not in prompt
@@ -191,17 +191,17 @@ def test_prompt_replaces_stray_windows_path():
     base = "Path outside env: C:\\Users\\alice\\repo\\notes.txt\n" + BASE_PROMPT
     prompt = _identity("warp-1").prompt(base, now=datetime(2026, 11, 6, tzinfo=UTC))
     assert "C:\\Users\\alice" not in prompt
-    assert "/workspace/warp-1" in prompt
+    assert "/workspace/oc-warp-1" in prompt
 
 
 def test_prompt_template_appends_env_when_missing():
     prompt = render_system_prompt(
         "You are an AI agent running in OpenCode.",
-        "/workspace/warp-2",
+        "/workspace/oc-warp-2",
         now=datetime(2026, 11, 6, tzinfo=UTC),
     )
     assert "<env>" in prompt
-    assert "Working directory: /workspace/warp-2" in prompt
+    assert "Working directory: /workspace/oc-warp-2" in prompt
     assert "Today's date: Fri Nov 06 2026" in prompt
 
 
@@ -216,7 +216,7 @@ def test_template_official_body_only_rewrites_system_message():
         "stream": True,
     }
     templated = template_official_body(body, identity, now=datetime(2026, 11, 6, tzinfo=UTC))
-    assert "Working directory: /workspace/warp-1" in templated["messages"][0]["content"]
+    assert "Working directory: /workspace/oc-warp-1" in templated["messages"][0]["content"]
     assert "C:\\Users\\alice" not in templated["messages"][0]["content"]
     assert templated["messages"][1] == {"role": "user", "content": "keep me"}
     assert body["messages"][0]["content"] == BASE_PROMPT
@@ -247,7 +247,7 @@ def test_template_sanitizes_tool_descriptions():
     templated = template_official_body(body, identity)
     serialized = json.dumps(templated)
     assert "C:\\Users\\alice" not in serialized
-    assert "/workspace/warp-1" in serialized
+    assert "/workspace/oc-warp-1" in serialized
 
 
 def test_audit_accepts_clean_station_set():

@@ -60,6 +60,7 @@ class QuotaProfile:
     reserve_pct: float = 0.10
     rotation_pct: float = 0.20
     bad_ip_ttl_s: float = 1800.0
+    bad_ip_min_429: int = 2
     quota_ip_block_s: float = 120.0
     demand: int = 10
 
@@ -86,6 +87,7 @@ class QuotaProfile:
             reserve_pct=reserve_pct,
             rotation_pct=rotation_pct,
             bad_ip_ttl_s=max(1.0, _as_float(raw.get("bad_ip_ttl_s", 1800), 1800.0)),
+            bad_ip_min_429=max(1, _as_int(raw.get("bad_ip_min_429", 2), 2)),
             quota_ip_block_s=max(1.0, _as_float(raw.get("quota_ip_block_s", 120), 120.0)),
             demand=max(1, _as_int(quota_cfg.get("selection_demand", 10), 10)),
         )
@@ -197,6 +199,10 @@ class IpQuotaLease:
         self.last_429_at = 0.0
         self.recent_429 = 0
         self.error_count = max(0, self.error_count)
+        # A real 200 through this IP disproves the quota block for this
+        # (model, IP) lease; without clearing it the station stayed
+        # ``quota-blocked`` after a successful scan/repair.
+        self.blocked_until = 0.0
         if self.state == BAD:
             self.state = ACTIVE
         if profile is not None:
@@ -218,8 +224,14 @@ class IpQuotaLease:
         if int(status or 0) != 429:
             return self.state
         if self.success_count <= 0:
-            # 429 sans aucun succès : ce n'est pas un quota consommé, c'est
-            # une mauvaise IP. Quarantaine longue.
+            # 429 sans aucun succès : un seul refus ne prouve pas une
+            # mauvaise IP (rafale, lease neuf après redémarrage, quota
+            # transitoire). Blocage court d'abord ; la quarantaine longue
+            # n'arrive qu'après ``bad_ip_min_429`` refus sans succès.
+            if self.recent_429 < max(1, int(profile.bad_ip_min_429)):
+                self.blocked_until = max(self.blocked_until, ts + profile.quota_ip_block_s)
+                self.state = ACTIVE
+                return self.state
             self.state = BAD
             self.blocked_until = max(self.blocked_until, ts + profile.bad_ip_ttl_s)
             return self.state

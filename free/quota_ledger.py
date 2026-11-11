@@ -538,10 +538,12 @@ class QuotaLedger:
             return min(resets) if resets else None
 
     def exhausted_ips(self, now: float | None = None) -> set[str]:
-        """IPs (déjà normalisées en /64 ou /32) dont le bucket est épuisé.
+        """Clés IP stockées (``server_ip_key``) dont le bucket est épuisé.
 
-        Utilisé par la rotation WARP pour éviter de recréer un conteneur dans
-        un bloc dont le quota est déjà connu comme consommé.
+        Les clés ne sont pas encore des blocs : les appelants les normalisent
+        via ``quota_block`` (IPv4 → /32, IPv6 → /64). Utilisé par la rotation
+        WARP pour éviter de recréer un conteneur dans un bloc dont le quota
+        est déjà connu comme consommé.
         """
         ts = self._now(now)
         out: set[str] = set()

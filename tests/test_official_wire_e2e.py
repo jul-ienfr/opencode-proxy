@@ -13,8 +13,6 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import pytest
-
 import opencode as oc
 from free.identities import IdentityVault
 

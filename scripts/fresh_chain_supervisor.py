@@ -36,6 +36,7 @@ from free.chain_state import (  # noqa: E402
     save_state as _save_chain_state,
 )
 from free.ip_registry.config import load_registry_config  # noqa: E402
+from free.qualification.supervisor_bridge import qualification_tick  # noqa: E402
 from free.repair_queue import RepairQueue  # noqa: E402
 
 INTERVAL_S = 20.0
@@ -567,6 +568,97 @@ def _preferred_transport(
     if "auth" in text or "credential" in text:
         return fallback
     return configured
+
+
+def _repair_request_is_stale(request: dict, station: dict) -> bool:
+    """[P0 2026-11-10] La demande vise-t-elle une IP qui n'est plus live ?
+
+    Une réparation est liée à l'IP qui a reçu le 429. Après rotation, la
+    demande de l'ancienne IP ne doit plus forcer une nouvelle chaîne : sinon
+    le superviseur re-rotate indéfiniment une station déjà réparée.
+    """
+    req_ip = str((request or {}).get("ip") or "").strip()
+    live_ip = str((station or {}).get("current_ip") or "").strip()
+    return bool(req_ip and live_ip and req_ip != live_ip)
+
+
+def _repair_request_satisfied(request: dict, station: dict) -> bool:
+    """[P0 2026-11-10] La station sert-elle déjà le modèle de la demande ?
+
+    La file portait une demande avec ``ip`` vide (rotation en cours) qui
+    forçait une nouvelle chaîne à chaque cycle, même après récupération :
+    la station était stoppée/relancée en boucle. On consulte le verdict
+    **par modèle** pour ne pas masquer un 429 d'un autre modèle.
+    """
+    if not station:
+        return False
+    model = str((request or {}).get("model") or "").strip()
+    by_model = station.get("model_usable_by_model")
+    if model and isinstance(by_model, dict):
+        entry = by_model.get(model)
+        if isinstance(entry, dict):
+            return bool(entry.get("usable"))
+    return bool(station.get("station_usable") and station.get("model_usable"))
+
+
+def _auth_pause_remaining(stations: dict[int, dict]) -> float:
+    """[P0 2026-11-10] Pause globale AUTH du manager (secondes restantes).
+
+    Des binds simultanés au-delà de la limite de sessions NordVPN déclenchent
+    des AUTH_FAILED en cascade. Quand le manager a armé sa pause globale, le
+    superviseur doit attendre au lieu d'ajouter des chaînes qui échoueront.
+    """
+    remaining = 0.0
+    for station in (stations or {}).values():
+        vpn = station.get("vpn") if isinstance(station.get("vpn"), dict) else {}
+        try:
+            remaining = max(
+                remaining,
+                float(vpn.get("auth_global_pause_remaining_s") or 0.0),
+            )
+        except (TypeError, ValueError):
+            continue
+    return remaining
+
+
+def _auth_recent(stations: dict[int, dict]) -> bool:
+    """[P0 2026-11-11] Une station a-t-elle un AUTH_FAILED dans sa fenêtre 30 min ?"""
+    for station in (stations or {}).values():
+        vpn = station.get("vpn") if isinstance(station.get("vpn"), dict) else {}
+        try:
+            if int(vpn.get("auth_fail_30min") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _effective_max_parallel(
+    stations: dict[int, dict], base: int, *, auth_pause: float = 0.0
+) -> int:
+    """[P0 2026-11-11] Une seule chaîne pendant une pause AUTH.
+
+    La pause globale du manager autorise UNE probe : le superviseur doit
+    faire pareil. Hors pause, le parallélisme normal revient ; les démarrages
+    sont espacés de 60 s quand un AUTH_FAILED récent existe (cf. boucle).
+    """
+    if float(auth_pause or 0.0) > 0:
+        return 1
+    return max(1, int(base))
+
+
+def _repair_holds(usable_now: int, active: int, *, refresh: bool) -> bool:
+    """[P0 2026-11-10] Faut-il retenir une réparation ?
+
+    Un refresh proactif ne doit jamais consommer la réserve de stations qui
+    servent encore : sans ce garde, quatre refreshs simultanés ont laissé la
+    flotte à 0/6.  Une réparation d'une station déjà down ne réduit pas le
+    nombre d'usables, mais on garde toujours la dernière station debout.
+    """
+    if int(usable_now) <= 0:
+        return False  # rien à protéger : réparer toutes les stations
+    reserve = 3 if refresh else 0
+    return int(usable_now) - int(active) <= reserve
 
 
 def _needs_chain(station: dict) -> bool:
@@ -1254,9 +1346,14 @@ def _supervise() -> None:
     paused_until = 0.0
     stale_logged_at = 0.0
     last_alert_at = 0.0
+    last_global_alert_at = 0.0
+    last_exhausted_alert_at = 0.0
     last_heartbeat = 0.0
+    last_auth_log = 0.0
+    last_chain_started_at = 0.0
     last_health_probe = 0.0
     last_maintenance_at = time.time()
+    last_qualification_at = 0.0
     last_cycle_log = 0.0
     zero_functional_polls = 0
     observe_logged: dict[int, str] = {}
@@ -1269,6 +1366,12 @@ def _supervise() -> None:
             mode = str(alloc.get("mode") or "off")
             observe_only = mode == "observe"
             poll = max(5.0, float(alloc.get("poll_interval_s", INTERVAL_S) or INTERVAL_S))
+            last_qualification_at = qualification_tick(
+                ROOT,
+                last_at=last_qualification_at,
+                no_window=_NO_WINDOW,
+                log=log,
+            )
             if mode == "off":
                 if last_mode != "off":
                     log("allocator mode=off — supervisor idle")
@@ -1399,6 +1502,9 @@ def _supervise() -> None:
                 1, int(alloc.get("exhausted_threshold", 40) or 40)
             )
             ex_pause = max(300.0, float(alloc.get("exhausted_pause_s", 1800) or 1800))
+            global_pause_enabled = bool(
+                yaml_get("ip_registry", "allocator.global_pause_enabled", False)
+            )
             max_state_age_s = max(
                 10.0,
                 float(
@@ -1407,26 +1513,19 @@ def _supervise() -> None:
             )
             now = time.time()
             recent_429 = _recent_429(g_window)
-            if paused_until and now >= paused_until:
-                log("global 429 pause expired — resuming chains")
-                paused_until = 0.0
-                _write_allocator_state(
-                    {"paused_until": 0.0, "reason": None, "recent_429": recent_429}
-                )
-            if not paused_until and recent_429 >= g_threshold:
-                paused_until = now + g_pause
-                reason = f"global_429:{recent_429}/{int(g_window)}s"
-                _write_allocator_state(
-                    {
-                        "paused_until": paused_until,
-                        "reason": reason,
-                        "recent_429": recent_429,
-                    }
-                )
-                log(
-                    f"{recent_429} 429 in {int(g_window)}s — pausing new chains "
-                    f"{int(g_pause)}s ({reason})"
-                )
+            if global_pause_enabled:
+                if paused_until and now >= paused_until:
+                    log("global 429 pause expired — resuming chains")
+                    paused_until = 0.0
+                    _write_allocator_state({"paused_until": 0.0, "reason": None, "recent_429": recent_429})
+                if not paused_until and recent_429 >= g_threshold:
+                    paused_until = now + g_pause
+                    reason = f"global_429:{recent_429}/{int(g_window)}s"
+                    _write_allocator_state({"paused_until": paused_until, "reason": reason, "recent_429": recent_429})
+                    log(f"{recent_429} 429/{int(g_window)}s — pause {int(g_pause)}s ({reason})")
+            elif recent_429 >= g_threshold and now - last_global_alert_at >= g_pause:
+                last_global_alert_at = now
+                log(f"{recent_429} 429/{int(g_window)}s — no global pause (per-IP)")
 
             data = _status()
             free_health = _free_health()
@@ -1445,6 +1544,15 @@ def _supervise() -> None:
             if not observe_only:
                 _reconcile_registry(stations)
                 _clear_stale_pins(stations)
+            # [P0 2026-11-10] Auth pause globale : ne pas ajouter de binds qui
+            # vont échouer et prolonger la cascade AUTH_FAILED. La pause
+            # autorise UNE probe : on laisse le plafond effectif passer à 1.
+            auth_pause = _auth_pause_remaining(stations)
+            if auth_pause > 0 and now - last_auth_log >= 30.0:
+                last_auth_log = now
+                log(
+                    f"auth pause {int(auth_pause)}s — one probe at a time"
+                )
             functional = any(
                 bool(station.get("model_usable"))
                 for station in stations.values()
@@ -1469,24 +1577,18 @@ def _supervise() -> None:
             except Exception as exc:  # noqa: BLE001
                 log(f"fleet incident sync unavailable: {type(exc).__name__}: {exc}")
             total_429 = _total_429()
-            if (
-                not paused_until
-                and _exhaustion_due(zero_functional_polls, total_429, ex_threshold)
-            ):
+            exhaustion_due = _exhaustion_due(
+                zero_functional_polls, total_429, ex_threshold
+            )
+            if global_pause_enabled and not paused_until and exhaustion_due:
                 paused_until = now + ex_pause
                 zero_functional_polls = 0
                 reason = f"exhausted_429:{total_429}"
-                _write_allocator_state(
-                    {
-                        "paused_until": paused_until,
-                        "reason": reason,
-                        "recent_429": total_429,
-                    }
-                )
-                log(
-                    f"{total_429} 429 cumulés et aucune station model-usable — "
-                    f"pause {int(ex_pause)}s ({reason})"
-                )
+                _write_allocator_state({"paused_until": paused_until, "reason": reason, "recent_429": total_429})
+                log(f"{total_429} 429, aucune station usable — pause {int(ex_pause)}s ({reason})")
+            elif not global_pause_enabled and exhaustion_due and now - last_exhausted_alert_at >= ex_pause:
+                last_exhausted_alert_at = now
+                log(f"{total_429} 429, aucune station usable — no global pause (per-station)")
             broken = [sid for sid in scope if _needs_chain(stations.get(sid, {}))]
             forced: set[int] = set()
             try:
@@ -1496,6 +1598,28 @@ def _supervise() -> None:
                     except (TypeError, ValueError):
                         continue
                     if sid not in scope:
+                        continue
+                    # [P0 2026-11-10] Demande déjà satisfaite : le modèle
+                    # demandé est usable sur cette station. Sans ce garde,
+                    # une demande à IP vide re-rotatait une station saine
+                    # en boucle (s1 : stopped/started toutes les 10 s).
+                    if _repair_request_satisfied(
+                        request, stations.get(sid) or {}
+                    ):
+                        repair_queue.complete(sid)
+                        continue
+                    # [P0 2026-11-10] Une demande de réparation appartient à
+                    # une IP précise. Après une rotation réussie, la demande
+                    # de l'ancienne IP est obsolète : la garder forçait le
+                    # superviseur à re-rotater une station déjà réparée en
+                    # boucle (station 2, ip=87.120.102.58 vs live .119).
+                    if _repair_request_is_stale(request, stations.get(sid) or {}):
+                        log(
+                            f"station {sid} stale repair request "
+                            f"ip={request.get('ip')} (live "
+                            f"{(stations.get(sid) or {}).get('current_ip')}) — dropped"
+                        )
+                        repair_queue.complete(sid)
                         continue
                     forced.add(sid)
                     if sid not in broken:
@@ -1761,7 +1885,7 @@ def _supervise() -> None:
 
             # Launch every broken station; the shared claims DB serializes
             # rebinds (global token bucket) while probes run in parallel.
-            if paused_until and time.time() < paused_until:
+            if global_pause_enabled and paused_until and time.time() < paused_until:
                 previous_running = dict(running)
                 last_mode = mode
                 time.sleep(min(poll, max(5.0, paused_until - time.time())))
@@ -1783,7 +1907,39 @@ def _supervise() -> None:
                 failed_ago = time.time() - last_failed_at.get(sid, 0.0)
                 if last_failed_at.get(sid) and failed_ago < failure_cooldown:
                     continue
-                if active >= max_parallel:
+                # [P0 2026-11-10] Ne jamais prendre la réserve de stations qui
+                # servent encore. Un refresh proactif doit laisser >=3 usables ;
+                # une réparation d'une station déjà down laisse la dernière.
+                _station = stations.get(sid, {})
+                _refresh = sid in refresh_pending or bool(
+                    _station.get("model_usable")
+                )
+                _usable_now = sum(
+                    1
+                    for _s in stations.values()
+                    if _s.get("model_usable")
+                )
+                if active >= _effective_max_parallel(
+                    stations, max_parallel, auth_pause=auth_pause
+                ):
+                    break
+                if _repair_holds(_usable_now, active, refresh=_refresh):
+                    log(
+                        f"repair hold: usable={_usable_now} active={active} "
+                        f"refresh={_refresh} station={sid} waits"
+                    )
+                    continue
+                # [P0 2026-11-11] Espacer les démarrages de 60 s quand un
+                # AUTH_FAILED récent existe : deux échecs dans la même fenêtre
+                # 60 s déclenchent la pause globale 5/15 min.
+                if (
+                    _auth_recent(stations)
+                    and time.time() - last_chain_started_at < 60.0
+                ):
+                    log(
+                        "auth stagger hold: next chain in "
+                        f"{int(60 - (time.time() - last_chain_started_at))}s"
+                    )
                     break
                 configured_transport = transports.get(str(sid), "wireguard")
                 transport = _TRANSPORT_OVERRIDE.get(sid) or _preferred_transport(
@@ -1805,10 +1961,11 @@ def _supervise() -> None:
                 _start_chain(
                     sid,
                     rebind_limit,
-                    5 if sid in refresh_pending else max_candidates,
+                    25 if sid in refresh_pending else max_candidates,
                     probe_models,
                     transport=transport,
                 )
+                last_chain_started_at = time.time()
                 refresh_pending.discard(sid)
                 running[sid] = True
                 running_transport[sid] = transport

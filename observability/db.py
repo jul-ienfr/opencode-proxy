@@ -282,6 +282,12 @@ _REQUEST_COLUMN_MIGRATIONS = [
     # [présélection IP] serveur réellement utilisé : sans lui, la qualité
     # mesurée (tok/s) ne peut pas être attribuée au hostname rebindable.
     ("server_host", "NULL"),
+    # [012 T028] requête client vs tentative : identifiant stable, numéro
+    # d'essai, statut effectif de la tentative (le MAX(attempt_no) est la
+    # ligne finale du client).
+    ("client_request_id", "NULL"),
+    ("attempt_no", "NULL"),
+    ("final_status", "NULL"),
 ]
 
 _INSERT_REQUESTS_SQL = """
@@ -290,8 +296,8 @@ _INSERT_REQUESTS_SQL = """
         protocol, is_stream, thinking, effort, client_ip, account_alias, tools, tools_used,
         request_body, response_body, client_user_agent, free_model_ip, identity, geo_country, geo_blocked,
         geo_direct_country, geo_direct_ip, geo_via_vpn, geo_allowed, station, free_status, paid_status,
-        ttfb_ms, stop_reason, aborted, server_host)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ttfb_ms, stop_reason, aborted, server_host, client_request_id, attempt_no, final_status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 # Tables cibles acceptées sous forme de tuple taggé ``(table, payload)`` dans

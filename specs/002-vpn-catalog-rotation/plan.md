@@ -752,7 +752,7 @@ ip_registry:
     threshold_pct: 80
   repair:
     max_parallel: 6            # = station_count, borné par le budget de sessions
-    shared_wireguard_key: true
+    # shared_wireguard_key retiré le 2026-11-10 : transports indépendants
   sweep:
     enabled: true
     batch_size: 200

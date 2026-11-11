@@ -6,7 +6,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 # [feature 007] Colonnes additives pour le provider/egress. ``ALTER TABLE``
@@ -19,6 +19,13 @@ _ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "observations": (("provider", "TEXT NOT NULL DEFAULT ''"),),
     "quota_buckets": (("provider", "TEXT NOT NULL DEFAULT ''"),),
+    "qualification_candidates": (("lease_until", "REAL NOT NULL DEFAULT 0"),),
+    "qualification_attempts": (
+        ("dns_ms", "REAL NOT NULL DEFAULT 0"),
+        ("connect_ms", "REAL NOT NULL DEFAULT 0"),
+        ("handshake_ms", "REAL NOT NULL DEFAULT 0"),
+        ("endpoint_ip", "TEXT NOT NULL DEFAULT ''"),
+    ),
 }
 
 
@@ -64,7 +71,12 @@ def apply_schema(conn: sqlite3.Connection, *, now: float | None = None) -> int:
     conn.execute(
         "INSERT INTO schema_migrations(version, applied_at, description) "
         "VALUES(?,?,?) ON CONFLICT(version) DO NOTHING",
-        (SCHEMA_VERSION, ts, "egress provider columns"),
+        (2, ts, "egress provider columns"),
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations(version, applied_at, description) "
+        "VALUES(?,?,?) ON CONFLICT(version) DO NOTHING",
+        (SCHEMA_VERSION, ts, "qualification control plane tables"),
     )
     conn.commit()
     return SCHEMA_VERSION

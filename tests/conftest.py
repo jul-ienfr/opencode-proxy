@@ -5,6 +5,19 @@ import pytest
 
 pytest_plugins = ["pytest_asyncio"]
 
+# Tests must never publish repair requests into the live registry: the
+# supervisor reads that table and would rebind a production station for a
+# duck-typed test double.  RepairQueue reads this override at construction.
+_REPAIR_TEST_DB = os.path.join(
+    tempfile.gettempdir(), f"opencode-repair-queue-{os.getpid()}.db"
+)
+if not os.environ.get("OPENCODE_REPAIR_QUEUE_DB"):
+    try:
+        os.unlink(_REPAIR_TEST_DB)
+    except OSError:
+        pass
+    os.environ["OPENCODE_REPAIR_QUEUE_DB"] = _REPAIR_TEST_DB
+
 _MKDIR_0700_BROKEN = None  # cache de sonde (None = pas encore sondé)
 
 
@@ -89,6 +102,31 @@ if _fix_mkdir_0700_enumeration():
 
 
 @pytest.fixture(autouse=True)
+def _cap_retry_wait(monkeypatch):
+    """Borne la fenêtre de retry à 0,5 s pendant les tests.
+
+    `retry_until_success.max_wait_s: 180` est une valeur de production : un
+    test d'intégration qui traverse l'app réelle attendrait 3 minutes par
+    requête. Le middleware garde son comportement (retries, statut final
+    honnête) ; seule l'attente est raccourcie.
+    """
+    try:
+        from streaming.retry_until_success import RetryPolicy, RetryUntilSuccessMiddleware
+    except Exception:
+        return
+
+    original = RetryUntilSuccessMiddleware._policy
+
+    def _capped(self):
+        policy = original(self)
+        if isinstance(policy, RetryPolicy) and policy.max_wait_s > 0.5:
+            policy.max_wait_s = 0.5
+        return policy
+
+    monkeypatch.setattr(RetryUntilSuccessMiddleware, "_policy", _capped)
+
+
+@pytest.fixture(autouse=True)
 def _reset_free_runtime_globals():
     """[P0.6] Aucun état free ne fuit d'un test à l'autre.
 
@@ -128,6 +166,23 @@ def _reset_free_runtime_globals():
         _identities._VAULT = None
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_module_logger_propagation():
+    """[P0 2026-11-10] ``attach_panel_logger`` met ``propagate=False``.
+
+    ``caplog`` capture via le logger root : sans reset, un test qui a démarré
+    l'app (ou attaché le panneau) coupe les logs ``vpn_manager`` pour tous les
+    tests caplog suivants (« failed to save state », « warm-up », etc.).
+    """
+    import logging
+
+    names = ("vpn_manager", "free_ip_pool", "vpn")
+    before = {name: logging.getLogger(name).propagate for name in names}
+    yield
+    for name, value in before.items():
+        logging.getLogger(name).propagate = value
 
 
 @pytest.fixture(autouse=True)

@@ -138,8 +138,9 @@ def test_validate_endpoint_dry_run_does_not_apply():
     import re
 
     import dashboard.api as api
+    from dashboard.routers import vpn_control_routes
 
-    reg_src = inspect.getsource(api.register_dashboard)
+    reg_src = inspect.getsource(vpn_control_routes.register_vpn_control_routes)
     m = re.search(r"async def validate_vpn_config.*?(?=\n    @|\Z)", reg_src, re.S)
     assert m, "handler validate introuvable"
     block = m.group(0)

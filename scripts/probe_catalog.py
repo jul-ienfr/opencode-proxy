@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -45,7 +45,7 @@ def now() -> float:
 
 
 def iso(ts: float) -> str:
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def load_catalog() -> dict[str, dict]:
@@ -180,7 +180,6 @@ def db_record(
     if egress:
         state = "verified" if status == 200 else "candidate"
         score = 1.0 if status == 200 else 0.0
-        sorted_types = ",".join(candidate.get("types") or [])
         cur = conn.execute(
             """
             update ip_state set hostname=?, country=?, state=?, score=?, last_status=?, last_tested_at=?,

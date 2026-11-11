@@ -358,7 +358,7 @@ def test_max_completion_tokens_clamped_to_official_cap():
     assert body["max_completion_tokens"] == 128000
 
 
-def test_max_completion_tokens_clamped_to_official_cap():
+def test_max_completion_tokens_v2_clamped_to_official_cap():
     """Forme v2 (`max_completion_tokens`) : meme plafond, meme non-mutation."""
     body = _body()
     body.pop("max_completion_tokens")

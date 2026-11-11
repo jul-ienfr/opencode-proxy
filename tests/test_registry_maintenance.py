@@ -15,7 +15,6 @@ def test_maintenance_applies_schema_and_writes_a_restoreable_backup(tmp_path):
     assert result["version"] >= 1
     assert result["integrity_ok"] is True
     assert result["backup"]
-    backup_path = tmp_path / "backups" / "registry-19700101T000640Z.db"
     # The exact stamp depends on the local epoch; check the directory instead.
     files = list(backups.glob("registry-*.db"))
     assert len(files) == 1

@@ -10,7 +10,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from free.best_ip import BestIpSelector
-from free.ip_quota import BAD, DRAINING, EXHAUSTED, IpQuotaRegistry, QuotaProfile
+from free.ip_quota import ACTIVE, BAD, DRAINING, EXHAUSTED, IpQuotaRegistry, QuotaProfile
 from free.repair import (
     AUTH_GLOBAL,
     AUTH_THROTTLE,
@@ -187,11 +187,16 @@ def test_lease_bad_429_without_success_is_blacklisted_then_recovers_after_ttl():
     reg = IpQuotaRegistry(profile)
     st = _station(ip="1.1.1.1")
     reg.note_request("m", st, now=10.0)
-    assert reg.note_429("m", st, now=11.0) == BAD
+    # Un premier 429 sans succès n'est qu'un blocage court : la preuve de
+    # mauvaise IP demande deux refus sans aucun succès.
+    assert reg.note_429("m", st, now=11.0) == ACTIVE
     ok, reason = reg.model_usable("m", st, now=12.0)
+    assert ok is False and reason == "quota-blocked"
+    assert reg.note_429("m", st, now=12.0) == BAD
+    ok, reason = reg.model_usable("m", st, now=13.0)
     assert ok is False and reason == "bad-ip"
     # TTL expiré : redevient qualifiée, mais pas active sans preuve.
-    ok, reason = reg.model_usable("m", st, now=11.0 + profile.bad_ip_ttl_s + 1.0)
+    ok, reason = reg.model_usable("m", st, now=12.0 + profile.bad_ip_ttl_s + 1.0)
     assert ok is True and reason is None
 
 
@@ -249,8 +254,9 @@ def test_selector_excludes_draining_and_bad():
         quota.note_request("m", draining, now=10.0 + i)
     quota.note_success("m", draining, now=30.0)
     quota.note_result("m", bad, 429, now=31.0)
+    quota.note_result("m", bad, 429, now=32.0)
     selector = BestIpSelector(quota)
-    assert selector.choose([draining, bad], "m", now=32.0) is None
+    assert selector.choose([draining, bad], "m", now=33.0) is None
     reasons = {row["reason"] for row in selector.last_rejections}
     assert "bad-ip" in reasons
     assert reasons & {"draining", "reserve", "quota-blocked", "exhausted"}
@@ -282,7 +288,7 @@ def test_selector_deduplicates_shared_ip():
     assert any(row.get("reason") == "duplicate-ip" for row in selector.last_rejections)
 
 
-def test_rotation_planner_one_at_a_time_and_spare_promotion():
+def test_rotation_planner_concurrent_and_spare_promotion():
     profile = QuotaProfile.from_config({"quota_per_ip_by_model": {"m": 20}})
     quota = IpQuotaRegistry(profile)
     st1 = _station(1, "7.7.7.7")
@@ -293,13 +299,16 @@ def test_rotation_planner_one_at_a_time_and_spare_promotion():
     quota.note_success("m", st1, now=40.0)
     quota.note_success("m", st2, now=41.0)
     leases = [quota.lease_for("m", st1, now=50.0), quota.lease_for("m", st2, now=50.0)]
-    planner = RotationPlanner(profile=profile)
+    planner = RotationPlanner(profile=profile, max_concurrent=2)
 
-    # Sans spare : une seule rotation, et pas sur la dernière station active.
+    # Deux stations peuvent tourner en parallèle (borne max_concurrent).
     decision = planner.plan(leases, active_count=2, qualified_spares=0, now=50.0)
     assert decision is not None and decision.action == "rotate_one" and decision.spare_used is False
     planner.note_started(now=50.0)
-    assert planner.plan(leases, active_count=2, qualified_spares=0, now=51.0) is None
+    assert planner.plan(leases, active_count=2, qualified_spares=0, now=51.0) is not None
+    planner.note_started(now=51.0)
+    assert planner.plan(leases, active_count=2, qualified_spares=0, now=52.0) is None
+    planner.note_finished()
     planner.note_finished()
 
     # Avec spare : promotion sans trou.
@@ -307,7 +316,7 @@ def test_rotation_planner_one_at_a_time_and_spare_promotion():
     assert decision is not None and decision.action == "promote_spare" and decision.spare_used is True
 
     # Dernière station : jamais de rotation.
-    planner2 = RotationPlanner(profile=profile)
+    planner2 = RotationPlanner(profile=profile, max_concurrent=2)
     assert planner2.plan([leases[0]], active_count=1, qualified_spares=0, now=53.0) is None
 
 

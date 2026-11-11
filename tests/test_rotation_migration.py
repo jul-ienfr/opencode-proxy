@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import sqlite3
 
-from free.ip_registry.sqlite import connect as legacy_connect, init_schema
+from free.ip_registry.sqlite import connect as legacy_connect
+from free.ip_registry.sqlite import init_schema
 from rotation.infrastructure.db.migrate import apply_schema, connect
 from rotation.infrastructure.db.migrate_legacy import migrate_legacy
 from rotation.infrastructure.db.retention import backup, integrity_ok, prune

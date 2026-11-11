@@ -353,6 +353,38 @@ def render_vpn_section(vpn: dict | None) -> list[str]:
     return lines
 
 
+def render_catalog_section(
+    summary: dict | None,
+    threat: dict | None = None,
+) -> list[str]:
+    """Catalogue d'egress : options par provider/statut et threat-intel."""
+
+    lines: list[str] = []
+    if not summary:
+        return lines
+    rows: list[tuple[str, int]] = []
+    for provider, bucket in sorted(summary.items()):
+        if not isinstance(bucket, dict):
+            continue
+        for status in ("known", "reachable", "usable", "quota", "auth", "dead", "candidate"):
+            rows.append((f'provider="{provider}",status="{status}"', int(bucket.get(status, 0))))
+        rows.append(
+            (f'provider="{provider}",status="unique_blocks"', int(bucket.get("unique_blocks", 0)))
+        )
+    _gauge(lines, "egress_catalog_options", "options du catalogue par provider/statut", rows)
+    if threat:
+        _gauge(
+            lines,
+            "egress_catalog_threat_indicators",
+            "indicateurs threat-intel chargés",
+            [
+                ('kind="exact"', int(threat.get("exact", 0))),
+                ('kind="cidr"', int(threat.get("networks", 0))),
+            ],
+        )
+    return lines
+
+
 def render_pool_section(pool: dict | None) -> list[str]:
     """[audit 2026-09-08 §6/O4] Éligibilité pool free (SLO).
 
@@ -495,6 +527,7 @@ __all__ = [
     "percentile",
     "render_fallback_section",
     "render_free_429_section",
+    "render_catalog_section",
     "render_lot0_section",
     "render_pool_section",
     "render_vpn_section",

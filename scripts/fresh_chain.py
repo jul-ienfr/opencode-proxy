@@ -33,6 +33,17 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 from config.settings import yaml_get  # noqa: E402
+from free.chain_repair import acquire_lock as _acquire_lock  # noqa: E402
+from free.chain_repair import exhausted_egress as _exhausted_egress  # noqa: E402
+from free.chain_repair import (  # noqa: E402
+    filter_candidates_for_transport as filter_candidates_for_transport,
+)
+from free.chain_repair import pid_alive as _pid_alive  # noqa: E402
+from free.chain_repair import release_lock as _release_lock  # noqa: E402
+from free.chain_repair import transport_parts as _transport_parts  # noqa: E402
+from free.qualification.chain_bridge import (  # noqa: E402
+    record_chain_attempt as _record_chain_attempt,
+)
 
 API_URL = "https://api.nordvpn.com/v1/servers?limit=0"
 CANDIDATES_CACHE = ROOT / "logs" / "fresh_chain_candidates.json"
@@ -391,40 +402,12 @@ def _registry_countries() -> dict[str, str]:
     return out
 
 
-def _registry_hosts() -> list[str]:
-    """Known hostnames from the quota inventory, best quota first.
+def _registry_hosts(transport: str | None = None) -> list[str]:
+    """Registry hostnames, transport-aware (extracted to free.chain_registry)."""
 
-    [2026-11-03] The inventory now holds 700+ egress↔hostname rows. Only the
-    rows whose daily bucket is not known-exhausted are worth a bind: trying a
-    host whose IP resets at midnight wastes 80 s and an AUTH token. 200s come
-    first, then the untested rows, then old 429s without a known reset.
-    """
-    path = ROOT / "logs" / "registry.db"
-    if not path.exists():
-        return []
-    now = time.time()
-    try:
-        with sqlite3.connect(path) as conn:
-            rows = list(
-                conn.execute(
-                    "select s.hostname, "
-                    "max(case when e.last_ok_at is not null then 1 else 0 end) as has_200, "
-                    "max(e.last_ok_at) as ok_at "
-                    "from servers s "
-                    "left join ip_server_map m on m.hostname = s.hostname "
-                    "left join egress_ips e on e.ip = m.ip "
-                    "where s.hostname != '' "
-                    "and (e.last_ok_at is not null "
-                    "or e.state in ('fresh','candidate','assigned')) "
-                    "and coalesce(e.reset_at, 0) <= ? "
-                    "group by s.hostname "
-                    "order by has_200 desc, ok_at desc",
-                    (now,),
-                )
-            )
-        return [str(r[0]) for r in rows if r and r[0]]
-    except Exception:
-        return []
+    from free.chain_registry import registry_hosts
+
+    return registry_hosts(ROOT, transport)
 
 
 def _ensure_registry_schema(path: Path) -> None:
@@ -663,17 +646,6 @@ def _transport_order() -> tuple[str, ...]:
     return tuple(dict.fromkeys(order))
 
 
-def _transport_parts(transport: str) -> tuple[str, str | None]:
-    """Map a chain transport name to Gluetun ``VPN_TYPE`` + OVPN protocol."""
-
-    value = str(transport or "wireguard").strip().lower()
-    if value == "openvpn-tcp":
-        return "openvpn", "tcp"
-    if value == "openvpn-udp":
-        return "openvpn", "udp"
-    return "wireguard", None
-
-
 def _read_env_key(key: str) -> str:
     """Read one key from the repository ``.env`` (last value wins)."""
 
@@ -884,7 +856,7 @@ def build_candidates(
     quality = _host_quality()
     success = _host_success()
     weights = _score_weights()
-    has_200 = set(_registry_hosts())
+    has_200 = set(_registry_hosts(transport))
     registry_countries = _registry_countries()
     # [2026-11-05] No country quota: every country is eligible. Country is
     # metadata only; the selector ranks by measured performance.
@@ -1020,7 +992,7 @@ def build_candidates(
     # after the perimeter was opened to 150 countries. The embedded catalog
     # still lists them as a LAST-RESORT fallback (step 3), with their real
     # country, but they no longer outrank the live catalog.
-    for host in _registry_hosts():
+    for host in _registry_hosts(transport):
         item = api_by_host.get(host)
         if item is None:
             # [2026-11-03] The hostname is proven in ip_state but absent from
@@ -1218,24 +1190,16 @@ def _lock_path(station: int, transport: str = "wireguard") -> Path:
 
 
 def acquire_lock(station: int, transport: str = "wireguard") -> bool:
-    """One chain per (station, transport); a stale lock expires after one hour."""
-    path = _lock_path(station, transport)
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if time.time() - float(data.get("ts") or 0.0) < 3600.0:
-                return False
-        except Exception:
-            pass
-    path.write_text(json.dumps({"pid": os.getpid(), "ts": time.time()}), encoding="utf-8")
-    return True
+    """One chain per (station, transport); the guard lives in free.chain_repair."""
+
+    return _acquire_lock(
+        _lock_path(station, transport),
+        pid_alive_fn=_pid_alive,
+    )
 
 
 def release_lock(station: int, transport: str = "wireguard") -> None:
-    try:
-        _lock_path(station, transport).unlink()
-    except Exception:
-        pass
+    _release_lock(_lock_path(station, transport))
 
 
 def load_state(path: Path) -> dict:
@@ -1473,6 +1437,7 @@ def _record_registry_winner(
     country: str,
     ip: str,
     latency_ms: float | None,
+    transport: str = "wireguard",
 ) -> None:
     """Persist the tested winner in the shared IP registry (test-then-keep).
 
@@ -1521,17 +1486,17 @@ def _record_registry_winner(
             conn.execute(
                 "INSERT INTO ip_server_map(ip, hostname, transport, "
                 "first_seen_at, last_seen_at, successes) "
-                "VALUES(?,?,'wireguard',?,?,1) "
+                "VALUES(?,?,?,?,?,1) "
                 "ON CONFLICT(ip, hostname, transport) DO UPDATE SET "
                 "last_seen_at=excluded.last_seen_at, "
                 "successes=ip_server_map.successes+1",
-                (str(ip), str(host), now, now),
+                (str(ip), str(host), str(transport), now, now),
             )
             conn.execute(
                 "INSERT INTO observations(station, hostname, transport, ip, "
                 "model, status, valid, latency_ms, tested_at) "
-                "VALUES(?,?,'wireguard',?,'',200,1,?,?)",
-                (int(station), str(host), str(ip), latency_ms, now),
+                "VALUES(?,?,?,?,'',200,1,?,?)",
+                (int(station), str(host), str(transport), str(ip), latency_ms, now),
             )
             conn.execute(
                 "UPDATE leases SET status='released', released_at=?, "
@@ -1548,12 +1513,13 @@ def _record_registry_winner(
                 conn.execute(
                     "INSERT INTO leases(lease_id, station, ip, hostname, "
                     "transport, model, started_at, renewed_at, expires_at, status) "
-                    "VALUES(?,?,?,?,'wireguard','',?,?,?,'active')",
+                    "VALUES(?,?,?,?,?,'',?,?,?,'active')",
                     (
                         f"chain-{int(station)}-{str(ip)}-{int(now)}",
                         int(station),
                         str(ip),
                         str(host),
+                        str(transport),
                         now,
                         now,
                         now + 6 * 3600.0,
@@ -1639,6 +1605,24 @@ def _should_mark_ledger_429(result) -> bool:
 
     scope = str(getattr(result, "quota_scope", "") or "").strip().lower()
     return scope != "transient"
+
+
+def _probe_attempt_status(result) -> str:
+    """Map a probe result to the qualification attempt taxonomy."""
+    try:
+        code = int(getattr(result, "status", 0) or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code == 200:
+        return "200" if bool(getattr(result, "valid", True)) else "dead"
+    if code == 429:
+        return "429"
+    if code in (401, 407):
+        return "auth"
+    if code == 0:
+        text = str(getattr(result, "error", "") or "").lower()
+        return "timeout" if "timeout" in text or "timed out" in text else "no_egress"
+    return "dead" if 500 <= code < 600 else "no_egress"
 
 
 async def _probe_with_fallbacks(probe, station: int, primary: str, fallbacks: list[str]):
@@ -1779,6 +1763,12 @@ async def _run_claims(
         fast_discovery = bool(
             yaml_get("ip_registry", "allocator.fast_discovery", False)
         )
+        if str(args.transport) == "auto":
+            # FR-072: in auto mode the tri-stack is mandatory.  A single
+            # transport shortcut would leave WireGuard (or OpenVPN) untested
+            # and turn an infrastructure failure into a false ``dead``.
+            fast_discovery = False
+            log("fast discovery off: auto mode walks every transport")
         if fast_discovery and _fleet_usable() <= 0:
             # No station can answer a model request: one transport per attempt
             # would leave WireGuard untested forever when the containers are
@@ -1814,16 +1804,13 @@ async def _run_claims(
                 or 2
             ),
         )
-        country_fails: dict[str, int] = {}
-        country_noegress: dict[str, int] = {}
-        country_backoff: dict[str, float] = {}
         while True:
             if args.max and tested >= args.max:
                 log(f"claims mode: max={args.max} reached")
                 _close_run("max_candidates")
                 await _restore_previous_host(args, binder, snapshot or {})
                 return 2
-            claim = claims.claim_next(args.station)
+            claim = claims.claim_next(args.station, forbidden_ips=exhausted)
             if claim is None:
                 log("catalog exhausted or every candidate is claimed/reset")
                 _close_run("catalog_exhausted")
@@ -1831,16 +1818,6 @@ async def _run_claims(
                 return 2
             host = str(claim["host"])
             country = str(claim["country"])
-            country_key = country.strip().lower()
-            if country_backoff.get(country_key, 0.0) > time.monotonic():
-                # Temporary search backoff after repeated failures in this
-                # run, NOT a country quota: the country becomes eligible
-                # again after 30 minutes. It stops the chain from spending
-                # another hour on a country whose whole egress range is 429.
-                claims.record(
-                    host, args.station, "country_backoff", error="country-backoff"
-                )
-                continue
             # The shared catalog keeps rows from older runs (no prune: an
             # active host must stay reclaimable). If this run's candidate
             # build filtered the host — exhausted /24, no longer in the live
@@ -1882,10 +1859,39 @@ async def _run_claims(
                 continue
 
             row = by_host.get(host, {})
+            burned = _exhausted_egress(row, exhausted)
+            if burned:
+                claims.record(
+                    host,
+                    args.station,
+                    "no_egress",
+                    ip=burned,
+                    error="exhausted-egress",
+                )
+                log(f"  last egress {burned} exhausted - skip without bind")
+                await asyncio.sleep(args.delay)
+                continue
             transports = list(row.get("transports") or [])
             if not transports:
                 transports = [args.transport]
             if str(args.transport) != "auto":
+                # A qualification candidate may only support WireGuard or one
+                # OpenVPN protocol.  Never spend a bind on a transport the
+                # host does not advertise: the claim is released to pending
+                # and the next candidate is selected.
+                if transports and args.transport not in transports:
+                    claims.record(
+                        host,
+                        args.station,
+                        "no_egress",
+                        error="transport-unsupported",
+                    )
+                    log(
+                        f"  host does not support {args.transport} "
+                        f"(has {','.join(str(item) for item in transports)}) - skip"
+                    )
+                    await asyncio.sleep(args.delay)
+                    continue
                 transports = [args.transport]
             # [2026-11-05] Try the transport already configured in the
             # container first: the hybrid binder can switch its hostname via
@@ -1900,7 +1906,7 @@ async def _run_claims(
                 transports = [preferred] + [
                     item for item in transports if item != preferred
                 ]
-            if fast_discovery:
+            if fast_discovery and str(args.transport) == "auto":
                 # Discovery mode: one transport per station and move to the
                 # next hostname on any failure. Prefer the transport already
                 # configured in the container (the control API then switches
@@ -1908,6 +1914,11 @@ async def _run_claims(
                 # the station's own stack so a WireGuard station does not
                 # silently test only OpenVPN egresses. The full tri-stack
                 # remains available with fast_discovery=false.
+                #
+                # An explicit ``--transport`` is an operator constraint: it
+                # must win over discovery, otherwise a TCP repair silently
+                # binds WireGuard and blocks every other station through the
+                # shared key lease.
                 discovery_pref = preferred if preferred in transports else ""
                 if not discovery_pref:
                     configured = _station_transport(args.station)
@@ -1927,22 +1938,7 @@ async def _run_claims(
             ip = ""
             result = None
             model_used = ""
-            wg_held = False
             for transport in transports:
-                if wg_held:
-                    claims.release_transport("wireguard", args.station)
-                    wg_held = False
-                if str(transport) == "wireguard":
-                    if not claims.acquire_transport(
-                        "wireguard",
-                        args.station,
-                        hostname=host,
-                        ttl_s=360.0,
-                    ):
-                        last_error = "wireguard:lease-busy"
-                        log("  wireguard lease busy - try next transport")
-                        continue
-                    wg_held = True
                 while not claims.rebind_allowed():
                     await asyncio.sleep(2)
                 claims.renew(host, args.station)
@@ -1963,6 +1959,14 @@ async def _run_claims(
                     )
                     last_error = f"{transport}:{bind.error or 'bind-error'}"
                     log(f"  bind rejected ({transport}): {bind.error}")
+                    _record_chain_attempt(
+                        station=args.station,
+                        hostname=host,
+                        transport=str(transport),
+                        status="bind_error",
+                        error=bind.error or "bind-error",
+                        db_path=args.claims_db,
+                    )
                     continue
                 dns_fallback.reset(args.station)
                 # The bind may have consumed most of the initial lease; renew
@@ -1973,12 +1977,30 @@ async def _run_claims(
                 if ip and ip in _active_egress_ips(args.api_base, args.station):
                     last_error = f"{transport}:duplicate"
                     log("  egress already used by a serving station — try next transport")
+                    _record_chain_attempt(
+                        station=args.station,
+                        hostname=host,
+                        transport=str(transport),
+                        status="duplicate",
+                        egress_ip=ip,
+                        error="active-egress",
+                        db_path=args.claims_db,
+                    )
                     continue
                 # [2026-11-05] No country or /24 quota: the operator's only
                 # hard constraint is that two stations never share the same IP.
                 if ip and ip in exhausted:
                     last_error = f"{transport}:ledger-429"
                     log("  egress already in the 429 ledger — try next transport")
+                    _record_chain_attempt(
+                        station=args.station,
+                        hostname=host,
+                        transport=str(transport),
+                        status="429",
+                        egress_ip=ip,
+                        error="ledger-429",
+                        db_path=args.claims_db,
+                    )
                     continue
                 result, model_used = await _probe_with_fallbacks(
                     probe, args.station, args.model, args.probe_models
@@ -1991,9 +2013,78 @@ async def _run_claims(
                     f"scope={getattr(result, 'quota_scope', '') or '-'} "
                     f"fp={str(getattr(result, 'request_fingerprint', '') or '')[:12]}"
                 )
+                _record_chain_attempt(
+                    station=args.station,
+                    hostname=host,
+                    transport=str(transport),
+                    status=_probe_attempt_status(result),
+                    egress_ip=ip,
+                    error=str(getattr(result, "error", "") or "")[:300],
+                    latency_ms=float(getattr(result, "latency_ms", 0.0) or 0.0),
+                    retry_after_s=float(getattr(result, "retry_after_s", 0.0) or 0.0),
+                    round_n=0,
+                    db_path=args.claims_db,
+                )
                 if result.status == 200 and bool(getattr(result, "valid", True)):
-                    winner = (str(transport), ip, result, model_used)
-                    break
+                    # [P0 2026-11-10] Un 200 isolé ne prouve pas un bucket
+                    # utilisable : les IP partagées n'ont parfois qu'une
+                    # requête de marge et 429 à la suivante. Confirmer avant
+                    # de pinner évite un cycle de rotation complet (~2 min)
+                    # pour une IP déjà morte.
+                    confirm, confirm_model = await _probe_with_fallbacks(
+                        probe,
+                        args.station,
+                        model_used or args.model,
+                        args.probe_models,
+                    )
+                    log(
+                        f"  confirmation status={confirm.status} "
+                        f"model={confirm_model} transport={transport}"
+                    )
+                    _record_chain_attempt(
+                        station=args.station,
+                        hostname=host,
+                        transport=str(transport),
+                        status=_probe_attempt_status(confirm),
+                        egress_ip=ip,
+                        error=str(getattr(confirm, "error", "") or "")[:300],
+                        latency_ms=float(
+                            getattr(confirm, "latency_ms", 0.0) or 0.0
+                        ),
+                        retry_after_s=float(
+                            getattr(confirm, "retry_after_s", 0.0) or 0.0
+                        ),
+                        round_n=1,
+                        db_path=args.claims_db,
+                    )
+                    if confirm.status == 200 and bool(
+                        getattr(confirm, "valid", True)
+                    ):
+                        winner = (str(transport), ip, confirm, confirm_model)
+                        break
+                    if confirm.status == 429 and _should_mark_ledger_429(confirm):
+                        retry_after = max(
+                            retry_after, float(confirm.retry_after_s or 0.0)
+                        )
+                        exhausted.add(ip)
+                        mark(
+                            args.api_base,
+                            ip,
+                            429,
+                            confirm.retry_after_s,
+                            args.station,
+                            confirm_model,
+                            transport=str(transport),
+                        )
+                        _record_registry_429(
+                            ip, host, country, confirm.retry_after_s
+                        )
+                        last_error = f"{transport}:429-confirm"
+                        log("  confirmation 429 - IP exhausted, next host")
+                        continue
+                    last_error = f"{transport}:confirm-{confirm.status}"
+                    log("  confirmation failed - next host")
+                    continue
                 if result.status == 200:
                     last_error = (
                         f"{transport}:invalid-200:"
@@ -2051,48 +2142,13 @@ async def _run_claims(
                 )
 
             if winner is None:
-                # [2026-11-05] Only a real quota 429 condemns a country for
-                # 30 min. A cluster of bind/no-egress failures is weaker
-                # evidence (one dead subnet or blocked UDP), so it only gets a
-                # short 10 min pause after 5 failures.
-                if quota_429:
-                    country_noegress[country_key] = 0
-                    country_fails[country_key] = (
-                        country_fails.get(country_key, 0) + 1
-                    )
-                    if country_fails[country_key] >= 3:
-                        country_backoff[country_key] = time.monotonic() + 1800.0
-                        country_fails[country_key] = 0
-                        log(
-                            f"  {country} backoff 30 min after 3 quota 429 "
-                            "(search heuristic, not a quota)"
-                        )
-                else:
-                    country_noegress[country_key] = (
-                        country_noegress.get(country_key, 0) + 1
-                    )
-                    if country_noegress[country_key] >= 5:
-                        country_backoff[country_key] = time.monotonic() + 600.0
-                        country_noegress[country_key] = 0
-                        log(
-                            f"  {country} pause 10 min after 5 bind/no-egress "
-                            "(search heuristic, not a quota)"
-                        )
-            else:
-                country_fails[country_key] = 0
-                country_noegress[country_key] = 0
-
-            if winner is None and wg_held:
-                claims.release_transport("wireguard", args.station)
+                # No country gate: a 429 or bind failure is a property of the
+                # tested IP/transport, not of the country. The shared claim
+                # backoff handles the host; another host is tried next.
+                log(f"  {country}: no country gate; next host after {last_error}")
 
             if winner is not None:
                 transport, ip, result, model_used = winner
-                if transport == "wireguard":
-                    # The winning station keeps the shared WireGuard key for
-                    # an hour; other stations use OpenVPN meanwhile.
-                    claims.renew_transport(
-                        "wireguard", args.station, hostname=host, ttl_s=3600.0
-                    )
                 claims.record(host, args.station, "ok", ip=ip)
                 mark(
                     args.api_base,
@@ -2105,7 +2161,12 @@ async def _run_claims(
                     transport=transport,
                 )
                 _record_registry_winner(
-                    args.station, host, country, ip, getattr(result, "latency_ms", None)
+                    args.station,
+                    host,
+                    country,
+                    ip,
+                    getattr(result, "latency_ms", None),
+                    transport,
                 )
                 _record_verified_spare(
                     args.station, host, country, ip, model_used, transport
@@ -2300,6 +2361,12 @@ async def run(args) -> int:
     if not candidates:
         log("no candidates")
         return 1
+    if str(args.transport) != "auto":
+        # The candidate cache is shared between transports.  A list built for
+        # ``auto``/WireGuard contains hosts that only advertise WireGuard;
+        # spending a claim on them for a TCP chain just burns the rebind
+        # budget.
+        candidates = filter_candidates_for_transport(candidates, args.transport)
     log(f"candidates={len(candidates)} start={args.start or state.get('index', 0)}")
 
     if args.dry_run:
@@ -2467,7 +2534,12 @@ async def run(args) -> int:
                 hostname=host,
             )
             _record_registry_winner(
-                args.station, host, country, ip, getattr(result, "latency_ms", None)
+                args.station,
+                host,
+                country,
+                ip,
+                getattr(result, "latency_ms", None),
+                args.transport,
             )
             _record_verified_spare(
                 args.station, host, country, ip, model_used, args.transport
@@ -2527,8 +2599,79 @@ def main() -> int:
     parser.add_argument("--claims", action="store_true")
     parser.add_argument("--claims-db", default=str(ROOT / "logs" / "registry.db"))
     parser.add_argument("--rebind-limit", type=int, default=8)
+    parser.add_argument("--sweep", action="store_true", help="qualification sweep mode (feature 014)")
+    parser.add_argument("--epoch", default="", help="sweep epoch id")
+    parser.add_argument("--shadow", action="store_true", help="sweep without binding a station")
     args = parser.parse_args()
+    if args.sweep:
+        return _run_qualification_sweep(args)
     return asyncio.run(run(args))
+
+
+def _run_qualification_sweep(args) -> int:
+    """Thin bridge from ``fresh_chain`` to the qualification sweep.
+
+    Shadow mode only ingests/scores.  Live mode uses the same Gluetun/Compose
+    adapter as the rest of the chain and rebinds the requested station.
+    """
+
+    import json
+
+    import yaml
+
+    from free.qualification import build_qualification, build_registry_station_adapter
+
+    config_path = ROOT / "config.yaml"
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:  # noqa: BLE001
+        log(f"sweep config read failed: {type(exc).__name__}: {exc}")
+        return 2
+    adapter = None
+    if not args.shadow:
+        adapter = build_registry_station_adapter(config, station=int(args.station))
+    runtime = build_qualification(
+        config,
+        db_path=args.claims_db or None,
+        adapter=adapter,
+    )
+    if runtime is None:
+        log("sweep disabled by egress_catalog.qualification.enabled")
+        return 2
+    try:
+        runtime.sweep.config.station = int(args.station)
+        runtime.sweep.config.max_hosts = max(0, int(args.max or 0))
+        if str(args.transport) == "auto":
+            runtime.sweep.config.strategy = "auto"
+            runtime.sweep.config.manual_transport = ""
+        else:
+            runtime.sweep.config.strategy = "manual"
+            runtime.sweep.config.manual_transport = str(args.transport)
+        if args.shadow:
+            ingested = runtime.ingest()
+            payload = {
+                "mode": "shadow",
+                "ingested": ingested,
+                "summary": {
+                    **runtime.summary(),
+                    "by_status": {
+                        str(key): value for key, value in runtime.summary()["by_status"].items()
+                    },
+                },
+            }
+        else:
+            result = asyncio.run(
+                runtime.sweep.run_epoch(
+                    epoch_id=str(args.epoch or ""),
+                    max_hosts=max(0, int(args.max or 0)),
+                    shadow=False,
+                )
+            )
+            payload = {"mode": "live", "result": result.snapshot(), "summary": runtime.summary()}
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        return 0
+    finally:
+        runtime.close()
 
 
 if __name__ == "__main__":

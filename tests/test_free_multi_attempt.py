@@ -350,6 +350,62 @@ def _free_body():
     return {"model": PAID_MODEL, "messages": [{"role": "user", "content": "hello"}]}
 
 
+@pytest.mark.asyncio
+async def test_dispatch_skips_ip_with_exhausted_ledger(free_vpn_env, free_cfg, monkeypatch):
+    """[P0 2026-11-10] Une IP au bucket épuisé ne reçoit AUCUNE tentative.
+
+    La sélection peut courir (rotation concurrente) entre le choix et le POST :
+    le garde ledger au dispatch doit sauter la station, pas la re-striker.
+    """
+    a = _Station(1, "9.9.9.1", "socks5://127.0.0.1:1080")
+    b = _Station(2, "9.9.9.2", "socks5://127.0.0.1:1081")
+    pool = _PoolMulti([a, b])
+    pool.model_bucket_usable = lambda model, station: station is not a
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    fake = _FakeFreeCurl(
+        [_FakeResp(200, {"content-type": "application/json"}, usage={"prompt_tokens": 1, "completion_tokens": 1})]
+    )
+    monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
+
+    result = await oc._try_free_model_first(
+        _free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL
+    )
+    assert result is not None
+    # Station A (pré-sélectionnée par on_request) n'a jamais été frappée.
+    assert [s for _p, s in fake.calls] == [b]
+
+
+@pytest.mark.asyncio
+async def test_admission_timeout_returns_503_without_dispatch(
+    free_vpn_env, free_cfg, monkeypatch
+):
+    """[P0 2026-11-10] Slot saturé → 503 + Retry-After, aucune requête amont."""
+    from contextlib import asynccontextmanager
+
+    import free.pool as fp
+
+    a = _Station(1, "9.9.9.3", "socks5://127.0.0.1:1080")
+    pool = _PoolMulti([a])
+    monkeypatch.setattr(oc, "_free_ip_pool", pool)
+    fake = _FakeFreeCurl([])
+    monkeypatch.setattr(oc, "_do_free_request_curl_cffi", fake)
+
+    @asynccontextmanager
+    async def _busy_slot(model, station):
+        raise fp.ModelSlotTimeout(model, station, 12.0, 2.0)
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(oc, "_free_model_slot", _busy_slot)
+
+    with pytest.raises(oc.FreeRefusal) as excinfo:
+        await oc._try_free_model_first(
+            _free_body(), dict(PAID_HEADERS), "openai", PAID_MODEL
+        )
+    assert excinfo.value.status == 503
+    assert excinfo.value.retry_after == "2"
+    assert fake.calls == []
+
+
 # ── (a) non-stream 429 sur A → retry B → OK ────────────────────────────────
 @pytest.mark.asyncio
 async def test_non_stream_429_retries_fresh_station(free_vpn_env, free_cfg, monkeypatch):

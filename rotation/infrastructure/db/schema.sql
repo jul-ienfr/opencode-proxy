@@ -368,3 +368,171 @@ CREATE TABLE IF NOT EXISTS scan_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_scan_attempts_run
     ON scan_attempts(run_id);
+
+-- Qualification queue (feature 014).  One row per catalog hostname, one
+-- append-only row per (hostname, transport, round), one epoch per sweep.
+CREATE TABLE IF NOT EXISTS qualification_candidates (
+    hostname            TEXT PRIMARY KEY,
+    provider            TEXT NOT NULL DEFAULT 'nordvpn',
+    country             TEXT NOT NULL DEFAULT '',
+    city                TEXT NOT NULL DEFAULT '',
+    load                REAL NOT NULL DEFAULT 0,
+    status              TEXT NOT NULL DEFAULT 'pending',
+    transports          TEXT NOT NULL DEFAULT '[]',
+    transport_cursor    TEXT NOT NULL DEFAULT '',
+    transport_round     INTEGER NOT NULL DEFAULT 0,
+    potential_score     REAL NOT NULL DEFAULT 0,
+    measured_score      REAL NOT NULL DEFAULT 0,
+    rtt_ms              REAL,
+    quota_remaining     INTEGER,
+    quota_reset_at      REAL,
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    infra_failures      INTEGER NOT NULL DEFAULT 0,
+    success_count       INTEGER NOT NULL DEFAULT 0,
+    fail_count          INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at     REAL,
+    last_result         TEXT NOT NULL DEFAULT '',
+    last_egress_ip      TEXT NOT NULL DEFAULT '',
+    last_transport      TEXT NOT NULL DEFAULT '',
+    next_eligible_at    REAL NOT NULL DEFAULT 0,
+    epoch_id            TEXT NOT NULL DEFAULT '',
+    lease_until         REAL NOT NULL DEFAULT 0,
+    skipped_reason      TEXT NOT NULL DEFAULT '',
+    source_id           TEXT NOT NULL DEFAULT '',
+    first_seen_at       REAL NOT NULL,
+    last_seen_at        REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    meta_json           TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_qual_order
+    ON qualification_candidates(status, next_eligible_at, potential_score DESC);
+CREATE INDEX IF NOT EXISTS idx_qual_country
+    ON qualification_candidates(country, status);
+CREATE INDEX IF NOT EXISTS idx_qual_epoch
+    ON qualification_candidates(epoch_id, status);
+
+CREATE TABLE IF NOT EXISTS qualification_attempts (
+    attempt_id      TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL DEFAULT '',
+    epoch_id        TEXT NOT NULL DEFAULT '',
+    station         INTEGER NOT NULL DEFAULT 0,
+    hostname        TEXT NOT NULL,
+    transport       TEXT NOT NULL DEFAULT '',
+    round           INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL,
+    egress_ip       TEXT NOT NULL DEFAULT '',
+    latency_ms      REAL NOT NULL DEFAULT 0,
+    rtt_ms          REAL NOT NULL DEFAULT 0,
+    dns_ms          REAL NOT NULL DEFAULT 0,
+    connect_ms      REAL NOT NULL DEFAULT 0,
+    handshake_ms    REAL NOT NULL DEFAULT 0,
+    endpoint_ip     TEXT NOT NULL DEFAULT '',
+    reset_at        REAL NOT NULL DEFAULT 0,
+    retry_after_s   REAL NOT NULL DEFAULT 0,
+    error           TEXT NOT NULL DEFAULT '',
+    validation      TEXT NOT NULL DEFAULT '',
+    started_at      REAL NOT NULL,
+    finished_at     REAL NOT NULL,
+    provider        TEXT NOT NULL DEFAULT 'nordvpn'
+);
+CREATE INDEX IF NOT EXISTS idx_attempt_host
+    ON qualification_attempts(hostname, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_attempt_epoch
+    ON qualification_attempts(epoch_id, status);
+CREATE INDEX IF NOT EXISTS idx_attempt_station
+    ON qualification_attempts(station, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS transport_health (
+    transport       TEXT NOT NULL,
+    station         INTEGER NOT NULL DEFAULT 0,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    successes       INTEGER NOT NULL DEFAULT 0,
+    quota           INTEGER NOT NULL DEFAULT 0,
+    infra           INTEGER NOT NULL DEFAULT 0,
+    latency_p50_ms  REAL,
+    success_rate    REAL NOT NULL DEFAULT 0,
+    degraded        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT NOT NULL DEFAULT '',
+    updated_at      REAL NOT NULL,
+    PRIMARY KEY (transport, station)
+);
+CREATE INDEX IF NOT EXISTS idx_transport_health_degraded
+    ON transport_health(degraded, transport);
+
+CREATE TABLE IF NOT EXISTS qualification_epochs (
+    epoch_id        TEXT PRIMARY KEY,
+    provider        TEXT NOT NULL DEFAULT 'nordvpn',
+    status          TEXT NOT NULL DEFAULT 'running',
+    total           INTEGER NOT NULL DEFAULT 0,
+    tested          INTEGER NOT NULL DEFAULT 0,
+    usable          INTEGER NOT NULL DEFAULT 0,
+    quota           INTEGER NOT NULL DEFAULT 0,
+    infra           INTEGER NOT NULL DEFAULT 0,
+    dead            INTEGER NOT NULL DEFAULT 0,
+    skipped         INTEGER NOT NULL DEFAULT 0,
+    cursor          TEXT NOT NULL DEFAULT '',
+    started_at      REAL NOT NULL,
+    finished_at     REAL,
+    reason          TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_epoch_status
+    ON qualification_epochs(status, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS station_runtime (
+    station             INTEGER PRIMARY KEY,
+    state               TEXT NOT NULL DEFAULT 'idle',
+    current_option_key  TEXT NOT NULL DEFAULT '',
+    current_egress_ip   TEXT NOT NULL DEFAULT '',
+    current_transport   TEXT NOT NULL DEFAULT '',
+    standby_option_key  TEXT NOT NULL DEFAULT '',
+    standby_egress_ip   TEXT NOT NULL DEFAULT '',
+    standby_transport   TEXT NOT NULL DEFAULT '',
+    lease_until         REAL NOT NULL DEFAULT 0,
+    last_cutover_at     REAL,
+    cutover_ms          REAL,
+    availability_1h     REAL NOT NULL DEFAULT 0,
+    availability_24h    REAL NOT NULL DEFAULT 0,
+    last_reason         TEXT NOT NULL DEFAULT '',
+    updated_at          REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS station_cutovers (
+    cutover_id       TEXT PRIMARY KEY,
+    station          INTEGER NOT NULL,
+    from_option_key  TEXT NOT NULL DEFAULT '',
+    from_egress_ip   TEXT NOT NULL DEFAULT '',
+    to_option_key    TEXT NOT NULL DEFAULT '',
+    to_egress_ip     TEXT NOT NULL DEFAULT '',
+    transport        TEXT NOT NULL DEFAULT '',
+    started_at       REAL NOT NULL,
+    committed_at     REAL,
+    finished_at      REAL,
+    duration_ms      REAL,
+    result           TEXT NOT NULL DEFAULT 'pending',
+    reason           TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_cutover_station
+    ON station_cutovers(station, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS watchdog_state (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    heartbeat_at REAL NOT NULL DEFAULT 0,
+    last_run_at  REAL,
+    status       TEXT NOT NULL DEFAULT 'idle',
+    error        TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS discovery_runs (
+    id                  TEXT PRIMARY KEY,
+    source              TEXT NOT NULL DEFAULT '',
+    started_at          REAL NOT NULL,
+    finished_at         REAL,
+    status              TEXT NOT NULL DEFAULT 'running',
+    server_count        INTEGER NOT NULL DEFAULT 0,
+    transport_count     INTEGER NOT NULL DEFAULT 0,
+    stale               INTEGER NOT NULL DEFAULT 0,
+    catalog_fetched_at  REAL,
+    error               TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_started
+    ON discovery_runs(started_at DESC);

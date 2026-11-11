@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = ROOT / "logs" / "registry.db"

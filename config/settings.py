@@ -108,7 +108,10 @@ def load_yaml_config() -> dict:
 
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
-            _yaml_data = yaml.safe_load(f) or {}
+            # [perf boot] libyaml (CSafeLoader) parse config.yaml ~10x plus
+            # vite que le loader Python ; fallback pur si absent.
+            _loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+            _yaml_data = yaml.load(f, Loader=_loader) or {}
         try:
             _config_yaml_mtime = os.path.getmtime(CONFIG_PATH)
         except OSError:
@@ -493,6 +496,8 @@ FREE_MODEL_MAP = yaml_get("free_model_map", default={})
 
 # ── IP rotation (OpenVPN for free model quota) ────────────────────
 IP_ROTATION = yaml_get("ip_rotation", default={})
+EGRESS_CATALOG = yaml_get("egress_catalog", default={}) or {}
+
 
 # [audit 2026-10-30] If the tracked YAML still carries the control key and
 # the supported source (.env / process env) provides it, scrub the file once.

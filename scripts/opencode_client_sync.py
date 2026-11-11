@@ -119,7 +119,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
             _CAPTURED.append(
                 {
                     "path": self.path,
-                    "headers": {key: value for key, value in self.headers.items()},
+                    "headers": dict(self.headers.items()),
                     "body_raw": raw.decode("utf-8", "replace"),
                     "body": parsed,
                     "at": time.time(),

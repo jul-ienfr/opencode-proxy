@@ -73,9 +73,9 @@ def _full_request_row(
     to=22,
     tc=33,
 ) -> tuple:
-    """Tuple SQL complet (36 colonnes) au format `_INSERT_REQUESTS_SQL`.
+    """Tuple SQL complet (39 colonnes) au format `_INSERT_REQUESTS_SQL`.
 
-    Le writer reçoit toujours un tuple de 36 valeurs : un tuple court fait
+    Le writer reçoit toujours un tuple de 39 valeurs : un tuple court fait
     échouer l'INSERT (item sauté, batch vide) — piège rencontré en écrivant
     ces tests, d'où ce constructeur explicite.
     """
@@ -116,13 +116,16 @@ def _full_request_row(
         None,
         None,
         None,  # ttfb_ms / stop_reason / aborted / server_host
+        None,
+        None,
+        None,  # client_request_id / attempt_no / final_status
     )
 
 
-def test_full_request_row_has_36_columns():
+def test_full_request_row_has_39_columns():
     """Garde-fou : le layout de test doit correspondre au schéma réel."""
-    assert len(_full_request_row()) == 36
-    assert odb._INSERT_REQUESTS_SQL.count("?") == 36
+    assert len(_full_request_row()) == 39
+    assert odb._INSERT_REQUESTS_SQL.count("?") == 39
 
 
 # ── 1. token_counters_daily ──────────────────────────────────────────

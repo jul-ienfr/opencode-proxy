@@ -324,6 +324,10 @@ Autres correctifs :
   WireGuard une heure ; les autres passent en OpenVPN au lieu de la
   déloger. `CatalogClaims.acquire_transport/renew_transport/
   release_transport` ; test dans `tests/test_catalog_claims.py`.
+  **Addendum 2026-11-10 : règle retirée.** Chaque station peut utiliser
+  WireGuard, OpenVPN UDP et OpenVPN TCP indépendamment ; la table
+  `transport_leases`, les méthodes de bail et `shared_wireguard_key` ont été
+  supprimés. Seule l'unicité d'IP reste globale (constitution VI).
 - **Backoff pays temporaire** : après 3 échecs dans le même pays pendant un
   run, le pays est mis de côté 30 min (`abandoned`, pas un quota permanent).
   C'est ce qui a fait sortir les chaînes de la Suisse, où elles tournaient
@@ -398,11 +402,12 @@ quota n'est pas déjà consommé ; aucun 200 n'est déclaré avant preuve.
   (repli après 2 échecs, reset sur bind réussi). Tests :
   `tests/test_ip_registry_dns.py`.
 - **D-01 — migration des claims** : `rotation/infrastructure/db/claims.py`
-  copie `catalog`, `claims`, `rebind_budget`, `transport_leases` dans
-  `logs/registry.db` (idempotent). La maintenance du superviseur migre au
-  boot ; `fresh_chain` et le superviseur utilisent désormais
-  `logs/registry.db` par défaut. Migration live vérifiée : **9788 catalog /
-  3223 claims**, ancien `catalog_claims.db` renommé `.migrated`, chaîne
+  copie `catalog`, `claims`, `rebind_budget` dans `logs/registry.db`
+  (idempotent ; `transport_leases` retirée le 2026-11-10). La maintenance du
+  superviseur migre au boot ; `fresh_chain` et le superviseur utilisent
+  désormais `logs/registry.db` par défaut. Migration live vérifiée :
+  **9788 catalog / 3223 claims**, ancien `catalog_claims.db` renommé
+  `.migrated`, chaîne
   station 1 sur `db=...\\logs\\registry.db`.
 - **D-01 — migration de l’état de rotation** : `free/chain_state.py` porte
   désormais les documents `fresh_chain_state*.json`, `shared_rotation.json`,

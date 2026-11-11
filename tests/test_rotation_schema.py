@@ -45,9 +45,9 @@ def _seed_server(conn):
 
 
 def test_schema_is_idempotent_and_versioned(db):
-    assert current_version(db) == 2
+    assert current_version(db) == 3
     apply_schema(db, now=1001.0)
-    assert current_version(db) == 2
+    assert current_version(db) == 3
     tables = {
         row[0]
         for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -69,6 +69,13 @@ def test_schema_is_idempotent_and_versioned(db):
         "incidents",
         "station_state",
         "score_snapshots",
+        "qualification_candidates",
+        "qualification_attempts",
+        "qualification_epochs",
+        "transport_health",
+        "station_runtime",
+        "watchdog_state",
+        "discovery_runs",
     }.issubset(tables)
 
 

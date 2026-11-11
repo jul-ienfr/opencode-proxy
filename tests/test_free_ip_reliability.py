@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 import free.pool as fp
 from free.pool import Socks5Endpoint
 
@@ -21,7 +23,7 @@ class _Station:
         self.socks5_url = f"socks5://127.0.0.1:{1080 + sid}"
 
 
-def _pool(monkeypatch, *, profile=None, inflight=2, slot_wait=0.05):
+def _pool(monkeypatch, *, profile=None, inflight=2, slot_wait=0.05, fail_closed=True):
     values = {
         "quota_per_ip_by_model": profile or {},
         "bad_ip_ttl_s": 1800,
@@ -31,6 +33,8 @@ def _pool(monkeypatch, *, profile=None, inflight=2, slot_wait=0.05):
         "model_global_cooldown_s": 60,
         "max_inflight_per_model_ip": inflight,
         "model_slot_wait_s": slot_wait,
+        "model_slot_fail_closed": fail_closed,
+        "model_slot_retry_after_s": 2,
     }
 
     def fake_yaml(section, key, default=None):
@@ -157,9 +161,23 @@ async def test_model_slot_limits_concurrency_and_releases(monkeypatch):
     st = _Station()
     first = await pool.acquire_model_slot("m", st)
     assert first is not None
-    second = await pool.acquire_model_slot("m", st)
-    assert second is None
+    # [P0 2026-11-10] Fail-closed : le second appel lève au lieu de rendre
+    # None (l'ancien fail-open contournait le plafond sous rafale).
+    with pytest.raises(fp.ModelSlotTimeout) as excinfo:
+        await pool.acquire_model_slot("m", st)
+    assert excinfo.value.retry_after_s >= 1.0
     pool.release_model_slot(first)
     third = await pool.acquire_model_slot("m", st)
     assert third is not None
     pool.release_model_slot(third)
+    assert pool.slot_wait_stats()["rejections"] == 1
+
+
+async def test_model_slot_fail_open_is_opt_in(monkeypatch):
+    pool = _pool(monkeypatch, inflight=1, slot_wait=0.05, fail_closed=False)
+    st = _Station()
+    first = await pool.acquire_model_slot("m", st)
+    assert first is not None
+    assert await pool.acquire_model_slot("m", st) is None
+    pool.release_model_slot(first)
+    assert pool.slot_wait_stats()["rejections"] == 0

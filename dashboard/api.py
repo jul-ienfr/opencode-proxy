@@ -16,8 +16,8 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import Query, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import config.settings as config_settings
@@ -29,17 +29,20 @@ from config import (
     MODELS,
     PORT,
     PROXY,
+    WEB_SEARCH_NATIVE_MODELS,
     apply_server_changes,
     save_api_keys,
     save_custom_routes,
     save_env,
 )
+from config.settings import validate_custom_routes as _validate_custom_routes
 
 # [Phase 2 refonte] domicile canonique : observability.capture (traffic_capture.py = shim).
 from observability.capture import capture as _traffic_capture
 
 from .display import debug as _debug
 from .display import log_lines
+from .display import set_debug_log_file as _set_debug_log_file
 from .events import get_event_manager
 from .quota import (
     SWR_MAX_AGE_S,
@@ -122,6 +125,11 @@ _stats_cache = _TTLCache(ttl=2.0)
 # COUNT de pagination — invalidés par DELETE /api/history.
 _filters_cache: dict | None = None
 _tools_provider = None  # set[str] des tools utilisés, maintenu côté writer proxy
+
+
+def _set_filters_cache(value: dict | None) -> None:
+    global _filters_cache
+    _filters_cache = value
 _shared_conn = None  # connexion sqlite partagée du proxy (écritures)
 
 # Cache for local IP resolution (rarely changes)
@@ -157,6 +165,11 @@ def _traffic_apply_lazy() -> None:
     wanted = bool(_traffic_user_enabled and watched)
     if _traffic_capture.enabled != wanted:
         _traffic_capture.configure(enabled=wanted)
+
+
+def _set_traffic_user_enabled(value: bool) -> None:
+    global _traffic_user_enabled
+    _traffic_user_enabled = bool(value)
 
 
 # ── Dashboard auth (opt-in via DASHBOARD_TOKEN env) ──
@@ -235,6 +248,11 @@ def _config_yaml_mtime() -> float:
 
 
 _config_yaml_known_mtime = _config_yaml_mtime()
+
+
+def _set_config_yaml_known_mtime(value: float) -> None:
+    global _config_yaml_known_mtime
+    _config_yaml_known_mtime = float(value)
 
 
 def _check_dashboard_token(request: Request):
@@ -645,6 +663,14 @@ def _free_model_id_set() -> set[str]:
             return set()
 
 
+def _pricing_config() -> dict:
+    try:
+        value = config_settings._yaml_data.get("pricing")
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
 def _compute_costs(rows, pricing: dict | None = None) -> dict:
     """[v10 §12.3.10] Coût payant + économies free à partir de lignes agrégées.
 
@@ -947,6 +973,8 @@ def _persist_vpn_config(updates: dict):
                 "country_offset_stride": "country_offset_stride",
                 "egress_allow_any_country": "egress_allow_any_country",
                 "free_model_spread": "free_model_spread",
+                # [public-proxies] feed/worker lifecycle block.
+                "public_proxies": "public_proxies",
                 "ip_check_url": "ip_check_url",
                 "circuit_breaker_threshold": "circuit_breaker_threshold",
                 "circuit_breaker_recovery": "circuit_breaker_recovery",
@@ -1504,6 +1532,23 @@ def _dashboard_managers() -> list:
         return []
 
 
+def _dashboard_egress_catalog():
+    """The catalog runtime installed by the lifespan (None when disabled)."""
+    try:
+        import shared_state
+
+        return getattr(shared_state, "egress_catalog_runtime", None)
+    except Exception:
+        return None
+
+
+def _qualification_db_path() -> str:
+    """Registry path used by the qualification read models."""
+    runtime = _dashboard_egress_catalog()
+    store = getattr(runtime, "store", None)
+    return str(getattr(store, "path", "logs/registry.db"))
+
+
 def _egress_observed_counts() -> dict[str, int]:
     """Requêtes assignées par provider (cumul pool) pour le conseiller 010."""
     pool = _dashboard_pool()
@@ -1722,10 +1767,18 @@ def _apply_socks5_rows(rows: list, *, action: str = "socks5_update") -> dict | N
     return None
 
 
+def _https_manual_rows(pool) -> list:
+    """Lignes HTTPS gérées par l'opérateur (jamais les endpoints publics)."""
+    rows = getattr(pool, "_manual_https_proxies", None)
+    if rows is None:
+        rows = getattr(pool, "_https_proxies", None) or []
+    return list(rows)
+
+
 def _https_payload(pool) -> list:
     """HTTPS CONNECT proxy rows for the GUI. Passwords never leave the
     server; the browser only learns whether one is set."""
-    rows = getattr(pool, "_https_proxies", None) or []
+    rows = _https_manual_rows(pool)
     out = []
     for r in rows:
         if not isinstance(r, dict):
@@ -2254,1345 +2307,143 @@ def register_dashboard(
             return data
         return None
 
-    @app.get("/")
-    async def root():
-        data = _load_index()
-        if data is not None:
-            return Response(content=data, media_type="text/html; charset=utf-8")
-        # Aucun front lisible. Un FileResponse sur un fichier absent ferait
-        # échouer l'envoi (500 opaque) : on préfère une erreur lisible qui
-        # indique comment régénérer le bundle.
-        return Response(
-            content=("Dashboard UI introuvable : lancez `npm run build` dans dashboard-ui/ (sortie : static/dist/)."),
-            status_code=503,
-            media_type="text/plain; charset=utf-8",
-        )
+    from dashboard.routers.root_routes import register_root_route
+
+    register_root_route(app, index_loader=lambda: _load_index())
 
     # ── Config endpoints ──
 
-    @app.get("/api/config")
-    async def get_config(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        routes_info = {}
-        for name, info in config_settings.ROUTES.items():
-            routes_info[name] = {
-                "match": info["match"],
-                "model": info["model"],
-            }
-        # Fast path: local_ips and models are slow (socket, disk), return cached/instant
-        models_info: Any
-        try:
-            models_info = get_available_models()
-        except Exception:
-            models_info = []
-        # local_ips: use cache if available, otherwise don't block (empty, next poll will fill)
-        try:
-            if _local_ips_cache and (time.monotonic() - _local_ips_cache[0]) < 60:
-                local_ips = _local_ips_cache[1]
-            else:
-                # don't await — return cached or empty, refresh in background
-                local_ips = _local_ips_cache[1] if _local_ips_cache else []
-                try:
-                    asyncio.create_task(asyncio.to_thread(_get_local_ips))
-                except Exception:
-                    pass
-        except Exception:
-            local_ips = []
-        _mgr = server_manager_getter() if server_manager_getter else None
-        try:
-            _port = int(getattr(_mgr, "port", PORT)) if _mgr else PORT
-        except (TypeError, ValueError):
-            _port = PORT
-        _free_policy = config_settings.get_free_substitution_policy()
-        _free_map = config_settings.FREE_MODEL_MAP or {}
-        # [2026-10-29] Le mapping explicite est souverain : la politique ne
-        # filtre que les candidats automatiques. L'API doit refléter ce que le
-        # proxy applique réellement (sinon le GUI affichait « ignoré » un
-        # mapping pourtant utilisé, ou l'inverse).
-        _free_map_effective = dict(_free_map)
-        try:
-            from config.model_tier import tier_counts as _tier_counts
+    from dashboard.routers.config_routes import register_config_routes
 
-            _model_counts = _tier_counts(models_info.values() if isinstance(models_info, dict) else ())
-        except Exception:
-            _model_counts = {
-                "total": len(models_info) if isinstance(models_info, dict) else 0,
-                "free": 0,
-                "paid": 0,
-                "paid_free_fallback": 0,
-                "paid_free_ignored": 0,
-                "unknown": 0,
-                "route_mismatch": 0,
-                "catalog_mismatch": 0,
-            }
-        return {
-            "proxy": PROXY or "",
-            "api_key_set": bool(API_KEY),
-            "api_key_masked": (API_KEY[:4] + "****" + API_KEY[-4:])
-            if API_KEY and len(API_KEY) > 8
-            else ("****" if API_KEY else ""),
-            "host": HOST,
-            "port": _port,
-            "local_ips": local_ips,
-            "routes": routes_info,
-            "models": models_info,
-            "model_counts": _model_counts,
-            "model_limits": get_model_limits_for_all(models_info),
-            "model_capabilities": get_model_capabilities_for_all(models_info),
-            "proxy_running": server_manager_getter().is_running
-            if server_manager_getter and server_manager_getter()
-            else True,
-            "disable_mapping": config_settings.DISABLE_MAPPING,
-            "custom_routes": config_settings.CUSTOM_ROUTES,
-            "go_workspace_id_set": bool(config_settings.OPENCODE_GO_WORKSPACE_ID),
-            # [plan v10 §14.2.2] ≤4 chars = valeur EN CLAIR sinon — toujours masquer
-            "go_workspace_id_masked": (
-                config_settings.OPENCODE_GO_WORKSPACE_ID[:4] + "****"
-                if len(config_settings.OPENCODE_GO_WORKSPACE_ID) > 4
-                else "****"
+    register_config_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        settings=config_settings,
+        get_models=lambda: get_available_models(),
+        local_ips_cache_getter=lambda: _local_ips_cache,
+        get_local_ips=lambda: _get_local_ips(),
+        default_port=PORT,
+        proxy_getter=lambda: PROXY,
+        api_key_getter=lambda: API_KEY,
+        host_getter=lambda: HOST,
+        api_keys_getter=lambda: API_KEYS,
+        api_key_routing_getter=lambda: API_KEY_ROUTING,
+        model_limits=lambda models: get_model_limits_for_all(models),
+        model_capabilities=lambda models: get_model_capabilities_for_all(models),
+        save_env=lambda updates: save_env(updates),
+        apply_server_changes=lambda **kwargs: apply_server_changes(**kwargs),
+        server_manager_getter=(
+            lambda: server_manager_getter() if server_manager_getter else None
+        ),
+        debug=lambda message: _debug(message),
+    )
+
+    from dashboard.routers.route_table_routes import register_route_table_routes
+
+    register_route_table_routes(
+        app,
+        settings=config_settings,
+    )
+
+    from dashboard.routers.geo_routes import register_geo_routes
+
+    register_geo_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        settings=config_settings,
+        config_yaml_mtime=lambda: _config_yaml_mtime(),
+        config_yaml_known_mtime_setter=_set_config_yaml_known_mtime,
+        root=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+
+    from dashboard.routers.config_extra_routes import register_config_extra_routes
+
+    register_config_extra_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        settings=config_settings,
+        models_getter=lambda: MODELS,
+        native_models=WEB_SEARCH_NATIVE_MODELS,
+        yaml_get=lambda *args, **kwargs: config_settings.yaml_get(*args, **kwargs),
+        yaml_set=lambda *args, **kwargs: config_settings.yaml_set(*args, **kwargs),
+        validate_custom_routes=lambda body: _validate_custom_routes(body),
+        save_custom_routes=lambda body: save_custom_routes(body),
+        api_keys_getter=lambda: API_KEYS,
+        api_key_routing_getter=lambda: API_KEY_ROUTING,
+        merge_preserved_api_keys=(
+            lambda rows, replace=False: _merge_preserved_api_keys(
+                rows,
+                replace=replace,
             )
-            if config_settings.OPENCODE_GO_WORKSPACE_ID
-            else "",
-            "go_auth_cookie_set": bool(config_settings.OPENCODE_GO_AUTH_COOKIE),
-            "go_auth_cookie_masked": (config_settings.OPENCODE_GO_AUTH_COOKIE[:6] + "****")
-            if config_settings.OPENCODE_GO_AUTH_COOKIE and len(config_settings.OPENCODE_GO_AUTH_COOKIE) > 6
-            else (""),
-            "api_keys": [
-                {
-                    "api_key_masked": (k["api_key"][:4] + "****" + k["api_key"][-4:])
-                    if len(k.get("api_key", "")) > 8
-                    else "****",
-                    "go_workspace_id_masked": (k.get("go_workspace_id", "")[:4] + "****")
-                    if len(k.get("go_workspace_id", "")) > 4
-                    else "",
-                    "go_auth_cookie_masked": (k.get("go_auth_cookie", "")[:6] + "****")
-                    if len(k.get("go_auth_cookie", "")) > 6
-                    else "",
-                    # Finding i: never ship full secrets to the browser. The UI
-                    # (static/app.js) shows *_masked placeholders and posts ''
-                    # for unchanged fields — the merge in update_api_keys_config
-                    # keeps the stored value when a posted secret is empty.
-                    "enabled": k.get("enabled", True),
-                    "alias": k.get("alias", ""),
-                }
-                for k in API_KEYS
-            ],
-            "routing": API_KEY_ROUTING,
-            "free_parallel": dict(getattr(config_settings, "FREE_PARALLEL", {})),
-            "free_substitution_policy": _free_policy,
-            "free_model_map": _free_map,
-            "free_model_map_effective": _free_map_effective,
-            "lang": os.getenv("PROXY_LANG", "en"),
-        }
-
-    @app.get("/api/routes")
-    async def get_routes(request: Request, q: str = None, geo_status: str = None, limit: int = 50, offset: int = 0):
-        """Routes with geo enrichment + pagination (vivid-hinton P4)."""
-        limit = max(1, min(200, int(limit or 50)))
-        offset = max(0, int(offset or 0))
-        items = []
-        for key, route in config_settings.ROUTES.items():
-            try:
-                g = config_settings.resolve_geo(route)
-            except Exception:
-                g = {
-                    "effective_allowed": set(),
-                    "mode": "strict",
-                    "require_vpn": False,
-                    "geo_status": "ok",
-                }
-            status = str(g.get("geo_status", "ok"))
-            if geo_status and status != geo_status:
-                continue
-            if q and q.lower() not in key.lower() and q.lower() not in str(route.get("model", "")).lower():
-                continue
-            eff = g.get("effective_allowed", set())
-            items.append(
-                {
-                    "key": key,
-                    "match": route.get("match", []),
-                    "model": route.get("model", ""),
-                    "thinking": route.get("thinking"),
-                    "geo": route.get("geo"),
-                    "geo_status": status,
-                    "effective_allowed": sorted(eff) if isinstance(eff, set) else [],
-                    "mode": g.get("mode", "strict"),
-                    "require_vpn": bool(g.get("require_vpn", False)),
-                }
-            )
-        total = len(items)
-        page = items[offset : offset + limit]
-        return {
-            "routes": page,
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "has_more": offset + limit < total,
-        }
-
-    @app.get("/api/geo-policies")
-    async def get_geo_policies(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        return {
-            "enabled": bool(getattr(config_settings, "GEO_ENABLED", False)),
-            "version": int(getattr(config_settings, "GEO_VERSION", 1) or 1),
-            "policies": dict(getattr(config_settings, "GEO_POLICIES", {}) or {}),
-            "allow_direct_when_compatible": bool(getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)),
-        }
-
-    @app.put("/api/geo-policies")
-    async def put_geo_policies(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        # X-API-Key control-server guard + If-Match ETag
-        ctrl_key = str(config_settings.yaml_get("ip_rotation", "control_api_key", "") or "").strip()
-        provided_ctrl = request.headers.get("X-API-Key", "")
-        if ctrl_key and provided_ctrl != ctrl_key:
-            return JSONResponse(
-                status_code=401,
-                content={"error": "unauthorized", "message": "X-API-Key valide requise"},
-            )
-        # ETag via mtime
-        current_mtime = _config_yaml_mtime()
-        etag = str(int(current_mtime))
-        if_match = request.headers.get("If-Match", "")
-        if if_match and if_match != etag and if_match != f'"{etag}"':
-            return JSONResponse(
-                status_code=412,
-                content={
-                    "error": "precondition_failed",
-                    "message": "ETag obsolète — rechargez et réessayez",
-                },
-            )
-        body = await request.json()
-        # Validate schema
-        if "enabled" in body:
-            config_settings.GEO_ENABLED = bool(body["enabled"])
-            config_settings._yaml_data.setdefault("geo", {})["enabled"] = bool(body["enabled"])
-        if "version" in body:
-            try:
-                config_settings.GEO_VERSION = int(body["version"])
-                config_settings._yaml_data.setdefault("geo", {})["version"] = int(body["version"])
-            except Exception:
-                return JSONResponse(status_code=400, content={"error": "version doit être un entier"})
-        if "policies" in body:
-            pol = body["policies"]
-            if not isinstance(pol, dict):
-                return JSONResponse(status_code=400, content={"error": "policies doit être un objet"})
-            config_settings.GEO_POLICIES.clear()
-            config_settings.GEO_POLICIES.update(pol)
-            config_settings.SORTED_GEO_POLICIES[:] = sorted(pol.items())
-            config_settings._yaml_data.setdefault("geo", {})["policies"] = dict(pol)
-        if "allow_direct_when_compatible" in body:
-            val = bool(body["allow_direct_when_compatible"])
-            config_settings.GEO_ALLOW_DIRECT_WHEN_COMPATIBLE = val
-            config_settings._yaml_data.setdefault("geo", {})["allow_direct_when_compatible"] = val
-        # persist
-        try:
-            config_settings.save_yaml_config()
-            global _config_yaml_known_mtime
-            _config_yaml_known_mtime = _config_yaml_mtime()
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"error": str(e)})
-        return {
-            "ok": True,
-            "enabled": bool(config_settings.GEO_ENABLED),
-            "version": int(config_settings.GEO_VERSION),
-            "allow_direct_when_compatible": bool(config_settings.GEO_ALLOW_DIRECT_WHEN_COMPATIBLE),
-            "etag": str(int(_config_yaml_mtime())),
-        }
-
-    @app.post("/api/geo-policies/rollback")
-    async def geo_rollback(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        # Rollback = toggle enabled off (kill-switch) — simple N-1 without history
-        config_settings.GEO_ENABLED = False
-        config_settings._yaml_data.setdefault("geo", {})["enabled"] = False
-        try:
-            config_settings.save_yaml_config()
-            global _config_yaml_known_mtime
-            _config_yaml_known_mtime = _config_yaml_mtime()
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"error": str(e)})
-        return {"ok": True, "enabled": False}
-
-    @app.get("/api/geo/notifications")
-    async def get_geo_notifications(request: Request):
-        """Last geo fallback warnings (direct → VPN) for badge/tray toast polling."""
-        try:
-            import json as _js
-
-            p = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "geo_notifications.json"
-            )
-            if not os.path.exists(p):
-                return {"notifications": []}
-            with open(p, encoding="utf-8") as _f:
-                data = _js.load(_f) or []
-            # also enrich with live direct IP/country for current banner
-            try:
-                from opencode import _direct_country_cache, _direct_ip_cache
-
-                current = {
-                    "direct_country": _direct_country_cache.get("country", ""),
-                    "direct_ip": _direct_country_cache.get("ip", "") or _direct_ip_cache.get("ip", ""),
-                }
-            except Exception:
-                current = {}
-            return {"notifications": data[-20:], "current": current}
-        except Exception as e:
-            return {"notifications": [], "error": str(e)}
-
-    @app.get("/api/config/custom-routes")
-    async def get_custom_routes():
-        return config_settings.CUSTOM_ROUTES
-
-    @app.post("/api/config/custom-routes")
-    async def update_custom_routes(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        # [v10 §14.2.5] validation schéma AVANT persistance (l'ancien code
-        # persistait du JSON brut → crash différé au prochain reload).
-        from config.settings import validate_custom_routes as _vcr
-
-        v_err = _vcr(body)
-        if v_err:
-            return JSONResponse(status_code=400, content={"error": f"custom_routes invalide: {v_err}"})
-        _debug(f"  [config] custom routes updated ({len(body)} routes)")
-        save_custom_routes(body)
-        return {"status": "ok", "message": "Custom routes updated."}
-
-    @app.get("/api/config/web-search")
-    async def get_web_search_config():
-        from config import WEB_SEARCH_NATIVE_MODELS, yaml_get
-
-        # web_search
-        ws_mode = yaml_get("web_search", "mode", "duckduckgo")
-        ws_target = yaml_get("web_search", "target_model", None)
-        ws_max = yaml_get("web_search", "max_results", 5)
-        ws_timeout = yaml_get("web_search", "timeout", 10)
-        ws_enabled = yaml_get("web_search", "enabled", True)
-        ws_via = yaml_get("web_search", "via_vpn", False)
-        ws_onerr = yaml_get("web_search", "on_error", "strip")
-        # web_fetch
-        wf_mode = yaml_get("web_fetch", "mode", "direct")
-        wf_target = yaml_get("web_fetch", "target_model", None)
-        wf_maxb = yaml_get("web_fetch", "max_bytes", 12000)
-        wf_timeout = yaml_get("web_fetch", "timeout", 15)
-        wf_enabled = yaml_get("web_fetch", "enabled", True)
-        wf_via = yaml_get("web_fetch", "via_vpn", False)
-        wf_onerr = yaml_get("web_fetch", "on_error", "strip")
-        return {
-            "mode": ws_mode,
-            "target_model": ws_target,
-            "max_results": ws_max,
-            "timeout": ws_timeout,
-            "enabled": bool(ws_enabled),
-            "via_vpn": bool(ws_via),
-            "on_error": ws_onerr,
-            "web_fetch": {
-                "mode": wf_mode,
-                "target_model": wf_target,
-                "max_bytes": wf_maxb,
-                "timeout": wf_timeout,
-                "enabled": bool(wf_enabled),
-                "via_vpn": bool(wf_via),
-                "on_error": wf_onerr,
-            },
-            "available_models": sorted(MODELS.keys()),
-            "modes": ["duckduckgo", "model", "ddg_then_model", "model_then_ddg"],
-            "web_fetch_modes": ["direct", "model", "direct_then_model"],
-            "native_models": WEB_SEARCH_NATIVE_MODELS,
-        }
-
-    @app.post("/api/config/web-search")
-    async def update_web_search_config(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        from config import yaml_set
-
-        # helper to coerce bool
-        def _to_bool(v):
-            if isinstance(v, bool):
-                return v
-            if isinstance(v, str):
-                return v.lower() in ("1", "true", "yes", "on")
-            return bool(v)
-
-        # web_search clamps
-        if "mode" in body:
-            m = str(body["mode"])
-            if m in ("duckduckgo", "model", "ddg_then_model", "model_then_ddg"):
-                yaml_set("web_search", "mode", m)
-            else:
-                _debug(f"  [config] web_search invalid mode {m!r} → ignored")
-        if "target_model" in body:
-            tm = body["target_model"]
-            if tm is None or tm in MODELS:
-                yaml_set("web_search", "target_model", tm)
-            else:
-                _debug(f"  [config] web_search invalid target_model {tm!r}")
-        if "max_results" in body:
-            try:
-                v = max(1, min(10, int(body["max_results"])))
-                yaml_set("web_search", "max_results", v)
-            except Exception:
-                pass
-        if "timeout" in body:
-            try:
-                v = max(5, min(30, int(body["timeout"])))
-                yaml_set("web_search", "timeout", v)
-            except Exception:
-                pass
-        if "enabled" in body:
-            yaml_set("web_search", "enabled", _to_bool(body["enabled"]))
-        if "via_vpn" in body:
-            yaml_set("web_search", "via_vpn", _to_bool(body["via_vpn"]))
-        if "on_error" in body and body["on_error"] == "strip":
-            yaml_set("web_search", "on_error", "strip")
-        # web_fetch via nested or flat
-        wf = body.get("web_fetch") if isinstance(body.get("web_fetch"), dict) else body
-        # detect if web_fetch fields present
-        if isinstance(wf, dict):
-            if "mode" in wf and wf is not body:
-                m = str(wf["mode"])
-                if m in ("direct", "model", "direct_then_model"):
-                    yaml_set("web_fetch", "mode", m)
-            elif "web_fetch_mode" in body:
-                m = str(body["web_fetch_mode"])
-                if m in ("direct", "model", "direct_then_model"):
-                    yaml_set("web_fetch", "mode", m)
-            # flat keys for web_fetch with prefix
-            if "web_fetch_target_model" in body:
-                tm = body["web_fetch_target_model"]
-                if tm is None or tm in MODELS:
-                    yaml_set("web_fetch", "target_model", tm)
-            if "target_model" in wf and wf is not body and "web_fetch" in body:
-                tm = wf["target_model"]
-                if tm is None or tm in MODELS:
-                    yaml_set("web_fetch", "target_model", tm)
-            if "max_bytes" in wf:
-                try:
-                    v = max(2000, min(50000, int(wf["max_bytes"])))
-                    yaml_set("web_fetch", "max_bytes", v)
-                except Exception:
-                    pass
-            if "web_fetch_max_bytes" in body:
-                try:
-                    v = max(2000, min(50000, int(body["web_fetch_max_bytes"])))
-                    yaml_set("web_fetch", "max_bytes", v)
-                except Exception:
-                    pass
-            if "timeout" in wf and wf is not body:
-                try:
-                    v = max(5, min(30, int(wf["timeout"])))
-                    yaml_set("web_fetch", "timeout", v)
-                except Exception:
-                    pass
-            if "web_fetch_timeout" in body:
-                try:
-                    v = max(5, min(30, int(body["web_fetch_timeout"])))
-                    yaml_set("web_fetch", "timeout", v)
-                except Exception:
-                    pass
-            if "enabled" in wf and wf is not body:
-                yaml_set("web_fetch", "enabled", _to_bool(wf["enabled"]))
-            if "web_fetch_enabled" in body:
-                yaml_set("web_fetch", "enabled", _to_bool(body["web_fetch_enabled"]))
-            if "via_vpn" in wf and wf is not body:
-                yaml_set("web_fetch", "via_vpn", _to_bool(wf["via_vpn"]))
-            if "web_fetch_via_vpn" in body:
-                yaml_set("web_fetch", "via_vpn", _to_bool(body["web_fetch_via_vpn"]))
-            if "on_error" in wf and wf is not body and wf["on_error"] == "strip":
-                yaml_set("web_fetch", "on_error", "strip")
-        _debug(
-            f"  [config] web search updated: mode={body.get('mode')}, model={body.get('target_model')} web_fetch={body.get('web_fetch')}"
-        )
-        return {"status": "ok", "message": "Web search config updated."}
-
-    @app.get("/api/config/web-fetch")
-    async def get_web_fetch_config():
-        from config import WEB_SEARCH_NATIVE_MODELS, yaml_get
-
-        return {
-            "mode": yaml_get("web_fetch", "mode", "direct"),
-            "target_model": yaml_get("web_fetch", "target_model", None),
-            "max_bytes": yaml_get("web_fetch", "max_bytes", 12000),
-            "timeout": yaml_get("web_fetch", "timeout", 15),
-            "enabled": bool(yaml_get("web_fetch", "enabled", True)),
-            "via_vpn": bool(yaml_get("web_fetch", "via_vpn", False)),
-            "on_error": yaml_get("web_fetch", "on_error", "strip"),
-            "available_models": sorted(MODELS.keys()),
-            "modes": ["direct", "model", "direct_then_model"],
-            "native_models": WEB_SEARCH_NATIVE_MODELS,
-        }
-
-    @app.post("/api/config/web-fetch")
-    async def update_web_fetch_config(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        from config import yaml_set
-
-        def _to_bool2(v):
-            if isinstance(v, bool):
-                return v
-            if isinstance(v, str):
-                return v.lower() in ("1", "true", "yes", "on")
-            return bool(v)
-
-        if "mode" in body and str(body["mode"]) in ("direct", "model", "direct_then_model"):
-            yaml_set("web_fetch", "mode", str(body["mode"]))
-        if "target_model" in body and (body["target_model"] is None or body["target_model"] in MODELS):
-            yaml_set("web_fetch", "target_model", body["target_model"])
-        if "max_bytes" in body:
-            try:
-                yaml_set("web_fetch", "max_bytes", max(2000, min(50000, int(body["max_bytes"]))))
-            except Exception:
-                pass
-        if "timeout" in body:
-            try:
-                yaml_set("web_fetch", "timeout", max(5, min(30, int(body["timeout"]))))
-            except Exception:
-                pass
-        if "enabled" in body:
-            yaml_set("web_fetch", "enabled", _to_bool2(body["enabled"]))
-        if "via_vpn" in body:
-            yaml_set("web_fetch", "via_vpn", _to_bool2(body["via_vpn"]))
-        if "on_error" in body and body["on_error"] == "strip":
-            yaml_set("web_fetch", "on_error", "strip")
-        return {"status": "ok", "message": "Web fetch config updated."}
-
-    @app.get("/api/config/api-keys")
-    async def get_api_keys_config(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        return {
-            "api_keys": [
-                {
-                    "api_key_masked": (k["api_key"][:4] + "****" + k["api_key"][-4:])
-                    if len(k.get("api_key", "")) > 8
-                    else "****",
-                    "has_go_workspace": bool(k.get("go_workspace_id")),
-                    "has_go_cookie": bool(k.get("go_auth_cookie")),
-                    # Finding i: never ship full secrets to the browser —
-                    # only presence flags + masked values. The UI posts ''
-                    # for unchanged secret fields; the merge below keeps the
-                    # stored value in that case.
-                    "enabled": k.get("enabled", True),
-                    "alias": k.get("alias", ""),
-                }
-                for k in API_KEYS
-            ],
-            "count": len(API_KEYS),
-            "routing": API_KEY_ROUTING,
-        }
-
-    @app.post("/api/config/api-keys")
-    async def update_api_keys_config(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        if "api_keys" in body:
-            _debug(f"  [config] API keys updated ({len(body['api_keys'])} keys)")
-            merged = _merge_preserved_api_keys(body["api_keys"], replace=bool(body.get("replace")))
-            save_api_keys(merged)
-            try:
-                import opencode as _oc
-
-                _oc._rebuild_key_cache()
-            except Exception as _e:
-                _debug(f"  [config] key cache rebuild failed: {_e}")
-        if "routing" in body:
-            save_env({"API_KEY_ROUTING": body["routing"]})
-            # [audit 2026-10-30] opencode imported API_KEY_ROUTING by value;
-            # save_env only updated config.settings, so the dashboard toggle
-            # had no effect until a restart.
-            try:
-                import opencode as _oc
-
-                _oc.API_KEY_ROUTING = str(body["routing"])
-            except Exception:
-                pass
-        return {"status": "ok", "message": "API keys saved."}
-
-    @app.post("/api/config")
-    async def update_config(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        env_updates = {}
-
-        if "routes" in body:
-            for route_name, model in body["routes"].items():
-                if route_name == "opus":
-                    env_updates["OPUS_MAP_MODEL"] = model
-                elif route_name == "sonnet":
-                    env_updates["SONNET_MAP_MODEL"] = model
-                elif route_name == "haiku":
-                    env_updates["HAIKU_MAP_MODEL"] = model
-
-        if "proxy" in body:
-            env_updates["OPENCODE_PROXY"] = body["proxy"]
-
-        if "disable_mapping" in body:
-            env_updates["DISABLE_MAPPING"] = "1" if body["disable_mapping"] else "0"
-
-        if "api_key" in body and body["api_key"]:
-            env_updates["OPENCODE_API_KEY"] = body["api_key"]
-
-        if "go_workspace_id" in body and body["go_workspace_id"]:
-            env_updates["OPENCODE_GO_WORKSPACE_ID"] = body["go_workspace_id"]
-
-        if "go_auth_cookie" in body and body["go_auth_cookie"]:
-            env_updates["OPENCODE_GO_AUTH_COOKIE"] = body["go_auth_cookie"]
-
-        if "routing" in body:
-            env_updates["API_KEY_ROUTING"] = body["routing"]
-            try:
-                import opencode as _oc
-
-                _oc.API_KEY_ROUTING = str(body["routing"])
-            except Exception:
-                pass
-
-        if "lang" in body:
-            env_updates["PROXY_LANG"] = body["lang"]
-
-        restart_needed = False
-
-        if "port" in body:
-            try:
-                new_port = int(body["port"])
-            except (ValueError, TypeError):
-                return {"status": "error", "message": "Valeur de port invalide"}
-            if not (1 <= new_port <= 65535):
-                return {"status": "error", "message": "Le port doit être entre 1 et 65535"}
-            if new_port != PORT:
-                env_updates["OPENCODE_PORT"] = str(new_port)
-                restart_needed = True
-
-        if "host" in body:
-            new_host = body["host"]
-            if new_host != HOST:
-                env_updates["OPENCODE_HOST"] = new_host
-                restart_needed = True
-
-        if env_updates:
-            save_env(env_updates)
-
-        if restart_needed:
-            apply_server_changes(
-                port=body.get("port"),
-                host=body.get("host"),
-            )
-            mgr = server_manager_getter() if server_manager_getter else None
-            if mgr:
-                # [fix ticket P1 incident 25/08] mgr.restart() ne doit JAMAIS
-                # s'exécuter sur la boucle uvicorn courante : stop() fait
-                # self._thread.join() → join du thread COURANT → RuntimeError
-                # avant start() = serveur mort (« shutdown OK, startup jamais
-                # relancé »). Même pattern que POST /api/proxy/restart :
-                # thread dédié qui survit au démontage.
-                import threading
-
-                def _do_restart():
-                    try:
-                        mgr.restart(
-                            port=body.get("port"),
-                            host=body.get("host"),
-                        )
-                    except Exception as e:
-                        _debug(f"  [config] hot-restart FAILED: {type(e).__name__}: {e}")
-
-                threading.Thread(
-                    target=_do_restart,
-                    name="proxy-restart",
-                    daemon=False,
-                ).start()
-
-        return {
-            "status": "ok",
-            "needs_restart": False,
-            "message": "Configuration mise à jour. Redémarrage à chaud déclenché."
-            if restart_needed
-            else "Configuration mise à jour.",
-        }
+        ),
+        save_api_keys=lambda rows: save_api_keys(rows),
+        save_env=lambda updates: save_env(updates),
+        debug=lambda message: _debug(message),
+    )
 
     # ── Proxy control ──
 
-    @app.get("/api/proxy/status")
-    async def proxy_status():
-        mgr = server_manager_getter() if server_manager_getter else None
-        # [port CLI] --port 4100 ne modifie que le PORT du module opencode ;
-        # le PORT importé ici reste celui du config.yaml (4000). Le manager
-        # porte le port RÉELLEMENT écouté : le dashboard doit l'afficher.
-        try:
-            effective_port = int(getattr(mgr, "port", PORT)) if mgr else PORT
-        except (TypeError, ValueError):
-            effective_port = PORT
-        if mgr:
-            return {"running": mgr.is_running, "port": effective_port}
-        return {"running": True, "port": effective_port}
+    from dashboard.routers.proxy_routes import register_proxy_routes
 
-    @app.post("/api/proxy/start")
-    async def proxy_start():
-        mgr = server_manager_getter() if server_manager_getter else None
-        if not mgr:
-            return {"status": "ok", "message": "Aucun gestionnaire de serveur disponible"}
-        if mgr.is_running:
-            return {"status": "ok", "message": "Déjà en cours"}
-        # [fix P1] start() dort jusqu'à 5 s (attente bind) — hors loop.
-        await asyncio.to_thread(mgr.start)
-        return {"status": "ok", "message": "Proxy démarré"}
+    register_proxy_routes(
+        app,
+        server_manager_getter=server_manager_getter,
+        default_port=PORT,
+    )
 
-    @app.post("/api/proxy/stop")
-    async def proxy_stop():
-        mgr = server_manager_getter() if server_manager_getter else None
-        if not mgr:
-            return {"status": "ok", "message": "Aucun gestionnaire de serveur disponible"}
-        if not mgr.is_running:
-            return {"status": "ok", "message": "Déjà arrêté"}
-        # [fix ticket P1] stop() joint le thread serveur : depuis la boucle
-        # uvicorn (ce handler), join(current_thread) lèverait RuntimeError.
-        await asyncio.to_thread(mgr.stop)
-        return {"status": "ok", "message": "Proxy arrêté"}
+    from dashboard.routers.stats_routes import register_stats_routes
 
-    @app.post("/api/proxy/restart")
-    async def proxy_restart(full: bool = False):
-        mgr = server_manager_getter() if server_manager_getter else None
-        if not mgr:
-            return {"status": "error", "message": "Aucun gestionnaire de serveur disponible"}
-        # [v10 fix P1 incident 25/08] Le handler tourne SUR la boucle uvicorn
-        # qu'on va éteindre : stop()+start() dans ce call-stack couraient
-        # contre le démontage de la boucle (serveur parfois laissé mort).
-        # Redémarrage sur THREAD DÉDIÉ + réponse immédiate — le thread survit
-        # au démontage et le start() s'exécute dans de bonnes conditions.
-        import threading
+    register_stats_routes(
+        app,
+        stats_cache=_stats_cache,
+        build_where=_build_where,
+        db_read_sync=_db_read_sync,
+        period_minutes=_period_minutes,
+        period_rates=_period_rates,
+        timestamp_format=_TS_FMT,
+    )
 
-        target = mgr.full_restart if full else mgr.restart
-        threading.Thread(target=target, name="proxy-restart", daemon=False).start()
-        msg = "Redémarrage complet déclenché" if full else "Redémarrage déclenché"
-        return {"status": "ok", "message": msg}
+    from dashboard.routers.debug_routes import register_debug_routes
 
-    # ── Stats & history ──
-
-    @app.get("/api/stats")
-    async def get_stats(
-        from_date: str = None,
-        to_date: str = None,
-        station: int = None,
-        # [perf/dashboard] Le front envoie `?from=&to=` (Stats.svelte) alors que
-        # l'endpoint historique attend `from_date`/`to_date` : les deux étaient
-        # ignorés → agrégation sur TOUTE la table (2,5 Go, 3-10 s) à chaque
-        # affichage. Alias explicites pour que le filtre de période s'applique.
-        from_: str = Query(None, alias="from"),
-        to_: str = Query(None, alias="to"),
-    ):
-        from_date = from_date or from_
-        to_date = to_date or to_
-        where, params = _build_where(from_date, to_date, station=station)
-        cache_key = f"stats:{where}:{tuple(params)}"
-
-        # Return cached result if fresh (< 10s old)
-        cached = _stats_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        # Sliding windows: absolute UTC bounds, independent of the period filter.
-        now = datetime.now(UTC)
-        now_s = now.strftime(_TS_FMT)
-        b1m = (now - timedelta(seconds=60)).strftime(_TS_FMT)
-        b1h = (now - timedelta(hours=1)).strftime(_TS_FMT)
-        # Rates cache (TTL 5 s, 5 s bucket): 10 s staleness would be 16 % of the
-        # 1-min window, while TTL 0 would scan twice on every SSE event burst.
-        rates_key = f"rates:{station}:{int(now.timestamp()) // 5 * 5}"
-        rates = _stats_cache.get(rates_key)
-
-        # Station clause shared with _build_where (cohérence filtre station).
-        station_cond, station_params = "", []
-        if station is not None and str(station).strip() != "":
-            try:
-                station_cond, station_params = " AND station = ?", [int(station)]
-            except (TypeError, ValueError):
-                pass
-
-        def _query_stats(db):
-            row = db.execute(
-                "SELECT COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
-                "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
-                "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
-                "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
-                "       COALESCE(AVG(duration_ms), 0)"
-                " FROM requests " + where,
-                params,
-            ).fetchone()
-
-            total_input = row[0]
-            total_cache = row[2]
-            total_count = row[3]
-            total_success = row[4]
-            total_fail = row[5]
-            cache_hit_rate = (total_cache / total_input * 100) if total_input > 0 else 0.0
-            # [36] null (not 100%) when there are no requests — the UI shows « — »
-            success_rate = (total_success / total_count * 100) if total_count > 0 else None
-
-            totals = {
-                "input": total_input,
-                "output": row[1],
-                "cache": total_cache,
-                "total": total_input + row[1] + total_cache,
-                "count": total_count,
-                "success_count": total_success,
-                "fail_count": total_fail,
-                "avg_duration_ms": int(row[6]),
-                "cache_hit_rate": round(cache_hit_rate, 1),
-                "success_rate": round(success_rate, 1) if success_rate is not None else None,
-            }
-
-            rows = db.execute(
-                "SELECT model, COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
-                "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
-                "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
-                "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
-                "       COALESCE(AVG(duration_ms), 0)"
-                " FROM requests " + where + " GROUP BY model",
-                params,
-            ).fetchall()
-
-            acct_rows = db.execute(
-                "SELECT COALESCE(NULLIF(free_model_ip, ''), account_alias, ''), COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
-                "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
-                "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
-                "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
-                "       COALESCE(AVG(duration_ms), 0)"
-                " FROM requests " + where + " GROUP BY COALESCE(NULLIF(free_model_ip, ''), account_alias, '')",
-                params,
-            ).fetchall()
-
-            c1m, c1h = None, None
-            if rates is None:
-                # Index-only range probes on idx_timestamp (or idx_requests_station_ts).
-                c1m = db.execute(
-                    "SELECT COUNT(*) FROM requests WHERE timestamp >= ? AND timestamp <= ?" + station_cond,
-                    [b1m, now_s] + station_params,
-                ).fetchone()[0]
-                c1h = db.execute(
-                    "SELECT COUNT(*) FROM requests WHERE timestamp >= ? AND timestamp <= ?" + station_cond,
-                    [b1h, now_s] + station_params,
-                ).fetchone()[0]
-
-            return totals, rows, acct_rows, c1m, c1h
-
-        totals, rows, acct_rows, c1m, c1h = await _db_read_sync(_query_stats)
-
-        if rates is None:
-            period_minutes = _period_minutes(from_date, to_date, now)
-            p_min, avg_per_min = _period_rates(totals["count"], period_minutes)
-            rates = {
-                "c1m": c1m,
-                "rpm_1m": round(c1m / 1.0, 1),
-                "c1h": c1h,
-                "rpm_1h": round(c1h / 60.0, 2),
-                "period_minutes": p_min,
-                "avg_per_min": avg_per_min,
-            }
-            _stats_cache.set(rates_key, rates, ttl=5)
-        else:
-            # Cached sliding rates, but the period average follows the current filter.
-            period_minutes = _period_minutes(from_date, to_date, now)
-            p_min, avg_per_min = _period_rates(totals["count"], period_minutes)
-            rates = {
-                **rates,
-                "period_minutes": p_min,
-                "avg_per_min": avg_per_min,
-            }
-
-        sum_total = totals["total"]
-        models = {}
-        for r in rows:
-            t = r[1] + r[2] + r[3]
-            m_cache_rate = (r[3] / r[1] * 100) if r[1] > 0 else 0.0
-            # [36] null (not 100%) when no requests — the UI shows « — »
-            m_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else None
-            models[r[0]] = {
-                "input": r[1],
-                "output": r[2],
-                "cache": r[3],
-                "total": t,
-                "pct": f"{t / sum_total * 100:.1f}%" if sum_total else "0%",
-                "count": r[4],
-                "success_count": r[5],
-                "fail_count": r[6],
-                "avg_duration_ms": int(r[7]),
-                "cache_hit_rate": round(m_cache_rate, 1),
-                "success_rate": round(m_success_rate, 1) if m_success_rate is not None else None,
-            }
-
-        # Per-account stats
-        accounts = {}
-        for r in acct_rows:
-            t = r[1] + r[2] + r[3]
-            label = r[0] if r[0] else "(default)"
-            a_cache_rate = (r[3] / r[1] * 100) if r[1] > 0 else 0.0
-            # [36] null (not 100%) when no requests — the UI shows « — »
-            a_success_rate = (r[5] / r[4] * 100) if r[4] > 0 else None
-            accounts[label] = {
-                "input": r[1],
-                "output": r[2],
-                "cache": r[3],
-                "total": t,
-                "pct": f"{t / sum_total * 100:.1f}%" if sum_total else "0%",
-                "count": r[4],
-                "success_count": r[5],
-                "fail_count": r[6],
-                "avg_duration_ms": int(r[7]),
-                "cache_hit_rate": round(a_cache_rate, 1),
-                "success_rate": round(a_success_rate, 1) if a_success_rate is not None else None,
-            }
-
-        result = {"models": models, "accounts": accounts, "totals": totals, "rates": rates}
-        _stats_cache.set(cache_key, result, ttl=10)
-        return result
-
-    @app.get("/api/stats/timeseries")
-    async def get_stats_timeseries(
-        from_date: str = None, to_date: str = None, granularity: str = "hour", station: int = None
-    ):
-        """Return time-series data for charts: requests count, tokens, avg duration per time bucket."""
-        where, params = _build_where(from_date, to_date, station=station)
-
-        # [P2 perf] granularité "day" forcée au-delà de 7 jours : des buckets
-        # horaires sur un mois = ~720 groupes scannés pour rien à l'écran.
-        if granularity == "hour" and from_date and to_date:
-            try:
-                f = datetime.fromisoformat(str(from_date).replace("Z", "+00:00"))
-                t = datetime.fromisoformat(str(to_date).replace("Z", "+00:00"))
-                if f.tzinfo is not None:
-                    f = f.astimezone(UTC).replace(tzinfo=None)
-                if t.tzinfo is not None:
-                    t = t.astimezone(UTC).replace(tzinfo=None)
-                if (t - f).total_seconds() > 7 * 86400:
-                    granularity = "day"
-            except Exception:
-                pass
-
-        # [P2 perf] TTL cache : le dashboard re-poll cette endpoint en boucle.
-        cache_key = f"timeseries:{granularity}:{where}:{tuple(params)}"
-        cached = _stats_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        def _query_timeseries(db):
-            # Group by truncated timestamp
-            if granularity == "day":
-                trunc_expr = "substr(timestamp, 1, 10)"
-            elif granularity == "week":
-                # [29] real ISO 8601 week grouping (%G ISO year + %V week 01-53);
-                # the old day-of-month / 7 heuristic merged adjacent months.
-                trunc_expr = "strftime('%G', timestamp) || '-W' || strftime('%V', timestamp)"
-            else:  # hour
-                trunc_expr = "substr(timestamp, 1, 13) || ':00'"
-
-            rows = db.execute(
-                f"SELECT {trunc_expr} as period, "
-                "COUNT(*) as count, "
-                "SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count, "
-                "SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END) as fail_count, "
-                "COALESCE(SUM(tokens_input), 0) as input_tokens, "
-                "COALESCE(SUM(tokens_output), 0) as output_tokens, "
-                "COALESCE(SUM(tokens_cache), 0) as cache_tokens, "
-                "COALESCE(AVG(duration_ms), 0) as avg_duration "
-                "FROM requests " + where + " GROUP BY period ORDER BY period",
-                params,
-            ).fetchall()
-            return rows
-
-        rows = await _db_read_sync(_query_timeseries)
-
-        result = {
-            "series": [
-                {
-                    "period": r["period"],
-                    "count": r["count"],
-                    "success": r["success_count"],
-                    "fail": r["fail_count"],
-                    "input_tokens": r["input_tokens"],
-                    "output_tokens": r["output_tokens"],
-                    "cache_tokens": r["cache_tokens"],
-                    "avg_duration_ms": int(r["avg_duration"]),
-                }
-                for r in rows
-            ],
-            "granularity": granularity,
-        }
-        _stats_cache.set(cache_key, result, ttl=10)
-        return result
-
-    @app.get("/api/logs")
-    async def get_logs(limit: int = 100, offset: int = 0):
-        # P0 anti-thrashing : clamper limit/offset (deque bornée côté display.py,
-        # mais un limit énorme reste un slicing inutile).
-        try:
-            limit = max(1, min(int(limit or 100), 500))
-        except (TypeError, ValueError):
-            limit = 100
-        try:
-            offset = max(0, int(offset or 0))
-        except (TypeError, ValueError):
-            offset = 0
-        lines = list(log_lines)
-        return {
-            "logs": lines[offset : offset + limit],
-            "total": len(lines),
-            "has_more": offset + limit < len(lines),
-        }
-
-    # ── Debug toggle ──
-
-    @app.get("/api/debug")
-    async def get_debug():
-        return {"enabled": config_settings.DEBUG}
-
-    @app.post("/api/debug")
-    async def set_debug(request: Request):
-        body = await request.json()
-        enabled = body.get("enabled", False)
-        config_settings.DEBUG = bool(enabled)
-        # Persist to .env so debug survives restarts
-        save_env({"OPENCODE_DEBUG": "1" if enabled else "0"})
-        # Update display module's debug function too
-        from dashboard.display import set_debug_log_file
-
-        if enabled:
-            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-            debug_log_path = os.path.join(log_dir, "debug.log")
-            set_debug_log_file(debug_log_path)
-        from dashboard.display import debug as _debug_fn
-
-        _debug_fn(f"Debug mode {'ENABLED' if enabled else 'DISABLED'} via API")
-        return {"enabled": config_settings.DEBUG}
-
-    @app.get("/api/debug/logs")
-    async def get_debug_logs(limit: int = 500, offset: int = 0):
-        """Return lines from logs/debug.log, most recent first.
-        [P2 perf] rotation a 10 Mo cote display.py : le full-read ne vaut que
-        sous ce seuil ; au-dela, tail-reader seek-based. No-op immediat quand
-        (size, mtime) est inchange pour la meme page demandee (poll UI).
-        [P0 anti-thrashing] limit clampe 1-500 (defaut UI 200), offset >= 0 :
-        un limit=100000 aspirerait tout le fichier (jusqu'a 10 Mo)."""
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-        debug_log_path = os.path.join(log_dir, "debug.log")
-        try:
-            try:
-                limit = max(1, min(int(limit or 500), 500))
-            except (TypeError, ValueError):
-                limit = 500
-            try:
-                offset = max(0, int(offset or 0))
-            except (TypeError, ValueError):
-                offset = 0
-            if not os.path.exists(debug_log_path):
-                return {"logs": [], "total": 0, "has_more": False}
-
-            st = os.stat(debug_log_path)
-            file_size = st.st_size
-            if file_size == 0:
-                return {"logs": [], "total": 0, "has_more": False}
-
-            # Aligné sur _DEBUG_MAX_SIZE (dashboard/display.py) : la rotation
-            # plafonne le fichier à 10 Mo — pas 50.
-            MAX_FULL_READ = 10 * 1024 * 1024
-
-            # No-op si le fichier ET la page demandée sont inchangés
-            sig = (file_size, st.st_mtime, limit, offset)
-            cached = getattr(get_debug_logs, "_cache", None)
-            if cached and cached[0] == sig:
-                return cached[1]
-
-            def _read_all():
-                """Read the whole file (fine for files up to 10 MB)."""
-                with open(debug_log_path, encoding="utf-8", errors="replace") as f:
-                    all_lines = f.readlines()
-                total = len(all_lines)
-                # Most-recent-first, paginated
-                reversed_lines = [line.rstrip("\n") for line in reversed(all_lines)]
-                page = reversed_lines[offset : offset + limit]
-                return page, total
-
-            def _read_tail():
-                """Read from the end of a large file (seek-based).
-                Reads up to 10 MB from EOF — enough for thousands of lines."""
-                with open(debug_log_path, "rb") as f:
-                    f.seek(0, 2)
-                    fsize = f.tell()
-
-                    # Read up to 10 MB from end
-                    read_size = min(fsize, 10 * 1024 * 1024)
-                    f.seek(fsize - read_size)
-                    data = f.read().decode("utf-8", errors="replace")
-
-                lines = data.split("\n")
-                # Discard partial first line (continuation from before our window)
-                if fsize > read_size and len(lines) > 1:
-                    lines = lines[1:]
-                # Discard trailing empty from final newline
-                if lines and lines[-1] == "":
-                    lines = lines[:-1]
-
-                total = len(lines)
-                reversed_lines = list(reversed(lines))
-                page = reversed_lines[offset : offset + limit]
-                return page, total
-
-            if file_size <= MAX_FULL_READ:
-                page, total = await asyncio.to_thread(_read_all)
-            else:
-                page, total = await asyncio.to_thread(_read_tail)
-
-            resp = {
-                "logs": page,
-                "total": total,
-                "has_more": offset + limit < total,
-            }
-            get_debug_logs._cache = (sig, resp)
-            return resp
-        except Exception as e:
-            return {"logs": [], "total": 0, "has_more": False, "error": str(e)}
-
-    @app.delete("/api/debug/logs")
-    async def clear_debug_logs():
-        """Truncate logs/debug.log."""
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-        debug_log_path = os.path.join(log_dir, "debug.log")
-        try:
-            if os.path.exists(debug_log_path):
-                with open(debug_log_path, "w", encoding="utf-8") as f:
-                    f.truncate(0)
-            from dashboard.display import debug as _debug_fn
-
-            _debug_fn("Debug log cleared via API")
-            return {"status": "ok", "message": "Debug log cleared."}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+    register_debug_routes(
+        app,
+        settings=config_settings,
+        log_lines_getter=lambda: log_lines,
+        save_env=lambda updates: save_env(updates),
+        debug_log_path=os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "logs",
+            "debug.log",
+        ),
+        set_debug_log_file=lambda path: _set_debug_log_file(path),
+        debug=lambda message: _debug(message),
+    )
 
     # ── SSE events ──
 
-    @app.get("/api/events")
-    async def event_stream(request: Request):
-        manager = get_event_manager()
-        # [v10 §14.3.20] capture la boucle pour publish() thread-safe
-        try:
-            manager.bind_loop(asyncio.get_running_loop())
-        except Exception:
-            pass
-        # [P4.4 perf/sécurité] plafond subscribers — 503 si saturé (évite DoS LAN)
-        try:
-            queue = await manager.subscribe()
-        except RuntimeError as e:
-            if "limit" in str(e).lower():
-                return JSONResponse(status_code=503, content={"error": "too_many_subscribers", "message": str(e)})
-            raise
-        _debug("  [sse] new SSE subscriber")
+    from dashboard.routers.event_routes import register_event_routes
 
-        async def event_generator():
-            try:
-                yield f"event: connected\ndata: {json.dumps({'status': 'ok'})}\n\n"
-                while True:
-                    try:
-                        payload = await asyncio.wait_for(queue.get(), timeout=30)
-                        yield payload
-                    except TimeoutError:
-                        # Check if client disconnected during idle period
-                        if await request.is_disconnected():
-                            break
-                        # [31] Real event (not a comment): comments are invisible
-                        # to JS EventSource, so the client's silence watchdog
-                        # (app.js) can observe this ping and detect a stalled
-                        # stream instead of waiting forever.
-                        yield "event: ping\ndata: {}\n\n"
-            except (asyncio.CancelledError, RuntimeError):
-                pass
-            finally:
-                await manager.unsubscribe(queue)
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-        )
+    register_event_routes(
+        app,
+        event_manager_getter=get_event_manager,
+        debug_logger=_debug,
+    )
 
     # ── Quota endpoints ──
 
-    @app.get("/api/quotas")
-    async def get_quotas():
-        """Quotas des workspaces — stale-while-revalidate (Phase 4 plan boot).
+    from dashboard.routers.quota_routes import register_quota_routes
 
-        La donnée en cache est TOUJOURS servie immédiatement (jamais d'attente
-        upstream sur le chemin de la requête) ; son âge est publié dans
-        ``X-Cache`` / ``Cache-Control`` et un rafraîchissement part en fond si
-        elle dépasse max-age. Le client (dashboard) peut afficher un badge
-        « périmé » au lieu d'un spinner.
-        """
-        data = await get_quota_snapshot()
-        state, age = quota_cache_state()
-        age_hdr = "unknown" if age == float("inf") else f"{age:.1f}"
-        return JSONResponse(
-            content=data,
-            headers={
-                "Cache-Control": (f"private, max-age={int(SWR_MAX_AGE_S)}, stale-while-revalidate={int(SWR_STALE_S)}"),
-                "X-Cache": {"fresh": "HIT", "stale": "STALE", "miss": "MISS"}[state],
-                "X-Cache-Age": age_hdr,
-            },
-        )
+    register_quota_routes(
+        app,
+        snapshot_getter=get_quota_snapshot,
+        cache_state_getter=quota_cache_state,
+        max_age_s=SWR_MAX_AGE_S,
+        stale_s=SWR_STALE_S,
+    )
 
-    @app.get("/api/free-model-usage")
-    async def get_free_model_usage(days: int = 7):
-        """Free model usage stats for quota analysis.
+    from dashboard.routers.usage_routes import register_usage_routes
 
-        Returns per-model, per-key, per-workspace, per-IP aggregates with
-        total requests, tokens, and success/failure counts.
-        Also calculates quota reset times per IP.
-
-        [P2 perf] agrégation en SQL GROUP BY (l'ancienne version ramenait
-        jusqu'à 5000 lignes brutes et agrégeait en Python à chaque poll).
-        Les lignes individuelles ne servent que pour `recent` (100 dernières).
-        """
-
-        def _query(db):
-            where = "WHERE timestamp >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
-            params = [f"-{days} days"]
-            grouped = db.execute(
-                "SELECT paid_model, free_model, api_key, workspace_id, ip,"
-                "       COUNT(*) AS n,"
-                "       SUM(CASE WHEN status = 200 THEN 1 ELSE 0 END) AS ok_n,"
-                "       SUM(CASE WHEN status != 200 OR status IS NULL THEN 1 ELSE 0 END) AS fail_n,"
-                "       COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
-                "       MIN(timestamp), MAX(timestamp)"
-                " FROM free_model_usage " + where + " GROUP BY free_model, api_key, workspace_id, ip",
-                params,
-            ).fetchall()
-            recent = db.execute(
-                "SELECT timestamp, free_model, status, tokens_input, tokens_output, ip"
-                " FROM free_model_usage " + where + " ORDER BY timestamp DESC LIMIT 100",
-                params,
-            ).fetchall()
-            total = db.execute(
-                "SELECT COUNT(*) FROM free_model_usage " + where,
-                params,
-            ).fetchone()
-            return grouped, recent, (total[0] if total else 0)
-
-        grouped_rows, recent_rows, total_count = await _db_read_sync(_query)
-
-        by_model: dict = {}
-        by_key: dict = {}
-        by_workspace: dict = {}
-        by_ip: dict = {}
-        for r in grouped_rows:
-            _paid, free, key, ws, ip, n, ok_n, fail_n, tok_in, tok_out, first_seen, last_seen = (
-                r[:12] if len(r) >= 12 else (*r, "")[:12]
-            )
-            m = by_model.setdefault(
-                free,
-                {
-                    "requests": 0,
-                    "tokens_in": 0,
-                    "tokens_out": 0,
-                    "success": 0,
-                    "fail": 0,
-                },
-            )
-            m["requests"] += n
-            m["tokens_in"] += tok_in or 0
-            m["tokens_out"] += tok_out or 0
-            m["success"] += ok_n or 0
-            m["fail"] += fail_n or 0
-            k = by_key.setdefault(key, {"requests": 0, "tokens_in": 0, "tokens_out": 0})
-            k["requests"] += n
-            k["tokens_in"] += tok_in or 0
-            k["tokens_out"] += tok_out or 0
-            w = by_workspace.setdefault(ws, {"requests": 0, "tokens_in": 0, "tokens_out": 0})
-            w["requests"] += n
-            w["tokens_in"] += tok_in or 0
-            w["tokens_out"] += tok_out or 0
-            if ip:
-                ip_data = by_ip.setdefault(
-                    ip,
-                    {
-                        "requests": 0,
-                        "tokens_in": 0,
-                        "tokens_out": 0,
-                        "first_seen": first_seen,
-                        "last_seen": last_seen,
-                        "success": 0,
-                        "fail": 0,
-                        "reset_at": None,
-                        "available": False,
-                    },
-                )
-                ip_data["requests"] += n
-                ip_data["tokens_in"] += tok_in or 0
-                ip_data["tokens_out"] += tok_out or 0
-                ip_data["success"] += ok_n or 0
-                ip_data["fail"] += fail_n or 0
-
-        timeline = [
-            {
-                "ts": ts,
-                "model": free,
-                "status": status,
-                "tokens": (tok_in or 0) + (tok_out or 0),
-                "ip": ip,
-            }
-            for ts, free, status, tok_in, tok_out, ip in recent_rows
-        ]
-
-        # Calculate reset times for each IP (quota window = 48h from last request)
-        from datetime import datetime, timedelta
-
-        QUOTA_WINDOW_HOURS = 48
-        now = datetime.utcnow()
-        for _ip_addr, ip_data in by_ip.items():
-            try:
-                last = datetime.fromisoformat(ip_data["last_seen"])
-                if last.tzinfo is not None:
-                    # [30] UTC timestamps carry a Z suffix → normalize to naive UTC
-                    # so the comparison below stays naive-vs-naive.
-                    last = last.astimezone(UTC).replace(tzinfo=None)
-                reset_at = last + timedelta(hours=QUOTA_WINDOW_HOURS)
-                ip_data["reset_at"] = reset_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-                ip_data["available"] = now >= reset_at
-                ip_data["reset_in_sec"] = max(0, int((reset_at - now).total_seconds()))
-            except Exception:
-                ip_data["reset_at"] = None
-                ip_data["available"] = True
-                ip_data["reset_in_sec"] = 0
-
-        return {
-            "days": days,
-            "total_requests": total_count,
-            "by_model": by_model,
-            "by_key": by_key,
-            "by_workspace": by_workspace,
-            "by_ip": by_ip,
-            "recent": timeline[:100],
-        }
+    register_usage_routes(app, db_read_sync=_db_read_sync)
 
     # ── VPN / IP rotation endpoints ──
 
@@ -3704,1798 +2555,225 @@ def register_dashboard(
             getattr(shared_state, "free_ip_pool", None),
         )
 
-    @app.get("/api/vpn/station/{station_id}/logs")
-    async def get_station_logs(station_id: int, lines: int = 50):
-        """[plan v10 §4 Lot 4] derniers logs docker de la station N — MTTR
-        per-station sans ouvrir un terminal."""
-        import subprocess as _sp
-
-        import shared_state
-
-        mgr = next(
-            (
-                m
-                for m in (getattr(shared_state, "vpn_managers", None) or [])
-                if getattr(m, "_station", None) == station_id
-            ),
-            None,
-        )
-        if mgr is None:
-            return JSONResponse(status_code=404, content={"error": f"station {station_id} introuvable"})
-        n = max(10, min(int(lines or 50), 300))
-        try:
-            proc = await asyncio.to_thread(
-                _sp.run,
-                ["docker", "logs", "--tail", str(n), mgr._docker_container],
-                capture_output=True,
-                timeout=8,
-                creationflags=0x08000000 if sys.platform == "win32" else 0,
-            )
-            text = ((proc.stdout or b"") + (proc.stderr or b"")).decode("utf-8", errors="replace")[-20000:]
-            return {"station": station_id, "tail": n, "logs": text}
-        except Exception as e:
-            return JSONResponse(status_code=502, content={"error": str(e)})
-
-    @app.get("/api/vpn-status")
-    async def get_vpn_status():
-        """Get current VPN status, IP, server, and usage stats."""
-        import shared_state
-
-        managers = getattr(shared_state, "vpn_managers", None) or []
-        refreshed_at = datetime.now(UTC).isoformat()
-        refresh_error = None
-        stale = False
-        status_age_s = None
-        if managers:
-            # [roadmap] Stale-while-revalidate : le dashboard ne doit JAMAIS
-            # attendre 6 scans Docker (inspect+logs+control) sur son thread.
-            # On sert l'état en mémoire immédiatement et on rafraîchit en fond
-            # (single-flight). Le watchdog garde la fraîcheur côté station.
-            try:
-                _now = time.monotonic()
-                _ages = [
-                    None
-                    if getattr(m, "_last_status_refresh_at", None) is None
-                    else _now - float(getattr(m, "_last_status_refresh_at", 0.0))
-                    for m in managers
-                ]
-                _cache_s = max(
-                    0.5,
-                    min(float(getattr(m, "_STATUS_CACHE_SECONDS", 5.0)) for m in managers),
-                )
-                _known_ages = [a for a in _ages if a is not None]
-                status_age_s = max(_known_ages) if _known_ages else None
-                # « stale » = donnée vraiment périmée (badge UI / alerte) ;
-                # la revalidation, elle, part dès que le cache station expire.
-                # 120 s : un poll externe à 60 s ne doit pas être marqué
-                # périmé alors que le refresh de fond réussit.
-                _fresh_bound = max(120.0, _cache_s * 6.0)
-                stale = any(a is None or a >= _fresh_bound for a in _ages)
-                _needs_refresh = any(a is None or a >= _cache_s for a in _ages)
-                if _needs_refresh:
-                    _inflight = getattr(shared_state, "_refresh_inflight", None)
-                    if not _inflight or getattr(_inflight, "done", lambda: True)():
-                        # gather() renvoie un Future, pas une coroutine :
-                        # create_task() lève TypeError. ensure_future() accepte
-                        # les deux et garde le single-flight.
-                        shared_state._refresh_inflight = asyncio.ensure_future(
-                            asyncio.gather(
-                                *(m.refresh_status(force=False) for m in managers),
-                                return_exceptions=True,
-                            )
-                        )
-                        shared_state._refresh_inflight.add_done_callback(
-                            lambda t: setattr(shared_state, "_refresh_inflight", None)
-                        )
-            except Exception as _e:
-                refresh_error = f"{type(_e).__name__}: {_e}"
-            refreshed_at = datetime.now(UTC).isoformat()
-            if shared_state.free_ip_pool:
-                data = shared_state.free_ip_pool.get_status()
-            else:
-                try:
-                    _all = [m.get_status() for m in managers]
-                    # [graceful-aurora] up = connected + degraded.
-                    _connected = sum(1 for _s in _all if _s.get("status") in ("connected", "degraded"))
-                    _total = len(_all)
-                    if any(_s.get("status") == "connected" for _s in _all):
-                        _agg = "connected"
-                    elif any(_s.get("status") == "degraded" for _s in _all):
-                        _agg = "degraded"
-                    elif all(_s.get("status") == "error" for _s in _all):
-                        _agg = "error"
-                    else:
-                        _agg = _all[0].get("status", "not_configured")
-                    data = _all[0].copy()
-                    data["status"] = _agg
-                    data["vpn_status"] = _agg
-                    data["healthy"] = _connected
-                    data["total"] = _total
-                    data["stations"] = [
-                        {
-                            "station": _s.get("station"),
-                            "vpn_status": _s.get("status"),
-                            "current_ip": _s.get("ip"),
-                            "current_server": _s.get("server"),
-                            "vpn": _s,
-                        }
-                        for _s in _all
-                    ]
-                except Exception:
-                    try:
-                        data = managers[0].get_status()
-                    except Exception:
-                        data = {"enabled": False, "status": "not_configured"}
-        else:
-            data = {"enabled": False, "status": "not_configured"}
-        # Per-IP usage stats — injected unconditionally (works in direct mode
-        # too: free_ip is then the residential IP). Frontend polls this
-        # endpoint every 10s while the vpn tab is active.
-        # Fast path: instant GUI — return cached or empty, refresh in background
-        if isinstance(data, dict):
-            cached_ip = _stats_cache.get("ip_stats")
-            if cached_ip is not None:
-                data["ip_stats"] = cached_ip
-            else:
-                data["ip_stats"] = {}
-            # refresh in background (don't block)
-            # [v10 §14.3.21] dédoublonnage : chaque GET /vpn-status spawnait
-            # une tâche même si une autre tournait déjà → accumulation si la
-            # DB ralentit. Une seule tâche vivante à la fois.
-            try:
-                _running = getattr(_ip_stats_db, "_running_task", None)
-                if _running is None or _running.done():
-                    _ip_stats_db._running_task = asyncio.create_task(_ip_stats_db(shared_state.vpn_manager))
-            except Exception:
-                pass
-            # [plan] F: cross-station shared state (recent-IP registry +
-            # identity cursor) — lets the VPN tab show why an IP is skipped.
-            rot = getattr(shared_state, "shared_rotation", None)
-            if rot is not None:
-                data["shared_rotation"] = rot.get_status()
-            # [plan] C: real-time extras for the VPN panel — docker event
-            # watcher state (stream alive, last container event) and the
-            # per-station country (current / next / pinned-at / rotation on)
-            # overlaid from the managers: the pool status does not carry
-            # country fields.
-            watcher = getattr(shared_state, "docker_event_watcher", None)
-            if watcher is not None:
-                data["watch_events"] = watcher.get_status()
-            # [plan 18/08 §2.1] Anti-env périmé: clés VPN_* dont la valeur
-            # .env diffère de l'env du process — les enfants `docker compose`
-            # héritent de l'env du parent (cause racine 19/08). La bannière
-            # dashboard s'affiche quand ce champ est présent.
-            if config_settings.ENV_DIVERGENCE:
-                data["env_divergence"] = [{"key": k, "file": f, "env": e} for k, f, e in config_settings.ENV_DIVERGENCE]
-            # [roadmap] boot_error dynamique : l'ancien champ restait collé à
-            # « boot 5/6 » après guérison. On recalcule à chaque lecture.
-            try:
-                # [audit watchdog 2026-10-30] `expected` doit refléter les
-                # stations réellement enabled (hors disabled_stations) : le
-                # compteur config brut affichait un faux « boot N/N+1 » avec
-                # une station désactivée. Et une station `connecting` pendant
-                # sa rotation n'est pas un échec de boot.
-                _expected_n = sum(
-                    1
-                    for _m in managers
-                    if getattr(_m, "enabled", True) and not getattr(_m, "_disabled", False)
-                )
-                _up_n = sum(
-                    1
-                    for _m in managers
-                    if str(getattr(_m, "status", "disconnected") or "disconnected") in ("connected", "degraded")
-                )
-                _missing = [
-                    _m
-                    for _m in managers
-                    if getattr(_m, "enabled", True)
-                    and not getattr(_m, "_disabled", False)
-                    and str(getattr(_m, "status", "disconnected") or "disconnected")
-                    not in ("connected", "degraded")
-                ]
-                _only_transient = bool(_missing) and all(
-                    str(getattr(_m, "status", "disconnected") or "disconnected") == "connecting"
-                    and getattr(_m, "_rotation_task", None) is not None
-                    and not getattr(_m._rotation_task, "done", lambda: True)()
-                    for _m in _missing
-                )
-                _enabled = bool((getattr(config_settings, "IP_ROTATION", {}) or {}).get("enabled", False))
-                if _enabled and _up_n < _expected_n and not _only_transient:
-                    shared_state.boot_error = f"boot {_up_n}/{_expected_n}: connected {_up_n} — reconcile/pool"
-                    data["boot_error"] = shared_state.boot_error
-                else:
-                    shared_state.boot_error = None
-                    data["boot_error"] = None
-            except Exception:
-                if getattr(shared_state, "boot_error", None):
-                    data["boot_error"] = shared_state.boot_error
-            # [docker-autostart 2026-10-07] état daemon pour le badge
-            # dashboard (lecture seule, jamais bloquant).
-            try:
-                from vpn.manager import docker_daemon_status as _dd_status
-
-                data["docker_daemon"] = _dd_status()
-            except Exception:
-                pass
-            # [Axe 3.4] config.yaml modifié à la main sans POST dashboard →
-            # dirty: le hot-reload est push-only par design, une bannière GUI
-            # demande un restart ou une re-push (jamais d'auto-reload).
-            data["config_yaml_dirty"] = _config_yaml_mtime() != _config_yaml_known_mtime
-            # [Axe 3.1] socks5 backend state — the GUI's proxy table + the
-            # auto-rotate toggle (never ship passwords).
-            data["proxy_mode"] = _vpn_proxy_mode()
-            try:
-                from free.auto_egress import providers_from_mode
-
-                _sel = (getattr(config_settings, "IP_ROTATION", None) or {}).get(
-                    "egress_providers"
-                )
-                if not isinstance(_sel, list) or not _sel:
-                    _sel = providers_from_mode(str(data["proxy_mode"]))
-                data["egress_providers"] = list(_sel)
-                _ip_rot = getattr(config_settings, "IP_ROTATION", None) or {}
-                data["egress_strategy"] = str(
-                    _ip_rot.get("egress_strategy") or "fallback"
-                )
-                _w = _ip_rot.get("egress_weights")
-                data["egress_weights"] = dict(_w) if isinstance(_w, dict) else {}
-            except Exception:
-                data["egress_providers"] = []
-            # [plan v10 §4 Lot 4] latence-adaptive per-station (moteur §3.6)
-            try:
-                from latency_rotation import get_engine as _get_leng
-
-                _leng = getattr(shared_state, "latency_engine", None) or _get_leng()
-                _lat = {}
-                for (_lsid, _lip), _tr in list(_leng._trackers.items())[:80]:
-                    _lat[f"{_lsid}|{_lip}"] = _tr.snapshot().__dict__
-                data["latency"] = _lat
-                data["rotation_paused"] = bool(getattr(_leng, "paused", False))
-                # [GUI toggle « Cooldown latence »] état persistant du moteur
-                # (config.yaml latency_rotation.enabled) pour le toggle.
-                data["latency_enabled"] = bool(getattr(_leng.cfg, "enabled", True))
-                data["global_degraded_remaining"] = round(max(0.0, float(_leng._global_paused_until) - _leng._now()), 1)
-            except Exception:
-                pass
-            try:
-                from free.quality import get_quality_registry
-
-                data["quality"] = get_quality_registry().status()
-            except Exception:
-                pass
-            data["socks5"] = {
-                "proxies": _socks5_payload(shared_state.free_ip_pool),
-                "rotate": _socks5_auto_rotate_state(),
-            }
-            # [vivid-hinton P4] geo enrichment for vpn-status
-            try:
-                import opencode as _oc
-
-                _dur = getattr(_oc, "_geo_pin_duration", [])
-                _avg = sum(_dur) / len(_dur) if _dur else 0
-            except Exception:
-                _dur, _avg = [], 0
-            data["geo"] = {
-                "enabled": bool(getattr(config_settings, "GEO_ENABLED", False)),
-                "version": int(getattr(config_settings, "GEO_VERSION", 1) or 1),
-                "block_total": int(getattr(_oc, "_geo_block_total", 0)) if "_oc" in locals() else 0,
-                "pin_latency_avg_ms": round(_avg, 1),
-                "pin_latency_p95_ms": round(sorted(_dur)[int(len(_dur) * 0.95)] if _dur else 0, 1),
-                "queue_depth": len(getattr(_oc, "_geo_breaker", {})) if "_oc" in locals() else 0,
-                "allow_direct_when_compatible": bool(
-                    getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)
-                ),
-                "geo_allow_direct": bool(getattr(config_settings, "GEO_ALLOW_DIRECT_WHEN_COMPATIBLE", True)),
-            }
-            # [Axe C] geo_strict_union: union of all effective_allowed countries
-            # across all geo-enabled routes — lets the GUI show which countries
-            # are needed globally.
-            try:
-                _strict_union: set = set()
-                for _rk, _rv in config_settings.ROUTES.items():
-                    try:
-                        _rg = config_settings.resolve_geo(_rv)
-                        _reff = _rg.get("effective_allowed", set())
-                        if isinstance(_reff, set):
-                            _strict_union |= _reff
-                    except Exception:
-                        pass
-                data["geo_strict_union"] = sorted(_strict_union)
-            except Exception:
-                data["geo_strict_union"] = []
-            # [Axe C] per-route allowed check for current country — read ALL
-            # managers and prefer a station already in effective_allowed.
-            try:
-                cur_country = None
-                _all_mgr_countries: list = []
-                for mgr in managers:
-                    if mgr and getattr(mgr, "_current_country", None):
-                        _all_mgr_countries.append(mgr._current_country)
-                # Prefer a country in effective_allowed (across any route)
-                _any_effective: set = set()
-                for _rk, _rv in config_settings.ROUTES.items():
-                    try:
-                        _rg = config_settings.resolve_geo(_rv)
-                        _reff = _rg.get("effective_allowed", set())
-                        if isinstance(_reff, set):
-                            _any_effective |= _reff
-                    except Exception:
-                        pass
-                for cc in _all_mgr_countries:
-                    if cc in _any_effective:
-                        cur_country = cc
-                        break
-                if cur_country is None and _all_mgr_countries:
-                    cur_country = _all_mgr_countries[0]  # single-station compat
-                data["current_country"] = cur_country
-                allowed_for = []
-                for k, route in config_settings.ROUTES.items():
-                    try:
-                        g = config_settings.resolve_geo(route)
-                        eff = g.get("effective_allowed", set())
-                        if isinstance(eff, set) and cur_country and cur_country in eff:
-                            allowed_for.append(k)
-                    except Exception:
-                        pass
-                data["current_country_allowed_for"] = allowed_for
-            except Exception:
-                pass
-            countries = {}
-            # [plan 18/08 §4] N-station: per-station country overlay for
-            # every active tunnel (was mgr1+mgr2 fixed pair).
-            for mgr in managers:
-                if mgr is None:
-                    continue
-                st = mgr.get_status()
-                countries[mgr._station] = {
-                    "current_country": st.get("current_country"),
-                    "next_country": st.get("next_country"),
-                    "country_pinned_at": st.get("country_pinned_at"),
-                    "country_rotation": st.get("country_rotation"),
-                }
-            if countries:
-                data["countries"] = countries
-            # [prancy-unicorn Phase1] staleness + refresh observability for GUI spinner/tooltip
-            data["stale"] = stale
-            data["refreshed_at"] = refreshed_at
-            data["refresh_error"] = refresh_error
-            data["status_age_s"] = status_age_s
-            # [prancy-unicorn Phase1 Q5] garde-fou clone frais : warning si N>=2 && !free_parallel
-            try:
-                _fp_cfg = config_settings.FREE_PARALLEL if hasattr(config_settings, "FREE_PARALLEL") else {}
-                _fp_enabled = bool(_fp_cfg.get("enabled")) if isinstance(_fp_cfg, dict) else False
-                _n = int(data.get("total") or len(managers) or 0)
-                if _n >= 2 and not _fp_enabled:
-                    data["free_parallel_warning"] = "tout sur station 1 — activer free_parallel"
-                else:
-                    data["free_parallel_warning"] = None
-            except Exception:
-                pass
-            # warm-avalanche Q9: control 401 + socks5 EOF observability
-            try:
-                _c401 = None
-                _eof = 0
-                for _m in managers:
-                    _c = getattr(_m, "_control_last_401_at", None)
-                    if _c and (_c401 is None or _c > _c401):
-                        _c401 = _c
-                    _eof = max(_eof, int(getattr(_m, "_socks5_eof_count", 0) or 0))
-                data["control_last_401_at"] = _c401
-                data["socks5_eof_count"] = _eof
-                # badge 300s
-                data["control_401_badge"] = bool(_c401 and (time.time() - _c401) < 300)
-            except Exception:
-                pass
-            # [audit watchdog 2026-10-30] Le breaker superviseur était
-            # invisible : le pool pouvait exclure une station « routable »
-            # sans que le dashboard n'explique pourquoi.
-            try:
-                import shared_state as _ss_sup
-
-                _sups = []
-                for _sup in getattr(_ss_sup, "station_supervisors", None) or []:
-                    _ro = getattr(_sup, "breaker_open_readonly", None)
-                    _sups.append(
-                        {
-                            "station": int(getattr(_sup, "station", -1)),
-                            "breaker_open": bool(_ro()) if callable(_ro) else bool(getattr(_sup, "breaker_open_until", 0.0)),
-                            "half_open_pending": bool(getattr(_sup, "half_open_pending", False)),
-                            "consecutive_failures": int(getattr(_sup, "consecutive_failures", 0)),
-                            "restart_in_progress": bool(getattr(_sup, "restart_in_progress", False)),
-                        }
-                    )
-                data["supervisors"] = _sups
-            except Exception:
-                pass
-        return data
-
-    @app.get("/api/free/allocator/status")
-    async def get_allocator_status(request: Request):
-        """[allocator] Chaînes actives, winners, claims et assignations."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        from free.ip_registry.status import registry_status
-
-        status = await asyncio.to_thread(registry_status)
-        return {
-            "generated_at": status.get("generated_at"),
-            "enabled": status.get("enabled"),
-            "allocator": status.get("allocator"),
-            "db": {
-                "assignments_open": status.get("db", {}).get("assignments_open", 0),
-                "open_assignments": status.get("db", {}).get("open_assignments", []),
-                "ip_state": status.get("db", {}).get("ip_state", {}),
-            },
-        }
-
-    @app.get("/api/free/ip-registry/status")
-    async def get_ip_registry_status(request: Request):
-        """[P0.3] Provenance et état du registre catalogue/IP.
-
-        Lecture seule : fonctionne aussi quand `ip_registry.enabled=false` ou
-        quand la DB n'existe pas encore. Expose les sources sans adaptateur
-        (`no-adapter`) et la couverture d'attribution hostname du runtime.
-        """
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        from free.ip_registry.status import registry_status
-
-        return await asyncio.to_thread(registry_status)
-
-    @app.get("/api/pool-status")
-    async def get_pool_status():
-        """[v10] État du pool d'IPs free (stations, quotas, healthy/routable).
-
-        Endpoint attendu par scripts/verify_100.py (check 3/15) et utile au
-        monitoring externe — /api/vpn-status retourne la mÊME vue enrichie,
-        celui-ci reste la ressource stable documentée."""
-        import shared_state
-
-        pool = getattr(shared_state, "free_ip_pool", None)
-        if pool is None:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "free_ip_pool non initialisé", "proxy_mode": "none"},
-            )
-        return pool.get_status()
-
-    @app.get("/api/latency-status")
-    async def get_latency_status():
-        """[v10] État interne du moteur de rotation latence-adaptive.
-
-        Expose ce qui rend une station non-routable : seuils live (post
-        hot-reload), cooldowns soft/hard actifs avec TTL restant, historique
-        soft (source des escalades hard), compteurs anti-flapping. C'est le
-        point d'entrée pour répondre à « pourquoi healthy_routable < N ».
-        """
-        import shared_state
-
-        try:
-            from latency_rotation import get_engine
-
-            eng = getattr(shared_state, "latency_engine", None) or get_engine()
-        except Exception as e:
-            return {"enabled": False, "error": f"engine unavailable: {e}"}
-
-        now = time.time()
-        cfg = eng.cfg
-        cooldowns = []
-        for (sid, ip), (kind, until) in sorted(eng._cooldowns.items()):
-            remaining = max(0.0, until - now)
-            if remaining > 0:
-                cooldowns.append(
-                    {
-                        "station": sid,
-                        "ip": ip,
-                        "kind": kind,
-                        "remaining_s": round(remaining, 1),
-                    }
-                )
-        soft_history = sorted(f"{sid}|{ip}" for sid, ip in eng._soft_history)
-        trackers = []
-        for (sid, ip), tr in sorted(eng._trackers.items()):
-            snap = tr.snapshot()
-            trackers.append(
-                {
-                    "station": sid,
-                    "ip": ip,
-                    "count": snap.count,
-                    "ewma_ms": None if snap.ewma_ms is None else round(snap.ewma_ms, 1),
-                    "p95_ms": None if snap.p95_ms is None else round(snap.p95_ms, 1),
-                    "consecutive_slow": snap.consecutive_slow,
-                }
-            )
-        return {
-            "enabled": bool(cfg.enabled),
-            "config": {
-                "slow_threshold_ms": cfg.slow_threshold_ms,
-                "ewma_threshold_ms": cfg.ewma_threshold_ms,
-                "p95_threshold_ms": cfg.p95_threshold_ms,
-                "floor_ms": cfg.floor_ms,
-                "consecutive_slow": cfg.consecutive_slow,
-                "soft_cooldown_sec": cfg.soft_cooldown_sec,
-                "hard_cooldown_sec": cfg.hard_cooldown_sec,
-                "slow_threshold_ms_per_model": dict(cfg.per_model),
-                "stream_metric": cfg.stream_metric,
-            },
-            "cooldowns": cooldowns,
-            "soft_history": soft_history,
-            "trackers": trackers,
-        }
-
-    @app.get("/api/retry-config")
-    async def get_retry_config():
-        """Retry transparent : configuration effective (défauts inclus)."""
-        return _retry_until_success_config()
-
-    @app.post("/api/retry-config")
-    async def update_retry_config(request: Request):
-        """Active/désactive le retry transparent et règle sa fenêtre."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse(status_code=400, content={"error": "JSON invalide"})
-        if not isinstance(body, dict):
-            return JSONResponse(status_code=400, content={"error": "objet JSON attendu"})
-        updates: dict = {}
-        for key in (
-            "enabled",
-            "max_wait_s",
-            "base_delay_s",
-            "max_delay_s",
-            "keepalive_interval_s",
-            "buffer_max_bytes",
-        ):
-            if key in body:
-                updates[key] = body[key]
-        if "enabled" in updates:
-            raw = updates["enabled"]
-            if isinstance(raw, str):
-                updates["enabled"] = raw.strip().lower() in ("1", "true", "yes", "on")
-            else:
-                updates["enabled"] = bool(raw)
-        if not updates:
-            return _retry_until_success_config()
-        persist_err = _persist_retry_until_success(updates)
-        if persist_err:
-            return JSONResponse(status_code=400, content={"error": persist_err})
-        return _retry_until_success_config()
-
-    @app.get("/api/vpn-config")
-    async def get_vpn_config():
-        """Get current VPN configuration."""
-        import shared_state
-
-        if shared_state.vpn_manager:
-            cfg = shared_state.vpn_manager.get_config()
-            try:
-                _ip_rot = getattr(config_settings, "IP_ROTATION", None) or {}
-                for _block in _QUALITY_BLOCK_SPEC:
-                    if isinstance(_ip_rot.get(_block), dict):
-                        cfg[_block] = dict(_ip_rot[_block])
-                from free.auto_egress import providers_from_mode
-
-                _providers = _ip_rot.get("egress_providers")
-                if not isinstance(_providers, list) or not _providers:
-                    _providers = providers_from_mode(str(cfg.get("proxy_mode") or "vpn"))
-                cfg["egress_providers"] = list(_providers)
-                cfg["egress_strategy"] = str(
-                    _ip_rot.get("egress_strategy") or "fallback"
-                )
-                _weights = _ip_rot.get("egress_weights")
-                cfg["egress_weights"] = (
-                    dict(_weights) if isinstance(_weights, dict) else {}
-                )
-            except Exception:
-                pass
-            return cfg
-        return {
-            "enabled": False,
-            "servers": [],
-            "auth_file": "",
-            "protocol": "udp",
-            "free_substitution_policy": config_settings.get_free_substitution_policy(),
-        }
-
-    @app.get("/api/vpn-stack-info")
-    async def get_vpn_stack_info():
-        """[plan 18/08 §3d] VPN technology selector state — per-station
-        effective stack, key presence, reliability counters, flip journal."""
-        import shared_state
-
-        # [plan 18/08 §4] N-station: one entry per active station (was a
-        # fixed mgr1+mgr2 pair).
-        info = {"stations": {}}
-        for mgr in getattr(shared_state, "vpn_managers", None) or []:
-            info["stations"][str(mgr._station)] = mgr.stack_info()
-        return info
-
-    @app.get("/api/egress/capacity")
-    async def get_egress_capacity():
-        """Conseiller de capacité 010 — lecture seule, sans routage."""
-        from free.auto_egress import providers_from_mode
-        from free.capacity import capacity_config, evaluate_capacity
-
-        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
-        selected = cfg.get("egress_providers")
-        if not isinstance(selected, list) or not selected:
-            selected = providers_from_mode(str(cfg.get("proxy_mode") or "vpn"))
-        strategy = str(cfg.get("egress_strategy") or "fallback")
-        raw_weights = cfg.get("egress_weights")
-        weights = dict(raw_weights) if isinstance(raw_weights, dict) else {}
-        target, policy = capacity_config(cfg.get("egress_capacity"))
-        report = evaluate_capacity(
-            providers=_egress_capacity_counts(),
-            selected=list(selected),
-            strategy=strategy,
-            weights=weights,
-            target_slots=target,
-            reserve_policy=policy,
-            observed=_egress_observed_counts(),
-            endpoint_observed=_egress_endpoint_observed(),
-        )
-        payload = report.to_dict()
-        payload["endpoints"] = _egress_endpoint_inventory()
-        return payload
-
-    @app.post("/api/egress/capacity")
-    async def set_egress_capacity(request: Request):
-        """Persiste la cible/conseil (target_slots, reserve_policy) — 010.
-
-        Ne touche pas au routage, ni à station_count, ni aux endpoints WARP.
-        """
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        updates: dict[str, int | str] = {}
-        if "target_slots" in body:
-            try:
-                target = int(body.get("target_slots"))
-            except (TypeError, ValueError):
-                return {"error": "target_slots doit être un entier entre 1 et 10"}
-            if not (1 <= target <= 10):
-                return {"error": "target_slots doit être entre 1 et 10"}
-            updates["target_slots"] = target
-        if "reserve_policy" in body:
-            policy = str(body.get("reserve_policy") or "").strip().lower()
-            if policy not in ("full", "shared", "proportional"):
-                return {"error": "reserve_policy doit être full|shared|proportional"}
-            updates["reserve_policy"] = policy
-        if not updates:
-            return {"error": "target_slots ou reserve_policy requis"}
-        err = _persist_vpn_config({"egress_capacity": updates})
-        if err:
-            return {"error": err}
-        _egress_audit("capacity_config", {"egress_capacity": dict(updates)})
-        return {"ok": True, "egress_capacity": updates}
-
-    @app.get("/api/stations")
-    async def get_stations(request: Request):
-        """Vue consolidée des stations NordVPN et endpoints WARP (011)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        from free.capacity import capacity_config
-        from free.egress_reconcile import bucket_for_endpoint
-        from free.quota_ledger import quota_block
-
-        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
-        target, policy = capacity_config(cfg.get("egress_capacity"))
-        pool = _dashboard_pool()
-        health: dict = {}
-        if pool is not None and hasattr(pool, "_station_health"):
-            try:
-                health = pool._station_health.snapshot()
-            except Exception:
-                health = {}
-
-        def _health_for(sid: int) -> dict:
-            return health.get(sid) or health.get(str(sid)) or {}
-
-        rows: list[dict] = []
-        for manager in _dashboard_managers():
-            try:
-                status = manager.get_status()
-            except Exception:
-                status = {}
-            sid = int(getattr(manager, "_station", 0) or 0)
-            h = _health_for(sid)
-            rows.append(
-                {
-                    "provider": "nordvpn",
-                    "station": sid,
-                    "container": status.get("container") or getattr(manager, "_docker_container", ""),
-                    "generation": int(status.get("generation", 0) or 0),
-                    "state": h.get("state") or status.get("status") or "unknown",
-                    "client_usable": bool(h.get("usable", False)),
-                    "egress_ip": status.get("ip") or status.get("current_ip"),
-                    "block": quota_block(
-                        status.get("ip") or status.get("current_ip")
-                    ),
-                    "quota_state": "unknown",
-                    "reset_at": None,
-                    "last_evidence": None,
-                    "reason": h.get("last_error") or status.get("error"),
-                    "next_action": "none" if h.get("usable") else "repair",
-                    "provider_details": {
-                        "stack": status.get("assigned_stack") or status.get("stack"),
-                        "transport": status.get("ovpn_protocol_effective"),
-                        "hostname": status.get("current_host"),
-                    },
-                }
-            )
-        if pool is not None and hasattr(pool, "_socks5_enabled_eps"):
-            try:
-                endpoints = pool._socks5_enabled_eps()
-            except Exception:
-                endpoints = []
-            for endpoint in endpoints:
-                sid = int(getattr(endpoint, "_station", 0) or 0)
-                h = _health_for(sid)
-                egress = getattr(endpoint, "egress_ip", None)
-                try:
-                    endpoint_usable = bool(pool._socks5_client_usable(endpoint))
-                except Exception:
-                    endpoint_usable = bool(h.get("usable", False) and egress)
-                rows.append(
-                    {
-                        "provider": "warp",
-                        "station": sid,
-                        "container": getattr(endpoint, "container", None),
-                        "generation": 0,
-                        "state": "client_usable"
-                        if endpoint_usable
-                        else (h.get("state") or "degraded"),
-                        "client_usable": endpoint_usable,
-                        "egress_ip": egress,
-                        "block": bucket_for_endpoint(endpoint),
-                        "quota_state": "unknown",
-                        "reset_at": getattr(endpoint, "reset_at", None),
-                        "last_evidence": None,
-                        "reason": h.get("last_error"),
-                        "next_action": "none" if endpoint_usable else "repair",
-                        "provider_details": {
-                            "label": getattr(endpoint, "label", ""),
-                            "ipv6": bool(getattr(endpoint, "ipv6", False)),
-                            "managed": bool(getattr(endpoint, "managed", False)),
-                        },
-                    }
-                )
-        duplicate_groups = (
-            pool.duplicate_egress_groups() if pool is not None and hasattr(pool, "duplicate_egress_groups") else {}
-        )
-        return {
-            "generated_at": datetime.now(UTC).isoformat(),
-            "target_slots": target,
-            "reserve_policy": policy,
-            "providers": _egress_capacity_counts(),
-            "stations": rows,
-            "duplicate_buckets": duplicate_groups,
-            "warnings": [
-                f"duplicate_block:{bucket}" for bucket in duplicate_groups
-            ],
-        }
-
-    @app.get("/api/stations/reconcile-plan")
-    async def get_stations_reconcile_plan(request: Request):
-        """Plan de reconcile read-only (desired vs actual), sans action."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        from ops.providers.nordvpn import NordVpnProvider
-        from ops.providers.warp import WarpProvider
-        from ops.reconciler import ActualSlot, reconcile
-
-        pool = _dashboard_pool()
-        managers = _dashboard_managers()
-        desired = list(NordVpnProvider(managers).specs())
-        actual: list[ActualSlot] = []
-        for manager in managers:
-            try:
-                status = manager.get_status()
-            except Exception:
-                status = {}
-            sid = int(getattr(manager, "_station", 0) or 0)
-            stack = str(status.get("assigned_stack") or status.get("stack") or "")
-            proto = str(status.get("ovpn_protocol_effective") or "")
-            transport = (
-                "wireguard"
-                if stack == "wireguard"
-                else (f"openvpn-{proto}" if proto in ("tcp", "udp") else proto)
-            )
-            actual.append(
-                ActualSlot(
-                    provider="nordvpn",
-                    slot_id=sid,
-                    container=str(status.get("container") or ""),
-                    generation=0,
-                    stack=stack,
-                    transport=transport,
-                    running=bool(status.get("ip") or status.get("current_ip")),
-                    health="healthy" if status.get("error") is None else "unhealthy",
-                    port=int(status.get("proxy_port") or 0),
-                )
-            )
-        endpoints: list = []
-        if pool is not None and hasattr(pool, "_socks5_enabled_eps"):
-            try:
-                endpoints = list(pool._socks5_enabled_eps())
-            except Exception:
-                endpoints = []
-        desired.extend(WarpProvider(endpoints).specs())
-        for endpoint in endpoints:
-            actual.append(
-                ActualSlot(
-                    provider="warp",
-                    slot_id=0,
-                    container=str(getattr(endpoint, "container", "") or ""),
-                    generation=0,
-                    stack="warp",
-                    transport="socks5",
-                    running=bool(getattr(endpoint, "egress_ip", None)),
-                    health="healthy" if getattr(endpoint, "egress_ip", None) else "unhealthy",
-                    port=int(getattr(endpoint, "port", 0) or 0),
-                    block=str(getattr(endpoint, "block_key", "") or "") or None,
-                )
-            )
-        decisions = reconcile(desired, actual)
-        return {
-            "generated_at": datetime.now(UTC).isoformat(),
-            "read_only": True,
-            "decisions": [decision.as_dict() for decision in decisions],
-        }
-
-    @app.get("/api/stations/{provider}/{station}")
-    async def get_station(provider: str, station: int, request: Request):
-        """Détail d'une station (même vérité que /api/stations)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        payload = await get_stations(request)
-        for row in payload.get("stations", []):
-            if row.get("provider") == provider and int(row.get("station", 0)) == int(station):
-                return row
-        return {"error": "station inconnue", "provider": provider, "station": station}
-
-    @app.post("/api/vpn-config")
-    async def update_vpn_config(request: Request):
-        """Update VPN configuration (hot-reload + persist to config.yaml)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        body = await request.json()
-
-        # Handle credentials — [24] write the single source gluetun actually
-        # reads (credentials.env via docker-compose env_file).
-        if "credentials" in body:
-            creds = body.pop("credentials")
-            username = creds.get("username", "")
-            password = creds.get("password", "")
-            if username and password:
-                try:
-                    _write_credentials_env(username, password)
-                except ValueError as exc:
-                    return JSONResponse(status_code=400, content={"error": str(exc)})
-
-        # [fix 19/08] free_model_map is a TOP-LEVEL config.yaml key (not an
-        # ip_rotation one) — hot-reload by mutating the shared dict in place
-        # (opencode.py imports the SAME object by reference, so clear()+update
-        # is visible without a proxy restart) + persist to config.yaml + sync
-        # the in-memory mirror so a later settings.yaml_set() dump does not
-        # revert what we just wrote to disk. Consumed — never fanned out.
-        if "free_model_map" in body:
-            _fmm = body.pop("free_model_map")
-            if isinstance(_fmm, dict):
-                try:
-                    from config import settings as _st
-
-                    _st.FREE_MODEL_MAP.clear()
-                    _st.FREE_MODEL_MAP.update(_fmm)
-                    _st._yaml_data["free_model_map"] = dict(_fmm)
-                except Exception as e:
-                    _debug(f"  [free] free_model_map hot-reload failed: {e}")
-                    return {"error": f"échec hot-reload free_model_map : {e}"}
-                _persist_free_model_map(_fmm)
-
-        # [plan 19/08 §1/§2] free multi-attempt + exception ordering —
-        # validated here, then left in body so they reach _persist_vpn_config
-        # (config.yaml + in-memory mirror; read per-request via
-        # IP_ROTATION.get → hot-reload without restart). No container effect:
-        # update_config() stores them harmlessly in the manager _config dict.
-        if "max_free_attempts" in body:
-            try:
-                body["max_free_attempts"] = max(1, min(3, int(body["max_free_attempts"])))
-            except (TypeError, ValueError):
-                return {"error": "max_free_attempts doit être un entier entre 1 et 3"}
-        # [GUI « Essais gratuits / requête »] Le sélecteur doit être effectif :
-        # auto=false active réellement max_free_attempts (1-3). Sans ce flag,
-        # effective_free_max_attempts() dérive du nombre de stations et ignore
-        # silencieusement le choix de l'opérateur.
-        if "auto_max_free_attempts" in body:
-            _raw_auto = body["auto_max_free_attempts"]
-            if isinstance(_raw_auto, str):
-                body["auto_max_free_attempts"] = _raw_auto.strip().lower() in (
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                )
-            else:
-                body["auto_max_free_attempts"] = bool(_raw_auto)
-        if "free_exception_fallback" in body:
-            if str(body["free_exception_fallback"]) not in ("station-first", "direct"):
-                return {"error": "free_exception_fallback doit être 'station-first' ou 'direct'"}
-            body["free_exception_fallback"] = str(body["free_exception_fallback"])
-        if "free_substitution_policy" in body:
-            _v = str(body["free_substitution_policy"] or "").strip().lower()
-            if _v not in config_settings.FREE_SUBSTITUTION_POLICIES:
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "free_substitution_policy doit être 'homonym' ou 'family'"},
-                )
-            body["free_substitution_policy"] = _v
-        # Action sur 429 — validate, then let it flow to _persist + pool
-        if "on_429_action" in body:
-            _v = str(body["on_429_action"] or "").strip().lower()
-            if _v not in ("cooldown", "rotate", "both"):
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "on_429_action doit être 'cooldown', 'rotate' ou 'both'"},
-                )
-            body["on_429_action"] = _v
-        # [phase 1] qui choisit les serveurs VPN : proxy (nous) | gluetun.
-        if "server_pick_mode" in body:
-            _v = str(body["server_pick_mode"] or "").strip().lower()
-            if _v not in ("proxy", "gluetun"):
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "server_pick_mode doit être 'proxy' ou 'gluetun'"},
-                )
-            body["server_pick_mode"] = _v
-        # bad_ttl — legacy host fast-pin TTL (minutes) ; conservé pour compat.
-        if "bad_ttl" in body or "cooldown_sec" in body or "badTtl" in body:
-            _raw_bt = body.pop("bad_ttl", body.pop("cooldown_sec", body.pop("badTtl", None)))
-            try:
-                _bt = int(float(_raw_bt))
-            except (TypeError, ValueError):
-                return JSONResponse(status_code=400, content={"error": "bad_ttl doit être un entier entre 1 et 3600"})
-            if not (1 <= _bt <= 3600):
-                return JSONResponse(status_code=400, content={"error": "bad_ttl doit être un entier entre 1 et 3600"})
-            body["bad_ttl"] = _bt
-        # [GUI « Cooldown (s) »] Clé dédiée au bad-mark station, en SECONDES.
-        # L'ancien GUI écrivait bad_ttl (minutes côté fast-pin) : dès que
-        # station_bad_ttl_s existait dans config.yaml, le réglage n'avait plus
-        # aucun effet sur le cooldown station.
-        if "station_bad_ttl_s" in body:
-            try:
-                _sbt = int(float(body["station_bad_ttl_s"]))
-            except (TypeError, ValueError):
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "station_bad_ttl_s doit être un entier entre 1 et 3600"},
-                )
-            if not (1 <= _sbt <= 3600):
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "station_bad_ttl_s doit être un entier entre 1 et 3600"},
-                )
-            body["station_bad_ttl_s"] = _sbt
-
-        # [GUI toggle « Cooldown latence »] validation minimale du bloc imbriqué
-        # latency_rotation (scope: le booléen enabled — les autres clés restent
-        # couvertes par config.yaml / le validateur dry-run).
-        if "latency_rotation" in body:
-            _lr = body["latency_rotation"]
-            if not isinstance(_lr, dict):
-                return JSONResponse(status_code=400, content={"error": "latency_rotation doit être un objet"})
-            if "enabled" in _lr and not isinstance(_lr["enabled"], bool):
-                return JSONResponse(status_code=400, content={"error": "latency_rotation.enabled doit être booléen"})
-
-        _q_errors = _quality_blocks_errors(body)
-        if _q_errors:
-            return JSONResponse(status_code=400, content={"error": "; ".join(_q_errors)})
-
-        # [free_parallel] type check only — PAS de normalisation ici.
-        # `_normalize_free_parallel` remplit les clés absentes avec leurs
-        # DÉFAUTS ; appliqué à un patch partiel {enabled,routing,mode}, il
-        # fabriquait un hedge_delay_ms=400 qui écrasait ensuite la valeur
-        # existante (1500) lors de la fusion dans `_persist_vpn_config`.
-        # Mesuré le 2026-10-25 : un simple toggle GUI faisait 1500 -> 400.
-        # La normalisation (et donc la validation des valeurs) reste faite
-        # sur le dictionnaire FUSIONNÉ, dans `_persist_vpn_config`.
-        if "free_parallel" in body:
-            if not isinstance(body["free_parallel"], dict):
-                return {"error": "free_parallel doit être un objet"}
-        for _fk in (
-            "free_parallel_enabled",
-            "free_parallel_routing",
-            "free_parallel_mode",
-            "free_parallel_hedge_delay_ms",
-        ):
-            if _fk in body:
-                # will be validated in _persist_vpn_config / pool.update_config; keep as is
-                pass
-        if "free_parallel_routing" in body:
-            if str(body["free_parallel_routing"]).lower() not in ("round-robin", "failover"):
-                return {"error": "free_parallel_routing doit être 'round-robin' ou 'failover'"}
-            body["free_parallel_routing"] = str(body["free_parallel_routing"]).lower()
-        if "free_parallel_mode" in body:
-            if str(body["free_parallel_mode"]).lower() not in ("load-balance", "strict", "hedge"):
-                return {"error": "free_parallel_mode doit être 'load-balance', 'strict' ou 'hedge'"}
-            body["free_parallel_mode"] = str(body["free_parallel_mode"]).lower()
-
-        # Handle config updates (need VPN manager). [plan] F: fan-out to
-        # ALL stations — identity pool, watchdog backoff and freshness
-        # windows must stay symmetric on every station (a single shared
-        # registry and one absolute identity cursor globalise them).
-        managers = getattr(shared_state, "vpn_managers", None) or []
-        if not managers and "station_count" in (body or {}):
-            return JSONResponse(
-                status_code=503,
-                content={"error": "gestionnaire VPN non initialisé (aucune station active)"},
-            )
-        if managers and body:
-            # [plan 18/08 §4] N-station hot-reload — change the number of
-            # parallel tunnels at runtime (start/stop compose containers,
-            # no proxy restart). Short-circuits when the count did not
-            # actually change; _apply_station_count persists config.yaml
-            # LAST (coherent on mid-failure).
-            _requested_station_count: int | None = None
-            if "station_count" in body:
-                _raw_n = body["station_count"]
-                try:
-                    _new_n = int(_raw_n)
-                except (TypeError, ValueError):
-                    _new_n = 0
-                # [Axe 3.3] 400 explicite hors bornes — un clamp silencieux
-                # masque les erreurs GUI/programmatiques (un 15 tapé lancerait
-                # 10 stations sans sourciller).
-                if not (1 <= _new_n <= 10):
-                    return JSONResponse(
-                        status_code=400,
-                        content={"error": f"station_count doit être un entier entre 1 et 10, reçu {_raw_n!r}"},
-                    )
-                body.pop("station_count")  # consumed — never fanned out
-                _requested_station_count = _new_n
-                if _new_n != len(managers):
-                    try:
-                        from opencode import _apply_station_count
-
-                        await _apply_station_count(_new_n)
-                    except Exception as e:
-                        import traceback as _tb
-
-                        _debug(f"  [vpn] station_count hot-reload failed: {e}\n{_tb.format_exc()}")
-                        return JSONResponse(
-                            status_code=500,
-                            content={"error": f"échec hot-reload station_count : {e}"},
-                        )
-                    managers = getattr(shared_state, "vpn_managers", None) or []
-                else:
-                    # [fix 09/09] new == len(managers) : le registre runtime a
-                    # déjà N stations mais le miroir persisté peut être périmé
-                    # (ex. runtime 6 vs config.yaml 2) — le GUI renverrait
-                    # sinon l'ancienne valeur et « reviendrait sur 2 ».
-                    # Converge via _apply_station_count (chemin idempotent :
-                    # recrée les stations manquantes, redémarre les
-                    # déconnectées) puis persiste si le miroir diffère.
-                    try:
-                        from opencode import _apply_station_count as _asc_sync
-
-                        await _asc_sync(_new_n)
-                    except Exception as e:
-                        import traceback as _tb2
-
-                        _debug(f"  [vpn] station_count resync failed: {e}\n{_tb2.format_exc()}")
-                        return JSONResponse(
-                            status_code=500,
-                            content={"error": f"échec resync station_count : {e}"},
-                        )
-                    managers = getattr(shared_state, "vpn_managers", None) or []
-            if _requested_station_count is not None:
-                _egress_audit(
-                    "station_count",
-                    {"station_count": int(_requested_station_count)},
-                )
-            for mgr in managers:
-                await mgr.update_config(body)
-            # [plan] E: new ip_rotation timings drive the free-IP pool too
-            # (rotation_threshold stagger, connect retry, bad TTL, ...).
-            pool = getattr(shared_state, "free_ip_pool", None)
-            if pool is not None:
-                pool.update_config(body)
-
-            # Persist changes to config.yaml. [audit 18/08] vpn_stack is
-            # excluded here and persisted AFTER the stack application
-            # succeeded — persisting first would leave config.yaml saying
-            # wireguard while the effective stack stayed openvpn when
-            # set_stack refuses (no vpn_configs/wireguard.env): incoherent
-            # persistent state that would also kill auto-flips on reboot
-            # (stack != auto wins). The other keys are unconditional.
-            _persist_body = {k: v for k, v in body.items() if k != "vpn_stack"}
-            # [fix 09/09] le retour de _persist n'est plus ignoré : un échec
-            # disque silencieux laissait config.yaml périmé (désync 2 vs 6).
-            _persist_err = _persist_vpn_config(_persist_body)
-            if _persist_err:
-                _debug(f"  [vpn] persist config failed: {_persist_err}")
-                return JSONResponse(
-                    status_code=500,
-                    content={"error": f"échec persistance config : {_persist_err}"},
-                )
-
-            # [plan 18/08 §3d] stack selection — applied AFTER the config
-            # fan-out (set_stack persists the mode itself into the manager;
-            # config.yaml holds the selection via the conditional persist
-            # above). _apply_stack recreates ALL stations, so every station
-            # beyond the first only mirrors state (propagate=False) — no
-            # second compose — and only on success (a refused flip must not
-            # desync the other stations from station 1).
-            if "vpn_stack" in body:
-                _stack_ok = False
-                try:
-                    _stack_res = await managers[0].set_stack(str(body["vpn_stack"]))
-                    _stack_ok = bool(_stack_res.get("ok"))
-                    if _stack_ok:
-                        _persist_vpn_config({"vpn_stack": str(body["vpn_stack"])})
-                    else:
-                        _debug(
-                            f"  [vpn] set_stack refused: {_stack_res.get('error')} — config.yaml keeps the previous stack"
-                        )
-                except Exception as e:
-                    _debug(f"  [vpn] set_stack failed: {e}")
-                # only on success — a refused flip must not desync the other
-                # stations from station 1 (their mirror would claim a stack
-                # the primary never applied).
-                if _stack_ok:
-                    for _m in managers[1:]:
-                        try:
-                            await _m.set_stack(str(body["vpn_stack"]), propagate=False)
-                        except Exception as e:
-                            _debug(f"  [vpn] set_stack (station {_m._station}) failed: {e}")
-
-        config = managers[0].get_config() if managers else {}
-        return {"ok": True, "config": config}
-
-    @app.post("/api/vpn/toggle")
-    async def toggle_vpn(request: Request):
-        """Enable or disable VPN rotation."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        body = await request.json()
-        enabled = body.get("enabled", True)
-        managers = list(getattr(shared_state, "vpn_managers", None) or [])
-        if not managers and shared_state.vpn_manager:
-            managers = [shared_state.vpn_manager]
-        if managers:
-            res = await _fleet_controller().set_enabled_all(enabled)
-            return res
-        return {"error": "gestionnaire VPN non initialisé"}
-
-    @app.post("/api/vpn/connect")
-    async def connect_vpn(request: Request):
-        """Connect VPN — reconcile status, then connect via compose-managed gluetun."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        if not shared_state.vpn_manager:
-            return {"error": "gestionnaire VPN non initialisé"}
-
-        managers = list(getattr(shared_state, "vpn_managers", None) or [])
-        if not managers:
-            managers = [shared_state.vpn_manager]
-        try:
-            # [roadmap] Connecter TOUTE la flotte, pas seulement la station 1.
-            res = await _fleet_controller().connect_all()
-            first = managers[0]
-            try:
-                await first.refresh_status()
-            except Exception:
-                pass
-            return {
-                **res,
-                "ip": getattr(first, "current_ip", None),
-                "server": getattr(first, "current_server", None),
-            }
-        except Exception as e:
-            return {"error": str(e)}
-
-    @app.post("/api/vpn/disconnect")
-    async def disconnect_vpn(request: Request):
-        """Disconnect VPN."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        managers = list(getattr(shared_state, "vpn_managers", None) or [])
-        if not managers and not shared_state.vpn_manager:
-            return {"error": "gestionnaire VPN non initialisé"}
-        return await _fleet_controller().disconnect_all(stop_containers=False)
-
-    @app.post("/api/vpn/health-check")
-    async def vpn_health_check(request: Request):
-        """Run a health check on the current VPN connection."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        if not shared_state.vpn_manager:
-            return {"error": "gestionnaire VPN non initialisé"}
-        result = await shared_state.vpn_manager.health_check()
-        return result
-
-    @app.post("/api/vpn/heal")
-    async def heal_vpn(request: Request):
-        """[v6 P1-0] Heal idempotent: converge missing stations (docker absent) via _apply_station_count."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        try:
-            from config.settings import IP_ROTATION, resolved_station_count
-
-            n = resolved_station_count(IP_ROTATION)
-            managers = list(getattr(shared_state, "vpn_managers", None) or [])
-            if len(managers) < n:
-                # import at runtime to avoid circular import (opencode imports dashboard)
-                from opencode import _apply_station_count
-
-                await _apply_station_count(n)
-                managers = list(getattr(shared_state, "vpn_managers", None) or [])
-            res = await _fleet_controller().heal()
-            return {"healed": bool(res.get("healed")), "n": n, "managers": len(managers), **res}
-        except Exception as e:
-            return {"error": str(e), "healed": False}
-
-    @app.post("/api/vpn/next")
-    async def next_vpn(request: Request):
-        """Switch to next VPN server.
-
-        Body may carry ``station`` (0 = active station, default; n = station
-        n — the latter only within the resolved station_count).
-        """
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        managers = getattr(shared_state, "vpn_managers", None) or []
-        if not managers:
-            return {"error": "gestionnaire VPN non initialisé"}
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        station = body.get("station", 0)
-        try:
-            station = int(station)
-        except (TypeError, ValueError):
-            station = 0
-        if station:
-            # [plan 18/08 §4] N-station: 1-indexed lookup in the registry.
-            if not (1 <= station <= len(managers)):
-                return {"error": f"station {station} non configurée (station_count={len(managers)})"}
-            mgr = managers[station - 1]
-        else:
-            # 0 → the station the pool currently routes through.
-            mgr = None
-        try:
-            if shared_state.free_ip_pool:
-                if mgr is None:
-                    # 0 → the station the pool actually routes through.
-                    # switch_ip() rotates the pool's ACTIVE station (which may
-                    # be station 2); if we read station 1 here, a successful
-                    # station-2 rotation would be reported ok:false with the
-                    # wrong station_out — a false negative for the operator.
-                    mgr = shared_state.free_ip_pool.active_station or shared_state.vpn_manager
-                if mgr is None:
-                    return {"error": "aucun manager VPN disponible"}
-                ip_before = mgr.current_ip
-                await shared_state.free_ip_pool.switch_ip(station=mgr)
-                ip_after = mgr.current_ip
-                server = mgr.current_server
-                station_out = mgr._station
-            else:
-                mgr = mgr or shared_state.vpn_manager
-                if mgr is None:
-                    return {"error": "aucun manager VPN disponible"}
-                ip_before = mgr.current_ip
-                await mgr.connect_next()
-                ip_after = mgr.current_ip
-                server = mgr.current_server
-                station_out = mgr._station
-            ok = bool(ip_after) and (ip_before is None or ip_after != ip_before)
-            return {"ok": ok, "ip": ip_after, "server": server, "station": station_out}
-        except Exception as e:
-            return {"error": str(e)}
-
-    @app.post("/api/vpn/update")
-    async def update_vpn(request: Request):
-        """Force-check and apply a pending gluetun image update."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        if not shared_state.vpn_manager:
-            return {"error": "gestionnaire VPN non initialisé"}
-        try:
-            available = await shared_state.vpn_manager.check_update()
-            if not available:
-                return {
-                    "ok": False,
-                    "error": "aucune mise à jour disponible",
-                    "update": shared_state.vpn_manager.get_status()["update"],
-                }
-            # [roadmap] mise à jour coordonnée de toute la flotte, pas de la
-            # seule station 1. On conserve le garde-fou « trafic actif ».
-            if not shared_state.vpn_manager._update_opportune():
-                return {"ok": False, "error": "pas opportun (trafic actif)"}
-            from ops.updater import apply_fleet_update
-
-            result = await apply_fleet_update(
-                list(getattr(shared_state, "vpn_managers", None) or []),
-                shared_state.vpn_manager,
-            )
-            result["update"] = shared_state.vpn_manager.get_status()["update"]
-            return result
-        except Exception as e:
-            return {"error": str(e)}
-
-    @app.get("/api/vpn/credentials")
-    async def get_vpn_credentials(request: Request):
-        """Check if VPN credentials exist (does not return actual values)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import os
-
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        cred_path = os.path.join(root, "credentials.env")
-        exists = os.path.exists(cred_path) and os.path.getsize(cred_path) > 0
-        username_saved = ""
-        if exists:
-            try:
-                with open(cred_path, encoding="utf-8") as f:
-                    for line in f:
-                        if line.startswith("OPENVPN_USER="):
-                            username_saved = line.split("=", 1)[1].strip()
-                            break
-            except Exception:
-                pass
-        return {
-            "exists": exists,
-            "username_preview": username_saved[:4] + "****" if username_saved else "",
-        }
-
-    @app.post("/api/vpn/credentials")
-    async def save_vpn_credentials(request: Request):
-        """Save NordVPN credentials — writes credentials.env (gluetun env_file)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        username = body.get("username", "")
-        password = body.get("password", "")
-
-        if not username or not password:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Nom d'utilisateur et mot de passe requis"},
-            )
-
-        try:
-            _write_credentials_env(username, password)
-        except ValueError as exc:
-            return JSONResponse(status_code=400, content={"error": str(exc)})
-        return {
-            "ok": True,
-            "note": "restart the VPN container (docker compose up -d) for gluetun to pick up new credentials",
-        }
-
-    @app.post("/api/vpn/save-state")
-    async def save_vpn_state(request: Request):
-        """Persist VPN state to disk."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        if shared_state.vpn_manager:
-            shared_state.vpn_manager.save_state()
-            return {"ok": True}
-        return {"error": "gestionnaire VPN non initialisé"}
-
-    @app.get("/api/vpn/export")
-    async def export_vpn_config(request: Request):
-        """Export VPN configuration as JSON."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        if not shared_state.vpn_manager:
-            return {"error": "gestionnaire VPN non initialisé"}
-
-        config = shared_state.vpn_manager.get_config()
-        state = {
-            "ip_history": shared_state.vpn_manager._ip_history,
-            "total_switches": shared_state.vpn_manager._total_switches,
-        }
-
-        export = {
-            "config": config,
-            "state": state,
-            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "version": "1.0",
-        }
-        return export
-
-    @app.post("/api/vpn/station/{sid}/pin_country")
-    async def pin_station_country(sid: int, request: Request):
-        """[v10 §12.1.5] Pin manuel d'un pays pour la station {id}.
-        Body : {"country": "Japan"} — le control server gluetun fait une
-        vraie reconnexion (~8-15 s)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse(status_code=400, content={"error": "JSON invalide"})
-        country = str((body or {}).get("country") or "").strip()
-        if not country:
-            return JSONResponse(status_code=400, content={"error": "'country' requis"})
-        import shared_state
-
-        mgr = next(
-            (m for m in (getattr(shared_state, "vpn_managers", None) or []) if getattr(m, "_station", None) == sid),
-            None,
-        )
-        if mgr is None:
-            return JSONResponse(status_code=404, content={"error": f"station {sid} introuvable"})
-        try:
-            ok = await asyncio.wait_for(mgr.pin_country(country), timeout=60)
-        except TypeError:
-            return JSONResponse(status_code=500, content={"error": "manager sans pin_country"})
-        except Exception as e:
-            return JSONResponse(status_code=502, content={"error": str(e)[:200]})
-        if ok:
-            return {"ok": True, "station": sid, "country": country}
-        return JSONResponse(
-            status_code=502,
-            content={"error": "pin refusé par le control server (pays invalide ou tunnel KO)"},
-        )
-
-    @app.delete("/api/vpn/station/{sid}/pin_country")
-    async def unpin_station_country(sid: int, request: Request):
-        """[v10 §12.1.5] Retire le pin manuel : restaure la sélection
-        multi-pays complète (SERVER_COUNTRIES)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        mgr = next(
-            (m for m in (getattr(shared_state, "vpn_managers", None) or []) if getattr(m, "_station", None) == sid),
-            None,
-        )
-        if mgr is None:
-            return JSONResponse(status_code=404, content={"error": f"station {sid} introuvable"})
-        try:
-            ok = await asyncio.wait_for(mgr.unpin_country(), timeout=45)
-        except Exception as e:
-            return JSONResponse(status_code=502, content={"error": str(e)[:200]})
-        return {"ok": bool(ok), "station": sid}
-
-    @app.post("/api/vpn/station/{sid}/probe")
-    async def probe_station(sid: int, request: Request):
-        """Probe l'egress réel d'une station et met à jour sa santé (011)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        mgr = next(
-            (
-                m
-                for m in (getattr(shared_state, "vpn_managers", None) or [])
-                if getattr(m, "_station", None) == sid
-            ),
-            None,
-        )
-        if mgr is None:
-            return JSONResponse(
-                status_code=404, content={"error": f"station {sid} introuvable"}
-            )
-        try:
-            ip = await asyncio.wait_for(mgr.get_public_ip(), timeout=30)
-        except Exception as exc:
-            mgr._note_pool_health(False, cause="probe")
-            return {"ok": False, "station": sid, "error": str(exc)[:200]}
-        ok = bool(ip)
-        mgr._note_pool_health(ok, cause="probe")
-        if ok:
-            mgr._note_pool_health(True, cause="probe")
-            try:
-                mgr._error = None
-                mgr._auth_failed = False
-                mgr._set_status("connected")
-            except Exception:
-                pass
-        return {"ok": ok, "station": sid, "ip": ip}
-
-    @app.post("/api/vpn/station/{sid}/restart")
-    async def restart_station(sid: int, request: Request):
-        """[v10 §9.4] Redémarre la station {id} (docker restart léger).
-        Le statut converge via les vpn_event SSE (~15-45 s)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        mgr = next(
-            (m for m in (getattr(shared_state, "vpn_managers", None) or []) if getattr(m, "_station", None) == sid),
-            None,
-        )
-        if mgr is None:
-            return JSONResponse(status_code=404, content={"error": f"station {sid} introuvable"})
-        try:
-            await asyncio.wait_for(mgr.restart(), timeout=150)
-        except TimeoutError:
-            return {"ok": True, "station": sid, "note": "restart en cours — suivre via SSE"}
-        except Exception as e:
-            return JSONResponse(status_code=502, content={"error": str(e)[:200]})
-        return {"ok": True, "station": sid}
-
-    @app.post("/api/vpn/station/{sid}/soft-rotate")
-    async def soft_rotate_station(sid: int, request: Request):
-        """[v10 §9.4] Déclenche une rotation d'IP pour la station {id}
-        (queue pool, anti-flapping et garde-fous §3.6 applicables)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        mgr = next(
-            (m for m in (getattr(shared_state, "vpn_managers", None) or []) if getattr(m, "_station", None) == sid),
-            None,
-        )
-        pool = getattr(shared_state, "free_ip_pool", None)
-        if mgr is None or pool is None or not hasattr(pool, "_launch_rotation"):
-            return JSONResponse(status_code=404, content={"error": f"station {sid} ou pool indisponible"})
-        try:
-            pool._launch_rotation(mgr)
-        except Exception as e:
-            return JSONResponse(status_code=502, content={"error": str(e)[:200]})
-        return {"ok": True, "station": sid, "queued": True}
-
-    @app.post("/api/vpn/station/{sid}/stack")
-    async def set_station_stack(sid: int, request: Request):
-        """Change la stack d'UNE station (WG/OV) sans flip global."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        stack = str((body or {}).get("stack") or "").strip().lower()
-        if stack not in ("wireguard", "openvpn"):
-            return JSONResponse(status_code=400, content={"error": "stack doit être wireguard|openvpn"})
-        mgr = next(
-            (m for m in (getattr(shared_state, "vpn_managers", None) or []) if getattr(m, "_station", None) == sid),
-            None,
-        )
-        if mgr is None:
-            return JSONResponse(status_code=404, content={"error": f"station {sid} introuvable"})
-        try:
-            # Flip PER-STATION : stations=[sid] borne le blast-radius.
-            # force=True répare une éventuelle divergence état/conteneur.
-            res = await mgr.set_stack(stack, propagate=True, stations=[sid], force=True)
-            if not res.get("ok"):
-                return JSONResponse(
-                    status_code=502,
-                    content={"error": res.get("error") or "échec application stack"},
-                )
-            return {
-                "ok": True,
-                "station": sid,
-                "stack": stack,
-                "effective": mgr._stack_effective,
-            }
-        except Exception as e:
-            return JSONResponse(status_code=502, content={"error": str(e)[:200]})
-
-    @app.post("/api/vpn/station/{sid}/start")
-    async def start_station(sid: int, request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        return await _fleet_controller().start_station(sid)
-
-    @app.post("/api/vpn/station/{sid}/stop")
-    async def stop_station(sid: int, request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        return await _fleet_controller().stop_station(sid)
-
-    @app.post("/api/vpn/station/{sid}/connect")
-    async def connect_station(sid: int, request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        return await _fleet_controller().connect_station(sid)
-
-    @app.post("/api/vpn/station/{sid}/disconnect")
-    async def disconnect_station(sid: int, request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        return await _fleet_controller().disconnect_station(sid)
-
-    @app.post("/api/vpn/fleet/connect")
-    async def fleet_connect(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        return await _fleet_controller().connect_all()
-
-    @app.post("/api/vpn/fleet/disconnect")
-    async def fleet_disconnect(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        return await _fleet_controller().disconnect_all(stop_containers=False)
-
-    @app.get("/api/vpn/fleet")
-    async def fleet_status(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        return _fleet_controller().status()
-
-    @app.post("/api/vpn/jobs/fleet/{action}")
-    async def fleet_job(action: str, request: Request):
-        """Lance une opération de flotte en tâche de fond (202 + job_id)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        from ops.jobs import get_jobs
-
-        fleet = _fleet_controller()
-        actions = {
-            "connect": fleet.connect_all,
-            "disconnect": lambda: fleet.disconnect_all(stop_containers=False),
-            "heal": fleet.heal,
-        }
-        fn = actions.get(str(action))
-        if fn is None:
-            return JSONResponse(status_code=400, content={"error": f"action inconnue: {action}"})
-        job = get_jobs().create(f"fleet:{action}", fn())
-        return JSONResponse(status_code=202, content=job.snapshot())
-
-    @app.get("/api/vpn/jobs/{job_id}")
-    async def get_job(job_id: str):
-        from ops.jobs import get_jobs
-
-        job = get_jobs().get(job_id)
-        if job is None:
-            return JSONResponse(status_code=404, content={"error": "job introuvable"})
-        return job.snapshot()
-
-    @app.get("/api/vpn/jobs")
-    async def list_jobs():
-        from ops.jobs import get_jobs
-
-        return get_jobs().status()
-
-    @app.get("/api/costs")
-    async def get_costs(from_date: str = None, to_date: str = None, station: int = None):
-        """[v10 §12.3.10] Coût payant + économies réalisées via le free tier.
-
-        Tarification : section `pricing` de config.yaml (défauts Sonnet-class).
-        Les modèles `-free` coûtent 0 et créditent `free_saved_usd`."""
-        where, params = _build_where(from_date, to_date, station=station)
-        pricing = {}
-        try:
-            import config.settings as _st_c
-
-            _p = _st_c._yaml_data.get("pricing")
-            if isinstance(_p, dict):
-                pricing = _p
-        except Exception:
-            pass
-
-        def _query(db):
-            rows = db.execute(
-                "SELECT model, SUM(tokens_input) AS tokens_input, "
-                "SUM(tokens_output) AS tokens_output FROM requests " + where + " GROUP BY model",
-                params,
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-        rows = await _db_read_sync(_query)
-        result = _compute_costs(rows, pricing)
-        result["window"] = {"from": from_date, "to": to_date, "station": station}
-        return result
-
-    @app.post("/api/vpn-config/validate")
-    async def validate_vpn_config(request: Request):
-        """[v10 §12.1.4] DRY-RUN : valide un payload de config VPN SANS
-        l'appliquer. Retourne {valid, errors[]} — l'UI peut l'appeler avant
-        chaque POST réel."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        try:
-            body = await request.json()
-        except Exception as e:
-            return JSONResponse(status_code=400, content={"valid": False, "errors": [str(e)]})
-        errors = _validate_vpn_config_payload(body)
-        return {"valid": not errors, "errors": errors}
-
-    @app.post("/api/vpn/rotation-paused")
-    async def set_rotation_paused(request: Request):
-        """[v10 §3.8/§4 Lot 6] Mode maintenance : gèle soft/hard rotate du
-        moteur §3.6. Éphémère PAR DESIGN (non persisté) — évite un oubli ON
-        après un restart ; le badge dashboard l'affiche tant qu'il actif."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        paused = bool(body.get("paused"))
-        import shared_state
-
-        eng = getattr(shared_state, "latency_engine", None)
-        if eng is None:
-            from latency_rotation import get_engine as _ge
-
-            eng = _ge()
-        eng.paused = paused
-        _debug(f"  [vpn] rotation_paused → {paused}")
-        return {"ok": True, "paused": paused}
-
-    @app.post("/api/vpn/import")
-    async def import_vpn_config(request: Request):
-        """Import VPN configuration from JSON."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        import shared_state
-
-        body = await request.json()
-        # [fix mypy 26/08] _apply_import_payload est async : sans await,
-        # l'unpacking du tuple levait TypeError à l'appel (endpoint mort).
-        resp, status = await _apply_import_payload(
-            list(getattr(shared_state, "vpn_managers", None) or []),
+    from dashboard.routers.station_logs_routes import register_station_logs_routes
+
+    register_station_logs_routes(
+        app,
+        managers_getter=_dashboard_managers,
+    )
+
+    from dashboard.routers.vpn_status_routes import register_vpn_status_routes
+
+    register_vpn_status_routes(
+        app,
+        settings=config_settings,
+        stats_cache=_stats_cache,
+        ip_stats_db_getter=lambda: _ip_stats_db,
+        proxy_mode_getter=lambda: _vpn_proxy_mode(),
+        socks5_payload=lambda pool: _socks5_payload(pool),
+        socks5_auto_rotate_state=lambda: _socks5_auto_rotate_state(),
+        config_yaml_mtime=lambda: _config_yaml_mtime(),
+        config_yaml_known_mtime_getter=lambda: _config_yaml_known_mtime,
+    )
+
+    from dashboard.routers.free_routes import register_free_status_routes
+
+    register_free_status_routes(app, token_checker=_check_dashboard_token)
+
+    from dashboard.routers.pool_routes import register_pool_routes
+
+    register_pool_routes(app, pool_getter=_dashboard_pool)
+
+    from dashboard.routers.retry_routes import register_retry_routes
+
+    register_retry_routes(
+        app,
+        config_getter=lambda: _retry_until_success_config(),
+        config_persister=lambda updates: _persist_retry_until_success(updates),
+        token_checker=lambda request: _check_dashboard_token(request),
+    )
+
+    from dashboard.routers.vpn_config_routes import (
+        register_vpn_config_read_routes,
+        shared_vpn_manager,
+    )
+
+    register_vpn_config_read_routes(
+        app,
+        manager_getter=shared_vpn_manager,
+        managers_getter=_dashboard_managers,
+        rotation_config_getter=lambda: getattr(config_settings, "IP_ROTATION", None) or {},
+        free_policy_getter=config_settings.get_free_substitution_policy,
+        quality_blocks=_QUALITY_BLOCK_SPEC,
+    )
+
+    from dashboard.routers.capacity_routes import register_capacity_routes
+
+    register_capacity_routes(
+        app,
+        config_getter=lambda: getattr(config_settings, "IP_ROTATION", None) or {},
+        capacity_counts_getter=lambda: _egress_capacity_counts(),
+        observed_counts_getter=lambda: _egress_observed_counts(),
+        endpoint_observed_getter=lambda: _egress_endpoint_observed(),
+        endpoint_inventory_getter=lambda: _egress_endpoint_inventory(),
+        token_checker=lambda request: _check_dashboard_token(request),
+        persist_config=lambda updates: _persist_vpn_config(updates),
+        audit=lambda name, payload: _egress_audit(name, payload),
+    )
+
+    from dashboard.routers.station_routes import register_station_routes
+
+    register_station_routes(
+        app,
+        token_checker=_check_dashboard_token,
+        pool_getter=_dashboard_pool,
+        managers_getter=_dashboard_managers,
+        config_getter=lambda: getattr(config_settings, "IP_ROTATION", None) or {},
+        capacity_counts_getter=_egress_capacity_counts,
+    )
+
+    from dashboard.routers.vpn_config_update_routes import (
+        register_vpn_config_update_routes,
+    )
+
+    register_vpn_config_update_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        settings=config_settings,
+        write_credentials_env=lambda username, password: _write_credentials_env(
+            username,
+            password,
+        ),
+        persist_free_model_map=lambda mapping: _persist_free_model_map(mapping),
+        quality_blocks_errors=lambda body: _quality_blocks_errors(body),
+        persist_vpn_config=lambda updates: _persist_vpn_config(updates),
+        egress_audit=lambda action, details: _egress_audit(action, details),
+        debug=lambda message: _debug(message),
+    )
+
+    from dashboard.routers.vpn_config_routes import shared_vpn_manager
+    from dashboard.routers.vpn_fleet_routes import register_vpn_fleet_routes
+
+    register_vpn_fleet_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        managers_getter=_dashboard_managers,
+        single_manager_getter=shared_vpn_manager,
+        fleet_getter=_fleet_controller,
+    )
+
+    from dashboard.routers.vpn_health_routes import register_vpn_health_routes
+
+    register_vpn_health_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        manager_getter=shared_vpn_manager,
+    )
+
+    from dashboard.routers.vpn_heal_routes import register_vpn_heal_routes
+
+    register_vpn_heal_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        managers_getter=_dashboard_managers,
+        station_count_getter=None,
+        fleet_getter=_fleet_controller,
+    )
+
+    from dashboard.routers.vpn_next_routes import (
+        register_vpn_next_routes,
+        shared_pool,
+    )
+
+    register_vpn_next_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        managers_getter=_dashboard_managers,
+        single_manager_getter=shared_vpn_manager,
+        pool_getter=shared_pool,
+    )
+
+    from dashboard.routers.vpn_update_routes import register_vpn_update_routes
+
+    register_vpn_update_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        manager_getter=shared_vpn_manager,
+        managers_getter=_dashboard_managers,
+    )
+
+    from dashboard.routers.vpn_state_routes import register_vpn_state_routes
+
+    register_vpn_state_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        manager_getter=shared_vpn_manager,
+        credentials_path=os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "credentials.env",
+        ),
+        write_credentials=lambda username, password: _write_credentials_env(
+            username,
+            password,
+        ),
+    )
+
+    from dashboard.routers.station_control_routes import (
+        register_station_control_routes,
+    )
+
+    register_station_control_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        managers_getter=_dashboard_managers,
+        pool_getter=shared_pool,
+        fleet_getter=_fleet_controller,
+    )
+
+    from dashboard.routers.vpn_jobs_routes import register_vpn_jobs_routes
+
+    register_vpn_jobs_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        fleet_getter=_fleet_controller,
+    )
+
+    from dashboard.routers.cost_routes import register_cost_routes
+
+    register_cost_routes(
+        app,
+        build_where=lambda *args, **kwargs: _build_where(*args, **kwargs),
+        db_read_sync=lambda fn: _db_read_sync(fn),
+        compute_costs=lambda rows, pricing: _compute_costs(rows, pricing),
+        pricing_getter=_pricing_config,
+    )
+
+    from dashboard.routers.vpn_control_routes import (
+        register_vpn_control_routes,
+        shared_latency_engine,
+    )
+
+    register_vpn_control_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        validate_payload=lambda body: _validate_vpn_config_payload(body),
+        engine_getter=shared_latency_engine,
+        debug_logger=_debug,
+    )
+
+    from dashboard.routers.vpn_import_routes import register_vpn_import_routes
+
+    register_vpn_import_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        managers_getter=_dashboard_managers,
+        single_manager_getter=shared_vpn_manager,
+        apply_import=lambda managers, body, **kwargs: _apply_import_payload(
+            managers,
             body,
-            fallback_manager=shared_state.vpn_manager,
-        )
-        if status != 200:
-            return JSONResponse(status_code=status, content=resp)
-        return resp
+            **kwargs,
+        ),
+    )
 
     # ── [Axe 3.1] SOCKS5 backend / NordVPN / diagnostic endpoints ──
     # Contracts pinned from static/app.js (verified 19/08). All state-chan
@@ -5503,1008 +2781,228 @@ def register_dashboard(
     # GUI polls them every 10 s). External I/O lives in the isolated helpers
     # above (hot-patchable offline — live docker/API never runs in tests).
 
-    @app.get("/api/vpn/socks5")
-    async def get_vpn_socks5():
-        """Static SOCKS5 uplink list for the GUI (``{proxies, rotate,
-        fallback}``; proxies never carry passwords)."""
-        pool = _dashboard_pool()
-        return {
-            "proxies": _socks5_payload(pool),
-            "rotate": _socks5_auto_rotate_state(),
-            "fallback": _socks5_fallback_state(),
-            "mode": getattr(pool, "proxy_mode", ""),
-            "enabled": bool(getattr(pool, "enabled", False)),
-        }
+    from dashboard.routers.proxy_backend_routes import (
+        register_proxy_backend_routes,
+    )
 
-    @app.post("/api/vpn/socks5/refresh-egress")
-    async def refresh_vpn_socks5_egress(request: Request):
-        """Réconcilie l'egress live des endpoints WARP avec config/ledger."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        pool = _dashboard_pool()
-        if pool is None or not hasattr(pool, "refresh_socks5_egress"):
-            return {"ok": False, "error": "pool_unavailable"}
-        try:
-            results = await asyncio.to_thread(pool.refresh_socks5_egress, force=True)
-            duplicates = (
-                pool.duplicate_egress_groups()
-                if hasattr(pool, "duplicate_egress_groups")
-                else {}
+    register_proxy_backend_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        pool_getter=lambda: _dashboard_pool(),
+        socks5_payload=lambda pool: _socks5_payload(pool),
+        socks5_auto_rotate_state=lambda: _socks5_auto_rotate_state(),
+        socks5_fallback_state=lambda: _socks5_fallback_state(),
+        apply_socks5_rows=lambda rows, action="socks5_update": _apply_socks5_rows(
+            rows,
+            action=action,
+        ),
+        as_index=lambda value: _as_index(value),
+        stored_proxy_credentials=(
+            lambda pool, attribute, host, port: _stored_proxy_credentials(
+                pool,
+                attribute,
+                host,
+                port,
             )
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-        return {"ok": True, "results": results, "duplicates": duplicates}
+        ),
+        socks5_probe=lambda *args, **kwargs: _socks5_probe(*args, **kwargs),
+        https_fallback_state=lambda: _https_fallback_state(),
+        https_payload=lambda pool: _https_payload(pool),
+        https_manual_rows=lambda pool: _https_manual_rows(pool),
+        apply_https_rows=lambda rows: _apply_https_rows(rows),
+        https_probe=lambda *args, **kwargs: _https_probe(*args, **kwargs),
+        persist_vpn_config=lambda updates: _persist_vpn_config(updates),
+    )
 
-    @app.post("/api/vpn/socks5/rotate-egress")
-    async def rotate_vpn_socks5_egress(request: Request):
-        """Force une rotation des WARP managés dont le bucket est épuisé."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        pool = _dashboard_pool()
-        if pool is None or not hasattr(pool, "rotate_exhausted_managed"):
-            return {"ok": False, "error": "pool_unavailable"}
+    from dashboard.routers.adaptive_routes import register_adaptive_routes
+
+    register_adaptive_routes(
+        app,
+        pool_getter=lambda: _dashboard_pool(),
+    )
+
+    from dashboard.routers.egress_catalog_routes import register_egress_catalog_routes
+
+    register_egress_catalog_routes(app, _dashboard_egress_catalog)
+
+    from dashboard.qualification_launcher import launch_qualification_epoch
+    from dashboard.routers.qualification_routes import register_qualification_routes
+    from free.qualification.apply import apply_rotation
+
+    def _qualifier_manager():
         try:
-            started = int(pool.rotate_exhausted_managed())
-            scan = pool.rotation_scan() if hasattr(pool, "rotation_scan") else []
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-        return {"ok": True, "started": started, "scan": scan}
+            import shared_state as _ss
 
-    @app.post("/api/vpn/socks5")
-    async def add_vpn_socks5(request: Request):
-        """Append a static SOCKS5 proxy (``{host, port, username,
-        password}``). Persists + pushes the pool, returns the new list."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        pool = _dashboard_pool()
-        try:
-            port = int(body.get("port") or 1080)
-        except (TypeError, ValueError):
-            return {"error": f"port invalide: {body.get('port')!r}"}
-        rows = list(getattr(pool, "_socks5_proxies", None) or [])
-        rows.append(
-            {
-                "host": str(body.get("host", "") or ""),
-                "port": port,
-                "enabled": True,
-                "username": body.get("username"),
-                "password": body.get("password"),
-            }
-        )
-        err = _apply_socks5_rows(rows, action="socks5_add")
-        if err:
-            return err
-        return {"ok": True, "proxies": _socks5_payload(pool)}
-
-    @app.post("/api/vpn/socks5/remove")
-    async def remove_vpn_socks5(request: Request):
-        """Remove the proxy at ``{index}`` (app.js remove → ``{proxies}``)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        pool = _dashboard_pool()
-        rows = list(getattr(pool, "_socks5_proxies", None) or [])
-        idx = _as_index(body.get("index"))
-        if not (0 <= idx < len(rows)):
-            return {"error": f"proxy index hors bornes: {idx!r}"}
-        del rows[idx]
-        err = _apply_socks5_rows(rows, action="socks5_remove")
-        if err:
-            return err
-        return {"ok": True, "proxies": _socks5_payload(pool)}
-
-    @app.post("/api/vpn/socks5/toggle")
-    async def toggle_vpn_socks5(request: Request):
-        """Enable/disable the proxy at ``{index, enabled}``."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        pool = _dashboard_pool()
-        rows = list(getattr(pool, "_socks5_proxies", None) or [])
-        idx = _as_index(body.get("index"))
-        if not (0 <= idx < len(rows)):
-            return {"error": f"proxy index hors bornes: {idx!r}"}
-        rows[idx] = dict(rows[idx])
-        rows[idx]["enabled"] = bool(body.get("enabled", True))
-        err = _apply_socks5_rows(rows, action="socks5_toggle")
-        if err:
-            return err
-        return {"ok": True}
-
-    @app.post("/api/vpn/socks5/test")
-    async def test_vpn_socks5(request: Request):
-        """Probe one proxy (``{host, port}``) → ``{ok, ip, opencode_ok,
-        latency_ms, error}`` (raw SOCKS5 + ssl through ``_socks5_probe``).
-        Stored credentials are used when the row is in the list."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        host = body.get("host", "")
-        port = body.get("port", 0)
-        label = str(body.get("label") or "").strip()
-        ipv6 = False
-        username = password = None
-        pool = _dashboard_pool()
-        row = None
-        if label and pool is not None:
-            row = next(
-                (
-                    r
-                    for r in (getattr(pool, "_socks5_proxies", None) or [])
-                    if isinstance(r, dict) and str(r.get("label") or "") == label
-                ),
-                None,
-            )
-        if row is not None:
-            host = row.get("host", host)
-            port = row.get("port", port)
-            username = row.get("username")
-            password = row.get("password")
-            ipv6 = bool(row.get("ipv6", False))
-        else:
-            username, password = _stored_proxy_credentials(
-                pool, "_socks5_proxies", host, port
-            )
-        result = await _socks5_probe(
-            host, port, username=username, password=password, ipv6=ipv6
-        )
-        if result.get("opencode_ok") and pool is not None:
-            try:
-                endpoint = next(
-                    (
-                        ep
-                        for ep in pool._socks5_enabled_eps()
-                        if str(getattr(ep, "label", "")) == label
-                        or int(getattr(ep, "port", 0)) == int(port)
-                    ),
-                    None,
-                )
-                if endpoint is not None:
-                    sid = int(getattr(endpoint, "_station", 0))
-                    health = pool._station_health.get(sid)
-                    if health is not None:
-                        health.repair_succeeded()
-                    pool._station_health.observe(sid, True)
-                    pool._station_health.observe(sid, True)
-            except Exception:
-                pass
-        return result
-
-    @app.post("/api/vpn/socks5/rotate")
-    async def rotate_vpn_socks5(request: Request):
-        """Two roles (app.js socks5/rotate):
-        - body ``{rotate: bool}`` → persist the auto-rotate toggle;
-        - body WITHOUT ``rotate`` → manual rotate to the next usable proxy
-          (``{ok, next}`` superset). Both keep the pool in sync."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        try:
-            body = await request.json()
+            return getattr(_ss, "qualifier_manager", None)
         except Exception:
-            body = {}
-        if "rotate" in body:
-            _v = bool(body.get("rotate"))
-            _persist_vpn_config({"socks5_auto_rotate": _v})
-            pool = _dashboard_pool()
-            if pool is not None and hasattr(pool, "_socks5_auto_rotate"):
-                pool._socks5_auto_rotate = _v
-            return {"ok": True, "rotate": _v}
-        pool = _dashboard_pool()
-        if pool is None or not hasattr(pool, "rotate_socks5_now"):
-            return {"error": "pool socks5 non disponible"}
-        nxt = pool.rotate_socks5_now()
-        return {
-            "ok": nxt is not None,
-            "next": getattr(nxt, "pid", None) if nxt is not None else None,
-        }
+            return None
 
-    @app.post("/api/vpn/socks5/fallback")
-    async def set_vpn_socks5_fallback(request: Request):
-        """Arm/disarm ``ip_rotation.socks5_fallback_enabled``.
-
-        Armed means: when no docker station is usable in ``vpn`` mode, the
-        pool may serve through a configured SOCKS5 uplink before trying the
-        HTTPS tier."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        enabled = bool(body.get("enabled"))
-        _persist_vpn_config({"socks5_fallback_enabled": enabled})
-        pool = _dashboard_pool()
-        if pool is not None and hasattr(pool, "_socks5_fallback_enabled"):
-            pool._socks5_fallback_enabled = enabled
-        return {"ok": True, "enabled": enabled}
-
-    @app.get("/api/vpn/https-proxies")
-    async def get_vpn_https_proxies():
-        """HTTPS CONNECT fallback list + whether the fallback is armed."""
-        pool = _dashboard_pool()
-        return {
-            "enabled": _https_fallback_state(),
-            "proxies": _https_payload(pool),
-        }
-
-    @app.post("/api/vpn/https-proxies")
-    async def add_vpn_https_proxy(request: Request):
-        """Append a static HTTPS CONNECT proxy (NordVPN ``:89``)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        pool = _dashboard_pool()
-        try:
-            port = int(body.get("port") or 89)
-        except (TypeError, ValueError):
-            return {"error": f"port invalide: {body.get('port')!r}"}
-        rows = list(getattr(pool, "_https_proxies", None) or [])
-        rows.append(
-            {
-                "host": str(body.get("host", "") or ""),
-                "port": port,
-                "enabled": True,
-                "username": body.get("username"),
-                "password": body.get("password"),
-            }
+    _qualification_shadow = bool(
+        config_settings.yaml_get(
+            "egress_catalog",
+            "qualification.shadow_mode",
+            True,
         )
-        err = _apply_https_rows(rows)
-        if err:
-            return err
-        return {"ok": True, "proxies": _https_payload(pool)}
-
-    @app.post("/api/vpn/https-proxies/remove")
-    async def remove_vpn_https_proxy(request: Request):
-        """Remove the HTTPS proxy at ``{index}``."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        pool = _dashboard_pool()
-        rows = list(getattr(pool, "_https_proxies", None) or [])
-        idx = _as_index(body.get("index"))
-        if not (0 <= idx < len(rows)):
-            return {"error": f"proxy index hors bornes: {idx!r}"}
-        del rows[idx]
-        err = _apply_https_rows(rows)
-        if err:
-            return err
-        return {"ok": True, "proxies": _https_payload(pool)}
-
-    @app.post("/api/vpn/https-proxies/toggle")
-    async def toggle_vpn_https_proxy(request: Request):
-        """Enable/disable the HTTPS proxy at ``{index, enabled}``."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        pool = _dashboard_pool()
-        rows = list(getattr(pool, "_https_proxies", None) or [])
-        idx = _as_index(body.get("index"))
-        if not (0 <= idx < len(rows)):
-            return {"error": f"proxy index hors bornes: {idx!r}"}
-        rows[idx] = dict(rows[idx])
-        rows[idx]["enabled"] = bool(body.get("enabled", True))
-        err = _apply_https_rows(rows)
-        if err:
-            return err
-        return {"ok": True}
-
-    @app.post("/api/vpn/https-proxies/fallback")
-    async def set_vpn_https_fallback(request: Request):
-        """Arm/disarm ``ip_rotation.https_fallback_enabled``.
-
-        Armed means: when no docker station is usable in ``vpn`` mode, the
-        pool may serve through a configured HTTPS CONNECT proxy."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        enabled = bool(body.get("enabled"))
-        _persist_vpn_config({"https_fallback_enabled": enabled})
-        pool = _dashboard_pool()
-        if pool is not None and hasattr(pool, "_https_fallback_enabled"):
-            pool._https_fallback_enabled = enabled
-        return {"ok": True, "enabled": enabled}
-
-    @app.post("/api/vpn/https-proxies/test")
-    async def test_vpn_https_proxy(request: Request):
-        """Probe one HTTPS CONNECT proxy (stored credentials by host:port)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        host = body.get("host", "")
-        port = body.get("port", 0)
-        pool = _dashboard_pool()
-        username, password = _stored_proxy_credentials(pool, "_https_proxies", host, port)
-        return await _https_probe(host, port, username=username, password=password)
-
-    @app.post("/api/vpn/proxy-mode")
-    async def set_vpn_proxy_mode(request: Request):
-        """Switch egress mode ``vpn | socks5 | direct`` — persists + fans out
-        to every station (the pool's socks5_mode reads managers[0].proxy_mode,
-        so this single property drives the whole free path)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        try:
-            from free.auto_egress import (
-                derive_mode,
-                equal_weights,
-                normalize_providers,
-                normalize_weights,
-                providers_from_mode,
-            )
-
-            if "providers" in body:
-                providers = normalize_providers(body.get("providers"))
-                if not providers:
-                    return {"error": "au moins un provider est requis"}
-                mode = derive_mode(providers)
-            else:
-                mode = str(body.get("mode", "")).strip()
-                if mode not in ("vpn", "socks5", "direct", "auto_egress"):
-                    return {
-                        "error": f"mode doit être vpn|socks5|direct|auto_egress, reçu {mode!r}"
-                    }
-                providers = providers_from_mode(mode)
-            _ip_cfg = getattr(config_settings, "IP_ROTATION", None) or {}
-            strategy = str(body.get("strategy") or "").strip().lower()
-            if strategy not in ("fallback", "balance"):
-                strategy = str(_ip_cfg.get("egress_strategy") or "fallback").strip().lower()
-            if strategy not in ("fallback", "balance"):
-                strategy = "fallback"
-            raw_weights = body.get("weights")
-            if isinstance(raw_weights, dict):
-                weights = normalize_weights(raw_weights, providers)
-            elif strategy == "balance":
-                weights = equal_weights(providers)
-            else:
-                _existing = _ip_cfg.get("egress_weights")
-                weights = dict(_existing) if isinstance(_existing, dict) else {}
-        except ValueError as exc:
-            return {"error": str(exc)}
-        managers = _dashboard_managers()
-        if not managers:
-            return {"error": "gestionnaire VPN non initialisé"}
-        # Le moteur runtime reste `vpn` quand NordVPN est coché : les chemins
-        # free existants (`proxy_mode in ("vpn","socks5")`) continuent de
-        # fonctionner, et WARP/proxys servent de repli. Le GUI dérive la
-        # sélection multi-provider depuis `egress_providers`.
-        runtime_mode = "vpn" if mode == "auto_egress" else mode
-        for m in managers:
-            m.proxy_mode = runtime_mode
-        _persist_vpn_config(
-            {
-                "proxy_mode": runtime_mode,
-                "egress_providers": providers,
-                "egress_strategy": strategy,
-                "egress_weights": weights,
-            }
-        )
-        _egress_audit(
-            "egress_mode",
-            {
-                "providers": list(providers),
-                "strategy": strategy,
-                "weights": dict(weights),
-                "runtime_mode": runtime_mode,
+    )
+    register_qualification_routes(
+        app,
+        _qualification_db_path,
+        token_checker=_check_dashboard_token,
+        qualifier_manager_getter=_qualifier_manager,
+        start_epoch=lambda **kwargs: launch_qualification_epoch(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            db_path=_qualification_db_path(),
+            **kwargs,
+        ),
+        rotate_apply=lambda **kwargs: apply_rotation(
+            root=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            db_path=_qualification_db_path(),
+            config={
+                "ip_rotation": config_settings.yaml_get(
+                    "ip_rotation", default={}
+                )
+                or {},
+                "ip_registry": config_settings.yaml_get(
+                    "ip_registry", default={}
+                )
+                or {},
+                "egress_catalog": config_settings.yaml_get(
+                    "egress_catalog", default={}
+                )
+                or {},
             },
-        )
-        if mode == "auto_egress":
-            # WARP/proxys servent de repli quand NordVPN n'a plus de station.
-            _persist_vpn_config({"socks5_fallback_enabled": True})
-        try:
-            _pool = _dashboard_pool()
-            if _pool is not None and hasattr(_pool, "set_egress_config"):
-                _pool.set_egress_config(
-                    providers=providers,
-                    strategy=strategy,
-                    weights=weights,
-                )
-            elif _pool is not None:
-                _pool._egress_providers = list(providers)
-        except Exception:
-            pass
-        # When switching from direct → vpn/socks5, the boot gate
-        # `vpn_manager.start()` only dials when proxy_mode==vpn, so
-        # stations 2..N that were left disconnected in direct must be
-        # resurrected now. Fire-and-forget start() for every enabled
-        # manager that is not already connected; fail-soft (docker down
-        # must not block the API).
-        if runtime_mode in ("vpn", "socks5"):
-            try:
-                # Ensure every configured station (station_count) is present.
-                # If the registry is short (e.g. boot direct with 1), rebuild
-                # it via _apply_station_count to restore the missing managers.
-                try:
-                    import config.settings as _cs
-                    from config.settings import resolved_station_count as _rsc
-
-                    want = _rsc(getattr(_cs, "IP_ROTATION", {}) or {})
-                    have = len(managers)
-                    if want > have:
-                        from opencode import _apply_station_count as _asc
-
-                        await _asc(want)
-                        # re-read after upscale
-                        managers = _dashboard_managers()
-                        for mm in managers:
-                            mm.proxy_mode = runtime_mode
-                except Exception as _e:
-                    _debug(f"  [vpn] proxy-mode upscale check failed: {_e}")
-                # Now ensure every enabled manager is at least started.
-                # start() is idempotent and triggers background connect when
-                # status != connected, so this resurrects the 2..N that
-                # stayed disconnected in direct.
-                # [plan v10 §14.1.12] starts PARALLÈLES + réponse immédiate :
-                # l'ancien await séquentiel par station suspendait l'endpoint
-                # des minutes, SSE/GUI gelées. Le suivi d'état passe par les
-                # vpn_event SSE déjà émis par _set_status.
-                _starts = []
-                for mm in managers:
-                    if getattr(mm, "enabled", True) and str(
-                        getattr(mm, "status", "disconnected") or "disconnected"
-                    ) not in ("connected", "degraded"):
-                        _starts.append(
-                            asyncio.create_task(
-                                mm.start(),
-                                name=f"proxy-mode-start-st{getattr(mm, '_station', '?')}",
-                            )
-                        )
-                if _starts:
-                    asyncio.create_task(_reap_proxy_mode_starts(_starts))
-            except Exception as _e:
-                _debug(f"  [vpn] proxy-mode resurrect failed: {_e}")
-        return {"ok": True, "mode": mode}
-
-    async def _reap_proxy_mode_starts(tasks):
-        """[v10 §14.1.12] récolte les starts détachés : erreurs journalisées,
-        jamais perdues silencieusement."""
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for t, r in zip(tasks, results):
-            if isinstance(r, Exception):
-                _debug(f"  [vpn] proxy-mode detached start failed ({t.get_name()}): {r}")
-
-    @app.get("/api/vpn/nordvpn-available")
-    async def nordvpn_available():
-        """``{available}`` — credentials.env présent + provider nordvpn."""
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        cred_path = os.path.join(root, "credentials.env")
-        has = os.path.exists(cred_path) and os.path.getsize(cred_path) > 0
-        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
-        provider = str(cfg.get("server_provider") or "nordvpn").lower()
-        return {"available": has and provider == "nordvpn"}
-
-    @app.get("/api/vpn/nordvpn-status")
-    async def nordvpn_status():
-        """``{connected, country, city, ip}`` — adaptateur honnête depuis
-        l'état réel des managers (pas d'invention de credentials)."""
-        st = {"connected": False, "country": None, "city": None, "ip": None}
-        for m in _dashboard_managers():
-            try:
-                mg = m.get_status()
-            except Exception:
-                continue
-            if st["country"] is None:
-                st["country"] = mg.get("current_country") or None
-            if m.status in ("connected", "degraded") or mg.get("status") in ("connected", "degraded"):
-                st["connected"] = True
-            if st["ip"] is None:
-                st["ip"] = getattr(m, "current_ip", None) or mg.get("ip") or None
-            if st["city"] is None:
-                st["city"] = mg.get("city") or None
-        return st
-
-    @app.get("/api/vpn/nordvpn-countries")
-    async def nordvpn_countries_ep():
-        """``{countries}`` — API NordVPN quand use_nordvpn_api, sinon liste
-        statique (offline-safe)."""
-        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
-        return {"countries": await _nordvpn_countries(bool(cfg.get("use_nordvpn_api")))}
-
-    @app.get("/api/vpn/countries")
-    async def vpn_countries_ep():
-        """``{countries}`` — même source que nordvpn-countries (app.js
-        vpnLoadCountries consomme ``data.countries``)."""
-        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
-        return {"countries": await _nordvpn_countries(bool(cfg.get("use_nordvpn_api")))}
-
-    @app.post("/api/vpn/discover-and-add")
-    async def vpn_discover_and_add(request: Request):
-        """Découvre les serveurs OpenVPN recommandés d'un pays (API NordVPN)
-        et ajoute le pays à la liste de rotation ``server_countries``
-        (noms séparés par virgules, format config.yaml). Retourne le nombre
-        de serveurs découverts (app.js : ``✓ N serveur(s) ajouté(s)``)."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        body = await request.json()
-        code = str(body.get("country") or "").strip().upper()
-        try:
-            limit = max(1, min(50, int(body.get("limit") or 5)))
-        except (TypeError, ValueError):
-            limit = 5
-        if not code:
-            return {"error": "country requis (code, ex: DE)"}
-        servers = await _nordvpn_servers_by_country(code, limit=limit)
-        if not servers:
-            return {"error": f"aucun serveur trouvé pour {code}"}
-        # code → nom de pays (server_countries garde des NOMS de pays)
-        cname = code
-        for c in await _nordvpn_countries(True):
-            if str(c.get("code", "")).upper() == code:
-                cname = c.get("name") or code
-                break
-        cfg = getattr(config_settings, "IP_ROTATION", None) or {}
-        current = str(cfg.get("server_countries") or "")
-        names = [c.strip() for c in current.split(",") if c.strip()]
-        if cname not in names:
-            names.append(cname)
-        _persist_vpn_config({"server_countries": ", ".join(names)})
-        return {"count": len(servers), "country": cname}
-
-    @app.post("/api/vpn/upload-config")
-    async def vpn_upload_config(request: Request):
-        """Upload un fichier .ovpn (FormData ``{name, config}``) vers
-        ``vpn_configs/custom/`` et persiste ``custom_ovpn_file``."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        form = await request.form()
-        name = str(form.get("name") or "").strip() or "custom"
-        name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
-        if not name.lower().endswith(".ovpn"):
-            name += ".ovpn"
-        upload = form.get("config")
-        # [mypy] UploadFile | str : seul l'UploadFile porte .file
-        content = await upload.read() if upload is not None and not isinstance(upload, str) else None
-        if not content:
-            return {"error": "fichier config manquant (champ FormData 'config')"}
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        custom_dir = os.path.join(root, "vpn_configs", "custom")
-        os.makedirs(custom_dir, exist_ok=True)
-        path = os.path.join(custom_dir, name)
-        with open(path, "wb") as f:
-            f.write(content)
-        rel = os.path.join("vpn_configs", "custom", name)
-        _persist_vpn_config({"custom_ovpn_file": rel.replace(os.sep, "/")})
-        return {"ok": True, "path": rel.replace(os.sep, "/")}
-
-    @app.get("/api/vpn/diagnostic")
-    async def vpn_diagnostic():
-        """Bundle diagnostic (app.js vpnDiagnostic) — mode actuel, statut,
-        NordVPN app, docker, WSL2, OpenVPN natif, recommandation. Tout
-        l'I/O externe est dans les helpers isolés (monkeypatchables)."""
-        import shutil
-
-        managers = _dashboard_managers()
-        mode = _vpn_proxy_mode()
-        # État agrégé des stations actives.
-        status, ip = "not_configured", None
-        if managers:
-            connected = [m for m in managers if getattr(m, "status", None) in ("connected", "degraded")]
-            if connected:
-                status = "connected" if any(getattr(m, "status", None) == "connected" for m in managers) else "degraded"
-            elif any(getattr(m, "status", None) in ("connecting", "rotating") for m in managers):
-                status = "connecting"
-            elif managers:
-                status = "not_connected"
-            ip = next((m.current_ip for m in managers if m.current_ip), None)
-        nordvpn = {"available": False, "exe": None, "status": None}
-        if status in ("connected", "degraded"):
-            st = await nordvpn_status()
-            nordvpn = {"available": True, "exe": None, "status": st}
-        # [fix 20/08][Axe 3] Tout l'I/O subprocess/docker est offloadé sur
-        # des threads : un daemon docker gelé (le mode défaillance documenté
-        # sur le serveur — load > 150) bloquait l'event loop jusqu'à ~115 s
-        # (2×10 s diag + 15 s × N compose config + 5 s wsl) et gelait tous
-        # les SSE en vol, les workers de rotation et les watchdogs.
-        docker = await asyncio.to_thread(_docker_diag)
-        wsl2 = {"available": False}
-        try:
-            r = await asyncio.to_thread(
-                lambda: subprocess.run(
-                    ["wsl", "--status"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    creationflags=_CREATE_NO_WINDOW,
-                )
+            **kwargs,
+        ),
+        default_shadow=_qualification_shadow,
+        allow_live=not _qualification_shadow,
+        rotation_headroom_pct=float(
+            config_settings.yaml_get(
+                "egress_catalog",
+                "qualification.proactive_rotation_headroom_pct",
+                20,
             )
-            wsl2["available"] = r.returncode == 0
-        except Exception:
-            pass
-        openvpn = {"available": False, "path": None}
-        ovpn_path = shutil.which("openvpn")
-        if ovpn_path:
-            openvpn = {"available": True, "path": ovpn_path}
-        elif os.path.exists("/usr/sbin/openvpn"):
-            openvpn = {"available": True, "path": "/usr/sbin/openvpn"}
-        docker_ok = bool(docker.get("running"))
-        if mode == "vpn":
-            if status == "connected":
-                rec = "Connexion VPN active — rotation IP opérationnelle"
-            elif status == "degraded":
-                rec = "Connexion VPN dégradée mais routable (reset récent / cooldown / SOCKS) — voir stations"
-            elif docker_ok:
-                rec = "Docker OK — VPN non connecté (voir statut ci-dessus)"
-            else:
-                rec = "Docker absent ou arrêté — installer/démarrer Docker puis reconnecter"
-        else:
-            rec = f"Mode {mode} actif (pas de tunnel docker requis)"
-        return {
-            "current_mode": mode,
-            "status": status,
-            "ip": ip,
-            "nordvpn_app": nordvpn,
-            "docker": docker,
-            "wsl2": wsl2,
-            "openvpn": openvpn,
-            "recommendation": rec,
-            "config_yaml_dirty": (_config_yaml_mtime() != _config_yaml_known_mtime),
-            "config_yaml_mtime": _config_yaml_mtime(),
-            "config_yaml_known": _config_yaml_known_mtime,
-            "compose_config": await asyncio.to_thread(_docker_compose_config),
-        }
+            or 20
+        ),
+        last_station_protection=bool(
+            config_settings.yaml_get(
+                "egress_catalog",
+                "qualification.last_station_protection",
+                True,
+            )
+        ),
+        station_standby_size=int(
+            config_settings.yaml_get(
+                "egress_catalog",
+                "qualification.station_standby_size",
+                1,
+            )
+            or 1
+        ),
+    )
+
+    from dashboard.routers.egress_catalog_mutations import (
+        register_egress_catalog_mutations,
+    )
+
+    register_egress_catalog_mutations(
+        app,
+        catalog_getter=_dashboard_egress_catalog,
+        token_checker=_check_dashboard_token,
+        denylist_getter=lambda: list(
+            config_settings.yaml_get("egress_catalog", "denylist", []) or []
+        ),
+        denylist_setter=lambda value: config_settings.yaml_set(
+            "egress_catalog", "denylist", value
+        ),
+    )
+
+    from dashboard.routers.egress_mode_routes import register_egress_mode_routes
+
+    register_egress_mode_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        pool_getter=lambda: _dashboard_pool(),
+        managers_getter=lambda: _dashboard_managers(),
+        settings=config_settings,
+        persist_vpn_config=lambda updates: _persist_vpn_config(updates),
+        egress_audit=lambda action, details: _egress_audit(action, details),
+        debug=lambda message: _debug(message),
+    )
+
+    from dashboard.routers.nordvpn_routes import register_nordvpn_routes
+
+    _dashboard_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    register_nordvpn_routes(
+        app,
+        managers_getter=_dashboard_managers,
+        countries_getter=_nordvpn_countries,
+        config_getter=lambda: getattr(config_settings, "IP_ROTATION", None) or {},
+        credentials_path=os.path.join(_dashboard_root, "credentials.env"),
+    )
+
+    from dashboard.routers.vpn_diagnostic_routes import (
+        register_vpn_diagnostic_routes,
+    )
+
+    register_vpn_diagnostic_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        managers_getter=lambda: _dashboard_managers(),
+        proxy_mode_getter=lambda: _vpn_proxy_mode(),
+        servers_by_country=lambda *args, **kwargs: _nordvpn_servers_by_country(
+            *args,
+            **kwargs,
+        ),
+        countries_getter=lambda *args, **kwargs: _nordvpn_countries(
+            *args,
+            **kwargs,
+        ),
+        settings=config_settings,
+        persist_vpn_config=lambda updates: _persist_vpn_config(updates),
+        docker_diag=lambda: _docker_diag(),
+        compose_config=lambda: _docker_compose_config(),
+        config_yaml_mtime=lambda: _config_yaml_mtime(),
+        config_yaml_known_mtime_getter=lambda: _config_yaml_known_mtime,
+        root=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        no_window_flag=_CREATE_NO_WINDOW,
+    )
 
     # ── Traffic capture (Wireshark-like raw request view) ──
 
-    @app.get("/api/traffic/status")
-    async def get_traffic_status(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        _traffic_mark_viewer()
-        status = _traffic_capture.status()
-        # `enabled` = état effectif (lazy, viewer-gated) ; `user_enabled` =
-        # l'intention du toggle (checkbox UI), capture reprise au retour viewer.
-        if _traffic_user_enabled is None:
-            _traffic_apply_lazy()
-        status["user_enabled"] = bool(_traffic_user_enabled)
-        return status
+    from dashboard.routers.traffic_routes import register_traffic_routes
 
-    @app.post("/api/traffic/config")
-    async def set_traffic_config(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        global _traffic_user_enabled
-        body = await request.json()
-        if body.get("enabled") is not None:
-            _traffic_user_enabled = bool(body.get("enabled"))
-            _traffic_apply_lazy()
-        else:
-            _traffic_mark_viewer()
-        _traffic_capture.configure(
-            max_frames=body.get("max_frames"),
-            body_cap=body.get("body_cap"),
-            max_bytes=body.get("max_bytes"),
-        )
-        _debug(f"  [traffic] config updated -> {json.dumps(body)}")
-        return {"ok": True, **(_traffic_capture.status())}
+    register_traffic_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        capture=_traffic_capture,
+        mark_viewer=_traffic_mark_viewer,
+        apply_lazy=_traffic_apply_lazy,
+        user_enabled_getter=lambda: _traffic_user_enabled,
+        user_enabled_setter=_set_traffic_user_enabled,
+        debug=_debug,
+    )
 
-    @app.get("/api/traffic/frames")
-    async def get_traffic_frames(
-        request: Request,
-        limit: int = 200,
-        offset: int = 0,
-        method: str = None,
-        path: str = None,
-        status: int = None,
-        aborted: bool = None,
-        since: float = None,
-    ):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        _traffic_mark_viewer()
-        # P0 anti-thrashing : clamper limit/offset (même pattern que /api/history).
-        try:
-            limit = max(1, min(int(limit or 200), 200))
-        except (TypeError, ValueError):
-            limit = 200
-        try:
-            offset = max(0, int(offset or 0))
-        except (TypeError, ValueError):
-            offset = 0
-        frames = _traffic_capture.frames(
-            limit=limit,
-            offset=offset,
-            method=method,
-            path=path,
-            status=status,
-            aborted=aborted,
-            since=since,
-        )
-        return {"frames": frames, "total": len(frames), "status": _traffic_capture.status()}
+    from dashboard.routers.history_routes import register_history_routes
 
-    @app.get("/api/traffic/frames/{frame_id}")
-    async def get_traffic_frame_detail(request: Request, frame_id: int):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        _traffic_mark_viewer()
-        frame = _traffic_capture.frame_detail(frame_id)
-        if frame is None:
-            return JSONResponse(status_code=404, content={"error": "frame non trouvée"})
-        return frame
-
-    @app.post("/api/traffic/clear")
-    async def clear_traffic(request: Request):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        _traffic_mark_viewer()
-        n = _traffic_capture.clear()
-        _debug(f"  [traffic] capture cleared ({n} frames)")
-        return {"ok": True, "cleared": n}
-
-    @app.get("/api/traffic/stats")
-    async def get_traffic_stats(request: Request, window: float = 60.0):
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-        _traffic_mark_viewer()
-        return _traffic_capture.stats(window=max(1.0, window))
-
-    # ── Stats & history ──
-
-    @app.get("/api/history")
-    async def get_history(
-        from_date: str = None,
-        to_date: str = None,
-        limit: int = 20,
-        offset: int = 0,
-        status: str = None,
-        model: str = None,
-        original_model: str = None,
-        account: str = None,
-        tool: str = None,
-        search: str = None,
-        station: int = None,
-    ):
-        # [plan v10 §14.2.3] limit/offset NON bornés = dump table entière par
-        # requête → clamp défensif (comme /api/routes).
-        limit = max(1, min(int(limit or 20), 200))
-        offset = max(0, int(offset or 0))
-        where, params = _build_where(
-            from_date, to_date, status, model, original_model, account, tool, search, station=station
-        )
-        # [P4.1 perf] colonnes explicites SANS blobs request_body/response_body (~4 Mo I/O évités/page)
-        # SELECT * conservé pour /api/requests/{id} seul
-        query = (
-            "SELECT id, timestamp, model, original_model, duration_ms, tokens_input, tokens_output, "
-            "tokens_cache, success, error, protocol, is_stream, thinking, effort, client_ip, "
-            "account_alias, station, free_model_ip, geo_country, geo_blocked, geo_direct_country, "
-            "geo_direct_ip, geo_via_vpn, geo_allowed, tools, tools_used, free_status, paid_status "
-            "FROM requests " + where + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
-        )
-        params.extend([limit, offset])
-
-        def _query_history(db):
-            rows = db.execute(query, params).fetchall()
-            # [P2 perf] COUNT caché (TTL 2 s) : la pagination du dashboard
-            # re-poll le même where en boucle — un COUNT par fenêtre suffit.
-            count_key = f"histcount:{where}:{tuple(params[:-2])}"
-            total_count = _stats_cache.get(count_key)
-            if total_count is None:
-                count_query = "SELECT COUNT(*) FROM requests " + where
-                total_row = db.execute(count_query, params[:-2]).fetchone()
-                total_count = total_row[0] if total_row else 0
-                _stats_cache.set(count_key, total_count)
-            return rows, total_count
-
-        rows, total_count = await _db_read_sync(_query_history)
-        free_ids = _free_model_id_set()
-
-        return {
-            "logs": [
-                {
-                    "id": r["id"],
-                    "timestamp": r["timestamp"],
-                    "model": r["model"],
-                    "original_model": r["original_model"],
-                    "duration_ms": r["duration_ms"],
-                    "tokens_input": r["tokens_input"],
-                    "tokens_output": r["tokens_output"],
-                    "tokens_cache": r["tokens_cache"],
-                    "success": bool(r["success"]),
-                    "error": r["error"],
-                    "protocol": r["protocol"] if "protocol" in r.keys() else None,
-                    "is_stream": bool(r["is_stream"]) if "is_stream" in r.keys() else False,
-                    "thinking": r["thinking"] if "thinking" in r.keys() else None,
-                    "effort": r["effort"] if "effort" in r.keys() else None,
-                    "client_ip": r["client_ip"] if "client_ip" in r.keys() else None,
-                    "account_alias": r["account_alias"] if "account_alias" in r.keys() else None,
-                    "is_free_model": (r["model"] or "") in free_ids or "-free" in (r["model"] or ""),
-                    "station": r["station"] if "station" in r.keys() else None,
-                    "free_ip": r["free_model_ip"] if "free_model_ip" in r.keys() and r["free_model_ip"] else "",
-                    "geo_country": r["geo_country"] if "geo_country" in r.keys() else None,
-                    "geo_blocked": bool(r["geo_blocked"]) if "geo_blocked" in r.keys() and r["geo_blocked"] else False,
-                    "geo_direct_country": r["geo_direct_country"] if "geo_direct_country" in r.keys() else None,
-                    "geo_direct_ip": r["geo_direct_ip"] if "geo_direct_ip" in r.keys() else None,
-                    "geo_via_vpn": bool(r["geo_via_vpn"]) if "geo_via_vpn" in r.keys() and r["geo_via_vpn"] else False,
-                    "geo_allowed": r["geo_allowed"] if "geo_allowed" in r.keys() else None,
-                    # [Étape 2 — O2] jambes fallback corrélées par req_id (NULL = pas de fallback).
-                    "free_status": r["free_status"] if "free_status" in r.keys() else None,
-                    "paid_status": r["paid_status"] if "paid_status" in r.keys() else None,
-                    "tools": json.loads(r["tools"])
-                    if "tools" in r.keys() and r["tools"] and r["tools"] != "[]"
-                    else [],
-                    "tools_used": json.loads(r["tools_used"])
-                    if "tools_used" in r.keys() and r["tools_used"] and r["tools_used"] != "[]"
-                    else [],
-                }
-                for r in rows
-            ],
-            "total": total_count,
-            "page": offset // limit + 1,
-            "per_page": limit,
-            "has_more": offset + limit < total_count,
-        }
-
-    @app.get("/api/requests/{req_id}")
-    async def get_request_detail(req_id: str, request: Request):
-        """Return full request details including request/response bodies."""
-        err = _check_dashboard_token(request)
-        if err:
-            return err
-
-        def _query_request(db):
-            row = db.execute("SELECT * FROM requests WHERE id = ?", (req_id,)).fetchone()
-            return row
-
-        row = await _db_read_sync(_query_request)
-        if not row:
-            return JSONResponse(status_code=404, content={"error": "Requête non trouvée"})
-
-        def _parse_json_field(val):
-            if not val or val == "[]" or val == "null":
-                return None
-            try:
-                return json.loads(val)
-            except Exception:
-                return val
-
-        return {
-            "id": row["id"],
-            "timestamp": row["timestamp"],
-            "model": row["model"],
-            "original_model": row["original_model"],
-            "duration_ms": row["duration_ms"],
-            "tokens_input": row["tokens_input"],
-            "tokens_output": row["tokens_output"],
-            "tokens_cache": row["tokens_cache"],
-            "success": bool(row["success"]),
-            "error": row["error"],
-            "protocol": row["protocol"] if "protocol" in row.keys() else None,
-            "is_stream": bool(row["is_stream"]) if "is_stream" in row.keys() else False,
-            "thinking": row["thinking"] if "thinking" in row.keys() else None,
-            "effort": row["effort"] if "effort" in row.keys() else None,
-            "client_ip": row["client_ip"] if "client_ip" in row.keys() else None,
-            "client_user_agent": row["client_user_agent"] if "client_user_agent" in row.keys() else None,
-            "account_alias": row["account_alias"] if "account_alias" in row.keys() else None,
-            "tools": _parse_json_field(row["tools"]) if "tools" in row.keys() else [],
-            "tools_used": _parse_json_field(row["tools_used"]) if "tools_used" in row.keys() else [],
-            "request_body": _parse_json_field(row["request_body"]) if "request_body" in row.keys() else None,
-            "response_body": _parse_json_field(row["response_body"]) if "response_body" in row.keys() else None,
-            # [Étape 2 — O2] jambes fallback corrélées par req_id (NULL = pas de fallback).
-            "free_status": row["free_status"] if "free_status" in row.keys() else None,
-            "paid_status": row["paid_status"] if "paid_status" in row.keys() else None,
-        }
-
-    @app.get("/api/history/filters")
-    async def get_history_filters():
-        """Return unique values for history filter dropdowns.
-
-        [P2 perf] scan lourd (3× DISTINCT + parcours JSON de TOUTE la table)
-        caché en longue durée ; invalidé par DELETE /api/history. Les tools
-        utilisés viennent en premier du registre maintenu par le writer proxy
-        (zéro scan), le scan SQL ne servant que de filet de fond.
-        """
-        global _filters_cache
-        if _filters_cache is not None:
-            return _filters_cache
-
-        def _query_filters(db):
-            models = [
-                r[0]
-                for r in db.execute(
-                    "SELECT DISTINCT model FROM requests WHERE model IS NOT NULL ORDER BY model"
-                ).fetchall()
-            ]
-            orig_models = [
-                r[0]
-                for r in db.execute(
-                    "SELECT DISTINCT original_model FROM requests WHERE original_model IS NOT NULL ORDER BY original_model"
-                ).fetchall()
-            ]
-            accounts = [
-                r[0]
-                for r in db.execute(
-                    "SELECT DISTINCT account_alias FROM requests WHERE account_alias IS NOT NULL ORDER BY account_alias"
-                ).fetchall()
-            ]
-            # Extract all unique tool names from tools_used JSON arrays
-            tool_set: set = set()
-            if callable(_tools_provider):
-                try:
-                    tool_set.update(_tools_provider() or ())
-                except Exception:
-                    pass
-            for row in db.execute(
-                "SELECT tools_used FROM requests WHERE tools_used IS NOT NULL AND tools_used != '[]'"
-            ):
-                try:
-                    tools = json.loads(row[0])
-                    if isinstance(tools, list):
-                        tool_set.update(tools)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            return {
-                "models": models,
-                "original_models": orig_models,
-                "accounts": accounts,
-                "tools_used": sorted(tool_set),
-            }
-
-        result = await _db_read_sync(_query_filters)
-        _filters_cache = result
-        return result
-
-    @app.delete("/api/history")
-    async def delete_history(before: str = None, all: bool = False, model: str = None):
-        _debug(f"  [history] delete: all={all} model={model} before={before}")
-        if not all and not before and not model:
-            return {"error": "Spécifiez une date 'before', un nom de 'model' ou 'all=true'"}
-
-        def _delete():
-            if all:
-                conn.execute("DELETE FROM requests")
-                if token_usage:
-                    with token_lock:
-                        for d in token_usage.values():
-                            d["input"] = d["output"] = d["cache"] = 0
-            elif model:
-                conn.execute("DELETE FROM requests WHERE model = ?", (model,))
-                if token_usage and model in token_usage:
-                    with token_lock:
-                        token_usage[model]["input"] = token_usage[model]["output"] = token_usage[model]["cache"] = 0
-            elif before:
-                conn.execute(
-                    "DELETE FROM requests WHERE timestamp < ?",
-                    (_normalize_date_bound(before, end_of_day=True),),
-                )
-                # Recalculate all counters from remaining rows
-                if token_usage:
-                    rows = conn.execute(
-                        "SELECT model, COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
-                        " COALESCE(SUM(tokens_cache), 0) FROM requests GROUP BY model"
-                    ).fetchall()
-                    with token_lock:
-                        for d in token_usage.values():
-                            d["input"] = d["output"] = d["cache"] = 0
-                        for row in rows:
-                            m = row[0]
-                            if m in token_usage:
-                                token_usage[m]["input"] = row[1]
-                                token_usage[m]["output"] = row[2]
-                                token_usage[m]["cache"] = row[3]
-            conn.commit()
-
-        await _db_query_sync(_delete)
-        # [P2 perf] invalidation des caches dérivés après suppression
-        global _filters_cache
-        _filters_cache = None
-        _stats_cache.invalidate()
-        return {"status": "deleted"}
+    register_history_routes(
+        app,
+        token_checker=lambda request: _check_dashboard_token(request),
+        build_where=lambda *args, **kwargs: _build_where(*args, **kwargs),
+        db_read_sync=lambda fn: _db_read_sync(fn),
+        db_query_sync=lambda fn: _db_query_sync(fn),
+        stats_cache=_stats_cache,
+        free_model_id_set=lambda: _free_model_id_set(),
+        filters_cache_getter=lambda: _filters_cache,
+        filters_cache_setter=_set_filters_cache,
+        tools_provider_getter=lambda: _tools_provider,
+        connection_getter=lambda: conn,
+        token_usage_getter=lambda: token_usage,
+        token_lock_getter=lambda: token_lock,
+        normalize_date_bound=(
+            lambda value, end_of_day=False: _normalize_date_bound(
+                value,
+                end_of_day=end_of_day,
+            )
+        ),
+        debug=lambda message: _debug(message),
+    )

@@ -240,7 +240,8 @@ def test_rotation_rules_hot_reload_no_restart(config_path):
         assert cfg.IP_ROTATION.get("rotation_rules") == new_rules
 
 
-def test_schedule_hot_reload_no_restart(config_path):
+@pytest.mark.asyncio
+async def test_schedule_hot_reload_no_restart(config_path):
     """schedule → persist YAML + manager hot-reload."""
     import config.settings as cfg
     import shared_state
@@ -257,7 +258,7 @@ def test_schedule_hot_reload_no_restart(config_path):
         cfg._yaml_data["ip_rotation"] = ip_rot2
         cfg.save_yaml_config()
         cfg.IP_ROTATION["schedule"] = new_schedule
-        mgr.update_config({"schedule": new_schedule})
+        await mgr.update_config({"schedule": new_schedule})
 
         with open(config_path, encoding="utf-8") as f:
             on_disk = yaml.safe_load(f)
@@ -419,6 +420,149 @@ def test_server_stop_from_other_thread_joins_normally():
     stopper.join(timeout=3)
 
     assert result == ["stopped"], "stop() doit joindre le thread serveur sans blocage"
+    assert mgr.is_running is False
+
+
+def _live_fake_server():
+    """(mgr, server, thread, release) : faux uvicorn dont le thread vit."""
+    import threading
+
+    import opencode as oc
+
+    class FakeServer:
+        started = False
+        should_exit = False
+
+    mgr = oc.ServerManager(app=None, host="127.0.0.1", port=4000)
+    server = FakeServer()
+    release = threading.Event()
+    thread = threading.Thread(target=release.wait, daemon=True)
+    thread.start()
+    mgr._server = server
+    mgr._thread = thread
+    mgr._generation = 1
+    return mgr, server, thread, release
+
+
+def test_server_refresh_state_promotes_late_start():
+    """[fix 10/11] Un boot plus long que le délai de start() ne doit pas
+    laisser is_running=False alors qu'uvicorn écoute (dashboard bloqué)."""
+    mgr, server, thread, release = _live_fake_server()
+
+    assert mgr.refresh_state() is False  # pas encore `started`
+    server.started = True
+    assert mgr.refresh_state() is True
+    assert mgr.is_running is True
+
+    # Thread mort → on redescend honnêtement à False (jamais de faux vert).
+    release.set()
+    thread.join(timeout=2)
+    assert mgr.refresh_state() is False
+    assert mgr.is_running is False
+
+
+def test_server_ready_watchdog_promotes_when_lifespan_is_slow():
+    """Le watchdog de démarrage rattrape un lifespan > _START_WAIT_S."""
+    import time as _t
+
+    mgr, server, thread, release = _live_fake_server()
+    mgr._READY_WATCHDOG_S = 3.0
+
+    mgr._spawn_ready_watchdog(server, thread, 1)
+    _t.sleep(0.1)
+    assert mgr.is_running is False
+
+    server.started = True
+    deadline = _t.monotonic() + 2.0
+    while not mgr.is_running and _t.monotonic() < deadline:
+        _t.sleep(0.02)
+    assert mgr.is_running is True
+
+    release.set()
+    thread.join(timeout=2)
+
+
+def test_server_stop_during_boot_signals_exit_and_never_resurrects():
+    """Un clic « Arrêter » pendant le boot doit couper un serveur qui n'a pas
+    encore fini de démarrer, et le watchdog ne doit pas le repasser à True."""
+    import time as _t
+
+    mgr, server, thread, release = _live_fake_server()
+    mgr.is_running = False
+    mgr._spawn_ready_watchdog(server, thread, 1)
+
+    mgr.stop(timeout=0.05)
+
+    assert server.should_exit is True
+    assert mgr.is_running is False
+    assert mgr._server is None
+    assert mgr._thread is None
+
+    # Le serveur finit par écouter APRÈS le stop : le watchdog est périmé.
+    server.started = True
+    _t.sleep(0.4)
+    assert mgr.is_running is False
+    assert mgr.refresh_state() is False
+
+    release.set()
+    thread.join(timeout=2)
+
+
+def test_server_is_listening_probes_socket():
+    import socket as _socket
+
+    import opencode as oc
+
+    srv = _socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    mgr = oc.ServerManager(app=None, host="127.0.0.1", port=port)
+
+    try:
+        assert mgr.is_listening(timeout=0.5) is True
+    finally:
+        srv.close()
+    assert mgr.is_listening(timeout=0.2) is False
+
+
+def test_server_start_hands_slow_lifespan_to_watchdog(monkeypatch):
+    """start() rend la main sans mentir, puis le watchdog passe au vert quand
+    le « lifespan » (fake uvicorn) finit par écouter."""
+    import time as _t
+
+    import uvicorn
+
+    import opencode as oc
+
+    class SlowServer:
+        def __init__(self, config):
+            self.started = False
+            self.should_exit = False
+
+        def run(self):
+            _t.sleep(0.35)
+            if not self.should_exit:
+                self.started = True
+            while not self.should_exit:
+                _t.sleep(0.01)
+
+    monkeypatch.setattr(uvicorn, "Server", SlowServer)
+    mgr = oc.ServerManager(app=None, host="127.0.0.1", port=1)
+    mgr._START_WAIT_S = 0.15
+    mgr._READY_WATCHDOG_S = 2.0
+
+    started_at = _t.monotonic()
+    mgr.start()
+    assert _t.monotonic() - started_at < 1.0
+    assert mgr.is_running is False  # le socket ne répond pas encore
+
+    deadline = _t.monotonic() + 2.0
+    while not mgr.is_running and _t.monotonic() < deadline:
+        _t.sleep(0.02)
+    assert mgr.is_running is True
+
+    mgr.stop(timeout=1.0)
     assert mgr.is_running is False
 
 

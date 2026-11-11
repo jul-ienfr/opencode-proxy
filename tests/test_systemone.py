@@ -397,3 +397,41 @@ async def test_systemone_free_hedge_429_filet_relayed(monkeypatch):
     assert resp.status_code == 429
     assert len(calls["hedged"]) == 1
     assert calls["sequential"] == []
+
+
+async def test_systemone_free_accepts_auto_egress(monkeypatch):
+    """auto_egress = pool actif : jamais le 503 « pool indisponible »."""
+    import opencode as oc
+
+    calls = _hedge_mocks(monkeypatch, hedge_resp=(None, None), should_hedge=False)
+    monkeypatch.setattr(oc, "_free_proxy_mode", lambda: "auto_egress")
+    ok = _FakeResp(status=200)
+
+    async def _ok_curl(*args, **kwargs):
+        calls["sequential"].append(1)
+        return ok
+
+    monkeypatch.setattr(oc, "_do_free_request_curl_cffi", _ok_curl)
+    resp = await oc._systemone_free_via_pool(
+        "https://opencode.ai/inference/v1/systemone",
+        _body("jev-1.13-free"),
+        {"Authorization": "Bearer public", "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    assert calls["sequential"] == [1]
+
+
+async def test_systemone_free_auto_egress_without_pool_stays_503(monkeypatch):
+    """Pool réellement absent : le fail-closed 503 reste honnête."""
+    import opencode as oc
+
+    monkeypatch.setattr(oc, "_free_ip_pool", None)
+    monkeypatch.setattr(oc, "_free_proxy_mode", lambda: "auto_egress")
+    with pytest.raises(oc.UpstreamError) as exc:
+        await oc._systemone_free_via_pool(
+            "https://opencode.ai/inference/v1/systemone",
+            _body("jev-1.13-free"),
+            {"Authorization": "Bearer public", "Content-Type": "application/json"},
+        )
+    assert exc.value.status_code == 503
+    assert "pool indisponible" in str(exc.value)

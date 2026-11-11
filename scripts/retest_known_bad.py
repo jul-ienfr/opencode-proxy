@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from test_free_egress import CAPTURE, load_capture, post_once  # noqa: E402
-from test_selection_cycle import recreate, service_for, wait_egress  # noqa: E402
+from test_selection_cycle import recreate, wait_egress  # noqa: E402
 
 CATALOG = ROOT / "logs" / "nordvpn_classified.json"
 OUT = ROOT / "logs" / "datacenter_retest.json"

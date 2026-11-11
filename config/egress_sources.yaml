@@ -1,0 +1,246 @@
+# Catalogue externe des sources de proxys publics.
+# Ce fichier est la source de vérité éditable par l'opérateur ; config.yaml ne
+# contient plus la liste. Le scheduler l'ingère au boot et l'API/UI peut
+# ajouter des sources en base pour les essais à chaud.
+#
+# priority : plus grand = testé en premier dans un cycle.
+# enabled  : false conserve la source comme documentation/veille.
+# interval_s : cadence de re-téléchargement propre à la source.
+#
+# Vérifié le 2026-11-09 : statut HTTP, format, volume et fréquence annoncée.
+version: 1
+sources:
+  - id: manual_proxies
+    type: local_text
+    url: config/egress_proxies.txt
+    scheme: https
+    enabled: true
+    interval_s: 300
+    priority: 110
+    notes: "Liste manuelle locale (hors config.yaml) ; rechargée toutes les 5 min."
+  # ── HTTPS / HTTP ────────────────────────────────────────────────────────
+  - id: proxifly_https
+    type: public_text
+    url: https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/https/data.txt
+    scheme: https
+    enabled: true
+    interval_s: 21600
+    priority: 100
+    notes: "Proxifly, revalidé toutes les 5 min ; JSON/TXT par protocole."
+
+  - id: thespeedx_http
+    type: public_text
+    url: https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt
+    scheme: http
+    enabled: true
+    interval_s: 21600
+    priority: 90
+    notes: "TheSpeedX, liste historique très large ; qualité hétérogène."
+
+  - id: ercin_https
+    type: public_text
+    url: https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt
+    scheme: https
+    enabled: true
+    interval_s: 21600
+    priority: 85
+    notes: "ErcinDedeoglu, listes journalières HTTPS/SOCKS5."
+
+  - id: openproxylist_https
+    type: public_text
+    url: https://openproxylist.xyz/https.txt
+    scheme: https
+    enabled: true
+    interval_s: 21600
+    priority: 80
+    notes: "OpenProxyList, volume important ; vérifier la fraîcheur."
+
+  - id: jetkai_https
+    type: public_text
+    url: https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt
+    scheme: https
+    enabled: true
+    interval_s: 21600
+    priority: 75
+    notes: "jetkai, online-proxies, mis à jour régulièrement."
+
+  - id: zloi_https
+    type: public_text
+    url: https://raw.githubusercontent.com/zloi-user/hideip.me/main/https.txt
+    scheme: https
+    enabled: true
+    interval_s: 21600
+    priority: 65
+    notes: "hideip.me, format ip:port:Pays (supporté par le parseur)."
+
+  - id: shifty_https
+    type: public_text
+    url: https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt
+    scheme: https
+    enabled: true
+    interval_s: 21600
+    priority: 50
+    notes: "ShiftyTR, petit volume ; liste de secours."
+
+  - id: roosterkid_https
+    type: public_text
+    url: https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt
+    scheme: https
+    enabled: true
+    interval_s: 21600
+    priority: 45
+    notes: "roosterkid/openproxylist, petit volume vérifié."
+
+  - id: proxyscrape_https
+    type: public_text
+    url: https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=https&proxy_format=ipport&format=text
+    scheme: https
+    enabled: true
+    interval_s: 21600
+    priority: 70
+    notes: "ProxyScrape API v4, renouvellement annoncé chaque minute."
+
+  # ── SOCKS5 ──────────────────────────────────────────────────────────────
+  - id: proxifly_socks5
+    type: public_text
+    url: https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt
+    scheme: socks5
+    enabled: true
+    interval_s: 21600
+    priority: 100
+    notes: "Proxifly SOCKS5, revalidé toutes les 5 min."
+
+  - id: thespeedx_socks5
+    type: public_text
+    url: https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt
+    scheme: socks5
+    enabled: true
+    interval_s: 21600
+    priority: 90
+    notes: "TheSpeedX SOCKS5, volume historique."
+
+  - id: monosans_socks5
+    type: public_text
+    url: https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt
+    scheme: socks5
+    enabled: true
+    interval_s: 21600
+    priority: 85
+    notes: "monosans, listes journalières ; HTTPS absent du dépôt."
+
+  - id: hookzof_socks5
+    type: public_text
+    url: https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt
+    scheme: socks5
+    enabled: true
+    interval_s: 21600
+    priority: 80
+    notes: "hookzof, SOCKS5 uniquement, mise à jour fréquente."
+
+  - id: ercin_socks5
+    type: public_text
+    url: https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt
+    scheme: socks5
+    enabled: true
+    interval_s: 21600
+    priority: 85
+    notes: "ErcinDedeoglu SOCKS5."
+
+  - id: openproxylist_socks5
+    type: public_text
+    url: https://openproxylist.xyz/socks5.txt
+    scheme: socks5
+    enabled: true
+    interval_s: 21600
+    priority: 75
+    notes: "OpenProxyList SOCKS5, volume important."
+
+  - id: jetkai_socks5
+    type: public_text
+    url: https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt
+    scheme: socks5
+    enabled: true
+    interval_s: 21600
+    priority: 70
+    notes: "jetkai SOCKS5."
+
+  - id: zloi_socks5
+    type: public_text
+    url: https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt
+    scheme: socks5
+    enabled: true
+    interval_s: 21600
+    priority: 60
+    notes: "hideip.me SOCKS5, format ip:port:Pays."
+
+  - id: shifty_socks5
+    type: public_text
+    url: https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt
+    scheme: socks5
+    enabled: true
+    interval_s: 21600
+    priority: 45
+    notes: "ShiftyTR SOCKS5, secours."
+
+  - id: roosterkid_socks5
+    type: public_text
+    url: https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt
+    scheme: socks5
+    enabled: true
+    interval_s: 21600
+    priority: 40
+    notes: "roosterkid SOCKS5, petit volume."
+
+  - id: proxyscrape_socks5
+    type: public_text
+    url: https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=socks5&proxy_format=ipport&format=text
+    scheme: socks5
+    enabled: true
+    interval_s: 21600
+    priority: 70
+    notes: "ProxyScrape API v4 SOCKS5."
+
+  # ── JSON / API ──────────────────────────────────────────────────────────
+  - id: vakhov_fresh
+    type: public_json
+    url: https://vakhov.github.io/fresh-proxy-list/proxylist.json
+    enabled: true
+    interval_s: 21600
+    priority: 95
+    notes: "fresh-proxy-list : flags http/ssl/socks4/socks5, latence et uptime."
+
+  - id: geonode_api
+    type: geonode_json
+    url: https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc
+    enabled: true
+    interval_s: 21600
+    priority: 90
+    notes: "Geonode API JSON, protocoles et lastChecked ; 500 par page."
+
+  # ── Veille désactivée ───────────────────────────────────────────────────
+  - id: mmpx12_https
+    type: public_text
+    url: https://raw.githubusercontent.com/mmpx12/proxy-list/master/https.txt
+    scheme: https
+    enabled: false
+    interval_s: 21600
+    priority: 20
+    notes: "Désactivé : préfixe de réponse Cloudflare 'error code: 502'."
+
+  - id: mmpx12_socks5
+    type: public_text
+    url: https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt
+    scheme: socks5
+    enabled: false
+    interval_s: 21600
+    priority: 20
+    notes: "Désactivé : préfixe de réponse Cloudflare 'error code: 1015'."
+
+  - id: vpslab_https
+    type: public_text
+    url: https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/https.txt
+    scheme: https
+    enabled: false
+    interval_s: 21600
+    priority: 10
+    notes: "Désactivé : 404 au 2026-11-09 ; chemin à confirmer."

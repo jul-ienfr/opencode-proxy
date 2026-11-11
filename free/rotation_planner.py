@@ -1,14 +1,14 @@
-"""Planificateur de rotation proactive (drain, spare, une station à la fois).
+"""Planificateur de rotation proactive (drain, spare, rotations concurrentes).
 
 Il ne lance aucune rotation : il décide *quand* et *laquelle*, à partir des
 leases IP/quota. Le pool applique la décision via ``_launch_rotation``.
 
 Règles :
 
-- jamais deux rotations planifiées simultanément ;
-- jamais la dernière station active ;
+- rotations concurrentes par station, bornées par ``max_concurrent`` ;
+- jamais la dernière station active sans spare ;
 - avec un spare qualifié : promotion du spare avant drain (zéro trou) ;
-- sans spare : une seule station à la fois, capacité N-1 visible.
+- sans spare : capacité N-1 visible, une rotation par station à la fois.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ class RotationDecision:
 @dataclass
 class RotationPlanner:
     enabled: bool = True
-    max_concurrent: int = 1
+    max_concurrent: int = 6
     min_active: int = 1
     profile: QuotaProfile = field(default_factory=QuotaProfile)
     in_flight: int = 0
@@ -94,7 +94,11 @@ class RotationPlanner:
             self.last_defer_reason = "disabled"
             return None
         ts = float(now if now is not None else time.monotonic())
-        if rotation_in_flight or self._active_rotations(ts) >= max(1, int(self.max_concurrent)):
+        active = max(
+            self._active_rotations(ts),
+            int(rotation_in_flight) if isinstance(rotation_in_flight, int) else 0,
+        )
+        if active >= max(1, int(self.max_concurrent)):
             self.last_defer_reason = "rotation-in-flight"
             return None
         if int(active_count) <= max(1, int(self.min_active)):

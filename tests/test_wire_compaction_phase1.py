@@ -34,6 +34,8 @@ def _free_wire_models(monkeypatch):
     """
     monkeypatch.setitem(oc.IP_ROTATION, "free_substitution_policy", "family")
     monkeypatch.setitem(oc.FREE_MODEL_MAP, "minimax-m2.5", "minimax-m2.5-free")
+    # P2 « sonnet » route vers glm-5.1 : mapping free test-only.
+    monkeypatch.setitem(oc.FREE_MODEL_MAP, "glm-5.1", "mimo-v2.6-flash-free")
 
 
 # ── doubles ──────────────────────────────────────────────────────────

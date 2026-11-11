@@ -66,16 +66,22 @@ def _wait_healthy(container: str, timeout_s: float = 120.0) -> bool:
 
 
 def _plan(rows: list[dict]) -> list[WarpEndpointSpec]:
+    """Une spec par conteneur physique (IPv4 et IPv6 partagent le tunnel)."""
     specs: list[WarpEndpointSpec] = []
+    seen: set[str] = set()
     for row in rows:
         if str(row.get("provider") or "").lower() != "warp":
             continue
         if not bool(row.get("managed")) or not bool(row.get("enabled", True)):
             continue
+        container = str(row.get("container") or "")
+        if not container or container in seen:
+            continue
+        seen.add(container)
         specs.append(
             WarpEndpointSpec(
                 label=str(row.get("label") or ""),
-                container=str(row.get("container") or ""),
+                container=container,
                 port=int(row.get("port") or 0),
                 image=str(row.get("image") or "caomingjun/warp:latest"),
                 ipv6=bool(row.get("ipv6", True)),
@@ -86,6 +92,17 @@ def _plan(rows: list[dict]) -> list[WarpEndpointSpec]:
             )
         )
     return specs
+
+
+def _rows_for_container(rows: list[dict], container: str) -> list[dict]:
+    return [
+        row
+        for row in rows
+        if str(row.get("provider") or "").lower() == "warp"
+        and bool(row.get("managed"))
+        and bool(row.get("enabled", True))
+        and str(row.get("container") or "") == container
+    ]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -116,9 +133,13 @@ def main(argv: list[str] | None = None) -> int:
 
     provisioner = WarpProvisioner()
     results: list[dict] = []
-    rows_by_label = {str(row.get("label") or ""): row for row in rows}
     for spec in specs:
-        result: dict = {"label": spec.label, "port": spec.port, "ok": False}
+        result: dict = {
+            "container": spec.container,
+            "port": spec.port,
+            "families": [],
+            "ok": False,
+        }
         try:
             provisioner._runner(["rm", "-f", spec.container], 60)
             provisioner._runner(provisioner._run_args(spec), 120)
@@ -128,27 +149,39 @@ def main(argv: list[str] | None = None) -> int:
                 result["reason"] = "health_timeout"
                 results.append(result)
                 continue
-            ip = resolve_egress(
-                proxy_url=f"socks5h://127.0.0.1:{spec.port}",
-                ipv6=bool(spec.ipv6),
-                timeout_s=15.0,
-            )
-            if not ip:
-                result["reason"] = "egress_unresolved"
-                results.append(result)
-                continue
-            block = quota_block(ip)
-            row = rows_by_label.get(spec.label)
-            if row is not None:
+            all_ok = True
+            for row in _rows_for_container(rows, spec.container):
+                family = "ipv6" if bool(row.get("ipv6")) else "ipv4"
+                ip = resolve_egress(
+                    proxy_url=f"socks5h://127.0.0.1:{spec.port}",
+                    ipv6=bool(row.get("ipv6")),
+                    timeout_s=15.0,
+                )
+                entry = {"label": row.get("label"), "family": family, "ok": False}
+                if not ip:
+                    entry["reason"] = "egress_unresolved"
+                    all_ok = False
+                    result["families"].append(entry)
+                    continue
+                block = quota_block(ip)
                 row["egress_ip"] = ip
                 row["block"] = block or ""
-            result.update({"ok": True, "egress_ip": ip, "block": block})
+                entry.update({"ok": True, "egress_ip": ip, "block": block})
+                result["families"].append(entry)
+            result["ok"] = all_ok
+            if not all_ok:
+                result["reason"] = "family_unresolved"
         except Exception as exc:
             result["reason"] = f"{type(exc).__name__}: {exc}"
         results.append(result)
 
     _save_rows(rows)
-    blocks = [str(item.get("block") or "") for item in results if item.get("block")]
+    blocks = [
+        str(family.get("block") or "")
+        for item in results
+        for family in item.get("families", [])
+        if family.get("block")
+    ]
     duplicates = sorted({block for block in blocks if blocks.count(block) > 1})
     print(
         json.dumps(

@@ -94,18 +94,11 @@ def test_live_proxy_listens_on_4000() -> None:
 @pytest.mark.docker
 def test_live_usable_stations_matches_station_health() -> None:
     data = _api_json("/api/vpn-status")
-    providers = {str(item).lower() for item in (data.get("egress_providers") or [])}
-    if "warp" in providers:
-        keys = [key for key in (data.get("station_health") or {}) if str(key).startswith("-")]
-    else:
-        keys = [key for key in (data.get("station_health") or {}) if str(key).isdigit() and int(key) > 0]
-    health = data.get("station_health") or {}
-    healthy = sum(
-        1
-        for key in keys
-        if str((health.get(key) or {}).get("state")) in ("usable", "probing")
-    )
-    assert data.get("usable_stations") == healthy
+    # The pool now reports the honest routable count in
+    # ``active_stations_with_quota``: WARP endpoint health can be ``usable``
+    # while its daily bucket is exhausted.  ``usable_stations`` must match
+    # that quota-aware count, not the raw provider health map.
+    assert data.get("usable_stations") == data.get("active_stations_with_quota")
 
 
 @pytest.mark.docker

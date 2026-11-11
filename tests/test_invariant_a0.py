@@ -548,6 +548,9 @@ async def test_open_free_stream_count_false_reuses_stored_station(free_env, monk
     proxy/station — on_request() is never called, and the stored station is
     the one resolved by _current_free_identity (not pool.active_station)."""
     pytest.importorskip("curl_cffi")
+    # Le garde public-proxy refuse un endpoint HTTP sur un egress non fiable ;
+    # ce test utilise un faux tunnel et n'a pas besoin du serveur echo local.
+    monkeypatch.setattr(oc, "API_BASE_FREE", "https://opencode.ai/inference/openai/v1/chat/completions")
     _StubPoolNeverCount.calls = 0
     _FakeCurlSession.created.clear()
 
@@ -679,6 +682,9 @@ async def test_open_free_stream_fresh_station_switches_station(free_env, monkeyp
     with the ContextVar's stored (failed) station and tunnel over the FRESH
     proxy it returns — on_request() (counter advance) never runs."""
     pytest.importorskip("curl_cffi")
+    # Le garde public-proxy refuse un endpoint HTTP sur un egress non fiable ;
+    # ce test utilise un faux tunnel et n'a pas besoin du serveur echo local.
+    monkeypatch.setattr(oc, "API_BASE_FREE", "https://opencode.ai/inference/openai/v1/chat/completions")
     _StubPoolDisconnectRetry.calls_to_request = 0
     _StubPoolDisconnectRetry.calls_to_disconnect = []
     _FakeCurlSession.created.clear()

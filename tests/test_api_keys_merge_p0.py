@@ -5,8 +5,8 @@ merge ne préservait que les lignes POSTées : sauvegarder une nouvelle clé
 supprimait toutes les autres (et désactivait le fallback .env au reboot).
 """
 
-import dashboard.api as api
 import config.settings as settings
+import dashboard.api as api
 
 
 def _mask(key: str) -> str:

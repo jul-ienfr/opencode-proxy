@@ -9,3 +9,5 @@ pytest-cov==7.1.0
 ruff==0.15.19
 mypy==2.3.1
 respx==0.23.1
+# [public-proxies] MITM/TLS tests : certificat auto-signé local.
+cryptography==46.0.5

@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from curl_cffi import requests  # noqa: E402
+from curl_cffi.const import CurlOpt  # noqa: E402
 
 FREE_URL = "https://opencode.ai/inference/openai/v1/chat/completions"
 PAYLOAD = ROOT / "free" / "official_payload.json"
@@ -191,6 +192,11 @@ def post_once(
         kwargs["impersonate"] = impersonate
     if isinstance(fp, dict):
         kwargs.update(fp)
+    if proxy.startswith("https://"):
+        kwargs["curl_options"] = {
+            CurlOpt.PROXY_SSL_VERIFYPEER: 0,
+            CurlOpt.PROXY_SSL_VERIFYHOST: 0,
+        }
     started = time.time()
     try:
         response = requests.post(FREE_URL, **kwargs)
@@ -302,9 +308,7 @@ def main(argv: list[str] | None = None) -> int:
 
     counts = {200: 0, 403: 0, 429: 0, 0: 0}
     for result in results:
-        counts[result["status"] if result["status"] in counts else 0] = (
-            counts.get(result["status"], 0) + 1
-        )
+        counts[result["status"] if result["status"] in counts else 0] = counts.get(result["status"], 0) + 1
     print(
         json.dumps(
             {

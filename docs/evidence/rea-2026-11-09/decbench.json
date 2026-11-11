@@ -1,0 +1,886 @@
+{
+  "generated_at": "2026-11-09T19:37:53Z",
+  "latest_snapshot": {
+    "date": "04-11-2026",
+    "iso_date": "2026-11-04",
+    "label": "GED on Rust Joern",
+    "note": "The scoreboard as published on 2026-10-09, when GED moved from PyJoern to Rust Joern. Frozen on 2026-11-04 just before Nemesis's Psalms joined the sample set; adding Psalms moves no previously published number.",
+    "scoreboard": "DecBench Scoreboard",
+    "version": "1.0",
+    "generated_at": "2026-10-09T21:48:45.722318",
+    "functions": 96103,
+    "binaries": 770,
+    "preset": "unoptimized",
+    "decompilers": [
+      "angr",
+      "binja",
+      "claude-code",
+      "codex",
+      "codex@gpt-6-astra",
+      "dewolf",
+      "fission",
+      "ghidra",
+      "glaurung",
+      "ida",
+      "kuna",
+      "manifold",
+      "r2dec",
+      "reko",
+      "ventris"
+    ],
+    "decompiler_names": {
+      "angr": "angr",
+      "binja": "Binary Ninja",
+      "claude-code": "Claude Code",
+      "codex": "Codex",
+      "codex@gpt-6-astra": "Codex",
+      "dewolf": "dewolf",
+      "fission": "Fission",
+      "ghidra": "Ghidra",
+      "glaurung": "Glaurung",
+      "ida": "Hex-Rays",
+      "kuna": "Kuna",
+      "manifold": "Manifold",
+      "r2dec": "r2dec",
+      "reko": "Reko",
+      "ventris": "Ventris"
+    },
+    "decompiler_versions": {
+      "angr": "9.3.4",
+      "binja": "5.3.9757",
+      "claude-code": "claude-opus-4-8 (2.1.217)",
+      "codex": "gpt-6-astra (0.155.1)",
+      "codex@gpt-6-astra": "gpt-6-astra (0.155.1)",
+      "dewolf": "v2026.7.11",
+      "fission": "0.2.3",
+      "ghidra": "12.1",
+      "glaurung": "git-fb4ee6ba",
+      "ida": "9.2",
+      "kuna": "1.515",
+      "manifold": "v1",
+      "r2dec": "6.2.0",
+      "reko": "latest",
+      "ventris": "decompiler_v8_postpp_brace_fix"
+    },
+    "metrics": [
+      "byte_match",
+      "ged",
+      "type_match"
+    ],
+    "leaders": [
+      {
+        "dec": "kuna",
+        "name": "Kuna",
+        "pct": 51.409807355516634
+      },
+      {
+        "dec": "ida",
+        "name": "Hex-Rays",
+        "pct": 49.05429071803853
+      },
+      {
+        "dec": "angr",
+        "name": "angr",
+        "pct": 47.52481027437245
+      }
+    ]
+  },
+  "snapshots": [
+    {
+      "date": "04-11-2026",
+      "label": "GED on Rust Joern",
+      "functions": 96103,
+      "binaries": 770,
+      "preset": "unoptimized",
+      "versions": {
+        "angr": "9.3.4",
+        "binja": "5.3.9757",
+        "claude-code": "claude-opus-4-8 (2.1.217)",
+        "codex": "gpt-6-astra (0.155.1)",
+        "codex@gpt-6-astra": "gpt-6-astra (0.155.1)",
+        "dewolf": "v2026.7.11",
+        "fission": "0.2.3",
+        "ghidra": "12.1",
+        "glaurung": "git-fb4ee6ba",
+        "ida": "9.2",
+        "kuna": "1.515",
+        "manifold": "v1",
+        "r2dec": "6.2.0",
+        "reko": "latest",
+        "ventris": "decompiler_v8_postpp_brace_fix"
+      },
+      "leaders": [
+        {
+          "dec": "kuna",
+          "name": "Kuna",
+          "pct": 51.409807355516634
+        },
+        {
+          "dec": "ida",
+          "name": "Hex-Rays",
+          "pct": 49.05429071803853
+        },
+        {
+          "dec": "angr",
+          "name": "angr",
+          "pct": 47.52481027437245
+        }
+      ]
+    },
+    {
+      "date": "09-10-2026",
+      "label": "Codex Astra 6 joins full set (optimized only)",
+      "functions": 96103,
+      "binaries": 770,
+      "preset": "unoptimized",
+      "versions": {
+        "angr": "9.3.4",
+        "binja": "5.3.9757",
+        "claude-code": "claude-opus-4-8 (2.1.217)",
+        "codex": "gpt-6-astra (0.155.1)",
+        "codex@gpt-6-astra": "gpt-6-astra (0.155.1)",
+        "dewolf": "v2026.7.11",
+        "fission": "0.2.3",
+        "ghidra": "12.1",
+        "glaurung": "git-fb4ee6ba",
+        "ida": "9.2",
+        "kuna": "1.515",
+        "manifold": "v1",
+        "r2dec": "6.2.0",
+        "reko": "latest",
+        "ventris": "decompiler_v8_postpp_brace_fix"
+      },
+      "leaders": [
+        {
+          "dec": "kuna",
+          "name": "Kuna",
+          "pct": 51.409807355516634
+        },
+        {
+          "dec": "ida",
+          "name": "Hex-Rays",
+          "pct": 49.05429071803853
+        },
+        {
+          "dec": "angr",
+          "name": "angr",
+          "pct": 47.52481027437245
+        }
+      ]
+    },
+    {
+      "date": "19-09-2026",
+      "label": "Updated type distance evaluation",
+      "functions": 96092,
+      "binaries": 770,
+      "preset": "unoptimized",
+      "versions": {
+        "angr": "9.3.4",
+        "binja": "5.3.9757",
+        "claude-code": "claude-opus-4-8 (2.1.217)",
+        "codex": "gpt-5.6-sol (0.154.0)",
+        "dewolf": "v2026.7.11",
+        "fission": "0.2.3",
+        "ghidra": "12.1",
+        "glaurung": "git-fb4ee6ba",
+        "ida": "9.2",
+        "kuna": "1.515",
+        "manifold": "v1",
+        "r2dec": "6.2.0",
+        "reko": "latest",
+        "ventris": "decompiler_v8_postpp_brace_fix"
+      },
+      "leaders": [
+        {
+          "dec": "kuna",
+          "name": "Kuna",
+          "pct": 51.409807355516634
+        },
+        {
+          "dec": "ida",
+          "name": "Hex-Rays",
+          "pct": 49.05429071803853
+        },
+        {
+          "dec": "angr",
+          "name": "angr",
+          "pct": 47.52481027437245
+        }
+      ]
+    },
+    {
+      "date": "29-08-2026",
+      "label": "Ventris joins the sample set",
+      "functions": 94575,
+      "binaries": 803,
+      "preset": "unoptimized",
+      "versions": {
+        "angr": "9.2.223",
+        "binja": "5.3.9757",
+        "claude-code": "claude-opus-4-8 (2.1.217)",
+        "codex": "gpt-5.6-sol (0.144.1)",
+        "dewolf": "v2026.7.11",
+        "fission": "0.2.1",
+        "ghidra": "12.1",
+        "glaurung": "git-fb4ee6b",
+        "ida": "9.2",
+        "kuna": "v1.121",
+        "manifold": "v1",
+        "r2dec": "r2 6.0.8",
+        "ventris": "v8.0.0"
+      },
+      "leaders": [
+        {
+          "dec": "ida",
+          "name": "Hex-Rays",
+          "pct": 47.852063418046164
+        },
+        {
+          "dec": "kuna",
+          "name": "Kuna",
+          "pct": 46.83492655630683
+        },
+        {
+          "dec": "angr",
+          "name": "angr",
+          "pct": 45.70121240382374
+        }
+      ]
+    },
+    {
+      "date": "27-08-2026",
+      "label": "first recorded snapshot",
+      "functions": 94575,
+      "binaries": 803,
+      "preset": "unoptimized",
+      "versions": {
+        "angr": "9.2.223",
+        "binja": "5.3.9757",
+        "claude-code": "claude-opus-4-8 (2.1.217)",
+        "codex": "gpt-5.6-sol (0.144.1)",
+        "dewolf": "v2026.7.11",
+        "fission": "0.2.1",
+        "ghidra": "12.1",
+        "glaurung": "git-fb4ee6b",
+        "ida": "9.2",
+        "kuna": "v1.121",
+        "manifold": "v1",
+        "r2dec": "r2 6.0.8"
+      },
+      "leaders": [
+        {
+          "dec": "ida",
+          "name": "Hex-Rays",
+          "pct": 47.852063418046164
+        },
+        {
+          "dec": "kuna",
+          "name": "Kuna",
+          "pct": 46.83492655630683
+        },
+        {
+          "dec": "angr",
+          "name": "angr",
+          "pct": 45.70121240382374
+        }
+      ]
+    }
+  ],
+  "aggregates_error": null,
+  "extract": {
+    "unoptimized|1": {
+      "functions": 16339,
+      "binaries": 254,
+      "decompilers": {
+        "kuna": {
+          "name": "kuna",
+          "version": "1.515",
+          "perfect": 7870,
+          "measured": 16289,
+          "pct": 48.31,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 11852,
+          "compile_measured": 12745,
+          "compile_pct": 92.99
+        },
+        "ida": {
+          "name": "ida",
+          "version": "920",
+          "perfect": 7439,
+          "measured": 16289,
+          "pct": 45.67,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 12263,
+          "compile_measured": 12745,
+          "compile_pct": 96.22
+        },
+        "angr": {
+          "name": "angr",
+          "version": "9.3.4",
+          "perfect": 7161,
+          "measured": 16289,
+          "pct": 43.96,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 11657,
+          "compile_measured": 12745,
+          "compile_pct": 91.46
+        },
+        "binja": {
+          "name": "binja",
+          "version": "5.3.9757",
+          "perfect": 6644,
+          "measured": 16289,
+          "pct": 40.79,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 10408,
+          "compile_measured": 12745,
+          "compile_pct": 81.66
+        },
+        "ghidra": {
+          "name": "ghidra",
+          "version": "12.1",
+          "perfect": 5807,
+          "measured": 16289,
+          "pct": 35.65,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 11468,
+          "compile_measured": 12745,
+          "compile_pct": 89.98
+        },
+        "r2dec": {
+          "name": "r2dec",
+          "version": "6.2.0",
+          "perfect": 4768,
+          "measured": 16289,
+          "pct": 29.27,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 6140,
+          "compile_measured": 12745,
+          "compile_pct": 48.18
+        },
+        "dewolf": {
+          "name": "dewolf",
+          "version": "v2026.7.11",
+          "perfect": 2646,
+          "measured": 16289,
+          "pct": 16.24,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 0,
+          "compile_measured": 12745,
+          "compile_pct": 0.0
+        },
+        "codex": {
+          "name": "codex",
+          "version": "gpt-6-astra (0.155.1)",
+          "perfect": 64,
+          "measured": 16289,
+          "pct": 0.39,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 34,
+          "compile_measured": 34,
+          "compile_pct": 100.0
+        },
+        "psalms": {
+          "name": "psalms",
+          "version": "refine6t",
+          "perfect": 62,
+          "measured": 16289,
+          "pct": 0.38,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 26,
+          "compile_measured": 34,
+          "compile_pct": 76.47
+        },
+        "claude-code": {
+          "name": "claude-code",
+          "version": "claude-opus-4-8 (2.1.217)",
+          "perfect": 55,
+          "measured": 16289,
+          "pct": 0.34,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 30,
+          "compile_measured": 34,
+          "compile_pct": 88.24
+        },
+        "glaurung": {
+          "name": "glaurung",
+          "version": "git-fb4ee6ba",
+          "perfect": 38,
+          "measured": 16289,
+          "pct": 0.23,
+          "errors": 734,
+          "error_pct": 90.62,
+          "compiles": 17,
+          "compile_measured": 34,
+          "compile_pct": 50.0
+        },
+        "fission": {
+          "name": "fission",
+          "version": "0.2.3",
+          "perfect": 36,
+          "measured": 16289,
+          "pct": 0.22,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 32,
+          "compile_measured": 34,
+          "compile_pct": 94.12
+        },
+        "ventris": {
+          "name": "ventris",
+          "version": "decompiler_v8_postpp_brace_fix",
+          "perfect": 32,
+          "measured": 16289,
+          "pct": 0.2,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 33,
+          "compile_measured": 34,
+          "compile_pct": 97.06
+        },
+        "reko": {
+          "name": "reko",
+          "version": "latest",
+          "perfect": 24,
+          "measured": 16289,
+          "pct": 0.15,
+          "errors": 289,
+          "error_pct": 83.29,
+          "compiles": 15,
+          "compile_measured": 29,
+          "compile_pct": 51.72
+        },
+        "manifold": {
+          "name": "manifold",
+          "version": "v1",
+          "perfect": 7,
+          "measured": 16289,
+          "pct": 0.04,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 30,
+          "compile_measured": 30,
+          "compile_pct": 100.0
+        },
+        "codex@gpt-6-astra": {
+          "name": "codex@gpt-6-astra",
+          "version": "gpt-6-astra (0.155.1)",
+          "perfect": 0,
+          "measured": 16289,
+          "pct": 0.0,
+          "errors": 0,
+          "error_pct": null,
+          "compiles": 0,
+          "compile_measured": 0,
+          "compile_pct": null
+        }
+      }
+    },
+    "optimized|0": {
+      "functions": 35399,
+      "binaries": 257,
+      "decompilers": {
+        "codex@gpt-6-astra": {
+          "name": "codex@gpt-6-astra",
+          "version": "gpt-6-astra (0.155.1)",
+          "perfect": 25351,
+          "measured": 35173,
+          "pct": 72.08,
+          "errors": 2,
+          "error_pct": 0.01,
+          "compiles": 20442,
+          "compile_measured": 20458,
+          "compile_pct": 99.92
+        },
+        "kuna": {
+          "name": "kuna",
+          "version": "1.515",
+          "perfect": 13129,
+          "measured": 35173,
+          "pct": 37.33,
+          "errors": 1311,
+          "error_pct": 3.7,
+          "compiles": 18491,
+          "compile_measured": 20460,
+          "compile_pct": 90.38
+        },
+        "ida": {
+          "name": "ida",
+          "version": "920",
+          "perfect": 13008,
+          "measured": 35173,
+          "pct": 36.98,
+          "errors": 2090,
+          "error_pct": 5.9,
+          "compiles": 17850,
+          "compile_measured": 19025,
+          "compile_pct": 93.82
+        },
+        "angr": {
+          "name": "angr",
+          "version": "9.3.4",
+          "perfect": 12967,
+          "measured": 35173,
+          "pct": 36.87,
+          "errors": 1620,
+          "error_pct": 4.58,
+          "compiles": 17689,
+          "compile_measured": 19545,
+          "compile_pct": 90.5
+        },
+        "ghidra": {
+          "name": "ghidra",
+          "version": "12.1",
+          "perfect": 11079,
+          "measured": 35173,
+          "pct": 31.5,
+          "errors": 3732,
+          "error_pct": 10.54,
+          "compiles": 17889,
+          "compile_measured": 20211,
+          "compile_pct": 88.51
+        },
+        "binja": {
+          "name": "binja",
+          "version": "5.3.9757",
+          "perfect": 10808,
+          "measured": 35173,
+          "pct": 30.73,
+          "errors": 5006,
+          "error_pct": 14.14,
+          "compiles": 15821,
+          "compile_measured": 19756,
+          "compile_pct": 80.08
+        },
+        "r2dec": {
+          "name": "r2dec",
+          "version": "6.2.0",
+          "perfect": 6744,
+          "measured": 35173,
+          "pct": 19.17,
+          "errors": 8884,
+          "error_pct": 25.1,
+          "compiles": 6693,
+          "compile_measured": 15262,
+          "compile_pct": 43.85
+        },
+        "dewolf": {
+          "name": "dewolf",
+          "version": "v2026.7.11",
+          "perfect": 2362,
+          "measured": 35173,
+          "pct": 6.72,
+          "errors": 18498,
+          "error_pct": 52.26,
+          "compiles": 0,
+          "compile_measured": 11620,
+          "compile_pct": 0.0
+        },
+        "claude-code": {
+          "name": "claude-code",
+          "version": "claude-opus-4-8 (2.1.217)",
+          "perfect": 37,
+          "measured": 35173,
+          "pct": 0.11,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 72,
+          "compile_measured": 82,
+          "compile_pct": 87.8
+        },
+        "codex": {
+          "name": "codex",
+          "version": "gpt-6-astra (0.155.1)",
+          "perfect": 36,
+          "measured": 35173,
+          "pct": 0.1,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 82,
+          "compile_measured": 82,
+          "compile_pct": 100.0
+        },
+        "psalms": {
+          "name": "psalms",
+          "version": "refine6t",
+          "perfect": 36,
+          "measured": 35173,
+          "pct": 0.1,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 50,
+          "compile_measured": 82,
+          "compile_pct": 60.98
+        },
+        "ventris": {
+          "name": "ventris",
+          "version": "decompiler_v8_postpp_brace_fix",
+          "perfect": 26,
+          "measured": 35173,
+          "pct": 0.07,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 70,
+          "compile_measured": 82,
+          "compile_pct": 85.37
+        },
+        "glaurung": {
+          "name": "glaurung",
+          "version": "git-fb4ee6ba",
+          "perfect": 18,
+          "measured": 35173,
+          "pct": 0.05,
+          "errors": 1080,
+          "error_pct": 91.53,
+          "compiles": 37,
+          "compile_measured": 82,
+          "compile_pct": 45.12
+        },
+        "fission": {
+          "name": "fission",
+          "version": "0.2.3",
+          "perfect": 13,
+          "measured": 35173,
+          "pct": 0.04,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 61,
+          "compile_measured": 82,
+          "compile_pct": 74.39
+        },
+        "reko": {
+          "name": "reko",
+          "version": "latest",
+          "perfect": 7,
+          "measured": 35173,
+          "pct": 0.02,
+          "errors": 7044,
+          "error_pct": 98.96,
+          "compiles": 12,
+          "compile_measured": 62,
+          "compile_pct": 19.35
+        },
+        "manifold": {
+          "name": "manifold",
+          "version": "v1",
+          "perfect": 5,
+          "measured": 35173,
+          "pct": 0.01,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 75,
+          "compile_measured": 75,
+          "compile_pct": 100.0
+        }
+      }
+    },
+    "sample-set|0": {
+      "functions": 250,
+      "binaries": 223,
+      "decompilers": {
+        "codex": {
+          "name": "codex",
+          "version": "gpt-6-astra (0.155.1)",
+          "perfect": 149,
+          "measured": 250,
+          "pct": 59.6,
+          "errors": 1,
+          "error_pct": 0.4,
+          "compiles": 158,
+          "compile_measured": 158,
+          "compile_pct": 100.0
+        },
+        "psalms": {
+          "name": "psalms",
+          "version": "refine6t",
+          "perfect": 144,
+          "measured": 250,
+          "pct": 57.6,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 103,
+          "compile_measured": 158,
+          "compile_pct": 65.19
+        },
+        "claude-code": {
+          "name": "claude-code",
+          "version": "claude-opus-4-8 (2.1.217)",
+          "perfect": 142,
+          "measured": 250,
+          "pct": 56.8,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 139,
+          "compile_measured": 158,
+          "compile_pct": 87.97
+        },
+        "kuna": {
+          "name": "kuna",
+          "version": "1.515",
+          "perfect": 88,
+          "measured": 250,
+          "pct": 35.2,
+          "errors": 4,
+          "error_pct": 1.6,
+          "compiles": 136,
+          "compile_measured": 158,
+          "compile_pct": 86.08
+        },
+        "glaurung": {
+          "name": "glaurung",
+          "version": "git-fb4ee6ba",
+          "perfect": 83,
+          "measured": 250,
+          "pct": 33.2,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 72,
+          "compile_measured": 158,
+          "compile_pct": 45.57
+        },
+        "ventris": {
+          "name": "ventris",
+          "version": "decompiler_v8_postpp_brace_fix",
+          "perfect": 82,
+          "measured": 250,
+          "pct": 32.8,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 141,
+          "compile_measured": 158,
+          "compile_pct": 89.24
+        },
+        "angr": {
+          "name": "angr",
+          "version": "9.3.4",
+          "perfect": 80,
+          "measured": 250,
+          "pct": 32.0,
+          "errors": 12,
+          "error_pct": 4.8,
+          "compiles": 121,
+          "compile_measured": 152,
+          "compile_pct": 79.61
+        },
+        "ida": {
+          "name": "ida",
+          "version": "920",
+          "perfect": 77,
+          "measured": 250,
+          "pct": 30.8,
+          "errors": 7,
+          "error_pct": 2.8,
+          "compiles": 130,
+          "compile_measured": 154,
+          "compile_pct": 84.42
+        },
+        "fission": {
+          "name": "fission",
+          "version": "0.2.3",
+          "perfect": 73,
+          "measured": 250,
+          "pct": 29.2,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 127,
+          "compile_measured": 158,
+          "compile_pct": 80.38
+        },
+        "binja": {
+          "name": "binja",
+          "version": "5.3.9757",
+          "perfect": 70,
+          "measured": 250,
+          "pct": 28.0,
+          "errors": 11,
+          "error_pct": 4.4,
+          "compiles": 97,
+          "compile_measured": 156,
+          "compile_pct": 62.18
+        },
+        "ghidra": {
+          "name": "ghidra",
+          "version": "12.1",
+          "perfect": 66,
+          "measured": 250,
+          "pct": 26.4,
+          "errors": 7,
+          "error_pct": 2.8,
+          "compiles": 125,
+          "compile_measured": 158,
+          "compile_pct": 79.11
+        },
+        "r2dec": {
+          "name": "r2dec",
+          "version": "6.2.0",
+          "perfect": 48,
+          "measured": 250,
+          "pct": 19.2,
+          "errors": 44,
+          "error_pct": 17.6,
+          "compiles": 38,
+          "compile_measured": 133,
+          "compile_pct": 28.57
+        },
+        "reko": {
+          "name": "reko",
+          "version": "latest",
+          "perfect": 41,
+          "measured": 250,
+          "pct": 16.4,
+          "errors": 6,
+          "error_pct": 3.23,
+          "compiles": 42,
+          "compile_measured": 124,
+          "compile_pct": 33.87
+        },
+        "codex@gpt-6-astra": {
+          "name": "codex@gpt-6-astra",
+          "version": "gpt-6-astra (0.155.1)",
+          "perfect": 35,
+          "measured": 250,
+          "pct": 14.0,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 82,
+          "compile_measured": 82,
+          "compile_pct": 100.0
+        },
+        "dewolf": {
+          "name": "dewolf",
+          "version": "v2026.7.11",
+          "perfect": 24,
+          "measured": 250,
+          "pct": 9.6,
+          "errors": 48,
+          "error_pct": 19.2,
+          "compiles": 0,
+          "compile_measured": 129,
+          "compile_pct": 0.0
+        },
+        "manifold": {
+          "name": "manifold",
+          "version": "v1",
+          "perfect": 22,
+          "measured": 250,
+          "pct": 8.8,
+          "errors": 0,
+          "error_pct": 0.0,
+          "compiles": 142,
+          "compile_measured": 142,
+          "compile_pct": 100.0
+        }
+      }
+    }
+  }
+}

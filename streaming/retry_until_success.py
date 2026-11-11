@@ -11,11 +11,13 @@ qu'au succes ou apres la fenetre de grace configuree.
   * pas de retry : 400/401/403/404/405/413/422, erreurs de validation et de
     contexte trop long. Reessayer ne peut pas les corriger.
 
-**Flux.** Une requete streaming qui echoue avant le premier contenu recoit un
-`200 text/event-stream` + des commentaires `: keepalive` pendant les attentes.
-Le client ne voit ni 429 ni 502, et ne declenche pas sa propre boucle de retry.
-Des qu'une tentative produit du contenu, les octets sont relayes tels quels ;
-un echec APRES le premier octet n'est jamais rejoue (duplication garantie).
+**Flux.** Une requete streaming est rejouee tant qu'elle echoue avant le
+premier contenu. Le client ne voit ni 429 ni 502 **tant qu'un reessai peut
+encore reussir**. Si la fenetre de grace expire sans contenu, le dernier
+statut reel (429, 5xx) est rendu tel quel : jamais un 200 fabrique avec une
+trame d'erreur. Des qu'une tentative produit du contenu, les octets sont
+relayes tels quels ; un echec APRES le premier octet n'est jamais rejoue
+(duplication garantie).
 
 **Securite.** Le corps de la requete est bufferise une fois puis rejoue a
 chaque tentative. Le middleware abandonne des que le client se deconnecte.
@@ -24,13 +26,25 @@ chaque tentative. Le middleware abandonne des que le client se deconnecte.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import random
 import time
+import uuid
 from email.utils import parsedate_to_datetime
 from typing import Any
 
 from .empty_guard import looks_like_error_frame
+
+#: [012 T028] Identifiant stable de la requête CLIENT à travers les rejeux du
+#: middleware, et numéro de tentative. Lus par `_save_request` au moment de
+#: l'insertion ; NULL hors middleware (paid/direct).
+client_request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "client_request_id", default=None
+)
+attempt_no_var: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "attempt_no", default=None
+)
 
 __all__ = [
     "RetryPolicy",
@@ -116,6 +130,9 @@ _LOCAL_RATE_LIMIT_MARKERS = (
     "rate limit exceeded. please retry shortly.",
     '"code":"rate_limit_exceeded"',
     '"code": "rate_limit_exceeded"',
+    # Refus local du preflight free : le proxy a deja decide que tous les
+    # tunnels sont en cooldown. Rejouer immediatement ne peut pas le corriger.
+    "free quota exhausted on all vpn stations",
 )
 
 
@@ -581,6 +598,7 @@ class RetryUntilSuccessMiddleware:
         send,
         *,
         path: str,
+        is_stream: bool,
         outer_committed: bool,
         last: _Attempt | None,
         policy: RetryPolicy,
@@ -604,6 +622,31 @@ class RetryUntilSuccessMiddleware:
                     message = last.body[:300].decode("utf-8", "replace")
         if not message:
             message = f"upstream unavailable after retries ({reason})"
+        status = (
+            int(last.status)
+            if last is not None and last.status and last.status != 200
+            else 502
+        )
+        if is_stream and path.endswith("/chat/completions"):
+            # Protocole OpenAI Chat : le client attend des trames `data:` même
+            # pour l'erreur finale. On conserve le statut réel (429/5xx) et on
+            # rend le message amont dans SA forme de flux. `/v1/responses` et
+            # `/v1/messages` gardent leur enveloppe JSON structurée.
+            body = _sse_error(path, message, error_type)
+            try:
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": status,
+                        "headers": _sse_headers(),
+                    }
+                )
+                await send(
+                    {"type": "http.response.body", "body": body, "more_body": False}
+                )
+            except Exception:
+                pass
+            return
         if outer_committed:
             try:
                 await send(
@@ -612,7 +655,7 @@ class RetryUntilSuccessMiddleware:
             except Exception:
                 pass
             return
-        if last is not None and last.status:
+        if last is not None and last.status and last.status != 200:
             try:
                 await self._send_start(send, last)
                 await send({"type": "http.response.body", "body": last.body, "more_body": False})
@@ -651,6 +694,10 @@ class RetryUntilSuccessMiddleware:
             return
 
         path = str(scope.get("path") or "")
+        # [012 T028] Identifiant stable de la requête client (header si fourni).
+        client_id = _header_value(scope.get("headers"), b"x-request-id") or (
+            f"cr_{uuid.uuid4().hex[:16]}"
+        )
         chunks = await self._read_body(receive)
         if chunks is None:
             return
@@ -822,6 +869,8 @@ class RetryUntilSuccessMiddleware:
             while True:
                 if disconnected.is_set():
                     return
+                client_request_id_var.set(client_id)
+                attempt_no_var.set(attempt_no + 1)
                 at = _Attempt()
                 app_task = asyncio.create_task(
                     self.app(
@@ -874,6 +923,7 @@ class RetryUntilSuccessMiddleware:
                     await self._finish_with_error(
                         send,
                         path=path,
+                        is_stream=is_stream,
                         outer_committed=outer["committed"],
                         last=last,
                         policy=policy,
@@ -883,13 +933,6 @@ class RetryUntilSuccessMiddleware:
                 delay = self._delay(policy, attempt_no, at)
                 if deadline is not None:
                     delay = min(delay, max(0.0, deadline - now))
-                if is_stream and not outer["committed"]:
-                    try:
-                        await send({"type": "http.response.start", "status": 200, "headers": _sse_headers()})
-                        await send({"type": "http.response.body", "body": b": keepalive\n\n", "more_body": True})
-                        outer["committed"] = True
-                    except Exception:
-                        return
                 await self._sleep_with_keepalive(
                     delay,
                     send,

@@ -58,6 +58,38 @@ def test_plan_rejects_duplicate_port() -> None:
         )
 
 
+def test_plan_groups_ipv4_and_ipv6_on_one_container() -> None:
+    specs = [
+        _spec(
+            label="WARP 1",
+            container="warp-1",
+            port=11080,
+            block="104.28.230.203/32",
+        ),
+        _spec(
+            label="WARP 1 IPv6",
+            container="warp-1",
+            port=11080,
+            block="2a09:bac5:32d6:14dc::/64",
+            ipv6=True,
+        ),
+    ]
+    actions = WarpProvisioner().plan(specs, {})
+    assert len(actions) == 1
+    assert actions[0].container == "warp-1"
+    assert actions[0].action == "create"
+
+
+def test_plan_rejects_one_container_on_two_ports() -> None:
+    with pytest.raises(ValueError, match="duplicate container"):
+        WarpProvisioner().plan(
+            [
+                _spec(label="WARP 1", container="warp-1", port=11080),
+                _spec(label="WARP 1 IPv6", container="warp-1", port=11081),
+            ]
+        )
+
+
 def test_plan_rejects_duplicate_block() -> None:
     with pytest.raises(ValueError, match="duplicate block"):
         WarpProvisioner().plan(

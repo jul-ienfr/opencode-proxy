@@ -165,6 +165,28 @@ def test_rotate_failure_keeps_last_resolved_egress(monkeypatch):
     assert result.block == "2a09:bac1:27a0:2060::/64"
 
 
+def test_rotate_accepts_shared_ipv4_nat_block(monkeypatch):
+    rotator = WarpRotator()
+    monkeypatch.setattr(rotator, "_docker", lambda args, timeout=60: "")
+    monkeypatch.setattr(rotator, "_wait_healthy", lambda container: True)
+    monkeypatch.setattr(
+        rotator,
+        "_resolve_egress",
+        lambda port, ipv6: "104.28.230.202",
+    )
+    endpoint = _endpoint(
+        ipv6=False,
+        egress_ip="104.28.230.203",
+        block="104.28.230.203/32",
+    )
+    result = rotator.rotate(
+        endpoint,
+        forbidden_blocks={"104.28.230.202/32"},
+    )
+    assert result.ok is True
+    assert result.block == "104.28.230.202/32"
+
+
 def test_apply_tracking_updates_rejected_egress(monkeypatch):
     rotator = WarpRotator()
     ep = _endpoint()
@@ -255,8 +277,54 @@ def test_request_rotation_starts_managed_and_respects_cooldown(monkeypatch):
     ep = _endpoint(label="warp-test-cooldown", container="warp-restore1")
     assert rotator.request_rotation(ep, FakePool(), lambda *args: None) is True
     assert rotator.request_rotation(ep, FakePool(), lambda *args: None) is False
-    wr.LAST_ROTATION["warp-test-cooldown"] = time.monotonic()
+    wr.LAST_ROTATION["warp-restore1"] = time.monotonic()
     assert rotator.request_rotation(ep, FakePool(), lambda *args: None) is False
+
+
+def test_request_rotation_ipv4_nat_endpoint_is_not_rotated(monkeypatch):
+    import free.warp_rotation as wr
+
+    monkeypatch.setattr(wr, "MIN_ROTATION_INTERVAL_S", 300.0)
+    monkeypatch.setattr(wr, "INFLIGHT", set())
+    monkeypatch.setattr(wr, "LAST_ROTATION", {})
+    rotator = WarpRotator()
+    monkeypatch.setattr(rotator, "_run", lambda *args: None)
+    v4 = _endpoint(label="WARP 1", container="warp-1", ipv6=False)
+    v6 = _endpoint(label="WARP 1 IPv6", container="warp-1", ipv6=True)
+    # IPv4 NAT : jamais de rotation (elle détruirait le /64 IPv6).
+    assert rotator.request_rotation(v4, FakePool(), lambda *args: None) is False
+    assert rotator.request_rotation(v6, FakePool(), lambda *args: None) is True
+    # Le conteneur est déjà en cooldown : pas de seconde rotation.
+    assert rotator.request_rotation(v6, FakePool(), lambda *args: None) is False
+
+
+def test_refresh_siblings_only_touches_same_container(monkeypatch):
+    class _Health:
+        def get(self, _sid):
+            return None
+
+    class _Pool:
+        _station_health = _Health()
+
+        def __init__(self, endpoints):
+            self.endpoints = endpoints
+
+        def _socks5_enabled_eps(self):
+            return list(self.endpoints)
+
+    rotated = _endpoint(label="WARP 1", container="warp-1", ipv6=False)
+    sibling = _endpoint(label="WARP 1 IPv6", container="warp-1", ipv6=True)
+    other = _endpoint(label="WARP 2", container="warp-2", ipv6=False)
+    refreshed = []
+    monkeypatch.setattr(
+        "free.egress_reconcile.reconcile_endpoint",
+        lambda endpoint, persist=None, timeout_s=0: refreshed.append(endpoint)
+        or {"ok": True},
+    )
+    WarpRotator()._refresh_siblings(
+        rotated, _Pool([rotated, sibling, other]), lambda *args: None
+    )
+    assert refreshed == [sibling]
 
 
 class ProactivePool:

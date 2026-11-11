@@ -50,7 +50,7 @@
       "doc": "docs/models-protocol.md",
       "config_file": "config.yaml",
       "keys": [
-        "free_model_map.deepseek-v4-flash",
+        "free_model_map",
         "dashboard_trust.mode",
         "client_auth.mode",
         "protocol.emit_default_tool_choice"

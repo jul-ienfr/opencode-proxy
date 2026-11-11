@@ -54,11 +54,12 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-q --tb=short"
+addopts = "-q --tb=short -m 'not docker'"
 # [plan v10 §4 Lot 0 t2] Marqueur pour les tests exigeant un daemon Docker live
-# (chaos tests Lot 2, e2e §13). Gate par défaut : `pytest -k "not docker" -q`.
+# (chaos tests Lot 2, e2e §13). Gate par défaut : `pytest -q` exclut `docker` ;
+# les preuves live se lancent avec `pytest -m docker -q`.
 markers = [
-    "docker: requires a live Docker daemon — excluded from the default gate via -k 'not docker'",
+    "docker: requires a live Docker daemon — excluded from the default gate via -m 'not docker'",
 ]
 
 [tool.coverage.run]

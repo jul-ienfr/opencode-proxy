@@ -87,6 +87,20 @@ def evaluate_free_health_payload(payload: dict) -> list[str]:
         bad = sum(1 for row in leases if isinstance(row, dict) and row.get("state") == "bad")
         if bad:
             alerts.append(f"{bad} bad IP lease(s)")
+    slot = payload.get("slot_wait")
+    if isinstance(slot, dict):
+        try:
+            p95 = float(slot.get("p95_ms") or 0.0)
+            if p95 >= 1000.0:
+                alerts.append(f"slot wait p95 {p95:.0f} ms")
+        except (TypeError, ValueError):
+            pass
+        try:
+            timeouts = int(slot.get("timeouts") or 0)
+            if timeouts >= 100:
+                alerts.append(f"{timeouts} slot timeout(s)")
+        except (TypeError, ValueError):
+            pass
     return alerts
 
 

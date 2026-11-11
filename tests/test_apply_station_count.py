@@ -88,6 +88,9 @@ def _canvas(tmp_path, monkeypatch):
     m1 = _Rec(_cfg(tmp_path, vpn_stack="auto"), tmp_path=tmp_path)
     m2 = _Rec(_cfg(tmp_path, vpn_stack="auto"), station=2, tmp_path=tmp_path)
     pool, watcher = _FakePool(), _FakeWatcher()
+    # Ne pas hériter du parkage live (`disabled_stations: [1..6]`) : ce test
+    # décrit un upscale normal où la nouvelle station doit démarrer.
+    monkeypatch.setitem(opencode.IP_ROTATION, "disabled_stations", [])
     monkeypatch.setattr(shared_state, "vpn_managers", [m1, m2], raising=False)
     monkeypatch.setattr(shared_state, "vpn_manager", m1, raising=False)
     monkeypatch.setattr(shared_state, "vpn_manager_2", m2, raising=False)

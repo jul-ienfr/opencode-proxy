@@ -28,10 +28,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import opencode as oc  # noqa: E402
 from curl_cffi import requests  # noqa: E402
-
 from test_free_egress import CAPTURE, load_capture, post_once  # noqa: E402
+
+import opencode as oc  # noqa: E402
 
 CATALOG = ROOT / "logs" / "nordvpn_api.json"
 CREDS = ROOT / "credentials.env"

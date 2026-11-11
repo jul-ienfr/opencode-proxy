@@ -112,6 +112,9 @@ def test_consolidation_legacy_block_functions_delegate() -> None:
 
 def test_stations_api_route_exists() -> None:
     source = (ROOT / "dashboard" / "api.py").read_text(encoding="utf-8")
+    source += (ROOT / "dashboard" / "routers" / "station_routes.py").read_text(
+        encoding="utf-8"
+    )
     assert '"/api/stations"' in source
     assert '"/api/stations/{provider}/{station}"' in source
 

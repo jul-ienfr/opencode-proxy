@@ -17,6 +17,29 @@ import opencode as oc
 httpx = pytest.importorskip("httpx")
 
 
+@pytest.fixture(autouse=True)
+def _fast_retry(monkeypatch):
+    """Exerce la pile réelle (retry activé) sans attendre 180 s.
+
+    Le comportement V5.1 doit tenir même quand `retry_until_success` est
+    activé : on garde le middleware, on raccourcit seulement sa fenêtre.
+    """
+    from streaming.retry_until_success import RetryPolicy, RetryUntilSuccessMiddleware
+
+    monkeypatch.setattr(
+        RetryUntilSuccessMiddleware,
+        "_policy",
+        lambda self: RetryPolicy(
+            enabled=True,
+            max_wait_s=0.4,
+            base_delay_s=0.02,
+            max_delay_s=0.05,
+            keepalive_interval_s=0.02,
+            jitter=0.0,
+        ),
+    )
+
+
 class _EmptyUpstream:
     """Amont qui repond 200 et ne produit AUCUN octet (le defaut V5.1)."""
 

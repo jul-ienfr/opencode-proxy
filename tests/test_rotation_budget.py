@@ -32,3 +32,19 @@ def test_budget_store_zero_means_unlimited(tmp_path) -> None:
     for _ in range(50):
         store.record("warp-test")
     assert store.allow("warp-test", 0) is True
+
+
+def test_budget_store_finishes_a_job_with_its_result(tmp_path) -> None:
+    db = tmp_path / "registry.db"
+    store = RotationBudgetStore(str(db))
+    job_id = store.record("warp-1")
+    assert job_id is not None
+    store.finish(job_id, "ok", "rotated")
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT result, reason, finished_at FROM rotation_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+    assert row[0] == "ok"
+    assert row[1] == "rotated"
+    assert row[2] is not None

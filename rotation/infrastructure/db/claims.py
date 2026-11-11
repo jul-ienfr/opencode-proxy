@@ -35,16 +35,10 @@ CREATE TABLE IF NOT EXISTS rebind_budget (
     window_start REAL NOT NULL,
     count INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS transport_leases (
-    transport TEXT PRIMARY KEY,
-    station INTEGER NOT NULL,
-    hostname TEXT NOT NULL DEFAULT '',
-    updated_at REAL NOT NULL,
-    expires_at REAL NOT NULL
-);
+
 """
 
-_TABLES = ("catalog", "claims", "rebind_budget", "transport_leases")
+_TABLES = ("catalog", "claims", "rebind_budget")
 
 
 def ensure_claims_schema(target: str | Path) -> None:
@@ -64,7 +58,7 @@ def migrate_claims(target: str | Path, source: str | Path) -> dict[str, int]:
     target.parent.mkdir(parents=True, exist_ok=True)
     ensure_claims_schema(target)
     if not source.exists() or source.resolve() == target.resolve():
-        return {table: 0 for table in _TABLES}
+        return dict.fromkeys(_TABLES, 0)
     copied: dict[str, int] = {}
     conn = sqlite3.connect(str(target), timeout=10.0)
     try:

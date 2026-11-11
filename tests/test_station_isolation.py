@@ -231,3 +231,20 @@ async def test_set_stations_prunes_by_max_active_sid(monkeypatch):
     pool.update_config = lambda *a, **k: None
     pool.set_stations([_fake_manager(1), _fake_manager(3)])
     assert pruned_with == [3], "max(1,3)=3 et non count=2 — sinon prune_stations(2) tuerait la station 3 active"
+
+
+def test_station_health_repair_is_local():
+    from free.station_health import REPAIRING, USABLE, StationHealthRegistry
+
+    registry = StationHealthRegistry()
+    station1 = registry.get(1)
+    station2 = registry.get(2)
+    station2.observe_probe(False, now=100.0)
+    station2.observe_probe(False, now=101.0)
+    assert station2.state == REPAIRING
+    assert station1.state == USABLE
+
+    station2.begin_repair(now=102.0, cause="tunnel_down")
+    station2.repair_failed(now=103.0, cause="timeout", next_retry_at=200.0)
+    assert station1.state == USABLE
+    assert station1.action_required is False

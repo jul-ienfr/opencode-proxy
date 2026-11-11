@@ -65,3 +65,34 @@ def test_no_label_keeps_legacy_pid():
     ep = Socks5Endpoint("127.0.0.1", 11084, index=0)
     assert ep.pid == "127.0.0.1:11084"
     assert ep.current_ip == "socks5:127.0.0.1:11084"
+
+
+def test_pool_is_enabled_when_only_socks5_endpoints_are_active():
+    """Parquer NordVPN ne doit pas couper la jambe WARP du pool."""
+    from types import SimpleNamespace
+
+    from free.pool import FreeIPPool
+
+    pool = object.__new__(FreeIPPool)
+    pool._vpn = SimpleNamespace(enabled=False, proxy_mode="auto_egress")
+    pool._socks5_eps = []
+    assert pool.enabled is False
+
+    pool._socks5_eps = [Socks5Endpoint("127.0.0.1", 11080, label="WARP 1", enabled=True)]
+    assert pool.enabled is True
+
+
+def test_slot_wait_stats_exposes_p50_p95_and_timeouts():
+    from collections import deque
+
+    from free.pool import FreeIPPool
+
+    pool = object.__new__(FreeIPPool)
+    pool._slot_wait_ms = deque([10.0, 20.0, 30.0, 40.0], maxlen=200)
+    pool._slot_timeouts = 2
+    stats = pool.slot_wait_stats()
+    assert stats["samples"] == 4
+    assert stats["p50_ms"] == 30.0
+    assert stats["p95_ms"] == 40.0
+    assert stats["max_ms"] == 40.0
+    assert stats["timeouts"] == 2

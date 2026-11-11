@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dashboard.api import _quality_blocks_errors
-from free.quality import QualityConfig, QualityRegistry
 from free.pool import FreeIPPool
+from free.quality import QualityConfig, QualityRegistry
 from vpn.manager import VPNManager
 
 

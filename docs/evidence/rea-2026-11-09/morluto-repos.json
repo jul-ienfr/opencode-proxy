@@ -1,0 +1,737 @@
+{
+  "generated_at": "2026-11-09T19:37:53Z",
+  "count": 100,
+  "created_by_day": {
+    "2026-10-09": 88,
+    "2026-10-10": 1,
+    "2026-10-11": 1,
+    "2026-10-15": 1,
+    "2026-10-16": 1,
+    "2026-10-17": 1,
+    "2026-10-18": 1,
+    "2026-10-19": 1,
+    "2026-10-20": 1,
+    "2026-10-21": 1,
+    "2026-10-30": 1,
+    "2026-11-07": 1,
+    "2026-11-08": 1
+  },
+  "repos_created_on_top_day": 88,
+  "top_day": "2026-10-09",
+  "stars_total": 2225,
+  "stars_top10": [
+    1986,
+    47,
+    21,
+    11,
+    8,
+    7,
+    7,
+    7,
+    7,
+    6
+  ],
+  "repos_under_10_stars": 96,
+  "repos": [
+    {
+      "name": "mvanhorn",
+      "stars": 0,
+      "created": "2026-11-08",
+      "pushed": "2026-11-09",
+      "language": null
+    },
+    {
+      "name": "incur",
+      "stars": 0,
+      "created": "2026-11-07",
+      "pushed": "2026-11-07",
+      "language": null
+    },
+    {
+      "name": "kuna",
+      "stars": 6,
+      "created": "2026-10-30",
+      "pushed": "2026-10-30",
+      "language": null
+    },
+    {
+      "name": "oma-cast",
+      "stars": 2,
+      "created": "2026-10-21",
+      "pushed": "2026-10-21",
+      "language": null
+    },
+    {
+      "name": "DeepInfer",
+      "stars": 3,
+      "created": "2026-10-20",
+      "pushed": "2026-10-20",
+      "language": null
+    },
+    {
+      "name": "vector-os-nano",
+      "stars": 5,
+      "created": "2026-10-19",
+      "pushed": "2026-06-26",
+      "language": null
+    },
+    {
+      "name": "agent-tincan",
+      "stars": 8,
+      "created": "2026-10-18",
+      "pushed": "2026-10-18",
+      "language": null
+    },
+    {
+      "name": "mechrevo-drivers",
+      "stars": 2,
+      "created": "2026-10-17",
+      "pushed": "2026-10-17",
+      "language": null
+    },
+    {
+      "name": "crashlens",
+      "stars": 7,
+      "created": "2026-10-16",
+      "pushed": "2026-10-16",
+      "language": null
+    },
+    {
+      "name": "generate-social-preview",
+      "stars": 47,
+      "created": "2026-10-15",
+      "pushed": "2026-10-15",
+      "language": "Shell"
+    },
+    {
+      "name": "ghidra",
+      "stars": 21,
+      "created": "2026-10-11",
+      "pushed": "2026-10-11",
+      "language": null
+    },
+    {
+      "name": "vercel-skills",
+      "stars": 4,
+      "created": "2026-10-10",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "awesome-llm-skills",
+      "stars": 7,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "awesome-agent-skills-1",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "awesome-agentic-mcp-security",
+      "stars": 3,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "awesome-agent-skills",
+      "stars": 3,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "ok-skills",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "awesome-hermes-skills",
+      "stars": 6,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-awesome-llm-re",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-skills4redteam",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-grimoire-docs-source",
+      "stars": 3,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-habito-mcp-list",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-cybersecurity-mcp-tools",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-offensive-mcp-tools",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-best-mcp-servers",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-offensive-ai-resources",
+      "stars": 3,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-redteam-reversing-tools",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-android-ai-reversing-list",
+      "stars": 4,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-ai-driven-development-tools",
+      "stars": 3,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-kilo-mcp-marketplace",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-korean-agent-skill-directory",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-h4cker-reversing-resources",
+      "stars": 7,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-local-investigation-skill",
+      "stars": 5,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-agent-mcp-ecosystem",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-agent-directory-domain-skill",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-agent-skill-tools-cn",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-security-research-catalog",
+      "stars": 1,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-concise-skills-bilingual",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-eze-agent-skills",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-chinese-skills-catalog",
+      "stars": 1,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-hacking-resources",
+      "stars": 1,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-security-skills-list",
+      "stars": 1,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-agent-cortex-tools",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-skill-agentpostmortem",
+      "stars": 5,
+      "created": "2026-10-09",
+      "pushed": "2026-10-11",
+      "language": null
+    },
+    {
+      "name": "rea-heyclaude-source-skill",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-codex-guide-resource-cn",
+      "stars": 1,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-skill-list-traditional-cn",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-cursor-skill-list",
+      "stars": 3,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-claude-skill-bindu",
+      "stars": 4,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-third-party-skills-cn",
+      "stars": 3,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-codex-skills-rogge",
+      "stars": 7,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-agent-skills-jacky",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-agent-skills-libukai",
+      "stars": 5,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-claude-skills-behi",
+      "stars": 5,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-sixth-gen-tools-de",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-guia-assembly-br",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-agent-skills-es",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-apple-knowledge-list",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-jquery-claude-code-list",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-dev-resources",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-agent-cli-registry",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-claude-skills-zh",
+      "stars": 1,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-skills-zh",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-apple-security-list",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-10",
+      "language": null
+    },
+    {
+      "name": "rea-ai-cli",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-hook-re-mcp",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-web-reversing",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-wunder-mcp",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-ai-agent-tools",
+      "stars": 3,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-apple-security",
+      "stars": 11,
+      "created": "2026-10-09",
+      "pushed": "2026-10-11",
+      "language": null
+    },
+    {
+      "name": "rea-all-defense",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-ai-pentesting",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-gpt-security",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-codex-cli",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-gmh-skills",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-secskills",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-ai-coding-tools",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-engineering-ai",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-ctf-resources",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-mcp-open",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-ai-devtools",
+      "stars": 3,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "awesome-reverse-engineering",
+      "stars": 1986,
+      "created": "2026-10-09",
+      "pushed": "2026-11-09",
+      "language": "Python"
+    },
+    {
+      "name": "rea-otto-ai-security",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-embedded-security",
+      "stars": 1,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-awesome-ghidra",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-hacking-with-ai",
+      "stars": 3,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-genai-cyberhub",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-gmh-game-security",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-gmh-ai-security",
+      "stars": 1,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-ai-redteam",
+      "stars": 1,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-darbra-ai-reverse",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-ai-anytime-mcp",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-security-agent-analysis-tools",
+      "stars": 1,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-awesome-reverse-engineering",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-awesome-mcp-servers",
+      "stars": 3,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-awesome-cybersecurity-agentic-ai",
+      "stars": 1,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-awesome-mcp-list",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "puliczek-awesome-mcp-security",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "abordage-awesome-mcp",
+      "stars": 2,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    },
+    {
+      "name": "rea-software-reversing-id",
+      "stars": 0,
+      "created": "2026-10-09",
+      "pushed": "2026-10-09",
+      "language": null
+    }
+  ]
+}

@@ -52,7 +52,7 @@ class PreflightSummary:
     errors: dict[str, int] = field(default_factory=dict)
 
     @classmethod
-    def from_results(cls, results: Iterable[PreflightResult]) -> "PreflightSummary":
+    def from_results(cls, results: Iterable[PreflightResult]) -> PreflightSummary:
         items = list(results)
         rtts = [r.rtt_ms for r in items if r.ok and r.rtt_ms > 0]
         errors: dict[str, int] = {}
@@ -222,7 +222,7 @@ class PreflightProber:
                         ),
                         timeout=budget,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     return PreflightResult(
                         host, transport, country, error="budget"
                     )
@@ -273,7 +273,7 @@ class PreflightProber:
                 sock.sendto(b"\x00", (ip, int(port)))
                 try:
                     sock.recvfrom(2048)
-                except (socket.timeout, OSError):
+                except (TimeoutError, OSError):
                     pass
             return (time.monotonic() - started) * 1000.0
 

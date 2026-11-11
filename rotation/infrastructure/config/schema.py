@@ -23,7 +23,7 @@ class ScoreWeights:
     stability: float = 0.10
     freshness: float = 0.05
 
-    def normalized(self) -> "ScoreWeights":
+    def normalized(self) -> ScoreWeights:
         values = {
             "success": max(0.0, float(self.success)),
             "latency": max(0.0, float(self.latency)),
@@ -58,7 +58,6 @@ class TransportConfig:
 @dataclass(frozen=True)
 class RepairConfig:
     max_parallel: int = 6
-    shared_wireguard_key: bool = True
 
 
 @dataclass(frozen=True)
@@ -105,6 +104,5 @@ def load_rotation_config() -> RotationConfig:
     )
     repair = RepairConfig(
         max_parallel=max(1, int(yaml_get("ip_registry", "allocator.max_parallel_repairs", 6) or 6)),
-        shared_wireguard_key=bool(yaml_get("ip_registry", "repair.shared_wireguard_key", True)),
     )
     return RotationConfig(selection=selection, transport=transport, repair=repair)

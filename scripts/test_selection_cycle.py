@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from free.ip_registry.adapters.probe import StationProbe
+from free.ip_registry.adapters.probe import StationProbe  # noqa: E402
 
 
 def known_bad_ips() -> dict[str, float]:

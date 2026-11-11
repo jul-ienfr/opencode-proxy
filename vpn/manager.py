@@ -211,13 +211,13 @@ def _docker_desktop_process_running() -> bool:
         return False
     try:
         r = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq Docker Desktop.exe", "/NH"],
+            ["tasklist", "/FI", "IMAGENAME eq Docker Desktop.exe", "/NH"],  # platform-audit: allow Windows adapter debt
             capture_output=True,
             text=True,
             timeout=10,
             creationflags=CREATE_NO_WINDOW,
         )
-        return "docker desktop.exe" in (r.stdout or "").lower()
+        return "docker desktop.exe" in (r.stdout or "").lower()  # platform-audit: allow Windows adapter debt
     except Exception:
         return False
 
@@ -389,15 +389,15 @@ async def ensure_docker_running(timeout: int = 60) -> bool:
         return False
     # Common install paths
     candidates = [
-        r"C:\Program Files\Docker\Docker\Docker Desktop.exe",
-        r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
-        os.path.expandvars(r"%ProgramFiles%\Docker\Docker\Docker Desktop.exe"),
-        os.path.expandvars(r"%LocalAppData%\Docker\Docker Desktop.exe"),
+        r"C:\Program Files\Docker\Docker\Docker Desktop.exe",  # platform-audit: allow Windows adapter debt
+        r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",  # platform-audit: allow Windows adapter debt
+        os.path.expandvars(r"%ProgramFiles%\Docker\Docker\Docker Desktop.exe"),  # platform-audit: allow Windows adapter debt
+        os.path.expandvars(r"%LocalAppData%\Docker\Docker Desktop.exe"),  # platform-audit: allow Windows adapter debt
     ]
     exe = None
     for p in candidates:
         try:
-            if p and os.path.exists(p) and p.lower().endswith("docker desktop.exe"):
+            if p and os.path.exists(p) and p.lower().endswith("docker desktop.exe"):  # platform-audit: allow Windows adapter debt
                 exe = p
                 break
         except Exception:

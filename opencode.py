@@ -18,6 +18,7 @@ import os
 import random
 import re
 import re as _re_norm
+import socket
 import sqlite3
 import threading
 import time
@@ -586,6 +587,7 @@ if DEBUG:
 # matters most). Handlers are rotation-aware (see dashboard.display).
 attach_module_logger("vpn_manager")
 attach_module_logger("free_ip_pool")
+attach_module_logger("egress-catalog")
 # [011] Rotation/réparation WARP et ledger : les logs doivent survivre à
 # DEBUG=false. Sans ces handlers, `[warp-rotate]` n'était écrit nulle part.
 attach_module_logger("free.pool")
@@ -980,6 +982,9 @@ def _db_insert_sync(
     # le fallback QueueFull passe *row matérialisé — arité 32 exigée).
     free_status=None,
     paid_status=None,
+    client_request_id=None,
+    attempt_no=None,
+    final_status=None,
 ):
     """Synchronous DB insert — called via asyncio.to_thread().
 
@@ -1024,6 +1029,9 @@ def _db_insert_sync(
         station,
         free_status,
         paid_status,
+        client_request_id,
+        attempt_no,
+        final_status,
     )
     _app_db.insert_sync(_conn, _db_commit_lock, _db_state, row, debug_fn=_debug)
 
@@ -1236,6 +1244,26 @@ async def _save_request(
         response_body = _compact_body_stub(response_body)
     global _db_queue_bytes
     client_user_agent = _current_user_agent.get()
+    # [012 T028] Identifiant de requête client + numéro de tentative, posés par
+    # le middleware de retry (None hors middleware). `final_status` est le
+    # statut effectif de cette tentative ; la ligne finale d'un client est
+    # celle qui porte le plus grand `attempt_no`.
+    client_request_id = None
+    attempt_no = None
+    try:
+        from streaming.retry_until_success import attempt_no_var, client_request_id_var
+
+        client_request_id = client_request_id_var.get()
+        attempt_no = attempt_no_var.get()
+    except Exception:
+        pass
+    final_status = paid_status if paid_status is not None else free_status
+    if final_status is None:
+        final_status = 200 if success else 500
+    try:
+        final_status = int(final_status)
+    except (TypeError, ValueError):
+        final_status = None
     # Leaf reader for the free-channel stamp: the two writers set
     # _current_free_attempt (IP + identity profile) right before the free
     # request leaves; any save site in the same task picks it up — including
@@ -1355,6 +1383,9 @@ async def _save_request(
         stop_reason,
         1 if aborted else 0,
         server_host,
+        client_request_id,
+        attempt_no,
+        final_status,
     )
     item = _DbRowRaw(
         head,
@@ -3060,6 +3091,99 @@ async def _warp_rotation_watchdog():
             _debug(f"  [warp-rotate] watchdog error: {type(exc).__name__}: {exc}")
 
 
+def _catalog_warp_endpoint(option):
+    try:
+        import shared_state as _ss
+
+        pool = getattr(_ss, "free_ip_pool", None)
+    except Exception:
+        pool = None
+    for endpoint in getattr(pool, "_socks5_eps", None) or []:
+        if str(getattr(endpoint, "provider", "")).lower() != "warp":
+            continue
+        if (
+            str(getattr(endpoint, "container", "") or "") == str(option.station)
+            or str(getattr(endpoint, "egress_ip", "") or "") == str(option.egress_ip)
+        ):
+            return str(getattr(endpoint, "socks5_url", "") or "")
+    return ""
+
+
+def _catalog_nordvpn_endpoint(option) -> str:
+    try:
+        import shared_state as _ss
+
+        managers = list(getattr(_ss, "vpn_managers", None) or [])
+    except Exception:
+        managers = []
+    for index, manager in enumerate(managers, 1):
+        if f"station-{index}" != str(option.station):
+            continue
+        try:
+            return str(getattr(manager, "socks5_url", "") or "")
+        except Exception:
+            return ""
+    return ""
+
+
+async def _catalog_warp_probe(option):
+    from free.egress_probes import probe_proxy_free_gate
+
+    url = _catalog_warp_endpoint(option)
+    if not url:
+        return None
+    return await probe_proxy_free_gate(
+        url,
+        provider="warp",
+        egress_ip=str(option.egress_ip or ""),
+        label=f"warp:{option.station}",
+    )
+
+
+async def _catalog_nordvpn_probe(option):
+    from free.egress_probes import probe_proxy_free_gate
+
+    url = _catalog_nordvpn_endpoint(option)
+    if not url:
+        return None
+    return await probe_proxy_free_gate(
+        url,
+        provider="nordvpn",
+        egress_ip=str(option.egress_ip or ""),
+        label=f"nordvpn:{option.station}",
+    )
+
+
+def _catalog_station_rows() -> list[dict]:
+    """NordVPN stations as the catalog sees them (read-only, no session)."""
+
+    try:
+        import shared_state as _ss
+
+        managers = list(getattr(_ss, "vpn_managers", None) or [])
+    except Exception:
+        return []
+    rows: list[dict] = []
+    for index, manager in enumerate(managers, 1):
+        try:
+            status = manager.get_status() if hasattr(manager, "get_status") else {}
+        except Exception:
+            status = {}
+        if not isinstance(status, dict):
+            status = {}
+        rows.append(
+            {
+                "station": f"station-{status.get('station') or index}",
+                "server": str(status.get("current_server") or ""),
+                "egress_ip": str(status.get("current_ip") or status.get("ip") or ""),
+                "status": str(status.get("vpn_status") or status.get("status") or "").lower(),
+                "auth_failed": str(status.get("vpn_status") or "").lower()
+                in ("auth_failed", "unauthorized"),
+            }
+        )
+    return rows
+
+
 @asynccontextmanager
 async def lifespan(app):
     _debug("  [lifespan] app starting")
@@ -3315,6 +3439,18 @@ async def lifespan(app):
     # [plan] E: boot-time fan-out of the ip_rotation timings (connect retry,
     # bad TTL, rotation stagger) — the pool's built-in defaults are the
     # conservative legacy values.
+    # [013] A full restart loses the in-memory worker handles; remove the
+    # leftover public-egress containers before starting a new worker.
+    try:
+        _public_cfg = (IP_ROTATION.get("public_proxies") or {}) if isinstance(IP_ROTATION, dict) else {}
+        if str(_public_cfg.get("isolation") or "").lower() in ("container", "docker"):
+            from free.public_egress_container import cleanup_orphan_workers
+
+            _removed_workers = await asyncio.to_thread(cleanup_orphan_workers)
+            if _removed_workers:
+                _debug(f"  [public-proxies] {_removed_workers} worker(s) orphelin(s) supprimé(s)")
+    except Exception as _e_cleanup:
+        _debug(f"  [public-proxies] nettoyage workers orphelins (fail-soft): {_e_cleanup}")
     shared_state.free_ip_pool.update_config(IP_ROTATION)
     try:
         shared_state.free_ip_pool.load_pool_state()
@@ -3341,6 +3477,11 @@ async def lifespan(app):
     global _vpn_manager, _free_ip_pool
     _vpn_manager = _managers[0]
     _free_ip_pool = shared_state.free_ip_pool
+    # [public-proxies] branche le validateur free réel sur le scheduler du pool.
+    try:
+        _free_ip_pool.set_public_validator(_revalidate_public_proxies)
+    except Exception as _e_pubval:
+        _debug(f"  [lifespan] public-proxy validator init failed (fail-soft): {_e_pubval}")
     app.state._warp_rotation_task = asyncio.create_task(_warp_rotation_watchdog())
 
     # [plan 18/08 §2.2] Boot reconcile: a crash (or a stack flip that died
@@ -3918,9 +4059,67 @@ async def lifespan(app):
                 await asyncio.sleep(10.0)
 
     app.state._pool_persist_task = asyncio.create_task(_pool_persist_loop())
+    # [013-egress-catalog] Catalogue provider-agnostique : découverte publique,
+    # WARP et NordVPN, puis alimentation du pool par les seules options `usable`.
+    # Le scheduler est fail-soft et ne vit jamais dans le chemin de requête.
+    try:
+        import shared_state as _ss_pool
+        from free.egress_runtime import build_runtime
+
+        _catalog_runtime = build_runtime(
+            _cfg_settings.load_yaml_config() or {},
+            nordvpn_stations=_catalog_station_rows,
+            warp_probe=_catalog_warp_probe,
+            nordvpn_probe=_catalog_nordvpn_probe,
+            pool_getter=lambda: getattr(_ss_pool, "free_ip_pool", None),
+        )
+        if _catalog_runtime is not None:
+            import shared_state as _ss_catalog
+
+            _ss_catalog.egress_catalog_runtime = _catalog_runtime
+            app.state.egress_catalog = _catalog_runtime
+            await _catalog_runtime.start()
+            _debug("  [egress-catalog] scheduler started")
+    except Exception as _e_catalog:
+        _debug(f"  [egress-catalog] démarrage impossible: {type(_e_catalog).__name__}: {_e_catalog}")
+    # [qualifiers 2026-11-11] Qualifieurs dédiés (stations 7-10) pilotés par
+    # le dashboard. Le manager démarre même désactivé : le POST GUI peut
+    # l'activer sans redémarrer le proxy. Fail-soft : une erreur Docker ne
+    # doit jamais empêcher le boot.
+    try:
+        import shared_state as _ss_qualifiers
+        from free.qualification.qualifiers import (
+            QualifierManager,
+            qualifier_config_from_settings,
+        )
+
+        _qualifier_cfg = qualifier_config_from_settings()
+        _qualifier_manager = QualifierManager(
+            BASE_DIR,
+            config=_qualifier_cfg,
+            config_getter=lambda: _cfg_settings.load_yaml_config() or {},
+        )
+        _ss_qualifiers.qualifier_manager = _qualifier_manager
+        app.state.qualifier_manager = _qualifier_manager
+        await _qualifier_manager.start()
+        _debug(
+            "  [qualifiers] manager ready "
+            f"({_qualifier_cfg.active_count} active slot(s), "
+            f"enabled={_qualifier_cfg.enabled})"
+        )
+    except Exception as _e_qual:
+        _debug(
+            f"  [qualifiers] démarrage impossible: "
+            f"{type(_e_qual).__name__}: {_e_qual}"
+        )
     try:
         app.state._station_probe_task = asyncio.create_task(_station_quality_probe_loop())
         _debug("  [lifespan] station quality probe loop started (hot-toggle)")
+    except Exception:
+        pass
+    try:
+        app.state._station_egress_probe_task = asyncio.create_task(_station_egress_probe_loop())
+        _debug("  [lifespan] station egress probe loop started")
     except Exception:
         pass
 
@@ -3955,6 +4154,30 @@ async def lifespan(app):
     app.state._boot_ready = False
 
     _debug("  [lifespan] app shutting down")
+    # [013-egress-catalog] Arrêt propre : single-flight annulé, store fermé.
+    try:
+        import shared_state as _ss_cat_shutdown
+
+        _cat_shutdown = getattr(_ss_cat_shutdown, "egress_catalog_runtime", None)
+        if _cat_shutdown is not None:
+            await _cat_shutdown.close()
+            _ss_cat_shutdown.egress_catalog_runtime = None
+    except Exception as _e_cat_shutdown:
+        _debug(f"  [egress-catalog] arrêt: {type(_e_cat_shutdown).__name__}: {_e_cat_shutdown}")
+    # [qualifiers 2026-11-11] Arrêt des slots et des conteneurs 7-10 : libère
+    # les sessions NordVPN avant le shutdown du pool.
+    try:
+        import shared_state as _ss_qual_stop
+
+        _qm_stop = getattr(_ss_qual_stop, "qualifier_manager", None)
+        if _qm_stop is not None:
+            await _qm_stop.stop()
+            _ss_qual_stop.qualifier_manager = None
+    except Exception as _e_qual_stop:
+        _debug(
+            f"  [qualifiers] arrêt: {type(_e_qual_stop).__name__}: "
+            f"{_e_qual_stop}"
+        )
     # [roadmap] flush final du quota avant de tuer les tâches.
     try:
         _p_shutdown = getattr(shared_state, "free_ip_pool", None)
@@ -4834,6 +5057,22 @@ def _build_metrics_text() -> str:
         lines.extend(_metrics_mod.render_free_429_section(_f429))
     except Exception as e:
         _debug(f"  [metrics] pool/free429 échoués (partiel): {e}")
+
+    # [013-egress-catalog] Options par provider et volumétrie threat-intel.
+    try:
+        import shared_state as _ss_catalog
+
+        _catalog = getattr(_ss_catalog, "egress_catalog_runtime", None)
+        if _catalog is not None:
+            _summary = _catalog.store.summary()
+            _threat = (
+                _catalog.threat_intel.stats()
+                if getattr(_catalog, "threat_intel", None) is not None
+                else None
+            )
+            lines.extend(_metrics_mod.render_catalog_section(_summary, _threat))
+    except Exception as e:
+        _debug(f"  [metrics] catalogue échoué (partiel): {e}")
 
     # [Étape 2 — O3] compteurs fallback/failover par cause (familles counter).
     # Fail-soft : snapshot sous lock, émission hors lock, jamais de raise.
@@ -9348,7 +9587,7 @@ def _official_free_headers(
             import hashlib as _hl
 
             _ih = _hl.sha256(str(egress_ip).encode()).hexdigest()[:10]
-            out["x-opencode-directory"] = f"C:\\Users\\dev\\projects\\{_ih}"
+            out["x-opencode-directory"] = f"C:\\Users\\dev\\projects\\{_ih}"  # platform-audit: allow en-tête wire, pas un accès disque
             out["x-opencode-workspace"] = _ih[:8]
         except Exception:
             pass
@@ -10049,6 +10288,42 @@ def _station_free_headers(runtime, conversation_key=None, endpoint=""):
     )
 
 
+def _guard_free_wire_headers(headers: dict, *, station=None, proxy_url: str | None = None) -> dict:
+    """Interdit tout secret applicatif vers un proxy non fiable.
+
+    Fail-closed : si un credential console est activé ou si une valeur secrète
+    de l'environnement apparaît dans les en-têtes, la requête lève avant le
+    moindre octet sortant. Sur un tunnel managé, le comportement existant est
+    conservé.
+    """
+    from free.public_proxies import is_untrusted_proxy, sanitize_free_headers
+
+    return sanitize_free_headers(
+        headers,
+        untrusted_proxy=is_untrusted_proxy(station, proxy_url),
+    )
+
+
+def _assert_secure_free_endpoint(endpoint: str, *, station=None, proxy_url: str | None = None) -> None:
+    """Refuse un endpoint non HTTPS quand l'egress n'est pas fiable."""
+    from free.public_proxies import assert_secure_endpoint, is_untrusted_proxy
+
+    assert_secure_endpoint(
+        endpoint,
+        untrusted_proxy=is_untrusted_proxy(station, proxy_url),
+    )
+
+
+def _safe_proxy_label(proxy_url: str | None) -> str:
+    """URL de proxy sans credentials pour les logs."""
+    try:
+        from free.public_proxies import redact_proxy_url
+
+        return redact_proxy_url(proxy_url)
+    except Exception:
+        return "***" if proxy_url else ""
+
+
 def _station_free_body(body, runtime, client_body=None):
     from free.runtime_identity import build_body
 
@@ -10087,12 +10362,37 @@ def _set_free_path_map(body, station_runtime) -> None:
             pass
 
 
+def _note_static_egress_ok(station, status) -> None:
+    """Alimente le journal adaptatif des egress statiques (WARP/public).
+
+    Les stations Docker passent par `note_model_ip`/`_record_free_completion` ;
+    les endpoints statiques n'avaient pas de succès enregistré, donc leur
+    provider restait à `min_samples` sans preuve positive. Fail-soft total.
+    """
+    try:
+        if station is None:
+            return
+        sid = int(getattr(station, "_station", 0) or 0)
+        # Stations Docker/NordVPN = sid positif, déjà couvertes. Endpoints
+        # statiques (WARP/proxys publics) = sid négatif.
+        if sid >= 0:
+            return
+        if int(status or 0) != 200:
+            return
+        pool = _free_ip_pool
+        if pool is not None and hasattr(pool, "_note_egress_outcome"):
+            pool._note_egress_outcome(station, 200)
+    except Exception:
+        pass
+
+
 async def _do_free_request_curl_cffi(
     body: dict,
     headers: dict,
     proxy_url: str | None = None,
     station=None,
     endpoint: str | None = None,
+    timeout: tuple | None = None,
 ):
     """Make a free model request using curl_cffi for TLS fingerprint evasion.
 
@@ -10158,6 +10458,7 @@ async def _do_free_request_curl_cffi(
                     _ident_version = str(_vlt_fp.get(_egress_ip).version or "")
         except Exception:
             _ident_version = ""
+    req_headers = _guard_free_wire_headers(req_headers, station=station, proxy_url=proxy_url)
     _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version, req_headers)
     # [gate body 2026-09-18] grille tools (bash+read) + stream forcé : un corps
     # non-stream ou sans tools serait 403. Si stream forcé ici, le SSE est
@@ -10185,24 +10486,30 @@ async def _do_free_request_curl_cffi(
         # direct — sinon la boucle ne tourne jamais et ``raise last_exc``
         # lève None (TypeError: exceptions must derive from BaseException).
         proxies_to_try.append(None)
-    # [2026-11-06] Station IPv6 WARP : force CURL_IPRESOLVE_V6=2 au niveau
-    # SESSION, et sépare la clé de pool par famille pour ne pas partager une
-    # session IPv4 configurée sans l'option.
+    # [2026-11-06] Station WARP : force la famille d'egress au niveau
+    # SESSION (IPRESOLVE=6 pour IPv6, 4 pour IPv4) et sépare la clé de pool
+    # par famille. Sans le pin IPv4, une station IPv4 pouvait sortir en IPv6
+    # quand l'amont est dual-stack, et le ledger comptait le mauvais bucket.
     _station_ipv6 = bool(getattr(station, "ipv6", False))
+    _station_ipv4_pin = bool(getattr(station, "managed", False)) and not _station_ipv6
     _curl_options = None
-    if _station_ipv6:
-        try:
-            from curl_cffi import CurlOpt
+    try:
+        from curl_cffi import CurlOpt
 
+        if _station_ipv6:
             _curl_options = {CurlOpt.IPRESOLVE: 2}
-        except Exception:
-            _curl_options = None
+        elif _station_ipv4_pin:
+            _curl_options = {CurlOpt.IPRESOLVE: 1}
+    except Exception:
+        _curl_options = None
     last_exc: Exception | None = None
     for attempt_i, attempt_proxy in enumerate(proxies_to_try):
         is_last = attempt_i == len(proxies_to_try) - 1
         _variant = f"free-{_ident_version}" if _ident_version else ""
         if _station_ipv6:
             _variant = f"{_variant}-ipv6" if _variant else "free-ipv6"
+        elif _station_ipv4_pin:
+            _variant = f"{_variant}-ipv4" if _variant else "free-ipv4"
         # N'ajoute `curl_options` que lorsqu'il y en a : les doubles de test
         # historiques n'acceptent pas ce kwarg (rétro-compatibilité).
         _pool_kwargs = {"egress_ip": _egress_ip, "variant": _variant}
@@ -10235,12 +10542,13 @@ async def _do_free_request_curl_cffi(
                     if "/chat/completions" in API_BASE_FREE
                     else _ep
                 )
+        _assert_secure_free_endpoint(_ep, station=station, proxy_url=attempt_proxy)
         try:
             resp = await slot.sess.post(
                 _ep,
                 content=_serialize_json_body(wire_body),
                 headers=req_headers,
-                timeout=_curl_timeout(),  # (connect, read) — cf. _curl_timeout()
+                timeout=timeout or _curl_timeout(),  # (connect, read)
                 stream=_force_wire_stream,
             )
         except asyncio.CancelledError:
@@ -10270,6 +10578,7 @@ async def _do_free_request_curl_cffi(
             await pool.evict(slot)
             last_exc = e
             continue  # try next proxy (HTTP fallback)
+        _note_static_egress_ok(station, getattr(resp, "status_code", 0))
         # Wrap in a compatible response object
         if _force_wire_stream:
             # [gate body 2026-09-18] stream forcé pour passer le gate sur une
@@ -10331,6 +10640,56 @@ async def _do_free_request_curl_cffi(
     if last_exc is None:  # pragma: no cover — défensif
         raise RuntimeError("free curl: no proxy slots available")
     raise last_exc
+
+
+async def _revalidate_public_proxies(
+    endpoints,
+    *,
+    model: str = "deepseek-v4.1-flash-free",
+    concurrency: int = 4,
+) -> dict:
+    """Re-teste les endpoints publics via le worker isolé.
+
+    Utilise le wire free réel (capture 2.2.5, identité par IP, TLS Bun) et le
+    garde anti-secret. Retourne ``{pid: status}``. Un 429 garde l'endpoint
+    (bucket épuisé), tout le reste doit être 200 pour rester dans le pool.
+    """
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    semaphore = asyncio.Semaphore(max(1, min(12, int(concurrency or 4))))
+
+    async def _one(endpoint) -> tuple[str, int]:
+        async with semaphore:
+            try:
+                response = await _do_free_request_curl_cffi(
+                    body,
+                    {},
+                    proxy_url=getattr(endpoint, "socks5_url", None),
+                    station=endpoint,
+                    endpoint=API_BASE_FREE,
+                )
+                status = int(getattr(response, "status_code", 0) or 0)
+                close = getattr(response, "aclose", None)
+                if callable(close):
+                    try:
+                        await close()
+                    except Exception:
+                        pass
+                return str(getattr(endpoint, "pid", "") or ""), status
+            except Exception:
+                return str(getattr(endpoint, "pid", "") or ""), 0
+
+    results = await asyncio.gather(
+        *(_one(endpoint) for endpoint in endpoints),
+        return_exceptions=True,
+    )
+    statuses: dict[str, int] = {}
+    for result in results:
+        if isinstance(result, tuple) and len(result) == 2:
+            statuses[str(result[0])] = int(result[1])
+    return statuses
 
 
 async def _do_free_direct_request(endpoint, body: dict, headers: dict):
@@ -12421,6 +12780,12 @@ def _free_proxy_mode() -> str:
         return "direct"
 
 
+#: Modes qui signifient « route la jambe free via le pool d'egress ».
+#: ``auto_egress`` choisit le provider (WARP/NordVPN) à l'exécution : il doit
+#: être accepté par tous les chemins free, pas seulement par le streaming.
+_FREE_POOL_MODES = ("vpn", "socks5", "auto_egress")
+
+
 def _free_attempts_active(forced_pool=None) -> bool:
     """Free re-strike budget is active (>1 attempt or station-first)."""
     return effective_free_max_attempts(forced_pool) > 1 or _free_exception_fallback_mode() == "station-first"
@@ -12430,8 +12795,9 @@ def _free_attempts_active(forced_pool=None) -> bool:
 async def _free_model_slot(model: str, station):
     """[reliability P0] Porte de concurrence par (modèle, station/IP).
 
-    Fail-open si le pool ne l'implémente pas (doubles de test, boot) : la
-    disponibilité ne dépend jamais de cette optimisation.
+    [P0 2026-11-10] Fail-closed : ``acquire_model_slot`` lève
+    ``ModelSlotTimeout`` quand le plafond tient trop longtemps. Les doubles
+    de test sans ``model_slot`` restent un no-op.
     """
     pool = _free_ip_pool
     if pool is not None and hasattr(pool, "model_slot"):
@@ -12441,12 +12807,128 @@ async def _free_model_slot(model: str, station):
         yield
 
 
+def _is_model_slot_timeout(exc: BaseException) -> bool:
+    """True si ``exc`` est le refus d'admission fail-closed du pool."""
+    try:
+        from free.pool import ModelSlotTimeout
+
+        return isinstance(exc, ModelSlotTimeout)
+    except Exception:
+        return False
+
+
+def _pool_best_station(pool, forced_pool=None, model: str | None = None):
+    """``_best_station`` avec le modèle (ledger) ; repli pour les doubles."""
+    try:
+        return pool._best_station(forced_pool, model=model)
+    except TypeError:
+        return pool._best_station(forced_pool)
+
+
+def _pool_best_station_excluding_many(
+    pool, excluded, forced_pool=None, model: str | None = None
+):
+    """``_best_station_excluding_many`` avec ledger ; repli doubles."""
+    try:
+        return pool._best_station_excluding_many(excluded, forced_pool, model=model)
+    except TypeError:
+        return pool._best_station_excluding_many(excluded, forced_pool)
+
+
+def _pool_pick_candidates(pool, forced_pool=None, model: str | None = None):
+    """``pick_candidates`` avec ledger ; repli pour les doubles de test."""
+    try:
+        return pool.pick_candidates(forced_pool, model=model)
+    except TypeError:
+        return pool.pick_candidates(forced_pool)
+
+
+def _free_admission_refusal(exc: BaseException) -> "FreeRefusal":
+    """503 + Retry-After : l'admission free est saturée sur ce (modèle, IP).
+
+    [P0 2026-11-10] Sous rafale, le pool refuse la tentative au lieu de
+    laisser passer sans slot. Le client reçoit un vrai statut temporaire,
+    jamais un 429 quota fabriqué (son quota n'est pas épuisé).
+    """
+    try:
+        retry_after = str(int(max(1.0, float(getattr(exc, "retry_after_s", 2.0) or 2.0))))
+    except Exception:
+        retry_after = "2"
+    return FreeRefusal(
+        status=503,
+        body=(
+            "free admission saturated: too many concurrent free requests on "
+            f"this (model, station); retry after {retry_after}s"
+        ),
+        retry_after=retry_after,
+    )
+
+
+def _free_admission_refused(resp) -> bool:
+    """La réponse synthétique vient-elle du refus d'admission fail-closed ?"""
+    try:
+        headers = getattr(resp, "headers", None) or {}
+        return str(headers.get("x-free-admission") or "") == "1"
+    except Exception:
+        return False
+
+
+class _FreeAdmissionResponse:
+    """Réponse synthétique 503 quand l'admission free est saturée.
+
+    Utilisée par ``_open_free_stream`` avant tout POST : le flux SSE est déjà
+    ouvert côté client, donc on réutilise le chemin de refus existant avec un
+    vrai statut 503 et un ``Retry-After``. Aucune rotation n'est déclenchée.
+    """
+
+    def __init__(self, retry_after_s: float = 2.0):
+        self.status_code = 503
+        self._retry_after = str(int(max(1.0, float(retry_after_s or 2.0))))
+        self.headers = {
+            "content-type": "application/json",
+            "retry-after": self._retry_after,
+            "x-free-admission": "1",
+        }
+        self._oc_read_body = _json_dumps(
+            {
+                "error": {
+                    "type": "overloaded_error",
+                    "message": (
+                        "Free model admission saturated (too many concurrent "
+                        f"requests). Retry after {self._retry_after}s."
+                    ),
+                }
+            }
+        )
+
+    @property
+    def content(self) -> bytes:
+        return self._oc_read_body
+
+    @property
+    def text(self) -> str:
+        return self._oc_read_body.decode("utf-8", "replace")
+
+    def json(self):
+        return json.loads(self.text)
+
+    async def aread(self) -> bytes:
+        return self._oc_read_body
+
+    async def aclose(self) -> None:
+        return None
+
+
 async def _acquire_free_model_slot(model: str, station):
     pool = _free_ip_pool
     if pool is not None and hasattr(pool, "acquire_model_slot"):
         try:
             return await pool.acquire_model_slot(model, station)
-        except Exception:
+        except Exception as exc:
+            # [P0] Le refus d'admission ne doit jamais être avalé en None :
+            # ce serait un fail-open silencieux.
+            if _is_model_slot_timeout(exc):
+                raise
             return None
     return None
 
@@ -12813,6 +13295,7 @@ async def _open_free_stream(
                     forced_pool,
                     rate_limited=_rate_limited,
                     excluded=_dead_stations,
+                    model=_free_model_name,
                 )
             except TypeError:
                 try:
@@ -12836,6 +13319,41 @@ async def _open_free_stream(
             proxy_url = _attempt.get("proxy_url")
             station = _attempt.get("station") if proxy_url else None
         _debug(f"  [free-stream] pool result: proxy_url={proxy_url is not None}")
+        # [P0 2026-11-10] Garde ledger AU DISPATCH (stream) : une IP dont le
+        # bucket journalier est déjà 429 n'est jamais re-strikée. La sélection
+        # l'exclut déjà, mais une rotation concurrente peut avoir changé l'IP
+        # entre le choix et l'ouverture du tunnel.
+        if (
+            proxy_url
+            and station is not None
+            and _free_ip_pool is not None
+            and hasattr(_free_ip_pool, "model_bucket_usable")
+        ):
+            try:
+                _ledger_ok = bool(
+                    _free_ip_pool.model_bucket_usable(_free_model_name, station)
+                )
+            except Exception:
+                _ledger_ok = True
+            if not _ledger_ok:
+                _log(
+                    "  FREE STREAM ledger: station "
+                    f"{getattr(station, '_station', '?')} bucket exhausted for "
+                    f"{_free_model_name!r} — fresh station"
+                )
+                try:
+                    _fresh_proxy, _fresh_station = await _free_ip_pool.on_disconnect_retry(
+                        station,
+                        forced_pool,
+                        model=_free_model_name,
+                        excluded=_dead_stations,
+                    )
+                except TypeError:
+                    _fresh_proxy, _fresh_station = None, None
+                if _fresh_proxy:
+                    proxy_url, station = _fresh_proxy, _fresh_station
+                else:
+                    proxy_url, station = None, None
         if not proxy_url:
             _debug(
                 "  [free-stream] ⚠️ no VPN proxy — free endpoint is geo-restricted, direct connection will likely 400"
@@ -12898,12 +13416,39 @@ async def _open_free_stream(
                         endpoint or "", _body_conversation_key(body), _egress_ip_s or None
                     )
                     _ident_version = str((_inst_snap or {}).get("version") or "")
+                req_headers = _guard_free_wire_headers(req_headers, station=station, proxy_url=proxy_url)
                 _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version, req_headers)
                 # [gate body 2026-09-18] grille tools sur le corps stream.
                 wire_body, _ = _free_wire_body(body, force_stream=True, egress_ip=_egress_ip_s or None)
                 if _station_runtime is not None:
                     wire_body = _station_free_body(wire_body, _station_runtime, body)
                 _set_free_path_map(body, _station_runtime)
+                # [2026-11-08] Même pin de famille que le POST non-stream :
+                # le flux doit sortir par l'egress IPv4 ou IPv6 de la station,
+                # pas par la famille que le résolveur choisit par défaut.
+                _station_ipv6 = bool(getattr(station, "ipv6", False))
+                _station_ipv4_pin = (
+                    bool(getattr(station, "managed", False)) and not _station_ipv6
+                )
+                _curl_options = None
+                try:
+                    from curl_cffi import CurlOpt
+
+                    if _station_ipv6:
+                        _curl_options = {CurlOpt.IPRESOLVE: 2}
+                    elif _station_ipv4_pin:
+                        _curl_options = {CurlOpt.IPRESOLVE: 1}
+                except Exception:
+                    _curl_options = None
+                _stream_variant = f"free-{_ident_version}" if _ident_version else ""
+                if _station_ipv6:
+                    _stream_variant = (
+                        f"{_stream_variant}-ipv6" if _stream_variant else "free-ipv6"
+                    )
+                elif _station_ipv4_pin:
+                    _stream_variant = (
+                        f"{_stream_variant}-ipv4" if _stream_variant else "free-ipv4"
+                    )
                 # [P1.1 perf] timeout posé AU NIVEAU DE LA FACTORY
                 # de session poolée (_curl_timeout : connect 10 + read config
                 # upstream.timeout.read) : le POST ci-dessous n'a plus besoin
@@ -12912,13 +13457,20 @@ async def _open_free_stream(
                 # sain — aucune requête légitime n'est impactée ; un tunnel
                 # mort est détecté par le watchdog cancel_streams AVANT le
                 # read (filet ultime > idle SSE).
-                _debug(f"  [free-stream] creating curl_cffi session proxy={_curl_proxy_url(proxy_url)} (pooled)")
+                _debug(
+                    f"  [free-stream] creating curl_cffi session proxy={_safe_proxy_label(_curl_proxy_url(proxy_url))} (pooled)"
+                )
+                _pool_kwargs = {
+                    "egress_ip": _egress_ip_s or None,
+                    "variant": _stream_variant,
+                }
+                if _curl_options:
+                    _pool_kwargs["curl_options"] = _curl_options
                 pool2, slot2 = await _get_pooled_curl_session(
                     proxy_url,
                     _free_impersonate,
                     _free_fp,
-                    egress_ip=_egress_ip_s or None,
-                    variant=f"free-{_ident_version}" if _ident_version else "",
+                    **_pool_kwargs,
                 )
                 # [A1 perf] emprunt SANS verrou pendant le POST : seuls les
                 # headers transitent sous l'emprunt, le corps est consommé
@@ -12928,6 +13480,7 @@ async def _open_free_stream(
                     _slot_token = await _acquire_free_model_slot(
                         _free_model_name or str(body.get("model") or ""), station
                     )
+                    _assert_secure_free_endpoint(endpoint, station=station, proxy_url=proxy_url)
                     _t0_ttfb = time.monotonic()
                     resp = await slot2.sess.post(
                         endpoint,
@@ -12935,6 +13488,7 @@ async def _open_free_stream(
                         headers=req_headers,
                         stream=True,
                     )
+                    _note_static_egress_ok(station, getattr(resp, "status_code", 0))
                 except asyncio.CancelledError:
                     # [P2.1] éviction différée : close réel au lieu du
                     # discard (socket qui fuyait à chaque stop client en stream).
@@ -13000,12 +13554,31 @@ async def _open_free_stream(
                     if _free_ip_pool is not None and hasattr(_free_ip_pool, "unregister_stream"):
                         _free_ip_pool.unregister_stream(station, asyncio.current_task())
                     try:
-                        await resp.aclose()
+                        # [P0 2026-11-10] Fermer le WRAPPER, pas la réponse brute :
+                        # c'est lui qui rend le jeton de concurrence (modèle, IP).
+                        # Fermer `resp` seul laissait le slot orphelin à chaque
+                        # flux dont le consommateur n'appelait pas aclose().
+                        if _wrapped_stream is not None:
+                            await _wrapped_stream.aclose()
+                        else:
+                            await resp.aclose()
                     except Exception:
                         pass
                     # pooled session stays open (don't close)
                 return
             except Exception as e:
+                # [P0 2026-11-10] Admission fail-closed : aucune requête n'est
+                # partie, aucune rotation n'est due. On rend un 503 synthétique
+                # avec Retry-After ; les boucles stream le refusent sans retry.
+                if _is_model_slot_timeout(e):
+                    _log(
+                        "  FREE STREAM admission saturated "
+                        f"model={_free_model_name!r} station="
+                        f"{getattr(station, '_station', '?')} — refus 503 "
+                        f"(retry-after {getattr(e, 'retry_after_s', 2)}s)"
+                    )
+                    yield _FreeAdmissionResponse(getattr(e, "retry_after_s", 2.0))
+                    return
                 # [reliability P0] Ne jamais laisser un jeton de concurrence
                 # orphelin si l'ouverture échoue avant le yield.
                 try:
@@ -13280,6 +13853,17 @@ async def _open_via_pool(endpoint, body, headers, *, is_stream=False, forced_poo
     if not proxy_url:
         raise UpstreamError(
             "No VPN station available for geo-restricted request",
+            status_code=503,
+        )
+
+    # [public-proxies] Le chemin payant/geo ne doit jamais sortir par un proxy
+    # public : il porte la clé payante. Fail-closed si la sélection en a renvoyé
+    # un (endpoint statique, provider public/static, ou URL hors station).
+    from free.public_proxies import is_untrusted_proxy
+
+    if is_untrusted_proxy(station, proxy_url):
+        raise UpstreamError(
+            "public proxy forbidden on paid/geo path",
             status_code=503,
         )
 
@@ -14319,53 +14903,97 @@ def _record_free_completion(
         pass
 
 
-def _free_stations_exhausted(free_model: str) -> bool:
-    """True when NO station can serve a fresh free attempt for this model.
+def _free_egress_candidates(pool=None) -> list:
+    """Tous les egress réellement sélectionnables (NordVPN + WARP/proxys).
 
-    A station is exhausted when its tunnel is down / marked bad by a
-    recent 429, or when the (model, IP) cooldown key of its current IP
-    is still active. Used by strict_free: only refuse the request when
-    every station is truly exhausted — otherwise let the free attempt
-    land on the usable station instead of paying or refusing.
-
-    [Axe 1.4] A rotation in flight is about to land a fresh (model, IP)
-    key on its station — the pool is NOT exhausted. Checking participation
-    re-reads the same single-threaded state the pool mutates, so the gate
-    is atomic with respect to rotations (no lock needed; see
-    ``FreeIPPool.any_rotation_in_flight``).
+    Le préflight historique ne regardait que ``_stations`` (NordVPN) : avec
+    six stations en cooldown, il renvoyait un 429 client alors que WARP ou le
+    pool public était encore sain. Cette liste unifiée évite ce faux 429.
     """
-    if not _free_ip_pool:
+    pool = pool if pool is not None else _free_ip_pool
+    if not pool:
+        return []
+    selected = {
+        str(name or "").strip().lower()
+        for name in (getattr(pool, "_egress_providers", None) or [])
+        if str(name or "").strip()
+    }
+    out: list = []
+    seen: set[int] = set()
+
+    def _add(item) -> None:
+        if item is None or id(item) in seen:
+            return
+        seen.add(id(item))
+        out.append(item)
+
+    if "nordvpn" in selected or not selected:
+        for station in getattr(pool, "_stations", None) or []:
+            try:
+                if pool._station_usable(station, exclude_approaching=False):
+                    _add(station)
+            except Exception:
+                continue
+    include_socks = bool(selected & {"warp", "proxies"}) or bool(
+        getattr(pool, "socks5_mode", False)
+    )
+    if include_socks:
+        try:
+            endpoints = list(pool._socks5_enabled_eps())
+        except Exception:
+            endpoints = []
+        for endpoint in endpoints:
+            try:
+                matcher = getattr(pool, "_provider_matches", None)
+                if callable(matcher):
+                    provider = "warp" if matcher(endpoint, "warp") else "proxies"
+                else:
+                    provider = str(getattr(endpoint, "provider", "") or "proxies").lower()
+                    if provider in ("public", "static"):
+                        provider = "proxies"
+                if selected and provider not in selected:
+                    continue
+                usable = getattr(pool, "_socks5_usable", None)
+                if callable(usable) and not usable(endpoint, exclude_approaching=False):
+                    continue
+                _add(endpoint)
+            except Exception:
+                continue
+    return out
+
+
+def _free_stations_exhausted(free_model: str) -> bool:
+    """True when NO selected egress can serve a fresh free attempt.
+
+    Un egress est épuisé quand son tunnel est down, bad-marké par un 429
+    récent, ou quand la clé (modèle, IP) de son IP courante est encore en
+    cooldown. Prend en compte NordVPN, WARP et les proxys publics/statiques.
+    """
+    pool = _free_ip_pool
+    if not pool:
         return True
-    if getattr(_free_ip_pool, "socks5_mode", False):
-        # [Axe 3.1] socks5 mode: the docker stations are inert — the usable
-        # set is the enabled static proxies. No rotation can land a fresh
-        # (model, IP) key here (no docker), so the rotation-in-flight
-        # exemption below does not apply.
-        for ep in _free_ip_pool._socks5_enabled_eps():
-            if _free_ip_pool._socks5_usable(ep, exclude_approaching=False):
-                if not _free_cooldown_active(free_model, ep) and not (
-                    hasattr(_free_ip_pool, "model_ip_bad") and _free_ip_pool.model_ip_bad(free_model, ep)
-                ):
-                    if not (
-                        hasattr(_free_ip_pool, "model_bucket_usable")
-                        and not _free_ip_pool.model_bucket_usable(free_model, ep)
-                    ):
-                        return False
-        return True
-    if not _free_ip_pool._stations:
-        return True
-    if getattr(_free_ip_pool, "any_rotation_in_flight", lambda: False)():
+    selected = {
+        str(name or "").strip().lower()
+        for name in (getattr(pool, "_egress_providers", None) or [])
+        if str(name or "").strip()
+    }
+    if "direct" in selected:
         return False
-    for st in _free_ip_pool._stations:
-        if _free_ip_pool._station_usable(st, exclude_approaching=False):
-            if not _free_cooldown_active(free_model, st) and not (
-                hasattr(_free_ip_pool, "model_ip_bad") and _free_ip_pool.model_ip_bad(free_model, st)
+    if getattr(pool, "any_rotation_in_flight", lambda: False)():
+        return False
+    for station in _free_egress_candidates(pool):
+        try:
+            if _free_cooldown_active(free_model, station):
+                continue
+            if hasattr(pool, "model_ip_bad") and pool.model_ip_bad(free_model, station):
+                continue
+            if hasattr(pool, "model_bucket_usable") and not pool.model_bucket_usable(
+                free_model, station
             ):
-                if not (
-                    hasattr(_free_ip_pool, "model_bucket_usable")
-                    and not _free_ip_pool.model_bucket_usable(free_model, st)
-                ):
-                    return False
+                continue
+            return False
+        except Exception:
+            continue
     return True
 
 
@@ -14453,13 +15081,14 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
             return None
     except Exception:
         return None
-    stations = []
-    for st in getattr(pool, "_stations", None) or []:
-        try:
-            if pool._station_usable(st, exclude_approaching=False):
-                stations.append(st)
-        except Exception:
-            continue
+    selected = {
+        str(name or "").strip().lower()
+        for name in (getattr(pool, "_egress_providers", None) or [])
+        if str(name or "").strip()
+    }
+    if "direct" in selected:
+        return None
+    stations = _free_egress_candidates(pool)
     if not stations:
         return None
     try:
@@ -15295,7 +15924,11 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
         station = None
     else:
         try:
-            station = _free_ip_pool._best_station(forced_pool) if _free_ip_pool else None
+            station = (
+                _pool_best_station(_free_ip_pool, forced_pool, model=free_model)
+                if _free_ip_pool
+                else None
+            )
         except TypeError:
             station = _free_ip_pool._best_station() if _free_ip_pool else None
 
@@ -15457,7 +16090,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
     # lit `_hedge_done` dans TOUS les modes — en direct sans hedge il
     # n'était jamais assigné → UnboundLocalError au lieu du repli payant.
     _hedge_done = False
-    if proxy_mode in ("vpn", "socks5") and _free_ip_pool and _free_ip_pool.enabled:
+    if proxy_mode in _FREE_POOL_MODES and _free_ip_pool and _free_ip_pool.enabled:
         # VPN/socks5 mode: use curl_cffi for TLS fingerprint evasion,
         # routed through the chosen station's tunnel or static SOCKS5
         # proxy for a fresh IP — station.socks5_url guarantees the
@@ -15484,7 +16117,9 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 and _free_ip_pool
                 and _free_parallel_should_hedge(free_body, forced_pool)
             ):
-                _hedge_cands = _free_ip_pool.pick_candidates(forced_pool)
+                _hedge_cands = _pool_pick_candidates(
+                    _free_ip_pool, forced_pool, model=free_model
+                )
                 # bound already in _hedged_fetch via hedge_max, but we check length
                 if len(_hedge_cands) >= 2:
                     _debug(
@@ -15535,14 +16170,22 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                             f"  [free] hedge winner station {getattr(winner, '_station', '?')} status={resp.status_code if resp else '?'}"
                         )
                     except Exception as he:
+                        # [P0] Admission saturée : refus immédiat, pas de
+                        # repli séquentiel qui re-brûlerait le budget.
+                        if _is_model_slot_timeout(he):
+                            raise _free_admission_refusal(he) from he
                         _debug(f"  [free] hedge failed, fallback sequential: {he}")
                         resp = None
                         _hedge_done = False
         except Exception as he:
+            if _is_model_slot_timeout(he):
+                raise _free_admission_refusal(he) from he
             _debug(f"  [free] hedge check failed: {he}")
         # if hedge succeeded (resp is HTTP response, even 429), skip sequential loop and go to shared handling
         # if hedge failed or not enabled, run sequential multi-attempt loop
         tried: set = set()
+        _ledger_skipped: set = set()
+        _preselected_skipped = False
         # [PLAN_CORRECTION_FAUX_429 Lot A3] cause terminale mémorisée : le bloc
         # resp-is-None ne doit JAMAIS inventer un 429 — il rejoue la dernière
         # cause réelle (dernier HTTP vu ou dernière erreur tunnel).
@@ -15559,7 +16202,12 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             _free_used = 1
             tried = set(_hedge_cands)  # mark all hedged candidates as tried to avoid re-strike in fallback
         while not _hedge_done and resp is None and _free_used < free_max:
-            if _free_used == 0 and station is not None and not _free_trial_dead_active(free_model, station):
+            if (
+                _free_used == 0
+                and station is not None
+                and not _preselected_skipped
+                and not _free_trial_dead_active(free_model, station)
+            ):
                 # [trial-dead] la clé (modèle, IP) de la station pré-choisie
                 # est cliniquement morte : ne pas y brûler le 1er essai quand
                 # d'autres egress vivent (repli ci-dessous sinon — jamais de
@@ -15591,21 +16239,61 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                         _dead = set()
                     _excl = (set(tried) if tried else set()) | _dead
                     if _excl:
-                        attempt = _free_ip_pool._best_station_excluding_many(_excl, forced_pool)
+                        attempt = _pool_best_station_excluding_many(
+                            _free_ip_pool,
+                            _excl,
+                            forced_pool,
+                            model=free_model,
+                        )
                         if attempt is None and _dead:
                             attempt = (
-                                _free_ip_pool._best_station_excluding_many(tried, forced_pool)
+                                _pool_best_station_excluding_many(
+                                    _free_ip_pool,
+                                    tried,
+                                    forced_pool,
+                                    model=free_model,
+                                )
                                 if tried
-                                else _free_ip_pool._best_station(forced_pool)
+                                else _pool_best_station(
+                                    _free_ip_pool,
+                                    forced_pool,
+                                    model=free_model,
+                                )
                             )
                     else:
-                        attempt = _free_ip_pool._best_station(forced_pool)
+                        attempt = _pool_best_station(
+                            _free_ip_pool,
+                            forced_pool,
+                            model=free_model,
+                        )
                 if attempt is not None:
                     tried.add(attempt)
             else:
                 attempt = None
             if attempt is None:
                 break  # no station left → direct fallback below
+            # [P0 2026-11-10] Garde ledger AU DISPATCH : une IP dont le bucket
+            # journalier est déjà 429 n'est jamais re-strikée, même si la
+            # sélection a couru entre-temps (rotation, hedge, course d'IP).
+            if _free_ip_pool is not None and hasattr(_free_ip_pool, "model_bucket_usable"):
+                try:
+                    _dispatch_ok = bool(
+                        _free_ip_pool.model_bucket_usable(free_model, attempt)
+                    )
+                except Exception:
+                    _dispatch_ok = True
+                if not _dispatch_ok:
+                    _log(
+                        f"  FREE ledger: station {getattr(attempt, '_station', '?')} "
+                        f"bucket exhausted for {free_model!r} — dispatch skipped"
+                    )
+                    if attempt is station:
+                        _preselected_skipped = True
+                    if attempt in _ledger_skipped:
+                        break
+                    _ledger_skipped.add(attempt)
+                    tried.add(attempt)
+                    continue
             _free_used += 1
             _free_elapsed = int((time.monotonic() - t0) * 1000)
             try:
@@ -15789,6 +16477,15 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     continue
                 break  # 200, final-429 or other status → shared handling below
             except Exception as e:
+                # [P0 2026-11-10] Admission fail-closed : ne jamais la traiter
+                # comme un tunnel mort (elle n'a envoyé AUCUNE requête).
+                if _is_model_slot_timeout(e):
+                    _log(
+                        f"  FREE admission saturated model={free_model!r} "
+                        f"station {getattr(attempt, '_station', '?')} — refus 503 "
+                        f"(retry-after {getattr(e, 'retry_after_s', 2)}s)"
+                    )
+                    raise _free_admission_refusal(e) from e
                 _debug(f"  [free] curl_cffi error (station {attempt._station}): {e}")
                 # [PLAN_CORRECTION_FAUX_429 A3] mémorise l'erreur tunnel (cause terminale)
                 _last_tunnel_exc = e
@@ -15797,7 +16494,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                 # station while the budget lasts, then return None (paid) or
                 # FreeQuotaExhausted (strict_free) via the resp-is-None block
                 # below. free_exception_fallback only applies in direct mode.
-                if (station_first or proxy_mode in ("vpn", "socks5")) and _free_used < free_max:
+                if (station_first or proxy_mode in _FREE_POOL_MODES) and _free_used < free_max:
                     # [plan 19/08 §2] station-first: a dead tunnel retries
                     # another station BEFORE the residential-IP direct
                     # fallback (whose bucket is long exhausted).
@@ -15814,7 +16511,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
                     continue
                 # station-first budget spent, or direct mode → legacy fallback
                 # (reachable in direct proxy_mode only)
-                if proxy_mode in ("vpn", "socks5"):
+                if proxy_mode in _FREE_POOL_MODES:
                     _log(
                         f"  FREE via station {attempt._station} tunnel FAILED ({e}) — attempts exhausted, no direct fallback (proxy_mode={proxy_mode}) → paid"
                     )
@@ -15828,7 +16525,7 @@ async def _try_free_model_first(body, headers, protocol, model_id, forced_pool=N
             # [proxy_mode] vpn/socks5 never falls back to direct here — this
             # block is also reached after the 400/datapolicy retry budget is
             # exhausted, not only on dead tunnels: paid (or strict_free refus).
-            if proxy_mode in ("vpn", "socks5"):
+            if proxy_mode in _FREE_POOL_MODES:
                 _log(f"  FREE attempts exhausted — no direct fallback (proxy_mode={proxy_mode}) → paid fallback")
                 # [GUI strict_free] tunnels épuisés + strict/refuser → refus
                 # local, ZÉRO jambe paid (même avec clés payantes valides).
@@ -19873,6 +20570,26 @@ async def messages(request: Request):
                             _free_done_station = None
                             _free_done_ip = ""
                         if resp.status_code != 200:
+                            if _using_free and _free_admission_refused(resp):
+                                _log(
+                                    "  FREE admission saturated — refus immédiat "
+                                    "(no retry, no paid)"
+                                )
+                                yield await _free_stream_refuse_bytes(
+                                    resp,
+                                    req_id,
+                                    free_model,
+                                    original_model,
+                                    start_time,
+                                    protocol,
+                                    thinking_type,
+                                    effort,
+                                    client_ip,
+                                    tool_names,
+                                    request_body,
+                                    client_protocol="anthropic",
+                                )
+                                return
                             if _using_free:
                                 # Free endpoint non-200 (429 quota, 5xx...) → cooldown
                                 # the free model, fall back to paid. Never pauses PAID
@@ -21492,6 +22209,26 @@ async def messages(request: Request):
                 async with _stream_ctx as resp:
                     _debug(f"  [stream-oai] stream context entered, status={resp.status_code}")
                     if resp.status_code != 200:
+                        if _using_free and _free_admission_refused(resp):
+                            _log(
+                                "  FREE admission saturated — refus immédiat "
+                                "(no retry, no paid)"
+                            )
+                            yield await _free_stream_refuse_bytes(
+                                resp,
+                                req_id,
+                                free_model,
+                                original_model,
+                                start_time,
+                                protocol,
+                                thinking_type,
+                                effort,
+                                client_ip,
+                                tool_names,
+                                request_body,
+                                client_protocol="anthropic",
+                            )
+                            return
                         if _using_free:
                             # [capture-400-stream] persister le body upstream
                             # (tentative retentée uniquement — voir helper).
@@ -22874,6 +23611,64 @@ async def _station_quality_probe_loop() -> None:
         _debug(f"  [free-quality] probe loop disabled: {exc}")
 
 
+async def _station_egress_probe_loop() -> None:
+    """Maintient la santé des stations sans superviseur externe.
+
+    Un GET statique (robots.txt, zéro quota d'inférence) via le SOCKS de
+    chaque station alimente ``StationHealthRegistry``. Sans ce loop, une
+    station saine mais inactive devient ``egress-stale`` après
+    ``station_health.max_effective_age_s``, et une station marquée ``suspect``
+    après un 429 n'a plus aucun probe pour revenir ``usable``.
+    """
+    if __import__("os").getenv("PYTEST_CURRENT_TEST"):
+        return
+    try:
+        interval = float(yaml_get("ip_rotation", "station_health.probe_interval_s", 120) or 0)
+    except Exception:
+        interval = 120.0
+    if interval <= 0:
+        _debug("  [station-probe] interval<=0 : sonde désactivée")
+        return
+    interval = max(30.0, interval)
+    try:
+        timeout = float(yaml_get("ip_rotation", "station_health.probe_timeout_s", 8) or 8.0)
+    except Exception:
+        timeout = 8.0
+    await asyncio.sleep(min(30.0, interval))
+    while True:
+        try:
+            from free.probe import probe_station
+
+            _shared = __import__("shared_state")
+            managers = list(getattr(_shared, "vpn_managers", None) or [])
+            pool = getattr(_shared, "free_ip_pool", None)
+            targets = [m for m in managers if getattr(m, "socks5_url", None)]
+            results = await asyncio.gather(
+                *(probe_station(m, timeout=timeout) for m in targets),
+                return_exceptions=True,
+            )
+            by_sid = {int(getattr(m, "_station", -1)): m for m in targets}
+            for res in results:
+                if isinstance(res, Exception):
+                    continue
+                sid = int(res.get("station", -1))
+                mgr = by_sid.get(sid)
+                if mgr is None:
+                    continue
+                ok = bool(res.get("ok"))
+                cause = None if ok else f"probe-{res.get('error') or '?'}"
+                try:
+                    if pool is not None and hasattr(pool, "note_station_probe"):
+                        pool.note_station_probe(mgr, ok, cause=cause)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _debug(f"  [station-probe] erreur {type(exc).__name__}: {exc}")
+        await asyncio.sleep(interval)
+
+
 async def _free_prewarm_loop() -> None:
     """Préchauffage périodique (par défaut toutes les 5 min)."""
     try:
@@ -23561,6 +24356,7 @@ async def api_free_health():
     rotation_planner: dict = {}
     last_selection: dict = {}
     canary: dict = {}
+    slot_wait: dict = {}
     try:
         if _free_ip_pool is not None and hasattr(_free_ip_pool, "model_ip_status"):
             model_ip_health = _free_ip_pool.model_ip_status(40)
@@ -23581,6 +24377,8 @@ async def api_free_health():
                 last_selection = _free_ip_pool._best_ip.snapshot()
             if hasattr(_free_ip_pool, "_canary"):
                 canary = _free_ip_pool._canary.snapshot()
+            if hasattr(_free_ip_pool, "slot_wait_stats"):
+                slot_wait = _free_ip_pool.slot_wait_stats()
     except Exception:
         model_ip_health, model_global_backoff = [], []
     return {
@@ -23598,6 +24396,7 @@ async def api_free_health():
         "rotation_planner": rotation_planner,
         "last_selection": last_selection,
         "canary": canary,
+        "slot_wait": slot_wait,
         "note": (
             "`unproven` = aucun succès observé depuis le démarrage : soit le "
             "modèle n'a pas été appelé, soit il est refusé en amont. Un 200 du "
@@ -24183,7 +24982,7 @@ async def free_quota_mark(request: Request):
             except Exception:
                 pass
             try:
-                pool.mark_station_ok(mgr, cause="scan-200")
+                pool.mark_station_ok(mgr, cause="scan-200", model=model, ip=ip)
             except Exception:
                 pass
             try:
@@ -25576,6 +26375,26 @@ async def chat_completions(request: Request):
                             _free_done_station = None
                             _free_done_ip = ""
                         if resp.status_code != 200:
+                            if _using_free and _free_admission_refused(resp):
+                                _log(
+                                    "  FREE admission saturated — refus immédiat "
+                                    "(no retry, no paid)"
+                                )
+                                yield await _free_stream_refuse_bytes(
+                                    resp,
+                                    req_id,
+                                    free_model,
+                                    original_model,
+                                    start_time,
+                                    protocol,
+                                    thinking_type,
+                                    effort,
+                                    client_ip,
+                                    tool_names,
+                                    request_body,
+                                    client_protocol="openai",
+                                )
+                                return
                             if _using_free:
                                 # [capture-400-stream] persister le body upstream
                                 # (tentative retentée uniquement — voir helper).
@@ -27045,6 +27864,26 @@ async def chat_completions(request: Request):
                         _free_done_station = None
                         _free_done_ip = ""
                     if resp.status_code != 200:
+                        if _using_free and _free_admission_refused(resp):
+                            _log(
+                                "  FREE admission saturated — refus immédiat "
+                                "(no retry, no paid)"
+                            )
+                            yield await _free_stream_refuse_bytes(
+                                resp,
+                                req_id,
+                                free_model,
+                                original_model,
+                                start_time,
+                                protocol,
+                                thinking_type,
+                                effort,
+                                client_ip,
+                                tool_names,
+                                request_body,
+                                client_protocol="openai",
+                            )
+                            return
                         if _using_free:
                             # [capture-400-stream] persister le body upstream
                             # (tentative retentée uniquement — voir helper).
@@ -27718,7 +28557,7 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
     _last_tunnel_exc: Exception | None = None
     resp = None
 
-    pool_ok = bool(pool is not None and pool.enabled and proxy_mode in ("vpn", "socks5"))
+    pool_ok = bool(pool is not None and pool.enabled and proxy_mode in _FREE_POOL_MODES)
     if pool_ok:
         _register_failover_exhausted_cb(lambda: free_model)
         try:
@@ -27745,6 +28584,13 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
         # Boucle multi-station miroir de _try_free_model_first (sans les
         # conversions chat/responses/effort/min_tokens, sans objet
         # pour SystemOne) — hedge free_parallel INCLUS (parité chat).
+        _debug(
+            "[systemone-free] pool ok: model=%s free_max=%s station=%s socks_mode=%s",
+            free_model,
+            free_max,
+            getattr(station, "pid", station),
+            getattr(pool, "socks5_mode", None),
+        )
         _hedge_done = False
         _hedge_cands = []
         try:
@@ -27752,7 +28598,9 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                 pool is not None
                 and _free_parallel_should_hedge(body, forced_pool)
             ):
-                _hedge_cands = pool.pick_candidates(forced_pool)
+                _hedge_cands = _pool_pick_candidates(
+                    pool, forced_pool, model=free_model
+                )
                 if len(_hedge_cands) >= 2:
                     _debug(
                         f"  [systemone-free] hedge start N={len(_hedge_cands)} "
@@ -27796,10 +28644,14 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                             f"status={resp.status_code if resp else '?'}"
                         )
                     except Exception as he:
+                        if _is_model_slot_timeout(he):
+                            raise _free_admission_refusal(he) from he
                         _debug(f"  [systemone-free] hedge failed, fallback sequential: {he}")
                         resp = None
                         _hedge_done = False
         except Exception as he:
+            if _is_model_slot_timeout(he):
+                raise _free_admission_refusal(he) from he
             _debug(f"  [systemone-free] hedge check failed: {he}")
         if _hedge_done:
             # Le hedge a consommé 1 essai logique ; le handling partagé
@@ -27810,8 +28662,15 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
             if station is not None:
                 tried.add(station)  # on_request pick = first strike
             _free_used = 0
+        _s1_ledger_skipped: set = set()
+        _s1_preselected_skipped = False
         while not _hedge_done and resp is None and _free_used < free_max:
-            if _free_used == 0 and station is not None and not _free_trial_dead_active(free_model, station):
+            if (
+                _free_used == 0
+                and station is not None
+                and not _s1_preselected_skipped
+                and not _free_trial_dead_active(free_model, station)
+            ):
                 # [trial-dead] voir boucle générique : ne pas brûler le 1er
                 # essai sur une clé (modèle, IP) cliniquement morte.
                 attempt = station
@@ -27840,24 +28699,32 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                     _s1_excl = (set(tried) if tried else set()) | _s1_dead
                     if _s1_excl:
                         try:
-                            attempt = pool._best_station_excluding_many(_s1_excl, forced_pool)
+                            attempt = pool._best_station_excluding_many(
+                                _s1_excl, forced_pool, model=free_model
+                            )
                         except TypeError:
                             attempt = pool._best_station_excluding_many(_s1_excl)
                         if attempt is None and _s1_dead:
                             try:
                                 attempt = (
-                                    pool._best_station_excluding_many(tried, forced_pool)
+                                    pool._best_station_excluding_many(
+                                        tried, forced_pool, model=free_model
+                                    )
                                     if tried
-                                    else pool._best_station(forced_pool)
+                                    else pool._best_station(
+                                        forced_pool, model=free_model
+                                    )
                                 )
                             except TypeError:
                                 attempt = pool._best_station_excluding_many(tried) if tried else pool._best_station()
                     else:
                         try:
                             attempt = (
-                                pool._best_station_excluding_many(tried, forced_pool)
+                                pool._best_station_excluding_many(
+                                    tried, forced_pool, model=free_model
+                                )
                                 if tried
-                                else pool._best_station(forced_pool)
+                                else pool._best_station(forced_pool, model=free_model)
                             )
                         except TypeError:
                             attempt = pool._best_station_excluding_many(tried) if tried else pool._best_station()
@@ -27866,7 +28733,30 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
             else:
                 attempt = None
             if attempt is None:
+                _log(
+                    f"  [systemone-free] no station available "
+                    f"(tried={len(tried)}, free_used={_free_used}, free_max={free_max})"
+                )
                 break  # plus de station → fail-closed ci-dessous
+            # [P0 2026-11-10] Même garde ledger qu'en chat : jamais de dispatch
+            # sur une IP déjà 429 pour ce modèle.
+            if pool is not None and hasattr(pool, "model_bucket_usable"):
+                try:
+                    _s1_ok = bool(pool.model_bucket_usable(free_model, attempt))
+                except Exception:
+                    _s1_ok = True
+                if not _s1_ok:
+                    _log(
+                        f"  [systemone-free] ledger: station "
+                        f"{getattr(attempt, '_station', '?')} bucket exhausted — skipped"
+                    )
+                    if attempt is station:
+                        _s1_preselected_skipped = True
+                    if attempt in _s1_ledger_skipped:
+                        break
+                    _s1_ledger_skipped.add(attempt)
+                    tried.add(attempt)
+                    continue
             _free_used += 1
             _free_elapsed = int((time.monotonic() - t0) * 1000)
             try:
@@ -27879,6 +28769,12 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
                         endpoint=endpoint,
                     )
             except Exception as e:
+                if _is_model_slot_timeout(e):
+                    _log(
+                        f"  [systemone-free] admission saturated — refus 503 "
+                        f"(retry-after {getattr(e, 'retry_after_s', 2)}s)"
+                    )
+                    raise _free_admission_refusal(e) from e
                 _debug(f"  [systemone-free] tunnel error (station {getattr(attempt, '_station', '?')}): {e}")
                 _last_tunnel_exc = e
                 try:
@@ -28096,7 +28992,7 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
         )
 
     # ── Pool indispo : option B (direct) ou fail-closed ──
-    if proxy_mode in ("vpn", "socks5") or not _direct_fallback_allowed():
+    if proxy_mode in _FREE_POOL_MODES or not _direct_fallback_allowed():
         raise UpstreamError(
             f"free {free_model}: pool indisponible (proxy_mode={proxy_mode}) — pas de direct résidentiel",
             status_code=503,
@@ -30557,6 +31453,16 @@ async def responses(request: Request):
 class ServerManager:
     """Manages uvicorn server lifecycle for start/stop/restart."""
 
+    #: Attente synchrone du socket dans start(). Au-delà, le démarrage
+    #: continue en arrière-plan : le lifespan FastAPI peut dépasser 5 s
+    #: (boot complet mesuré ~8,5 s). L'ancien code concluait « FAILED » puis
+    #: laissait is_running=False POUR TOUJOURS alors qu'uvicorn écoutait bel
+    #: et bien (incident 10/11 : dashboard « le proxy demarre encore » alors
+    #: que /health répondait 200).
+    _START_WAIT_S = 5.0
+    #: Budget de la surveillance de démarrage en arrière-plan.
+    _READY_WATCHDOG_S = 300.0
+
     def __init__(self, app, host, port):
         self.app = app
         self.host = host
@@ -30564,6 +31470,10 @@ class ServerManager:
         self._server = None
         self._thread = None
         self._lock = threading.Lock()
+        # Incrémenté à chaque start/stop : tout watchdog de démarrage d'une
+        # génération précédente devient inerte (pas de résurrection après
+        # stop/restart).
+        self._generation = 0
         self.is_running = False
 
     def start(self):
@@ -30572,87 +31482,217 @@ class ServerManager:
         with self._lock:
             if self.is_running:
                 _debug(f"  [server] start skipped — already running on {self.host}:{self.port}")
-                return
-            h = RichLogHandler()
-            for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-                lg = logging.getLogger(name)
-                lg.handlers = [h]
-                lg.propagate = False
-            # [46] VPN logs were stderr-only (no handler attached) — route
-            # them into the same rich log panel as the rest of the app.
-            # Append, don't replace: attach_module_logger() at startup put a
-            # debug.log FileHandler on these loggers, and replacing handlers
-            # + propagate=False made [vpn]/[vpn-watchdog] lines invisible in
-            # logs/debug.log exactly during AUTH_FAILED incidents.
-            for name in ("vpn_manager", "free_ip_pool"):
-                attach_panel_logger(name, h)
-
-            try:
-                import uvloop  # noqa: F401
-
-                _loop = "uvloop"
-            except ImportError:
-                _loop = "asyncio"
-            config = Config(
-                self.app,
-                host=self.host,
-                port=self.port,
-                # [Phase 9 plan boot] « prod » = pas de GUI ni de DEBUG : le
-                # access log uvicorn n'apporte rien au dashboard (qui a son
-                # propre historique SQLite + traffic capture) et coûte une
-                # ligne par requête, y compris les SSE de longue durée.
-                log_level="warning" if _PROD_RUNTIME else "info",
-                log_config=None,
-                timeout_keep_alive=15,
-                backlog=4096,
-                limit_concurrency=2000,
-                loop=_loop,
-                http="httptools",
-                ws="none",
-                # [Phase 9] 30 s (au lieu de 5) : les streams SSE en vol ont le
-                # temps de se terminer proprement avant que le serveur ne coupe
-                # (le lifespan cancel déjà ses tâches de fond de son côté).
-                timeout_graceful_shutdown=30,
-                # [Phase 9] garde le flag access log piloté par le niveau :
-                # uvicorn n'active le logger d'accès que si log_level l'inclut.
-                access_log=not _PROD_RUNTIME,
-                # [Phase 9] pas d'en-tête « server: uvicorn » exposé.
-                server_header=not _PROD_RUNTIME,
-            )
-            self._server = Server(config)
-            self._thread = threading.Thread(target=self._server.run, daemon=True)
-            self._thread.start()
-
-            # Wait for server to actually start listening
-            for _ in range(50):
-                time.sleep(0.1)
-                if self._server.started:
-                    break
-            if self._server.started:
-                self.is_running = True
-                _debug(f"  [server] started on {self.host}:{self.port}")
-                log_boot_phase(f"server started (listening {self.host}:{self.port})")
+                return True
+            # Une tentative précédente est encore en cours de boot (lifespan
+            # lent) : ne JAMAIS empiler un second uvicorn sur le même port.
+            # On re-surveille simplement celle qui existe déjà.
+            if self._server is not None and self._thread is not None and self._thread.is_alive():
+                server, thread, generation = self._server, self._thread, self._generation
+                _debug(f"  [server] start skipped — boot already in progress on {self.host}:{self.port}")
             else:
-                # Ne JAMAIS mentir : sans socket, le tray reste rouge et
-                # l'échec est visible dans debug.log (sinon l'utilisateur
-                # croit le proxy vert alors que rien ne sert — incident
-                # 29/09 : processus vivant, port 4000 muet).
-                self.is_running = False
-                _debug(f"  [server] FAILED to listen on {self.host}:{self.port} after 5s")
-                log_boot_phase(f"server FAILED to listen on {self.host}:{self.port}")
+                h = RichLogHandler()
+                for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+                    lg = logging.getLogger(name)
+                    lg.handlers = [h]
+                    lg.propagate = False
+                # [46] VPN logs were stderr-only (no handler attached) — route
+                # them into the same rich log panel as the rest of the app.
+                # Append, don't replace: attach_module_logger() at startup put a
+                # debug.log FileHandler on these loggers, and replacing handlers
+                # + propagate=False made [vpn]/[vpn-watchdog] lines invisible in
+                # logs/debug.log exactly during AUTH_FAILED incidents.
+                for name in ("vpn_manager", "free_ip_pool", "egress-catalog"):
+                    attach_panel_logger(name, h)
+
+                try:
+                    import uvloop  # noqa: F401
+
+                    _loop = "uvloop"
+                except ImportError:
+                    _loop = "asyncio"
+                config = Config(
+                    self.app,
+                    host=self.host,
+                    port=self.port,
+                    # [Phase 9 plan boot] « prod » = pas de GUI ni de DEBUG : le
+                    # access log uvicorn n'apporte rien au dashboard (qui a son
+                    # propre historique SQLite + traffic capture) et coûte une
+                    # ligne par requête, y compris les SSE de longue durée.
+                    log_level="warning" if _PROD_RUNTIME else "info",
+                    log_config=None,
+                    timeout_keep_alive=15,
+                    backlog=4096,
+                    limit_concurrency=2000,
+                    loop=_loop,
+                    http="httptools",
+                    ws="none",
+                    # [Phase 9] 30 s (au lieu de 5) : les streams SSE en vol ont le
+                    # temps de se terminer proprement avant que le serveur ne coupe
+                    # (le lifespan cancel déjà ses tâches de fond de son côté).
+                    timeout_graceful_shutdown=30,
+                    # [Phase 9] garde le flag access log piloté par le niveau :
+                    # uvicorn n'active le logger d'accès que si log_level l'inclut.
+                    access_log=not _PROD_RUNTIME,
+                    # [Phase 9] pas d'en-tête « server: uvicorn » exposé.
+                    server_header=not _PROD_RUNTIME,
+                )
+                self._generation += 1
+                generation = self._generation
+                server = Server(config)
+                thread = threading.Thread(
+                    target=server.run,
+                    daemon=True,
+                    name="opencode-uvicorn",
+                )
+                self._server = server
+                self._thread = thread
+                thread.start()
+        # Attente HORS verrou : un stop() explicite doit pouvoir interrompre
+        # un boot lent sans rester bloqué derrière start().
+        return self._await_ready(server, thread, generation)
+
+    def _await_ready(self, server, thread, generation) -> bool:
+        """Attend le socket _START_WAIT_S, puis bascule en surveillance.
+
+        Ne jamais conclure à l'échec sur un simple dépassement de délai :
+        uvicorn met `started=True` seulement APRÈS le lifespan FastAPI, qui
+        peut prendre plusieurs dizaines de secondes (bootstrap VPN, DB...).
+        """
+        deadline = time.monotonic() + self._START_WAIT_S
+        while time.monotonic() < deadline:
+            if getattr(server, "started", False):
+                return self._mark_ready(server, thread, generation)
+            if not thread.is_alive():
+                # Le thread uvicorn est mort avant d'écouter : échec réel
+                # (port occupé, lifespan en erreur...). On le signale sans
+                # jamais mentir sur l'état.
+                return self._mark_failed(server, thread, generation, "thread exited before listening")
+            time.sleep(0.1)
+        _debug(
+            f"  [server] toujours en démarrage après {self._START_WAIT_S:.0f}s "
+            f"sur {self.host}:{self.port} — surveillance en arrière-plan"
+        )
+        log_boot_phase(f"server still starting after {self._START_WAIT_S:.0f}s (watchdog)")
+        self._spawn_ready_watchdog(server, thread, generation)
+        return False
+
+    def _mark_ready(self, server, thread, generation) -> bool:
+        """Passe is_running à True — uniquement si c'est toujours NOTRE serveur."""
+        with self._lock:
+            if server is not self._server or generation != self._generation:
+                return False
+            if not getattr(server, "started", False) or not thread.is_alive():
+                return False
+            already = self.is_running
+            self.is_running = True
+        if not already:
+            _debug(f"  [server] started on {self.host}:{self.port}")
+            log_boot_phase(f"server started (listening {self.host}:{self.port})")
+        return True
+
+    def _mark_failed(self, server, thread, generation, reason: str) -> bool:
+        """Échec réel : le thread est mort ou le budget de boot est épuisé."""
+        with self._lock:
+            if server is not self._server or generation != self._generation:
+                return False
+            self.is_running = False
+        _debug(f"  [server] FAILED to listen on {self.host}:{self.port} ({reason})")
+        log_boot_phase(f"server FAILED to listen on {self.host}:{self.port} ({reason})")
+        return False
+
+    def _spawn_ready_watchdog(self, server, thread, generation) -> None:
+        """Surveille en fond un démarrage plus long que _START_WAIT_S."""
+
+        def _watch() -> None:
+            deadline = time.monotonic() + self._READY_WATCHDOG_S
+            while time.monotonic() < deadline:
+                if getattr(server, "started", False):
+                    self._mark_ready(server, thread, generation)
+                    return
+                if not thread.is_alive():
+                    self._mark_failed(server, thread, generation, "thread exited before listening")
+                    return
+                with self._lock:
+                    stale = server is not self._server or generation != self._generation
+                if stale:
+                    return
+                time.sleep(0.25)
+            self._mark_failed(
+                server,
+                thread,
+                generation,
+                f"not listening after {self._READY_WATCHDOG_S:.0f}s",
+            )
+
+        threading.Thread(
+            target=_watch,
+            daemon=True,
+            name="opencode-uvicorn-ready",
+        ).start()
+
+    def refresh_state(self) -> bool:
+        """Réconcilie is_running avec l'état réel (self-heal).
+
+        Appelé par /api/proxy/status et le tray : un boot plus lent que
+        _START_WAIT_S ne doit pas laisser le flag bloqué à False alors
+        qu'uvicorn écoute. On ne promeut que si `started` est vrai (jamais
+        sur une simple sonde de port : un autre processus pourrait écouter).
+        """
+        server = self._server
+        thread = self._thread
+        if server is None or thread is None:
+            if self.is_running:
+                with self._lock:
+                    if self._server is server and self._thread is thread:
+                        self.is_running = False
+            return False
+        if not thread.is_alive():
+            with self._lock:
+                if self._server is server:
+                    self.is_running = False
+            return False
+        if self.is_running:
+            return True
+        if not getattr(server, "started", False):
+            return False
+        return self._mark_ready(server, thread, self._generation)
+
+    def is_listening(self, timeout=0.3) -> bool:
+        """True si le port TCP accepte une connexion (sonde locale)."""
+        host = (self.host or "").strip()
+        if host in ("", "0.0.0.0", "*"):
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        try:
+            with socket.create_connection((host, int(self.port)), timeout=timeout):
+                return True
+        except (OSError, ValueError):
+            return False
 
     def stop(self, timeout=10):
         """Graceful stop: signal uvicorn to stop, then wait for in-flight requests."""
         with self._lock:
-            if not self.is_running:
+            server = self._server
+            thread = self._thread
+            if server is None and not self.is_running:
                 _debug("  [server] stop skipped — not running")
                 return
+            if not self.is_running:
+                # Boot encore en cours : on signale quand même l'arrêt, sinon
+                # le serveur finirait par écouter après un clic « Arrêter ».
+                _debug(f"  [server] stop requested during startup on {self.host}:{self.port}")
             _debug(f"  [server] stopping on {self.host}:{self.port}...")
-            if self._server:
-                self._server.should_exit = True
+            # Invalide tout watchdog de démarrage : plus personne ne doit
+            # repasser is_running à True après un stop explicite.
+            self._generation += 1
             self.is_running = False
-        if self._thread and self._thread.is_alive():
-            if self._thread is threading.current_thread():
+            self._server = None
+            self._thread = None
+            if server is not None:
+                server.should_exit = True
+        if thread is not None and thread.is_alive():
+            if thread is threading.current_thread():
                 # [fix ticket P1 incident 25/08] appel DEPUIS le thread serveur
                 # lui-même (handler HTTP sur la boucle) : join(current_thread)
                 # lèverait RuntimeError et tuerait restart() avant start()
@@ -30660,9 +31700,7 @@ class ServerManager:
                 # seulement — le should_exit ci-dessus termine le serveur seul.
                 _debug("  [server] stop() depuis le thread serveur : join ignoré")
             else:
-                self._thread.join(timeout=timeout)
-        self._server = None
-        self._thread = None
+                thread.join(timeout=timeout)
         _debug("  [server] stopped")
 
     def restart(self, port=None, host=None):
@@ -30812,8 +31850,13 @@ if __name__ == "__main__":
 
         def _start_server_bg():
             try:
-                mgr.start()
-                log_boot_phase("server listen confirmed (__main__, bg)")
+                ready = mgr.start()
+                if ready:
+                    log_boot_phase("server listen confirmed (__main__, bg)")
+                else:
+                    # Lifespan plus long que le délai synchrone : le watchdog
+                    # de ServerManager logguera le vrai passage à l'écoute.
+                    log_boot_phase("server readiness handed to watchdog (__main__, bg)")
                 _log(f"API: http://localhost:{PORT}")
             except Exception as _e_start:
                 _log(f"FATAL: server start failed: {type(_e_start).__name__}: {_e_start}")

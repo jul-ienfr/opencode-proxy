@@ -7,18 +7,20 @@ per-model 429 cannot be hidden by a global ``model_usable`` flag.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PATH = ROOT / "logs" / "repair_queue.db"
+DEFAULT_PATH = ROOT / "logs" / "registry.db"
 
 
 class RepairQueue:
     def __init__(self, path: str | Path | None = None, *, ttl_s: float = 1800.0) -> None:
-        self._path = str(path or DEFAULT_PATH)
+        override = str(os.environ.get("OPENCODE_REPAIR_QUEUE_DB") or "").strip()
+        self._path = str(path or override or DEFAULT_PATH)
         self._ttl_s = max(30.0, float(ttl_s))
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self._path, timeout=10.0)

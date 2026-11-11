@@ -30,17 +30,11 @@ routing:
   aliases:
     nimo: mimo
 free_model_map:
-  mimo-v2.5: mimo-v2.6-flash-free
-  qwen3.7-max: mimo-v2.6-flash-free
-  glm-5.1: mimo-v2.6-flash-free
-  kimi-k2.6: mimo-v2.6-flash-free
-  minimax-m2.5: mimo-v2.6-flash-free
-  jev-1.13-free: jev-1.13-free
-  jev-1.13: jev-1.13-free
-  deepseek-v4-flash: deepseek-v4.1-flash-free
+  mimo-v2.5: deepseek-v4-flash-free
   glm-5.3-flash: glm-5.3-flash-free
   deepseek-v4.1-flash: deepseek-v4.1-flash-free
   mimo-v2.6-flash: mimo-v2.6-flash-free
+  minimax-m3.1-flash: minimax-m3.1-flash-free
 dashboard_trust:
   mode: lan
   lan_cidrs:
@@ -92,12 +86,13 @@ stations:
 ip_rotation:
   auto_flip_cooldown_min: 5
   auto_hetero_boot: false
-  auto_max_free_attempts: true
+  auto_max_free_attempts: false
   auto_mixed_stacks: false
   auto_ov_fail_threshold: 1
   auto_ov_return_min: 60
   auto_wg_egress_ticks: 20
   backoff_max_delay: 60
+  bad_ip_min_429: 2
   bad_ip_ttl_s: 900
   bad_ttl: 10
   bad_ttl_by_cause:
@@ -132,18 +127,26 @@ ip_rotation:
   docker_container_2: opencode-vpn-2
   docker_events: true
   dual_station: false
+  egress_adaptive:
+    enabled: true
+    min_samples: 3
+    min_weight_pct: 2
+    recent_429_penalty: 0.25
+    window_s: 300
   egress_allow_any_country: true
   egress_capacity:
-    reserve_policy: full
-    target_slots: 6
+    reserve_policy: shared
+    target_slots: 7
   egress_failure_tick_interval: 15.0
   egress_providers:
-  - warp
   - nordvpn
-  egress_strategy: fallback
+  - warp
+  - proxies
+  egress_strategy: balance
   egress_weights:
-    warp: 100
-    nordvpn: 0
+    nordvpn: 52
+    proxies: 24
+    warp: 24
   enabled: true
   enforce_vpn_only: true
   fallback:
@@ -172,7 +175,7 @@ ip_rotation:
     hedge_delay_ms: 1500
     hedge_max_attempts: 1
   free_substitution_policy: homonym
-  https_fallback_enabled: false
+  https_fallback_enabled: true
   https_proxies: []
   identity_diversity: true
   identity_max_profiles: 256
@@ -218,12 +221,14 @@ ip_rotation:
     soft_cooldown_sec: 600
     stream_metric: ttfb
     window: 20
-  max_free_attempts: 6
-  max_inflight_per_model_ip: 8
+  max_free_attempts: 2
+  max_inflight_per_model_ip: 4
   model_global_429_min_ips: 3
   model_global_429_window_s: 60
   model_global_cooldown_s: 60
-  model_slot_wait_s: 3
+  model_slot_fail_closed: true
+  model_slot_retry_after_s: 2
+  model_slot_wait_s: 12
   on_429_action: rotate
   ov_auth_backoff_max_s: 600
   ov_auth_backoff_s: 90
@@ -246,7 +251,11 @@ ip_rotation:
     max_attempts: 1
     max_tokens: 8
   proactive_tick_s: 60
-  proxy_mode: auto_egress
+  proxy_mode: vpn
+  public_proxies:
+    enabled: true
+    isolation: container
+    max_active: 3
   quality_preselection:
     enabled: false
     fast_tps: 55.0
@@ -263,7 +272,7 @@ ip_rotation:
     trend_pct: 25.0
     ttfb_ceiling_ms: 8000
   quota_ip_block_s: 300
-  quota_per_ip: 500
+  quota_per_ip: 200
   recent_ip_max_age: 1800
   recent_ip_window: 20
   reliability_canary:
@@ -295,93 +304,170 @@ ip_rotation:
     port: 11080
     username: null
     password: null
-    enabled: false
-    label: warp-ipv4
+    enabled: true
+    label: WARP 1
     ipv6: false
-    egress_ip: ''
-    managed: false
-    container: ''
-    image: ''
-    block: ''
+    egress_ip: 104.28.198.204
+    managed: true
+    container: warp-1
+    image: caomingjun/warp:latest
+    block: 104.28.198.204/32
     provider: warp
+    transport_url: ''
   - host: 127.0.0.1
     port: 11080
     username: null
     password: null
     enabled: true
-    label: warp-ipv6
+    label: WARP 1 IPv6
     ipv6: true
-    egress_ip: 2a09:bac1:2780:2060::3db:4e
+    egress_ip: 2a09:bac5:32d7:be::13:29c
     managed: true
-    container: warp-test
+    container: warp-1
     image: caomingjun/warp:latest
-    block: 2a09:bac1:2780:2060::/64
+    block: 2a09:bac5:32d7:be::/64
     provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11085
+    username: null
+    password: null
+    enabled: false
+    label: WARP 2
+    ipv6: false
+    egress_ip: 104.28.198.200
+    managed: true
+    container: warp-2
+    image: caomingjun/warp:latest
+    block: 104.28.198.200/32
+    provider: warp
+    transport_url: ''
   - host: 127.0.0.1
     port: 11085
     username: null
     password: null
     enabled: true
-    label: warp-ipv6-2
+    label: WARP 2 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d5:14e6::215:70
+    egress_ip: 2a09:bac5:32d5:14dc::214:a3
     managed: true
-    container: warp-test2
+    container: warp-2
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d5:14e6::/64
+    block: 2a09:bac5:32d5:14dc::/64
     provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11086
+    username: null
+    password: null
+    enabled: false
+    label: WARP 3
+    ipv6: false
+    egress_ip: 104.28.230.202
+    managed: true
+    container: warp-3
+    image: caomingjun/warp:latest
+    block: 104.28.230.202/32
+    provider: warp
+    transport_url: ''
   - host: 127.0.0.1
     port: 11086
     username: null
     password: null
     enabled: true
-    label: warp-ipv6-3
+    label: WARP 3 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d3:28a0::40c:17
+    egress_ip: 2a09:bac5:32d1:26aa::3da:42
     managed: true
-    container: warp-test3
+    container: warp-3
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d3:28a0::/64
+    block: 2a09:bac5:32d1:26aa::/64
     provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11087
+    username: null
+    password: null
+    enabled: false
+    label: WARP 4
+    ipv6: false
+    egress_ip: 104.28.198.202
+    managed: true
+    container: warp-4
+    image: caomingjun/warp:latest
+    block: 104.28.198.202/32
+    provider: warp
+    transport_url: ''
   - host: 127.0.0.1
     port: 11087
     username: null
     password: null
     enabled: true
-    label: warp-ipv6-4
+    label: WARP 4 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d6:1c82::2d7:cf
+    egress_ip: 2a09:bac5:32d2:26aa::3da:43
     managed: true
-    container: warp-test4
+    container: warp-4
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d6:1c82::/64
+    block: 2a09:bac5:32d2:26aa::/64
     provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11103
+    username: null
+    password: null
+    enabled: false
+    label: WARP 5
+    ipv6: false
+    egress_ip: 104.28.230.202
+    managed: true
+    container: warp-5
+    image: caomingjun/warp:latest
+    block: 104.28.230.202/32
+    provider: warp
+    transport_url: ''
   - host: 127.0.0.1
     port: 11103
     username: null
     password: null
     enabled: true
-    label: warp-restore1
+    label: WARP 5 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d2:1c82::2d7:c
+    egress_ip: 2a09:bac5:32d3:150f::219:f4
     managed: true
-    container: warp-restore1
+    container: warp-5
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d2:1c82::/64
+    block: 2a09:bac5:32d3:150f::/64
     provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11105
+    username: null
+    password: null
+    enabled: false
+    label: WARP 6
+    ipv6: false
+    egress_ip: 104.28.230.202
+    managed: true
+    container: warp-6
+    image: caomingjun/warp:latest
+    block: 104.28.230.202/32
+    provider: warp
+    transport_url: ''
   - host: 127.0.0.1
     port: 11105
     username: null
     password: null
     enabled: true
-    label: warp-restore3
+    label: WARP 6 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d7:28b4::40e:36
+    egress_ip: 2a09:bac5:32d4:1519::21a:91
     managed: true
-    container: warp-restore3
+    container: warp-6
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d7:28b4::/64
+    block: 2a09:bac5:32d4:1519::/64
     provider: warp
+    transport_url: ''
   - host: 127.0.0.1
     port: 11084
     username: null
@@ -395,20 +481,192 @@ ip_rotation:
     image: ''
     block: ''
     provider: static
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11106
+    username: null
+    password: null
+    enabled: false
+    label: WARP 7
+    ipv6: false
+    egress_ip: ''
+    managed: true
+    container: warp-7
+    image: caomingjun/warp:latest
+    block: ''
+    provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11106
+    username: null
+    password: null
+    enabled: true
+    label: WARP 7 IPv6
+    ipv6: true
+    egress_ip: 2a09:bac5:32d7:28a0::40c:44
+    managed: true
+    container: warp-7
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d7:28a0::/64
+    provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11107
+    username: null
+    password: null
+    enabled: false
+    label: WARP 8
+    ipv6: false
+    egress_ip: ''
+    managed: true
+    container: warp-8
+    image: caomingjun/warp:latest
+    block: ''
+    provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11107
+    username: null
+    password: null
+    enabled: true
+    label: WARP 8 IPv6
+    ipv6: true
+    egress_ip: 2a09:bac5:32d1:14f0::216:a5
+    managed: true
+    container: warp-8
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d1:14f0::/64
+    provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11108
+    username: null
+    password: null
+    enabled: false
+    label: WARP 9
+    ipv6: false
+    egress_ip: ''
+    managed: true
+    container: warp-9
+    image: caomingjun/warp:latest
+    block: ''
+    provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11108
+    username: null
+    password: null
+    enabled: true
+    label: WARP 9 IPv6
+    ipv6: true
+    egress_ip: 2a09:bac5:32d7:14dc::214:ad
+    managed: true
+    container: warp-9
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d7:14dc::/64
+    provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11109
+    username: null
+    password: null
+    enabled: false
+    label: WARP 10
+    ipv6: false
+    egress_ip: ''
+    managed: true
+    container: warp-10
+    image: caomingjun/warp:latest
+    block: ''
+    provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11109
+    username: null
+    password: null
+    enabled: true
+    label: WARP 10 IPv6
+    ipv6: true
+    egress_ip: 2a09:bac5:32d2:1519::21a:6e
+    managed: true
+    container: warp-10
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d2:1519::/64
+    provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11110
+    username: null
+    password: null
+    enabled: false
+    label: WARP 11
+    ipv6: false
+    egress_ip: ''
+    managed: true
+    container: warp-11
+    image: caomingjun/warp:latest
+    block: ''
+    provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11110
+    username: null
+    password: null
+    enabled: true
+    label: WARP 11 IPv6
+    ipv6: true
+    egress_ip: 2a09:bac5:32d0:be::13:298
+    managed: true
+    container: warp-11
+    image: caomingjun/warp:latest
+    block: 2a09:bac5:32d0:be::/64
+    provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11111
+    username: null
+    password: null
+    enabled: false
+    label: WARP 12
+    ipv6: false
+    egress_ip: ''
+    managed: true
+    container: warp-12
+    image: caomingjun/warp:latest
+    block: ''
+    provider: warp
+    transport_url: ''
+  - host: 127.0.0.1
+    port: 11111
+    username: null
+    password: null
+    enabled: true
+    label: WARP 12 IPv6
+    ipv6: true
+    egress_ip: 2a09:bac1:27e0:2060::215:121
+    managed: true
+    container: warp-12
+    image: caomingjun/warp:latest
+    block: 2a09:bac1:27e0:2060::/64
+    provider: warp
+    transport_url: ''
   socks5_proxy_port: 1080
   socks5_proxy_port_2: 1081
   socks_catchup_s: 90
   socks_down_routable: true
   stack_age_guard_s: 600
   state_file_2: logs/vpn_state2.json
-  station_bad_ttl_s: 10
+  station_bad_ttl_s: 120
   station_connect_retry_interval_s: 30
   station_count: 6
   station_health:
-    max_effective_age_s: 180
+    max_effective_age_s: 900
+    probe_interval_s: 120
+    probe_timeout_s: 8
     shadow: true
     strict: true
-  station_max_rotations_per_hour: 10
+  station_max_rotations_per_hour: 3
+  station_min_rotation_interval_s: 600
   station_repair:
     auth_backoff_s:
     - 30
@@ -454,7 +712,7 @@ ip_rotation:
   use_nordvpn_api: false
   vpn_proxy_port: 8888
   vpn_proxy_port_2: 8889
-  vpn_stack: auto
+  vpn_stack: wireguard
   wait_healthy_late_retry_s: 30
   wait_healthy_poll: 0.5
   wait_healthy_require_socks: false
@@ -775,10 +1033,10 @@ timeouts:
   request_budget_s: 240
 retry_until_success:
   enabled: true
-  max_wait_s: 180
+  max_wait_s: 120.0
   base_delay_s: 1.0
   max_delay_s: 15.0
-  keepalive_interval_s: 10
+  keepalive_interval_s: 10.0
   buffer_max_bytes: 10485760
 free:
   station_identity: true
@@ -835,6 +1093,128 @@ observability:
     glm-5.3-flash-free:
       p50_ms: 12000
       p95_ms: 30000
+egress_catalog:
+  enabled: true
+  update_jitter_pct: 15
+  retention_days: 7
+  cycle_candidate_budget: 500
+  cycle_timeout_s: 600
+  denylist:
+  - 103.26.10.23/32
+  threat_feeds:
+    enabled: true
+    refresh_interval_s: 21600
+    urls:
+    - id: abuse_feodo
+      url: https://feodotracker.abuse.ch/downloads/ipblocklist.txt
+      enabled: true
+    - id: spamhaus_drop
+      url: https://www.spamhaus.org/drop/drop.txt
+      enabled: true
+    - id: firehol_level1
+      url: https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset
+      enabled: true
+    - id: blocklist_de
+      url: https://lists.blocklist.de/lists/all.txt
+      enabled: true
+    - id: ipsum
+      url: https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt
+      enabled: true
+  providers:
+    public:
+      enabled: true
+      discovery_interval_s: 21600
+      revalidate_interval_s: 1800
+      max_active: 64
+      max_options: 20000
+      concurrency: 48
+      ttl_usable_s: 43200
+      ttl_quota_max_s: 86400
+      ttl_dead_s: 604800
+      sources_file: config/egress_sources.yaml
+    warp:
+      enabled: true
+      discovery_interval_s: 1800
+      max_active: 24
+      max_options: 24
+      concurrency: 6
+      ttl_usable_s: 43200
+      ttl_quota_max_s: 86400
+      ttl_dead_s: 604800
+    nordvpn:
+      enabled: true
+      discovery_interval_s: 1800
+      max_active: 6
+      max_options: 10
+      max_active_stations: 6
+      concurrency: 4
+      ttl_usable_s: 43200
+      ttl_quota_max_s: 86400
+      ttl_dead_s: 604800
+  qualification:
+    enabled: true
+    shadow_mode: false
+    daemon_shadow: true
+    station: 1
+    max_hosts: 200
+    max_attempts_per_host_per_epoch: 1
+    lease_s: 300
+    preflight_timeout_s: 5
+    infra_backoff_s: 300
+    infra_backoff_max_s: 3600
+    quota_retry_jitter_s: 60
+    retention_days: 7
+    api_cache: logs/nordvpn_api.json
+    latency_budget_ms: 250
+    quota_estimate: 500
+    freshness_ttl_h: 24
+    weights:
+      reliability: 0.3
+      latency: 0.3
+      quota: 0.2
+      load: 0.15
+      freshness: 0.05
+    transport_strategy: auto
+    transport_order:
+    - wireguard
+    transport_retry_rounds: 1
+    transport_retry_backoff_s: 60
+    transport_health_min_attempts: 100
+    auth_backoff_s: 3600
+    daemon_enabled: true
+    daemon_interval_s: 60
+    daemon_max_hosts: 40
+    qualifiers:
+      enabled: false
+      count: 0
+      max_count: 4
+      recommended_max: 2
+      station_base: 7
+      transport: wireguard
+      max_hosts_per_epoch: 40
+      interval_s: 30
+      max_attempts_per_host: 1
+      transport_rounds: 1
+    discovery_interval_s: 21600
+    discovery_stale_max_s: 86400
+    watchdog_stations:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    max_repair_attempts: 3
+    repair_backoff_s: 300
+    watchdog_enabled: true
+    watchdog_probe_interval_s: 30
+    proactive_rotation_headroom_pct: 20
+    last_station_protection: true
+    station_standby_size: 1
+    cutover_timeout_ms: 5000
+    per_station_workers: true
+    parallel_rotations: true
+    global_pause_on_429: false
 ip_registry:
   enabled: true
   slo:
@@ -875,15 +1255,13 @@ ip_registry:
     fallback_order:
     - dot
     failures_before_fallback: 2
-  repair:
-    shared_wireguard_key: true
   eligibility:
     error_cooldown_s: 1800
   allocator:
-    mode: active
+    mode: enforce
     max_attempts_per_need: 20
-    max_parallel_repairs: 6
-    rebind_limit_per_min: 12
+    max_parallel_repairs: 2
+    rebind_limit_per_min: 3
     winner_cooldown_s: 0
     winner_grace_s: 10
     failure_cooldown_s: 5
@@ -891,8 +1269,8 @@ ip_registry:
     host_429_cooldown_s: 600
     no_egress_backoff_s: 120
     no_egress_backoff_max_s: 60
-    settle_s: 8
-    egress_wait_s: 35
+    settle_s: 10
+    egress_wait_s: 60
     egress_poll_s: 2
     auth_fallback_transport: ''
     probe_validate_sse: true
@@ -916,20 +1294,21 @@ ip_registry:
     - big-pickle
     transports:
     - station: 1
-      transport: openvpn-udp
+      transport: auto
     - station: 2
-      transport: openvpn-udp
+      transport: auto
     - station: 3
-      transport: openvpn-tcp
+      transport: auto
     - station: 4
-      transport: openvpn-udp
+      transport: auto
     - station: 5
-      transport: wireguard
+      transport: auto
     - station: 6
-      transport: openvpn-udp
+      transport: auto
     refresh_when_exhausted: true
-    refresh_cooldown_s: 900
+    refresh_cooldown_s: 120
     refresh_min_available: 1
+    global_pause_enabled: false
     global_429_window_s: 600
     global_429_threshold: 100000
     global_429_pause_s: 900
@@ -1174,11 +1553,19 @@ models:
     protocol: gemini
   gemini-3.8-flash:
     protocol: gemini
-  crouton-alpha-free:
-    protocol: openai
   hy4:
     protocol: openai
   iceman-free:
     protocol: openai
   inkling-2-small-free:
     protocol: openai
+  longcat-2.5-free:
+    protocol: openai
+  muse-ember-1.0:
+    protocol: openai
+  claude-fable-5-2:
+    protocol: anthropic
+  minimax-m3.1-flash-free:
+    protocol: openai
+  gemini-4-carbon:
+    protocol: gemini

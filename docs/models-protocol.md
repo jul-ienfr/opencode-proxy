@@ -27,19 +27,21 @@ Upstream = endpoint OpenAI-compatible (`protocol: openai`). Le client parle
 toujours Anthropic (`/v1/messages`) ; la conversion est verrouillée par les
 goldens §v1-response.md. Aliases actuels (`free_model_map`) :
 
-- `deepseek-v4-flash` → `mimo-v2.6-flash-free` (le `-free` homonyme est mort côté amont : 0 succès, que des 400 — voir config)
-- `glm-5.1`, `kimi-k2.6`, `minimax-m2.5` → `mimo-v2.6-flash-free`
-- `mimo-v2.5` → `mimo-v2.6-flash-free`
+- `mimo-v2.5` → `mimo-v2.6-flash-free` (la cible config `deepseek-v4-flash-free` est remappée au défaut tant qu'elle n'est pas dans `models:`)
+- `glm-5.3-flash` → `glm-5.3-flash-free`
+- `deepseek-v4.1-flash` → `deepseek-v4.1-flash-free`
 - `mimo-v2.6-flash` → `mimo-v2.6-flash-free`
-- `qwen3.7-max` → `mimo-v2.6-flash-free`
+- `minimax-m3.1-flash` → `minimax-m3.1-flash-free`
 - `muse-spark-1.2-contributor` → `muse-spark-1.3-contributor-free` (la cible `-free` homonyme est `deprecated` côté anonyme — recâblé N2 le 2026-10-12)
 - `muse-spark-1.3-contributor` → `muse-spark-1.3-contributor-free`
 
 > Les alias `ROUTES`/custom routes sont résolus **avant** le mapping free :
 > `glm-5.1` et `qwen3.7-max` partent vers `glm-5.3-flash-free` (tier `paid`,
-> `tier_source=route`, `free_target=glm-5.3-flash-free`), même si une ancienne
-> entrée `free_model_map` existe. Une cible gratuite est un **repli**, pas une
-> promotion de l'alias en gratuit.
+> `tier_source=route`, `free_target=glm-5.3-flash-free`). Une cible gratuite
+> est un **repli**, pas une promotion de l'alias en gratuit. Les anciens
+> mappings explicites `glm-5.1`, `kimi-k2.6`, `minimax-m2.5` et
+> `deepseek-v4-flash` ont été retirés : sans entrée `free_model_map` ni
+> homonyme vivant, ils restent payants.
 >
 > Une entrée **explicite** de `free_model_map` est toujours honorée, y compris
 > quand la politique est `homonym` : la politique ne filtre que les candidats

@@ -70,6 +70,44 @@ class TestTheAuditDetectsAFreshDeadKey:
         resultat = audit.auditer()
         assert "ip_rotation.watchdog_intervall" in resultat["dead"]
 
+    def test_bom_prefixed_python_file_is_scanned(self, tmp_path, monkeypatch):
+        """Un fichier UTF-8 BOM ne doit pas être ignoré en silence."""
+        import yaml
+
+        (tmp_path / "bom_module.py").write_text(
+            "\ufeffyaml_get('ip_registry', 'alerts.enabled', True)\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"ip_registry": {"alerts": {"enabled": True}}},
+                allow_unicode=True,
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(audit, "RACINE", tmp_path)
+        monkeypatch.setattr(audit, "CONFIG", tmp_path / "config.yaml")
+        monkeypatch.setattr(audit, "_CLES_LUES_CACHE", None)
+        monkeypatch.setattr(audit, "_SOURCE_CACHE", None)
+        monkeypatch.setattr(audit, "_AUDIT_CACHE", {})
+        resultat = audit.auditer()
+        assert resultat["dead"] == []
+        assert resultat["missing"] == []
+
+    def test_real_supervisor_keys_are_seen(self):
+        """Régression : le superviseur (BOM) porte les clés ``ip_registry.*``."""
+        cles = audit._litteraux_yaml_get()
+        for cle in (
+            "ip_registry.alerts.enabled",
+            "ip_registry.alerts.client_usable_min",
+            "ip_registry.alerts.warm_pool_min",
+            "ip_registry.alerts.sweep_stalled_s",
+            "ip_registry.maintenance_interval_s",
+            "ip_registry.allocator.auth_fallback_transport",
+            "ip_registry.allocator.max_state_age_s",
+        ):
+            assert cle in cles
+
     def test_ip_registry_uses_strict_leaf_reads(self, tmp_path, monkeypatch):
         """Une clé `ip_registry.*` sans lecture explicite est morte, même si
         son nom de feuille apparaît ailleurs dans le code."""
