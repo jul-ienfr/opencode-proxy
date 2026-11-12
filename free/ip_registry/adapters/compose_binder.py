@@ -38,6 +38,7 @@ class ComposeHostnameBinder:
         settle_s: float = 10.0,
         egress_wait_s: float = 0.0,
         egress_poll_s: float = 2.0,
+        project_name: str | None = None,
         runner: Callable[[list[str], str], subprocess.CompletedProcess] | None = None,
         egress: Callable[[int], Awaitable[str]] | None = None,
         clock: Callable[[], float] = time.time,
@@ -53,6 +54,32 @@ class ComposeHostnameBinder:
         self._runner = runner or self._run
         self._egress = egress
         self._clock = clock
+        self._project_name = self._resolve_project_name(project_name)
+
+    def _resolve_project_name(self, project_name: str | None) -> str | None:
+        """Compose project the station containers already belong to.
+
+        A chain launched through a different working-directory alias resolves
+        the project name from that directory, so ``up`` targets a second
+        project and dies with "container name already in use". Passing the
+        canonical project explicitly keeps every recreate in the same project.
+        """
+
+        explicit = str(project_name or "").strip()
+        if explicit:
+            return explicit
+        from_env = str(os.environ.get("COMPOSE_PROJECT_NAME") or "").strip()
+        if from_env:
+            return from_env
+        try:
+            for raw in (self._root / ".env").read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if line.startswith("COMPOSE_PROJECT_NAME="):
+                    value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    return value or None
+        except OSError:
+            pass
+        return None
 
     def service_name(self, station: int) -> str:
         return "vpn-gluetun" if int(station) == 1 else f"vpn-gluetun-{int(station)}"
@@ -137,9 +164,10 @@ class ComposeHostnameBinder:
             )
         except Exception as exc:
             return BindResult(False, hostname, error=f"override-write:{type(exc).__name__}")
-        command = [
-            "docker",
-            "compose",
+        command = ["docker", "compose"]
+        if self._project_name:
+            command += ["-p", self._project_name]
+        command += [
             "--profile",
             self._profile,
             "-f",
@@ -211,6 +239,8 @@ class ComposeHostnameBinder:
             for key, value in os.environ.items()
             if not self._STALE_STATION_ENV.match(key)
         }
+        if self._project_name:
+            env["COMPOSE_PROJECT_NAME"] = self._project_name
         return subprocess.run(
             command,
             cwd=cwd,

@@ -53,6 +53,7 @@ wstest.py
 
 # Logs
 *.log
+logs/
 logs/debug.log*
 logs/opencode*.lock
 logs/paused_keys.yaml

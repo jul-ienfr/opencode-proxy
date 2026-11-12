@@ -210,3 +210,44 @@ def test_override_path_already_station_suffixed_is_kept(tmp_path):
         runner=FakeRunner(),
     )
     assert binder.override_path_for(3) == tmp_path / "logs" / "compose-hostname-3.yml"
+
+
+async def test_assign_pins_the_compose_project(tmp_path):
+    runner = FakeRunner()
+
+    async def egress(station: int) -> str:
+        return "186.247.44.61"
+
+    binder = ComposeHostnameBinder(
+        tmp_path,
+        settle_s=0,
+        project_name="opencode-proxy-one",
+        runner=runner,
+        egress=egress,
+    )
+    await binder.assign(2, "al110.nordvpn.com")
+
+    command, _ = runner.calls[0]
+    assert command[:4] == ["docker", "compose", "-p", "opencode-proxy-one"]
+
+
+def test_project_name_falls_back_to_dotenv(monkeypatch, tmp_path):
+    monkeypatch.delenv("COMPOSE_PROJECT_NAME", raising=False)
+    (tmp_path / ".env").write_text(
+        "KEEP=1\nCOMPOSE_PROJECT_NAME=opencode-proxy-one\n", encoding="utf-8"
+    )
+    binder = ComposeHostnameBinder(tmp_path)
+    assert binder._project_name == "opencode-proxy-one"
+
+
+def test_run_exports_the_resolved_project_name(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(compose_module.subprocess, "run", fake_run)
+    binder = ComposeHostnameBinder(tmp_path, project_name="opencode-proxy-one")
+    binder._run(["docker"], str(tmp_path))
+    assert captured["COMPOSE_PROJECT_NAME"] == "opencode-proxy-one"
