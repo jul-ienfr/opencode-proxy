@@ -19,6 +19,7 @@ sont la partie la plus facile à casser par inadvertance :
 """
 
 import json
+import re
 
 import pytest
 
@@ -687,9 +688,16 @@ def test_handler_uses_the_emitter_for_every_streaming_return():
 
     src = Path(__file__).resolve().parent.parent.joinpath("opencode.py").read_text(encoding="utf-8", errors="replace")
     sse_sites = src.count("responses_stream_sse(")
-    emitter_calls = src.count("responses_stream_events(")
-    assert sse_sites > 0, "aucun site SSE : le streaming Responses a disparu"
-    assert sse_sites == emitter_calls, (
-        f"{sse_sites} émission(s) SSE pour {emitter_calls} appel(s) à "
-        f"responses_stream_events : un site construit son flux sans l'émetteur"
+    assert sse_sites, "aucun site SSE : le streaming Responses a disparu"
+    # Chaque corps SSE doit être construit par ``responses_stream_events``.
+    # Le motif autorise un appel multiligne (l'adaptation des noms d'outils a
+    # ajouté des arguments, donc des retours à la ligne entre les deux appels).
+    # La voie de récupération (`/v1/responses`, flux réduit au cycle de vie)
+    # réutilise l'émetteur déjà créé et pousse les événements directement :
+    # elle n'est donc pas un site ``responses_stream_sse`` et n'entre pas dans
+    # ce contrôle.
+    paired = len(re.findall(r"responses_stream_sse\(\s*responses_stream_events\(", src))
+    assert paired == sse_sites, (
+        f"{sse_sites - paired} site(s) construisent leur flux SSE sans "
+        f"responses_stream_events (sites={sse_sites}, appariés={paired})"
     )

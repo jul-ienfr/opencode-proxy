@@ -35,6 +35,8 @@ from config.limits import clamp_output_token_limit as _clamp_output_token_limit
 from dashboard.display import debug as _debug
 from dashboard.display import log as _log
 
+from .tool_aliases import adapt_tool_call
+
 _cfg_settings: Any
 try:
     import config.settings as _cfg_settings  # type: ignore[assignment]
@@ -2247,7 +2249,12 @@ def strip_synthetic_thinking(body: dict) -> int:
     return stripped
 
 
-def openai_to_anthropic(resp: dict, model: str, name_map: dict | None = None) -> dict:
+def openai_to_anthropic(
+    resp: dict,
+    model: str,
+    name_map: dict | None = None,
+    tool_aliases: dict | None = None,
+) -> dict:
     """Convertit une réponse Chat en réponse Anthropic.
 
     ``name_map`` ([Lot L4 — A8]) est la map ``{short: original}`` produite à
@@ -2255,6 +2262,11 @@ def openai_to_anthropic(resp: dict, model: str, name_map: dict | None = None) ->
     un nom d'outil > 64 caractères recevrait le nom *raccourci* dans le bloc
     ``tool_use``, c'est-à-dire un outil qu'il ne reconnaît pas. Restaure le nom
     d'origine tel quel quand aucune map n'est fournie (jamais de renommage).
+
+    ``tool_aliases`` ([2026-11-12]) remappe le nom **officiel** émis par
+    l'amont (``bash``, injecté par la jambe free pour franchir le gate) vers
+    l'outil réellement déclaré par le client Anthropic (``Bash``, ``shell``…).
+    Sans cela, Claude Code répond « No such tool available: bash ».
     """
     choice = resp.get("choices", [{}])[0]
     msg = choice.get("message", {})
@@ -2279,8 +2291,19 @@ def openai_to_anthropic(resp: dict, model: str, name_map: dict | None = None) ->
         blocks.append({"type": "text", "text": msg["content"]})
     for tc in msg.get("tool_calls") or []:
         fn = tc.get("function", {})
+        _name = restore_tool_name(fn.get("name", ""), name_map)
+        _args = fn.get("arguments", "{}")
+        if tool_aliases:
+            # [2026-11-12] Nom officiel amont (``bash``) → nom déclaré par le
+            # client (``Bash``/…), clés d'arguments adaptées au schéma cible.
+            # Le repli shell couvre les familles absentes du runtime client
+            # (``webfetch`` sans ``WebFetch`` chez Claude Code) : sans lui,
+            # l'appel partait sous un nom que le client ne connaît pas.
+            _name, _args = adapt_tool_call(_name, _args, tool_aliases)
         try:
-            inp = _json_loads(fn.get("arguments", "{}"))
+            inp = _json_loads(
+                _args if isinstance(_args, str) else _json_dumps_str(_args)
+            )
         except Exception:
             inp = {}
         blocks.append(
@@ -2290,7 +2313,7 @@ def openai_to_anthropic(resp: dict, model: str, name_map: dict | None = None) ->
                 # [Lot L4 — A8] Restore : le client doit retrouver le nom qu'il a
                 # envoyé (la limite 64 est une contrainte de l'amont Chat, pas
                 # du client Anthropic, qui autorise 200).
-                "name": restore_tool_name(fn.get("name", ""), name_map),
+                "name": _name,
                 "input": inp,
             }
         )
@@ -5290,17 +5313,25 @@ _responses_tool_cache: dict = {}
 _responses_tool_index_map: dict = {}  # output_index -> sequential tool index (0,1,2...)
 # Track reasoning item_ids for which a delta was already emitted (dedupe delta vs done)
 _reasoning_seen_ids: set = set()
+# Texte déjà émis (par output_index/content_index) et arguments d'outil déjà
+# émis (par output_index). Certains amonts n'envoient QUE le cycle de vie
+# (created/output_item.done/completed) sans aucun delta : on reconstruit alors
+# le contenu depuis ces événements sans dupliquer ce qui a déjà coulé.
+_responses_text_seen: dict = {}
+_responses_args_seen: dict = {}
 
 
 class ResponsesSseState:
     """État de conversion SSE Responses-API pour UN stream."""
 
-    __slots__ = ("tool_cache", "tool_index_map", "reasoning_seen", "tool_name_map")
+    __slots__ = ("tool_cache", "tool_index_map", "reasoning_seen", "tool_name_map", "text_seen", "args_seen")
 
     def __init__(self) -> None:
         self.tool_cache: dict = {}
         self.tool_index_map: dict = {}
         self.reasoning_seen: set = set()
+        self.text_seen: dict = {}
+        self.args_seen: dict = {}
         # Restore-retour stream : {short: original}, posée par requête par le
         # caller (même map que l'aller) ; None = pas de rename sur ce stream.
         self.tool_name_map: dict | None = None
@@ -5309,7 +5340,158 @@ class ResponsesSseState:
         self.tool_cache.clear()
         self.tool_index_map.clear()
         self.reasoning_seen.clear()
+        self.text_seen.clear()
+        self.args_seen.clear()
         self.tool_name_map = None
+
+
+def _responses_item_text(item: dict) -> str:
+    """Texte visible porté par un item ``message`` complet."""
+    content = item.get("content")
+    text = ""
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                text += part.get("text") or ""
+    elif isinstance(content, str):
+        text = content
+    if not text:
+        raw = item.get("text")
+        if isinstance(raw, str):
+            text = raw
+    return text
+
+
+def _responses_seen_text(text_seen: dict, output_index: int) -> str:
+    """Concatène le texte déjà émis pour un output_index (toutes parts)."""
+    prefix = f"idx_{output_index}:"
+    parts: list[tuple[int, str]] = []
+    for key, value in text_seen.items():
+        if not key.startswith(prefix):
+            continue
+        suffix = key[len(prefix) :]
+        if suffix.isdigit() and isinstance(value, str):
+            parts.append((int(suffix), value))
+    return "".join(value for _, value in sorted(parts))
+
+
+def _responses_set_seen_text(text_seen: dict, output_index: int, text: str) -> None:
+    """Remplace tout le texte déjà émis d'un output_index par ``text``."""
+    prefix = f"idx_{output_index}:"
+    for key in [k for k in text_seen if k.startswith(prefix)]:
+        text_seen.pop(key, None)
+    text_seen[f"{prefix}0"] = text
+
+
+def _responses_item_delta(
+    item: dict,
+    output_index: int,
+    tool_cache: dict,
+    tool_index_map: dict,
+    text_seen: dict,
+    args_seen: dict,
+    tool_name_map: dict | None,
+):
+    """Delta Chat reconstruit depuis un item complet (flux « cycle de vie »).
+
+    Ne remonte que la partie non déjà streamée : un amont qui émet à la fois
+    les deltas et ``output_item.done`` ne doit jamais dupliquer le contenu.
+    """
+    if not isinstance(item, dict):
+        return None
+    itype = item.get("type")
+
+    if itype == "message":
+        full = _responses_item_text(item)
+        if not full:
+            return None
+        seen = _responses_seen_text(text_seen, output_index)
+        if full.startswith(seen):
+            emit = full[len(seen) :]
+        elif not seen:
+            emit = full
+        else:
+            emit = ""
+        _responses_set_seen_text(text_seen, output_index, full)
+        if not emit:
+            return None
+        return {"choices": [{"delta": {"content": emit}, "finish_reason": None}]}
+
+    if itype in ("function_call", "custom_tool_call", "local_shell_call"):
+        raw_args = item.get("arguments")
+        if isinstance(raw_args, dict):
+            args = _json_dumps_str(raw_args, ensure_ascii=False)
+        elif isinstance(raw_args, str):
+            args = raw_args
+        else:
+            args = ""
+        name = restore_tool_name(item.get("name", ""), tool_name_map)
+        iid = item.get("id") or item.get("call_id") or ""
+        info = tool_cache.get(iid) or tool_cache.get(f"idx_{output_index}")
+        if info is None:
+            if output_index not in tool_index_map:
+                tool_index_map[output_index] = len(tool_index_map)
+            tool_idx = tool_index_map[output_index]
+        else:
+            tool_idx = info["index"]
+        key = f"idx_{output_index}"
+        seen = args_seen.get(key, "")
+        if args.startswith(seen):
+            emit_args = args[len(seen) :]
+        elif not seen:
+            emit_args = args
+        else:
+            emit_args = ""
+        args_seen[key] = args
+        if info is None:
+            call_id = _tool_id_or_stable(
+                item.get("call_id") or item.get("id"),
+                "call_",
+                item.get("name", ""),
+                output_index + 1,
+            )
+            tool_cache[iid] = {
+                "index": tool_idx,
+                "call_id": call_id,
+                "name": name,
+                "output_index": output_index,
+            }
+            tool_cache[f"idx_{output_index}"] = {
+                "index": tool_idx,
+                "call_id": call_id,
+                "name": name,
+            }
+            if not name:
+                return None
+            return {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": tool_idx,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": emit_args},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            }
+        if not emit_args:
+            return None
+        return {
+            "choices": [
+                {
+                    "delta": {"tool_calls": [{"index": tool_idx, "function": {"arguments": emit_args}}]},
+                    "finish_reason": None,
+                }
+            ]
+        }
+
+    return None
 
 
 def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesSseState | None" = None):
@@ -5344,10 +5526,14 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
         tool_cache = state.tool_cache
         tool_index_map = state.tool_index_map
         reasoning_seen = state.reasoning_seen
+        text_seen = state.text_seen
+        args_seen = state.args_seen
     else:
         tool_cache = _responses_tool_cache
         tool_index_map = _responses_tool_index_map
         reasoning_seen = _reasoning_seen_ids
+        text_seen = _responses_text_seen
+        args_seen = _responses_args_seen
 
     def _clear_state() -> None:
         if state is not None:
@@ -5356,6 +5542,10 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
             _responses_tool_cache.clear()
             _responses_tool_index_map.clear()
             _reasoning_seen_ids.clear()
+            _responses_text_seen.clear()
+            _responses_args_seen.clear()
+
+    _tool_name_map = state.tool_name_map if state is not None else None
 
     etype = chunk.get("type", "")
     if _cfg_settings.DEBUG:
@@ -5367,7 +5557,33 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
         text = chunk.get("delta", "")
         if not text:
             return None
+        _out_idx = chunk.get("output_index", 0)
+        _cidx = chunk.get("content_index", 0)
+        _key = f"idx_{_out_idx}:{_cidx}"
+        text_seen[_key] = text_seen.get(_key, "") + text
         return {"choices": [{"delta": {"content": text}, "finish_reason": None}]}
+
+    # response.output_text.done — texte complet d'une part. Sur un flux qui
+    # n'émet QUE le cycle de vie, c'est la seule source du contenu : on remonte
+    # le suffixe non déjà streamé (aucun doublon si les deltas existaient).
+    if etype == "response.output_text.done":
+        text = chunk.get("text", "")
+        if not isinstance(text, str) or not text:
+            return None
+        _out_idx = chunk.get("output_index", 0)
+        _cidx = chunk.get("content_index", 0)
+        _key = f"idx_{_out_idx}:{_cidx}"
+        seen = text_seen.get(_key, "")
+        if text.startswith(seen):
+            emit = text[len(seen) :]
+        elif not seen:
+            emit = text
+        else:
+            emit = ""
+        text_seen[_key] = text
+        if not emit:
+            return None
+        return {"choices": [{"delta": {"content": emit}, "finish_reason": None}]}
 
     # response.content_part.delta — text or reasoning summary delta
     if etype == "response.content_part.delta":
@@ -5382,6 +5598,10 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
         if not text:
             return None
         if dtype == "output_text":
+            _out_idx = chunk.get("output_index", 0)
+            _cidx = chunk.get("content_index", 0)
+            _key = f"idx_{_out_idx}:{_cidx}"
+            text_seen[_key] = text_seen.get(_key, "") + text
             return {"choices": [{"delta": {"content": text}, "finish_reason": None}]}
         elif dtype == "reasoning_summary_text":
             return {"choices": [{"delta": {"reasoning_content": text}, "finish_reason": None}]}
@@ -5492,6 +5712,8 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
             return None
         out_idx = chunk.get("output_index", 0)
         iid = chunk.get("item_id", "")
+        _key = f"idx_{out_idx}"
+        args_seen[_key] = args_seen.get(_key, "") + delta
         # Lookup tool index
         info = tool_cache.get(iid) or tool_cache.get(f"idx_{out_idx}")
         if info is None:
@@ -5513,16 +5735,39 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
             ]
         }
 
-    # response.function_call_arguments.done — final tool arguments (optional, ensure completeness)
+    # response.function_call_arguments.done — arguments complets. On ne
+    # remonte que le suffixe non streamé ; sans deltas, c'est la source du
+    # contenu de l'outil (mais seulement si l'item a déjà été ouvert, pour
+    # connaître son id/call_id).
     if etype == "response.function_call_arguments.done":
-        # This contains the full arguments but deltas already streamed; we can skip or emit final check
-        # Don't emit extra delta if already streamed via .delta events; just ensure cache is updated
         iid = chunk.get("item_id", "")
-        chunk.get("arguments", "")
+        out_idx = chunk.get("output_index", 0)
+        args = chunk.get("arguments", "")
         name = chunk.get("name", "")
+        info = tool_cache.get(iid) or tool_cache.get(f"idx_{out_idx}")
         if iid and iid in tool_cache and name:
             tool_cache[iid]["name"] = name
-        return None
+        if info is None or not isinstance(args, str) or not args:
+            return None
+        _key = f"idx_{out_idx}"
+        seen = args_seen.get(_key, "")
+        if args.startswith(seen):
+            emit = args[len(seen) :]
+        elif not seen:
+            emit = args
+        else:
+            emit = ""
+        args_seen[_key] = args
+        if not emit:
+            return None
+        return {
+            "choices": [
+                {
+                    "delta": {"tool_calls": [{"index": info["index"], "function": {"arguments": emit}}]},
+                    "finish_reason": None,
+                }
+            ]
+        }
 
     # response.output_item.done — reasoning item final with summary array (fallback + 100% guarantee)
     if etype == "response.output_item.done":
@@ -5586,7 +5831,15 @@ def _responses_sse_to_chat_deltas(raw_line: str, parsed=None, state: "ResponsesS
                     f"  [responses-sse] output_item.done reasoning fallback len={len(_emit)} iid={iid!r} unseen={len(_unseen)} seen_any={_seen_any}"
                 )
                 return {"choices": [{"delta": {"reasoning_content": _emit}, "finish_reason": None}]}
-        return None
+        return _responses_item_delta(
+            item,
+            chunk.get("output_index", 0),
+            tool_cache,
+            tool_index_map,
+            text_seen,
+            args_seen,
+            _tool_name_map,
+        )
 
     # response.completed — final event with usage
     if etype == "response.completed":
@@ -5940,6 +6193,10 @@ def responses_stream_events(
     response: dict,
     model: str,
     emitter: ResponsesStreamEmitter | None = None,
+    *,
+    skip_lifecycle: bool = False,
+    tool_aliases: dict | None = None,
+    shell_kind: str = "powershell",
 ) -> list[dict]:
     """[Lot L5 — A11/A21] Séquence d'événements Responses conforme pour `response`.
 
@@ -5963,9 +6220,13 @@ def responses_stream_events(
 
     ``usage`` est reporté tel quel sur ``response.completed`` — c'est là que le
     client lit la consommation finale.
+
+    ``skip_lifecycle=True`` n'émet ni ``response.created`` ni
+    ``response.in_progress`` : l'appelant les a déjà envoyés et réutilise le
+    même émetteur pour ne pas trouer ``sequence_number``.
     """
     emitter = emitter or ResponsesStreamEmitter(model, response.get("id"))
-    events: list[dict] = [emitter.created(), emitter.in_progress()]
+    events: list[dict] = [] if skip_lifecycle else [emitter.created(), emitter.in_progress()]
 
     for output_index, item in enumerate(response.get("output") or []):
         if not isinstance(item, dict):
@@ -5988,6 +6249,19 @@ def responses_stream_events(
             events.append(emitter.output_item_done(item, output_index))
 
         elif itype == "function_call":
+            if tool_aliases:
+                # [2026-11-12] Nom officiel amont (``bash``) → nom réellement
+                # déclaré par le client (``Bash``/``shell``/``exec_command``).
+                _adapted_name, _adapted_args = adapt_tool_call(
+                    item.get("name", ""),
+                    item.get("arguments") or "",
+                    tool_aliases,
+                    shell_kind=shell_kind,
+                )
+                _adapted_args = str(_adapted_args or "{}")
+                if _adapted_name != item.get("name") or _adapted_args != (item.get("arguments") or ""):
+                    item = {**item, "name": _adapted_name, "arguments": _adapted_args}
+                    response["output"][output_index] = item
             events.append(emitter.output_item_added(item, output_index))
             item_id = item.get("id") or item.get("call_id") or f"fc_{uuid.uuid4().hex[:16]}"
             args = item.get("arguments") or ""

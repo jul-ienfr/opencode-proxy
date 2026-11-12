@@ -53,6 +53,12 @@ def set_client_tool_schemas(tools) -> None:
             continue
         names.append(name)
         params = fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {}
+        if not params and isinstance(fn.get("input_schema"), dict):
+            # Client Anthropic (`/v1/messages`) : le schéma vit dans
+            # ``input_schema``, pas ``parameters``. Sans cette lecture, le
+            # middleware ne connaissait aucune clé de chemin et laissait
+            # ``path`` au lieu de ``file_path`` pour Claude Code.
+            params = fn["input_schema"]
         props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
         for candidate in _CANDIDATE_PATH_KEYS:
             if candidate in props:
@@ -95,6 +101,13 @@ def heal_tool_name(name: str) -> str:
         return raw
     if raw in available:
         return raw
+    # [2026-11-12] Casse du client : Claude Code déclare ``Bash``/``Read``/
+    # ``Glob`` ; l'amont officiel émet ``bash``/``read``/``glob``. On rend le
+    # nom exact du client au lieu de laisser le placeholder minuscule.
+    by_lower = {name.lower(): name for name in available}
+    target = by_lower.get(raw.lower())
+    if target:
+        return target
     target = TOOL_NAME_ALIASES.get(raw)
     if target and target in available:
         return target

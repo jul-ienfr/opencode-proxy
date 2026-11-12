@@ -15,6 +15,7 @@ from opencode import _ChatToolCallHealer, _heal_tool_call_paths
 from streaming.tool_path_healing import ToolPathHealingMiddleware
 from streaming.tool_paths import (
     CLIENT_TOOL_NAMES,
+    expected_path_key,
     heal_anthropic_payload,
     heal_openai_payload,
     heal_sse_data_line,
@@ -338,6 +339,38 @@ def test_heal_tool_name_maps_official_placeholder() -> None:
         assert heal_tool_name("unknown") == "unknown"
     finally:
         CLIENT_TOOL_NAMES.reset(token)
+
+
+def test_heal_tool_name_restores_client_capitalisation() -> None:
+    """Claude Code déclare ``Read`` ; l'amont officiel émet ``read``."""
+    token = CLIENT_TOOL_NAMES.set(frozenset({"Bash", "Read", "Glob", "Write"}))
+    try:
+        assert heal_tool_name("read") == "Read"
+        assert heal_tool_name("glob") == "Glob"
+        assert heal_tool_name("write") == "Write"
+        assert heal_tool_name("bash") == "Bash"
+    finally:
+        CLIENT_TOOL_NAMES.reset(token)
+
+
+def test_client_tool_schemas_read_anthropic_input_schema() -> None:
+    """Un client Anthropic porte ``input_schema``, pas ``parameters``."""
+    set_client_tool_schemas(
+        [
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            }
+        ]
+    )
+    try:
+        assert expected_path_key("Read") == "file_path"
+    finally:
+        set_client_tool_schemas([])
 
 
 def test_heal_openai_payload_renames_bash_to_shell() -> None:

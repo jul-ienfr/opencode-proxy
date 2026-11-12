@@ -232,6 +232,55 @@ def test_hermes_gets_official_grid_plus_core_client_tools():
     assert len(body["tools"]) == 11, "le corps client ne doit pas etre filtre"
 
 
+def test_claude_code_tools_keep_their_case_and_read_write_survive():
+    """Régression : Claude Code déclare ``Bash``/``Read``/``Write`` en capitales.
+
+    La sélection par priorité ne connaissait que les noms minuscules Hermes :
+    ``Read`` et ``Write`` étaient écartés au profit de ``Agent``/``Artifact``.
+    Le modèle ne voyait alors que les placeholders minuscules ``read``/``write``
+    et répondait que « le runtime attend les noms capitalisés ». La note doit
+    aussi citer les noms EXACTS (pas leur version minuscule de gate).
+    """
+    body = _body()
+    body["tools"] = [
+        _chat_tool(name)
+        for name in (
+            "Agent",
+            "Artifact",
+            "AskUserQuestion",
+            "Bash",
+            "DeferredToolPlaceholder",
+            "Edit",
+            "Glob",
+            "Grep",
+            "ListAgents",
+            "PowerShell",
+            "Read",
+            "ReportFindings",
+            "ScheduleWakeup",
+            "Skill",
+            "ToolSearch",
+            "Workflow",
+            "Write",
+        )
+    ]
+    wire, _ = oc._free_wire_body(body, force_stream=True)
+    names = [t["function"]["name"] for t in wire["tools"]]
+    for core in ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "PowerShell"):
+        assert core in names, f"{core} absent du wire free : le client ne peut pas l'appeler"
+    assert names[: len(OFFICIAL_TOOL_NAMES)] == OFFICIAL_TOOL_NAMES
+
+    systems = [m for m in wire["messages"] if m.get("role") == "system"]
+    note = systems[-1]["content"]
+    allowed = note.split("Call ONLY these client tools:", 1)[1]
+    allowed = allowed.split("Never invent", 1)[0]
+    tokens = {token.strip() for token in allowed.split(",")}
+    assert {"Bash", "Read", "Edit", "Write"} <= tokens
+    assert "bash" not in tokens, "la note cite la forme minuscule au lieu du nom client"
+    assert "read" not in tokens
+    assert "write" not in tokens
+
+
 def test_hermes_long_system_is_truncated_on_free_wire():
     """Le prompt Hermes de 31 Ko est coupe a 4 Ko ; l'officiel reste complet."""
     client_system = "# SOUL.md\n" + ("consigne " * 3000)

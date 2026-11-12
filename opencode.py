@@ -7247,11 +7247,26 @@ def _free_summary_max_tokens() -> int:
 #: noms differents (`read_file`, `terminal`, `patch`...). On injecte donc les
 #: 10 officiels et on ne garde que les 8 outils client les plus utiles, sinon
 #: le total (10 + 18) depasse le budget du gate et prend un faux quota.
+#:
+#: [2026-11-12] Les noms CANONIQUES des clients reels passent en tete, et la
+#: correspondance est insensible a la casse. Sans cela, Claude Code (qui
+#: declare `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `PowerShell`)
+#: perdait `Read` et `Write` au profit d'outils secondaires (`Agent`,
+#: `Artifact`...) : le modele ne voyait plus que les placeholders minuscules
+#: `read`/`write` du gate et repondait « le runtime attend Read/Write ».
 _FREE_CORE_CLIENT_TOOL_PRIORITY = (
+    "bash",
+    "read",
+    "edit",
+    "write",
+    "glob",
+    "grep",
+    "powershell",
     "terminal",
     "read_file",
     "write_file",
     "patch",
+    "apply_patch",
     "search_files",
     "execute_code",
     "delegate_task",
@@ -7266,7 +7281,14 @@ _FREE_CORE_CLIENT_TOOL_PRIORITY = (
     "tool_search",
     "tool_describe",
     "tool_call",
+    "exec_command",
+    "shell",
+    "view_image",
 )
+
+_FREE_CORE_CLIENT_TOOL_PRIORITY_INDEX = {
+    name.lower(): index for index, name in enumerate(_FREE_CORE_CLIENT_TOOL_PRIORITY)
+}
 
 
 def _free_max_client_tools() -> int:
@@ -7284,9 +7306,8 @@ def _select_free_client_tools(tools, max_tools: int):
     ranked = []
     for index, tool in enumerate(tools):
         name = _free_tool_name(tool)
-        try:
-            priority = _FREE_CORE_CLIENT_TOOL_PRIORITY.index(name)
-        except ValueError:
+        priority = _FREE_CORE_CLIENT_TOOL_PRIORITY_INDEX.get(str(name).lower())
+        if priority is None:
             priority = len(_FREE_CORE_CLIENT_TOOL_PRIORITY) + index
         ranked.append((priority, index, tool))
     ranked.sort(key=lambda item: (item[0], item[1]))
@@ -7517,6 +7538,23 @@ def _free_tool_name(tool) -> str:
     if isinstance(fn, dict):
         return str(fn.get("name") or "").strip().lower()
     return str(tool.get("name") or "").strip().lower()
+
+
+def _free_tool_display_name(tool) -> str:
+    """Nom réel d'un outil, casse du client PRÉSERVÉE.
+
+    [2026-11-12] ``_free_tool_name`` minuscule pour les comparaisons de gate.
+    L'utiliser dans la note au modèle faisait dire « Call ONLY bash, read,
+    write… » alors que les outils client sont ``Bash``, ``Read``, ``Write`` :
+    Claude Code répondait que le runtime attendait les noms capitalisés et
+    refusait d'appeler les outils. La note doit citer les noms exacts.
+    """
+    if not isinstance(tool, dict):
+        return ""
+    fn = tool.get("function")
+    if isinstance(fn, dict):
+        return str(fn.get("name") or "").strip()
+    return str(tool.get("name") or "").strip()
 
 
 def _filter_free_tools(tools):
@@ -8193,7 +8231,7 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
         if not _official_defs:
             # Repli historique si le payload officiel est absent.
             wire["tools"] = list(_client_tools)
-            _gate_allowed_names = [_free_tool_name(t) for t in _client_tools]
+            _gate_allowed_names = [_free_tool_display_name(t) for t in _client_tools]
         elif _have_official >= 5:
             # Client deja aligne sur la grille officielle (harnais DeepSeek) :
             # on conserve ses outils tels quels, on ne les remplace pas.
@@ -8244,7 +8282,9 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
             ]
             _extras = _select_free_client_tools(_extras, _free_max_client_tools())
             wire["tools"] = _grid + _extras
-            _gate_allowed_names = _preserved_official + [_free_tool_name(t) for t in _extras]
+            _gate_allowed_names = _preserved_official + [
+                _free_tool_display_name(t) for t in _extras
+            ]
             _gate_forbidden_names = _placeholder_official
             _log(
                 f"  [free] grille officielle injectee ({len(_grid)} outils, "
@@ -8734,6 +8774,9 @@ class _ChatToolCallHealer:
     def __init__(self, tools, path_map: dict[str, str] | None = None):
         self._tools = tools if isinstance(tools, list) else []
         self._path_map = dict(path_map or {})
+        # [2026-11-12] Noms d'outils émis par l'amont → noms réellement
+        # déclarés par le client (``bash`` → ``Bash`` / ``shell`` / …).
+        self._aliases = build_tool_alias_map(self._tools)
         self._states: dict[int, dict] = {}
         self._template = None
         self.used_names: list[str] = []
@@ -8758,6 +8801,7 @@ class _ChatToolCallHealer:
                 "name": "",
                 "args": "",
                 "pending": False,
+                "defer": False,
                 "emitted": False,
             }
             self._states[idx] = st
@@ -8820,6 +8864,18 @@ class _ChatToolCallHealer:
                 st["pending"] = False
                 self.dropped_calls += 1
                 continue
+            # [2026-11-12] Le nom officiel (``bash``) est remappé vers celui du
+            # client (``Bash``/``shell``/…), et les clés d'arguments suivent
+            # (``command`` ↔ ``cmd``) quand le schéma cible le demande.
+            # Le repli shell n'est possible qu'avec le JSON complet : un appel
+            # ``webfetch`` est retenu (``defer``) et converti à la clôture.
+            st["name"], st["args"] = adapt_tool_call(
+                st["name"],
+                st["args"],
+                self._aliases,
+                allow_shell_fallback=bool(st.get("defer")),
+            )
+            st["args"] = str(st["args"] or "")
             out.append(self._call_chunk(template, st))
             st["pending"] = False
             self._mark_emitted(st)
@@ -8884,11 +8940,20 @@ class _ChatToolCallHealer:
                     st["args"] = _heal_tool_call_paths(
                         st["name"], st["args"], self._path_map
                     )
+                    _raw_name = st["name"]
+                    st["name"] = adapt_tool_name(_raw_name, self._aliases)
+                    if needs_shell_fallback(_raw_name, self._aliases):
+                        # Famille absente du client (``webfetch`` chez Claude
+                        # Code) : on accumule et on émettra la commande shell
+                        # complète au ``finish_reason``.
+                        st["defer"] = True
+                        st["pending"] = True
+                        continue
                 if not st["name"]:
                     # Nom inconnu : on retient le delta, jamais de tool_call vide.
                     st["pending"] = True
                     continue
-                if st["pending"]:
+                if st["pending"] and not st.get("defer"):
                     # Nom trouvé après coup : on rejoue les arguments accumulés
                     # en un premier delta valide, puis on reprend le flux.
                     # [2026-10-26] L'amont peut avoir omis l'ouverture ``{"``
@@ -8964,6 +9029,7 @@ def _collect_chat_completion(lines, model, tools=None) -> dict | None:
     reasoning: list[str] = []
     details_seen = False
     tool_calls: dict[int, dict] = {}
+    _aliases = build_tool_alias_map(tools)
     for ev in _iter_sse_data(lines):
         if not isinstance(ev, dict):
             continue
@@ -9066,6 +9132,16 @@ def _collect_chat_completion(lines, model, tools=None) -> dict | None:
             fn["arguments"] = _heal_tool_call_paths(
                 fn["name"], fn["arguments"], _free_path_map.get() or {}
             )
+            # [2026-11-12] Nom officiel amont (``bash``) → nom déclaré par le
+            # client (``Bash``/``shell``/…), clés d'arguments adaptées.
+            _adapted_name, _adapted_args = adapt_tool_call(
+                fn["name"],
+                fn["arguments"],
+                _aliases,
+                allow_shell_fallback=False,
+            )
+            fn["name"] = _adapted_name
+            fn["arguments"] = str(_adapted_args if _adapted_args is not None else "{}")
             tc["function"] = fn
             if not tc.get("id"):
                 tc["id"] = f"call_free_{int(time.time() * 1000):x}{fn['name'][:6]}"
@@ -11534,7 +11610,12 @@ async def _handle_messages_gemini(
     cached = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
     if is_stream:
         try:
-            state = ChatSseToAnthropicState(model=original_model, tool_name_map=None)
+            state = ChatSseToAnthropicState(
+                model=original_model,
+                tool_name_map=None,
+                tool_aliases=build_tool_alias_map(body.get("tools")),
+                shell_kind=detect_shell_kind(body),
+            )
             choice = (chat_resp.get("choices") or [{}])[0] or {}
             msg = choice.get("message") or {}
             chunk = {
@@ -11565,7 +11646,11 @@ async def _handle_messages_gemini(
             )
         except Exception as exc:
             return _anthropic_error(502, f"Gemini stream conversion failed: {type(exc).__name__}: {exc}")
-    anthro_resp = openai_to_anthropic(chat_resp, original_model)
+    anthro_resp = openai_to_anthropic(
+        chat_resp,
+        original_model,
+        tool_aliases=build_tool_alias_map(body.get("tools")),
+    )
     try:
         _update_token_usage(model_id, req_in, req_out, cached)
         await _save_and_log_request(
@@ -11657,7 +11742,14 @@ async def _handle_responses_gemini(
         pass
     resp_obj = openai_chat_to_responses(chat_resp, original_model)
     if is_stream:
-        sse = responses_stream_sse(responses_stream_events(resp_obj, original_model))
+        sse = responses_stream_sse(
+            responses_stream_events(
+                resp_obj,
+                original_model,
+                tool_aliases=build_tool_alias_map(body.get("tools")),
+                shell_kind=detect_shell_kind(body),
+            )
+        )
         return Response(
             content=sse,
             media_type="text/event-stream",
@@ -19248,6 +19340,16 @@ from app.protocol.mapping import (  # noqa: E402,I001  # re-export after functio
     strip_synthetic_thinking,
 )
 
+from app.protocol.tool_aliases import (  # noqa: E402,I001  # re-export after function defs for compat
+    adapt_chat_completion,
+    adapt_tool_call,
+    adapt_tool_name,
+    build_tool_alias_map,
+    detect_shell_kind,
+    needs_shell_fallback,
+    tool_call_target,
+)
+
 # [Parité protocole — défaut mesuré, lot L1/P1] Convertisseur de flux Chat →
 # Anthropic, utilisé par la jambe free de `anthropic_stream` quand l'équivalent
 # free s'adresse à un endpoint /chat/completions alors que le client parle
@@ -19403,6 +19505,92 @@ def _sse_lines_from_buffered_json(raw, model: str = "") -> list[str] | None:
     return frames
 
 
+def _responses_output_has_visible_content(obj: dict) -> bool:
+    """L'objet Responses porte-t-il au moins un contenu affichable ?
+
+    Sert à décider si un flux ``/v1/responses`` réduit au seul cycle de vie
+    peut être rejoué, ou s'il faut retenter en non-streaming. On ne compte ni
+    ``response.created`` ni ``in_progress`` : ce sont des transitions, pas du
+    contenu.
+    """
+    if not isinstance(obj, dict):
+        return False
+    for item in obj.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        itype = item.get("type")
+        if itype == "message":
+            for part in item.get("content") or []:
+                if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                    if part.get("text"):
+                        return True
+            if isinstance(item.get("text"), str) and item["text"]:
+                return True
+        elif itype in ("function_call", "custom_tool_call", "local_shell_call"):
+            if item.get("name") or item.get("arguments"):
+                return True
+        elif itype == "reasoning":
+            for part in item.get("summary") or []:
+                if isinstance(part, dict) and part.get("text"):
+                    return True
+            if isinstance(item.get("text"), str) and item["text"]:
+                return True
+        elif isinstance(item.get("text"), str) and item["text"]:
+            return True
+    return False
+
+
+async def _responses_nonstream_payload(
+    endpoint: str,
+    body: dict,
+    headers: dict,
+    original_model: str,
+    tool_name_map: dict | None = None,
+) -> dict | None:
+    """Rejoue la même requête en non-streaming et renvoie l'objet Responses.
+
+    Dernier filet quand un amont ne rend, en SSE ``/v1/responses``, que des
+    événements de cycle de vie sans contenu (alors qu'il répond correctement
+    en non-streaming). ``None`` si le rejeu échoue ou reste vide : l'appelant
+    émet alors un ``response.failed`` explicite.
+    """
+    if not isinstance(body, dict):
+        return None
+    ns_body = {k: v for k, v in body.items() if k not in ("stream", "stream_options")}
+    ns_body["stream"] = False
+    try:
+        resp, _ = await _do_request_with_retry(endpoint, ns_body, headers, "openai")
+    except Exception:
+        return None
+    try:
+        if getattr(resp, "status_code", 0) != 200:
+            return None
+        data = None
+        _json_fn = getattr(resp, "json", None)
+        if callable(_json_fn):
+            try:
+                data = _json_fn()
+            except Exception:
+                data = None
+        if not isinstance(data, dict):
+            raw = getattr(resp, "text", "")
+            if isinstance(raw, str) and raw:
+                data = _json_loads(raw)
+        if not isinstance(data, dict):
+            return None
+        if isinstance(data.get("output"), list):
+            obj = data
+        elif isinstance(data.get("choices"), list):
+            obj = openai_chat_to_responses(data, original_model, tool_name_map)
+        else:
+            return None
+        if not _responses_output_has_visible_content(obj):
+            return None
+        return obj
+    except Exception:
+        return None
+
+
 async def _finalize_and_close_stream(
     started,
     open_blocks,
@@ -19433,6 +19621,9 @@ async def _finalize_and_close_stream(
     request_body,
     log_tag="",
     reasoning_signature="",
+    deferred_args=None,
+    tool_aliases=None,
+    shell_kind="powershell",
 ):
     """Yield closing SSE events for a stream and persist the request.
 
@@ -19478,6 +19669,31 @@ async def _finalize_and_close_stream(
             f"  [stream-oai] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content"
         )
     for idx in open_blocks:
+        # [2026-11-12] Appel dont la famille n'existe pas chez le client
+        # (``webfetch`` chez Claude Code) : les arguments ont été retenus, on
+        # émet ici la commande shell complète avant de fermer le bloc.
+        if deferred_args and idx in deferred_args:
+            _raw_name, _raw_args = deferred_args[idx]
+            _adapted_name, _adapted_args = adapt_tool_call(
+                _raw_name, _raw_args, tool_aliases, shell_kind=shell_kind
+            )
+            _adapted_text = (
+                _adapted_args
+                if isinstance(_adapted_args, str)
+                else _json_dumps_str(_adapted_args)
+            )
+            if _adapted_text:
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": _adapted_text,
+                        },
+                    },
+                )
         if idx == reasoning_block_idx and reasoning_signature:
             # [PLAN-raisonnement Phase C.1] signature locale AVANT le stop du
             # bloc thinking : ordre contractuel thinking_delta* → signature_delta
@@ -19680,6 +19896,12 @@ async def messages(request: Request):
     _mark_requested_model(original_model)
     tool_names = _extract_tool_names(body)
     request_body = body  # Capture original request before mutation
+    # [2026-11-12] Outils du CLIENT indexés AVANT toute conversion free : les
+    # branches non-stream plus bas réutilisent ``body`` après qu'il soit devenu
+    # le corps Chat/Responses (noms officiels). Indexer ce corps-là rendait le
+    # remap inopérant (``webfetch`` renvoyé brut à Claude Code).
+    _client_tool_aliases = build_tool_alias_map(body.get("tools"))
+    _client_shell_kind = detect_shell_kind(body)
     _install_client_tool_schemas(body)
     _debug(f"[messages] req_id={req_id} model={original_model!r} tools={tool_names} ip={client_ip}")
 
@@ -20423,6 +20645,13 @@ async def messages(request: Request):
             # boucle de relais) : False = relais verbatim historique.
             _free_chat_stream = False
             _free_tool_map: dict = {}
+            # [2026-11-12] Index des outils CLIENT, capturé avant toute
+            # conversion free : plus bas ``body`` devient le corps Chat/Responses
+            # (noms officiels ``bash``/``read``/``webfetch``). Construire la map
+            # depuis ce corps rendait le remap inopérant, d'où les ``webfetch``
+            # bruts renvoyés à Claude Code, qui ne déclare pas cet outil.
+            _client_tool_aliases = build_tool_alias_map(body.get("tools"))
+            _client_shell_kind = detect_shell_kind(body)
             if free_model:
                 _debug(f"  [stream] attempting free model {free_model!r} first")
                 paid_endpoint = endpoint
@@ -20928,6 +21157,8 @@ async def messages(request: Request):
                                         model=original_model,
                                         tool_name_map=_free_tool_map,
                                         input_tokens_estimate=await _ensure_est_input() or 0,
+                                        tool_aliases=_client_tool_aliases,
+                                        shell_kind=_client_shell_kind,
                                     )
                                 _conv_buf += chunk.decode("utf-8", errors="replace")
                                 _conv_out: list[str] = []
@@ -21589,6 +21820,7 @@ async def messages(request: Request):
                                     _oai_body_for_free.get(_TOOL_NAME_MAP_KEY)
                                     if isinstance(_oai_body_for_free, dict)
                                     else None,
+                                    tool_aliases=_client_tool_aliases,
                                 ),
                                 ensure_ascii=False,
                             ),
@@ -22007,6 +22239,15 @@ async def messages(request: Request):
             return _anthropic_error(502, "Upstream returned non-JSON response")
         # Detect Responses API format (has "output" key) vs Chat Completions (has "choices" key)
         is_responses_format = "output" in data and "choices" not in data
+        # [2026-11-12] Remap des noms officiels de la grille free (``bash``,
+        # ``read``…) vers les outils réellement déclarés par le client, y
+        # compris le repli shell pour Codex. Fait AVANT le log ``used_tools``
+        # et la sérialisation, pour que les deux voient les noms client.
+        adapt_chat_completion(
+            data,
+            _client_tool_aliases,
+            shell_kind=_client_shell_kind,
+        )
         usage = data.get("usage", {})
         if is_responses_format:
             req_in = usage.get("input_tokens", 0)
@@ -22050,7 +22291,12 @@ async def messages(request: Request):
             # [Lot L4 — A8] Restore des noms d'outils raccourcis à l'aller sur la
             # limite Chat (64) : le client Anthropic doit retrouver le nom qu'il
             # a envoyé (il a droit à 200), pas le nom raccourci.
-            anthro_resp = openai_to_anthropic(data, original_model, oai_body.pop(_TOOL_NAME_MAP_KEY, None))
+            anthro_resp = openai_to_anthropic(
+                data,
+                original_model,
+                oai_body.pop(_TOOL_NAME_MAP_KEY, None),
+                tool_aliases=_client_tool_aliases,
+            )
         await _save_and_log_request(
             req_id,
             model_id,
@@ -22120,6 +22366,11 @@ async def messages(request: Request):
         # map doit donc être restaurée de la même façon (sinon le client recevrait
         # des noms raccourcis qu'il ne reconnaît pas).
         _out_tool_map = oai_body.pop(_TOOL_NAME_MAP_KEY, None) if isinstance(oai_body, dict) else None
+        # [2026-11-12] Ce chemin (client Anthropic, amont OpenAI/Responses)
+        # émettait le nom officiel brut (``read``) : Claude Code répondait
+        # « No such tool available: read. Call Read instead ». On remappe vers
+        # les outils réellement déclarés par le client.
+        _stream_aliases = _client_tool_aliases
         # [B1 perf / v10 PLAN-commun 1.3] estimation tiktoken DIFFÉRÉE : elle
         # tourne en tâche concurrente avec la connexion upstream — le premier
         # yield n'attend plus le comptage (−20 à −150 ms de TTFB sur gros
@@ -22177,6 +22428,10 @@ async def messages(request: Request):
             tool_block_idx = {}  # Reset tracking dict on each retry
             skipped_tool_idx = set()  # [2026-10-26] tool_calls amont sans nom
             args_started = set()  # [2026-10-26] premier fragment d'arguments
+            # [2026-11-12] Famille absente du client : args retenus jusqu'à la
+            # clôture pour être convertis en commande shell.
+            _deferred_names: dict[int, str] = {}
+            _deferred_args: dict[int, str] = {}
             got_response_completed = False  # Responses API: set on response.completed
             _responses_stream_done = False  # True after response.completed/incomplete → break inner loop
             try:
@@ -22496,6 +22751,11 @@ async def messages(request: Request):
                             _ti, _ts = _thinking_flush()
                             # [B1] résout l'estimation différée avant réconciliation
                             stream_in_est = await _ensure_stream_in_est()
+                            _deferred_out = {
+                                tool_block_idx[_api]: (_raw, _deferred_args.get(_api, ""))
+                                for _api, _raw in _deferred_names.items()
+                                if _api in tool_block_idx
+                            }
                             async for ev in _finalize_and_close_stream(
                                 started,
                                 open_blocks,
@@ -22525,6 +22785,9 @@ async def messages(request: Request):
                                 used_tools,
                                 request_body,
                                 reasoning_signature=_ts,
+                                deferred_args=_deferred_out,
+                                tool_aliases=_stream_aliases,
+                                shell_kind=_client_shell_kind,
                             ):
                                 yield ev
                             emitted_finish = True
@@ -22703,7 +22966,16 @@ async def messages(request: Request):
                                 # l'amont Chat (≤64) redevient celui que le client
                                 # a envoyé. ``used_tools`` enregistre donc le nom
                                 # d'origine, comme en non-stream.
-                                tc_name = restore_tool_name(tc.get("function", {}).get("name", ""), _out_tool_map)
+                                _raw_name = restore_tool_name(
+                                    tc.get("function", {}).get("name", ""), _out_tool_map
+                                )
+                                # [2026-11-12] Famille absente du runtime client
+                                # (``webfetch`` chez Claude Code) : le bloc part
+                                # sous l'outil shell, args convertis à la clôture.
+                                _fallback = needs_shell_fallback(
+                                    _raw_name, _stream_aliases
+                                )
+                                tc_name = tool_call_target(_raw_name, _stream_aliases)
                                 if not tc_name:
                                     # [2026-10-26] Un tool_use au nom vide casse
                                     # l'appariement du tool_result côté client
@@ -22734,6 +23006,9 @@ async def messages(request: Request):
                                     },
                                 )
                                 open_blocks.append(block_idx)
+                                if _fallback:
+                                    _deferred_names[api_idx] = _raw_name
+                                    _deferred_args[api_idx] = ""
                             if args := tc.get("function", {}).get("arguments", ""):
                                 if api_idx not in args_started:
                                     args_started.add(api_idx)
@@ -22742,14 +23017,19 @@ async def messages(request: Request):
                                     if not args.lstrip().startswith(("{", "[")):
                                         args = _repair_tool_arguments_prefix(args)
                                 stream_out_tokens += _estimate_tokens(args)
-                                yield _sse(
-                                    "content_block_delta",
-                                    {
-                                        "type": "content_block_delta",
-                                        "index": tool_block_idx[api_idx],
-                                        "delta": {"type": "input_json_delta", "partial_json": args},
-                                    },
-                                )
+                                if api_idx in _deferred_names:
+                                    _deferred_args[api_idx] = (
+                                        _deferred_args.get(api_idx, "") + args
+                                    )
+                                else:
+                                    yield _sse(
+                                        "content_block_delta",
+                                        {
+                                            "type": "content_block_delta",
+                                            "index": tool_block_idx[api_idx],
+                                            "delta": {"type": "input_json_delta", "partial_json": args},
+                                        },
+                                    )
 
                     # [FIX EOF nu] Fin de flux amont sans AUCUN contenu, sans usage et sans
                     # événement terminal : l'amont a fermé après ses seuls événements
@@ -23064,6 +23344,11 @@ async def messages(request: Request):
             _ti, _ts = _thinking_flush()
             # [B1] résout l'estimation différée avant réconciliation
             stream_in_est = await _ensure_stream_in_est()
+            _deferred_post = {
+                tool_block_idx[_api]: (_raw, _deferred_args.get(_api, ""))
+                for _api, _raw in _deferred_names.items()
+                if _api in tool_block_idx
+            }
             async for ev in _finalize_and_close_stream(
                 started,
                 open_blocks,
@@ -23093,6 +23378,9 @@ async def messages(request: Request):
                 used_tools,
                 request_body,
                 reasoning_signature=_ts,
+                deferred_args=_deferred_post,
+                tool_aliases=_stream_aliases,
+                shell_kind=_client_shell_kind,
             ):
                 yield ev
             emitted_finish = True
@@ -26168,12 +26456,22 @@ async def chat_completions(request: Request):
             # dans le log/`used_tools` dérivé plus bas et dans le corps rendu.
             _name_map = body.pop(_TOOL_NAME_MAP_KEY, None)
             data = restore_chat_response_tool_names(data, _name_map)
+            # [2026-11-12] La jambe free injecte la grille officielle (``bash``…)
+            # et le modèle la suit : on rend au client SES noms d'outils
+            # (``shell``/``read``/…) et les clés d'arguments de son schéma.
+            _adapt_changed = adapt_chat_completion(
+                data,
+                build_tool_alias_map(body.get("tools")),
+                shell_kind=detect_shell_kind(body),
+            )
             # Le corps rendu était `resp.content` (bytes amont VERBATIM) : sans
             # re-sérialisation, le restore n'affectait que le dict parsé et le
             # client recevait quand même le nom raccourci. On re-sérialise donc
             # le SEUL cas où un rename a eu lieu (aucun changement d'octets pour
             # le passthrough ordinaire).
-            _restored_body_bytes = _json_dumps(data) if _name_map else None
+            _restored_body_bytes = (
+                _json_dumps(data) if (_name_map or _adapt_changed) else None
+            )
             if data.get("status") in ("queued", "in_progress"):
                 _debug(f"  [unwrap] status={data.get('status')} (non-stream) → 503 retryable")
                 _log(f"  Responses status {data.get('status')} (non-stream) → 503 retryable")
@@ -28112,7 +28410,12 @@ async def chat_completions(request: Request):
                             # Sans cette etape, aucune ligne exploitable : le client
                             # recevait un text/event-stream de 0 octet.
                             if _conv_state is None:
-                                _conv_state = ChatSseToAnthropicState(model=original_model, tool_name_map={})
+                                _conv_state = ChatSseToAnthropicState(
+                                    model=original_model,
+                                    tool_name_map={},
+                                    tool_aliases=build_tool_alias_map(body.get("tools")),
+                                    shell_kind=detect_shell_kind(body),
+                                )
                             _conv_buf += raw.decode("utf-8", errors="replace")
                             while "\n" in _conv_buf:
                                 _conv_line, _conv_buf = _conv_buf.split("\n", 1)
@@ -30272,7 +30575,14 @@ async def responses(request: Request):
         )
         oai_resp = anthropic_to_openai_responses(data, original_model, anthro_body.get(_TOOL_NAME_MAP_KEY))
         # [Lot L5 — A11/A21] Séquence conforme au lieu du seul terminal.
-        sse_body = responses_stream_sse(responses_stream_events(oai_resp, original_model))
+        sse_body = responses_stream_sse(
+            responses_stream_events(
+                oai_resp,
+                original_model,
+                tool_aliases=build_tool_alias_map(body.get("tools")),
+                shell_kind=detect_shell_kind(body),
+            )
+        )
         return Response(
             content=sse_body,
             media_type="text/event-stream",
@@ -30350,6 +30660,14 @@ async def responses(request: Request):
                 if free_result is not None:
                     resp, _, _actual_model, _actual_ip = free_result
                     data = _resp_json_or_empty(resp)
+                    # [2026-11-12] La jambe free injecte la grille officielle :
+                    # on rend au client ses propres noms d'outils (et le repli
+                    # shell ``exec_command`` pour Codex).
+                    adapt_chat_completion(
+                        data,
+                        build_tool_alias_map(body.get("tools")),
+                        shell_kind=detect_shell_kind(body),
+                    )
                     usage = data.get("usage", {})
                     req_in = usage.get("prompt_tokens", 0)
                     req_out = usage.get("completion_tokens", 0)
@@ -30383,7 +30701,14 @@ async def responses(request: Request):
                     # On respecte donc le mode demandé, comme les autres chemins.
                     if oai_body.get("stream"):
                         return Response(
-                            content=responses_stream_sse(responses_stream_events(oai_resp, original_model)),
+                            content=responses_stream_sse(
+                                responses_stream_events(
+                                    oai_resp,
+                                    original_model,
+                                    tool_aliases=build_tool_alias_map(body.get("tools")),
+                                    shell_kind=detect_shell_kind(body),
+                                )
+                            ),
                             media_type="text/event-stream",
                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                         )
@@ -30701,6 +31026,15 @@ async def responses(request: Request):
                 return _openai_error(503, f"Upstream {data.get('status')}, retry")
         # Detect Responses API format (has "output" key) vs Chat Completions (has "choices" key)
         is_responses_format = "output" in data and "choices" not in data
+        # [2026-11-12] Remap des noms officiels de la grille free (``bash``,
+        # ``read``…) vers les outils réellement déclarés par le client, y
+        # compris le repli shell pour Codex. Fait AVANT le log ``used_tools``
+        # et la sérialisation, pour que les deux voient les noms client.
+        adapt_chat_completion(
+            data,
+            build_tool_alias_map(body.get("tools")),
+            shell_kind=detect_shell_kind(body),
+        )
         usage = data.get("usage", {})
         if is_responses_format:
             req_in = usage.get("input_tokens", 0)
@@ -31007,7 +31341,14 @@ async def responses(request: Request):
                 }
                 oai_resp = openai_chat_to_responses(chat_resp, original_model, _out_tool_map)
                 # [Lot L5 — A11/A21] Séquence conforme au lieu du seul terminal.
-                sse_body = responses_stream_sse(responses_stream_events(oai_resp, original_model))
+                sse_body = responses_stream_sse(
+                    responses_stream_events(
+                        oai_resp,
+                        original_model,
+                        tool_aliases=build_tool_alias_map(body.get("tools")),
+                        shell_kind=detect_shell_kind(body),
+                    )
+                )
                 return Response(
                     content=sse_body,
                     media_type="text/event-stream",
@@ -31083,6 +31424,13 @@ async def responses(request: Request):
     async def _chat_stream_to_responses():
         _em = _RSE(original_model)
         _t0 = int(time.time())
+        # [2026-11-12] Codex déclare ``exec_command`` mais le prompt officiel
+        # amont fait appeler ``bash``/``read``/``glob`` : on remappe vers ses
+        # vrais outils (repli shell pour read/glob/grep).
+        _client_aliases = build_tool_alias_map(
+            body.get("tools") if isinstance(body, dict) else None
+        )
+        _shell_kind = detect_shell_kind(body)
 
         def _ev(event: dict) -> bytes:
             return (f"data: {_json_dumps_str(event, ensure_ascii=False)}\n\n").encode()
@@ -31102,6 +31450,8 @@ async def responses(request: Request):
         _usage: dict = {}
         _state = ResponsesSseState()
         _failed_msg = ""
+        _completed_response: dict | None = None
+        _done_items: list[dict] = []
         try:
             async for _line in resp.aiter_lines():
                 if not _line.startswith("data:"):
@@ -31118,6 +31468,11 @@ async def responses(request: Request):
                 if isinstance(_chunk.get("error"), dict):
                     _failed_msg = str(_chunk["error"].get("message") or "upstream stream error")
                     break
+                _etype = _chunk.get("type")
+                if _etype == "response.completed" and isinstance(_chunk.get("response"), dict):
+                    _completed_response = _chunk["response"]
+                elif _etype == "response.output_item.done" and isinstance(_chunk.get("item"), dict):
+                    _done_items.append(_chunk["item"])
                 _u = _chunk.get("usage")
                 if isinstance(_u, dict):
                     _usage = _u
@@ -31126,6 +31481,10 @@ async def responses(request: Request):
                     _conv = _responses_sse_to_chat_deltas(_raw, parsed=_chunk, state=_state)
                     if _conv is None:
                         continue
+                    if isinstance(_conv.get("usage"), dict):
+                        _usage = _conv["usage"]
+                    if _conv.get("_finish_reason"):
+                        _finish = str(_conv["_finish_reason"])
                     _chunk = _conv
                     _choices = _chunk.get("choices") or []
                 if not _choices or not isinstance(_choices[0], dict):
@@ -31240,6 +31599,10 @@ async def responses(request: Request):
                         continue
                     _call_id = _acc.get("id") or _fast_id("call")
                     _args = str(_fn.get("arguments") or "{}")
+                    _name, _args = adapt_tool_call(
+                        _name, _args, _client_aliases, shell_kind=_shell_kind
+                    )
+                    _args = str(_args or "{}")
                     _oix = len(_out)
                     _item = {
                         "id": _call_id,
@@ -31256,7 +31619,82 @@ async def responses(request: Request):
                     yield _ev(_em.output_item_done(_full_item, _oix))
                     _out.append(_full_item)
                 if not _out and not _failed_msg:
-                    yield _ev(_em.failed(message="upstream stream produced no output"))
+                    _payload: dict | None = None
+                    if isinstance(_completed_response, dict) and _responses_output_has_visible_content(
+                        _completed_response
+                    ):
+                        # L'amont a tout porté dans ``response.completed`` sans
+                        # jamais émettre de delta : on rejoue cet objet.
+                        _payload = dict(_completed_response)
+                    elif _done_items:
+                        _candidate = {
+                            "id": _em.response_id,
+                            "object": "response",
+                            "created_at": _t0,
+                            "status": "completed",
+                            "model": original_model,
+                            "output": _done_items,
+                        }
+                        if isinstance(_usage, dict) and _usage:
+                            _candidate["usage"] = {
+                                "input_tokens": int(_usage.get("prompt_tokens") or 0),
+                                "output_tokens": int(_usage.get("completion_tokens") or 0),
+                                "total_tokens": int(_usage.get("total_tokens") or 0),
+                                "input_tokens_details": _usage.get("prompt_tokens_details") or {},
+                            }
+                        if _responses_output_has_visible_content(_candidate):
+                            _payload = _candidate
+                    if _payload is None:
+                        # Dernier filet : l'amont répond correctement en
+                        # non-streaming alors que son SSE ne porte que le
+                        # cycle de vie.
+                        _payload = await _responses_nonstream_payload(
+                            endpoint, oai_body, headers, original_model, _out_tool_map
+                        )
+                    if _payload is not None:
+                        _payload["id"] = _em.response_id
+                        _payload["object"] = "response"
+                        _payload["model"] = original_model
+                        _payload.setdefault("created_at", _t0)
+                        _payload.setdefault("status", "completed")
+                        for _event in responses_stream_events(
+                            _payload,
+                            original_model,
+                            emitter=_em,
+                            skip_lifecycle=True,
+                            tool_aliases=_client_aliases,
+                            shell_kind=_shell_kind,
+                        ):
+                            yield _ev(_event)
+                        _rusage = _payload.get("usage") if isinstance(_payload.get("usage"), dict) else {}
+                        _det = _rusage.get("input_tokens_details")
+                        _cached = int((_det or {}).get("cached_tokens") or 0) if isinstance(_det, dict) else 0
+                        _in_t = int(_rusage.get("input_tokens") or 0)
+                        _out_t = int(_rusage.get("output_tokens") or 0)
+                        try:
+                            _update_token_usage(model_id, _in_t, _out_t, _cached)
+                            await _save_and_log_request(
+                                req_id,
+                                model_id,
+                                original_model,
+                                start_time,
+                                _in_t,
+                                _out_t,
+                                _cached,
+                                protocol,
+                                True,
+                                thinking_type,
+                                effort,
+                                client_ip,
+                                account_alias,
+                                tool_names,
+                                request_body=request_body,
+                                response_body={"usage": _rusage, "streamed": True, "recovered": True},
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        yield _ev(_em.failed(message="upstream stream produced no output"))
                 else:
                     _cached = _extract_cache_tokens(_usage) if _usage else 0
                     _in_t = int(_usage.get("prompt_tokens") or 0) if _usage else 0
@@ -31442,7 +31880,14 @@ async def responses(request: Request):
     # [Lot L5 — A11/A21] Séquence conforme (`response.created` → deltas →
     # `response.completed`) au lieu d'un unique bloc terminal : le client
     # n'affichait rien avant la fin de la génération.
-    sse_body = responses_stream_sse(responses_stream_events(oai_resp, original_model))
+    sse_body = responses_stream_sse(
+        responses_stream_events(
+            oai_resp,
+            original_model,
+            tool_aliases=build_tool_alias_map(body.get("tools")),
+            shell_kind=detect_shell_kind(body),
+        )
+    )
     return Response(
         content=sse_body,
         media_type="text/event-stream",

@@ -36,6 +36,11 @@ from app.protocol.mapping import (
     anthropic_usage_from_openai,
     restore_tool_name,
 )
+from app.protocol.tool_aliases import (
+    adapt_tool_call,
+    needs_shell_fallback,
+    tool_call_target,
+)
 
 __all__ = [
     "ChatSseToAnthropicState",
@@ -336,6 +341,9 @@ class ChatSseToAnthropicState:
         "model",
         "message_id",
         "tool_name_map",
+        "tool_aliases",
+        "shell_kind",
+        "deferred_tool_args",
         "started",
         "finished",
         "next_block_idx",
@@ -361,6 +369,8 @@ class ChatSseToAnthropicState:
         message_id: str = "",
         tool_name_map: dict | None = None,
         input_tokens_estimate: int = 0,
+        tool_aliases: dict | None = None,
+        shell_kind: str = "powershell",
     ) -> None:
         # Modèle annoncé au client (le modèle demandé, pas l'équivalent amont).
         self.model: str = model
@@ -368,6 +378,14 @@ class ChatSseToAnthropicState:
         self.message_id: str = message_id or _new_id()
         # Restore-retour A8 : {short ≤64 envoyé à l'amont: nom d'origine client}.
         self.tool_name_map: dict | None = tool_name_map
+        # [2026-11-12] ``bash`` (nom officiel injecté pour le gate free) doit
+        # ressortir sous le nom réel du client : ``Bash`` (Claude Code), etc.
+        self.tool_aliases: dict | None = tool_aliases
+        self.shell_kind: str = shell_kind
+        # Appels dont la famille n'existe pas chez le client (``webfetch`` sans
+        # ``WebFetch``) : arguments retenus puis convertis en commande shell à
+        # la clôture, car la réécriture exige le JSON complet.
+        self.deferred_tool_args: dict[int, str] = {}
         self.started: bool = False
         self.finished: bool = False
         # Indices de blocs alloués séquentiellement à partir de 0.
@@ -415,6 +433,7 @@ class ChatSseToAnthropicState:
         self.tool_block_idx.clear()
         self.pending_tool_args.clear()
         self.pending_tool_ids.clear()
+        self.deferred_tool_args.clear()
         self.open_blocks.clear()
         self.input_tokens = 0
         self.usage_seen = False
@@ -510,6 +529,11 @@ class ChatSseToAnthropicState:
             self.started = True
             events.extend(self.message_start_events())
 
+        # Arguments retenus (famille absente → outil shell) : la conversion en
+        # commande n'est possible qu'une fois le JSON complet, donc ici, juste
+        # avant le ``content_block_stop`` du bloc concerné.
+        events.extend(self._flush_deferred_events())
+
         # opencode.py:8618-8632 — clôture des blocs ouverts, dans l'ordre.
         # Parité chemin natif : le bloc thinking reçoit sa `signature_delta`
         # (forgée locale — reconnue et strippée avant upstream strict par
@@ -555,6 +579,42 @@ class ChatSseToAnthropicState:
 
         # opencode.py:8641 — message_stop.
         events.append(_sse("message_stop", {"type": "message_stop"}))
+        return events
+
+    def _flush_deferred_events(self) -> list[str]:
+        """Émet les arguments retenus, convertis en commande shell.
+
+        Idempotent : le dict est vidé, donc un ``finish_reason`` suivi de
+        ``[DONE]`` n'émet pas deux fois le même ``input_json_delta``.
+        """
+        events: list[str] = []
+        for api_idx, original in list(self.deferred_tool_args.items()):
+            block_idx = self.tool_block_idx.get(api_idx)
+            if block_idx is None:
+                continue
+            raw = self.pending_tool_args.pop(api_idx, "")
+            _name, adapted = adapt_tool_call(
+                original,
+                raw,
+                self.tool_aliases,
+                shell_kind=self.shell_kind,
+            )
+            text = adapted if isinstance(adapted, str) else _json_dumps_str(adapted)
+            if text:
+                events.append(
+                    _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": text,
+                            },
+                        },
+                    )
+                )
+        self.deferred_tool_args.clear()
         return events
 
     def _upstream_error_events(self, payload: object, *, already_anthropic: bool = False) -> list[str]:
@@ -709,7 +769,12 @@ class ChatSseToAnthropicState:
                 tc_id = tc.get("id") or self.pending_tool_ids.get(api_idx) or _new_tool_id()
                 # opencode.py:10660-10666 — [Lot L4 — A8] le nom raccourci pour
                 # l'amont Chat (≤64) redevient celui que le client a envoyé.
-                tc_name = restore_tool_name(function.get("name", ""), self.tool_name_map)
+                _restored = restore_tool_name(function.get("name", ""), self.tool_name_map)
+                # [2026-11-12] Famille absente du runtime client (``webfetch``
+                # sans ``WebFetch``) : le bloc part sous l'outil shell et les
+                # arguments seront convertis en commande à la clôture.
+                _deferred = needs_shell_fallback(_restored, self.tool_aliases)
+                tc_name = tool_call_target(_restored, self.tool_aliases)
                 if not tc_name:
                     # Parité officielle : jamais de bloc fantôme `tool_pending_*`.
                     # On bufferise id + args sans émettre ; le vrai nom arrivera
@@ -739,7 +804,11 @@ class ChatSseToAnthropicState:
                 # Flush des args bufferisés avant le nom.
                 _flushed = self.pending_tool_args.pop(api_idx, "")
                 self.pending_tool_ids.pop(api_idx, None)
-                if _flushed:
+                if _deferred:
+                    self.deferred_tool_args[api_idx] = _restored
+                    if _flushed:
+                        self.pending_tool_args[api_idx] = _flushed
+                elif _flushed:
                     events.append(
                         _sse(
                             "content_block_delta",
@@ -758,20 +827,29 @@ class ChatSseToAnthropicState:
                 except Exception:
                     args = ""
             if isinstance(args, str) and args:
-                events.append(
-                    _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": self.tool_block_idx[api_idx],
-                            "delta": {"type": "input_json_delta", "partial_json": args},
-                        },
+                if api_idx in self.deferred_tool_args:
+                    self.pending_tool_args[api_idx] = (
+                        self.pending_tool_args.get(api_idx, "") + args
                     )
-                )
+                else:
+                    events.append(
+                        _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": self.tool_block_idx[api_idx],
+                                "delta": {"type": "input_json_delta", "partial_json": args},
+                            },
+                        )
+                    )
 
         finish_reason = first_choice.get("finish_reason")
         if isinstance(finish_reason, str) and finish_reason:
             self.finish_reason = finish_reason
+            # Certains amonts ferment sans ``[DONE]`` : on ne peut pas attendre
+            # ``finalize_events`` pour rendre un appel dont les args sont
+            # complets ici (sinon le client reçoit un tool_use vide).
+            events.extend(self._flush_deferred_events())
 
         return events
 

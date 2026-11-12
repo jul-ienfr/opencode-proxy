@@ -253,3 +253,145 @@ def test_stream_false_body_is_a_responses_object(non_streamed):
     data = non_streamed.json()
     assert data.get("object") == "response"
     assert data.get("output"), "aucun item de sortie"
+
+
+# ─────────── amont SSE « cycle de vie seul » (aucun delta de contenu) ───────────
+#
+# Défaut observé : l'amont répond correctement en non-streaming, mais son flux
+# `/v1/responses` n'émet que des événements de cycle de vie. Le proxy rendait
+# alors un 200 avec un contenu vide. Le contenu doit être reconstruit depuis
+# `output_item.done` / `response.completed`, et si le flux est réellement vide,
+# la même requête doit être rejouée en non-streaming.
+
+_LIFECYCLE_TEXT = "texte reconstruit depuis le cycle de vie"
+
+_LIFECYCLE_ITEM = {
+    "id": "msg_life",
+    "type": "message",
+    "role": "assistant",
+    "status": "completed",
+    "content": [{"type": "output_text", "text": _LIFECYCLE_TEXT, "annotations": []}],
+}
+
+
+class _LifecycleOnlyResp:
+    """Flux Responses réduit au cycle de vie (aucun delta de contenu)."""
+
+    status_code = 200
+    headers = {"content-type": "text/event-stream"}
+
+    def __init__(self, *, item_done: bool, completed_output: bool):
+        self.item_done = item_done
+        self.completed_output = completed_output
+
+    def json(self):
+        return {}
+
+    async def aiter_lines(self):
+        created = {
+            "id": "resp_life",
+            "object": "response",
+            "status": "in_progress",
+            "model": _MODEL,
+            "output": [],
+        }
+        yield "data: " + json.dumps({"type": "response.created", "response": created})
+        yield "data: " + json.dumps({"type": "response.in_progress", "response": created})
+        if self.item_done:
+            yield "data: " + json.dumps(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {**_LIFECYCLE_ITEM, "content": []},
+                }
+            )
+            yield "data: " + json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": _LIFECYCLE_ITEM,
+                }
+            )
+        final = {
+            "id": "resp_life",
+            "object": "response",
+            "status": "completed",
+            "model": _MODEL,
+            "usage": {"input_tokens": 4, "output_tokens": 6, "total_tokens": 10},
+            "output": [_LIFECYCLE_ITEM] if self.completed_output else [],
+        }
+        yield "data: " + json.dumps({"type": "response.completed", "response": final})
+        yield "data: [DONE]"
+
+
+def _post_stream(monkeypatch, upstream):
+    """Monte l'endpoint et renvoie (status, ctype, events, raw, appels amont)."""
+    calls: list[dict] = []
+
+    async def _fake(endpoint, body, headers, protocol, *a, **k):
+        calls.append(dict(body))
+        return upstream(body), {}
+
+    async def _no_free(*a, **k):
+        return None
+
+    monkeypatch.setattr(opencode, "_do_request_with_retry", _fake)
+    monkeypatch.setattr(opencode, "_try_free_model_first", _no_free)
+
+    client = TestClient(opencode.app)
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={
+            "model": _MODEL,
+            "stream": True,
+            "input": [{"role": "user", "content": "dis bonjour"}],
+        },
+    ) as r:
+        status = r.status_code
+        ctype = r.headers.get("content-type", "")
+        raw = b"".join(r.iter_bytes()).decode()
+
+    frames = [ln[6:] for ln in raw.splitlines() if ln.startswith("data: ") and ln[6:].strip() != "[DONE]"]
+    return status, ctype, [json.loads(f) for f in frames], raw, calls
+
+
+def _streamed_text(events) -> str:
+    return "".join(e.get("delta", "") for e in events if e["type"] == "response.output_text.delta")
+
+
+def test_lifecycle_only_stream_recovers_text_from_output_item_done(monkeypatch):
+    _status, _ctype, events, _raw, calls = _post_stream(
+        monkeypatch, lambda body: _LifecycleOnlyResp(item_done=True, completed_output=False)
+    )
+    assert _streamed_text(events) == _LIFECYCLE_TEXT
+    assert events[-1]["type"] == "response.completed"
+    assert events[-1]["response"]["usage"]["output_tokens"] == 6
+    assert all(c.get("stream") for c in calls), "le repli non-streaming ne devait pas être nécessaire"
+
+
+def test_lifecycle_only_stream_recovers_text_from_completed(monkeypatch):
+    _status, _ctype, events, _raw, _calls = _post_stream(
+        monkeypatch, lambda body: _LifecycleOnlyResp(item_done=False, completed_output=True)
+    )
+    assert _streamed_text(events) == _LIFECYCLE_TEXT
+    assert events[-1]["type"] == "response.completed"
+
+
+def test_lifecycle_only_stream_does_not_duplicate_text(monkeypatch):
+    _status, _ctype, events, _raw, _calls = _post_stream(
+        monkeypatch, lambda body: _LifecycleOnlyResp(item_done=True, completed_output=True)
+    )
+    assert _streamed_text(events) == _LIFECYCLE_TEXT
+
+
+def test_fully_empty_stream_falls_back_to_nonstream(monkeypatch):
+    def _upstream(body):
+        if body.get("stream"):
+            return _LifecycleOnlyResp(item_done=False, completed_output=False)
+        return _FakeJsonResp(_CHAT_JSON)
+
+    _status, _ctype, events, _raw, calls = _post_stream(monkeypatch, _upstream)
+    assert _streamed_text(events) == "reponse complete"
+    assert events[-1]["type"] == "response.completed"
+    assert any(not c.get("stream") for c in calls), "le repli non-streaming n'a pas été tenté"
