@@ -29,7 +29,44 @@ python scripts/rollout_control_plane.py --dry-run --stations 6,5,4,3,2,1
 Sortie attendue : ordre 6 → 1, un maximum de six stations, `dry run: no station
 contacted, no config written`.
 
-## 2. Activer une station (6 → 1)
+## 2. Déployer l'image du fork sur une station pilote
+
+Construire l'image depuis le fork, puis créer un override local (non versionné)
+qui ne change que l'image et les réglages du plan de contrôle :
+
+```bash
+docker build -t gluetun-016:local gluetun
+
+cat > logs/compose-control-plane-N.yml <<'EOF'
+services:
+  vpn-gluetun-N:
+    image: gluetun-016:local
+    pull_policy: never
+    environment:
+      CONTROL_PLANE_ENABLED: "true"
+      CONTROL_STATE_DIR: /gluetun/control-state
+      CONTROL_STATE_MODE: env
+EOF
+
+docker compose --profile multi-station \
+  -f docker-compose.yml -f logs/compose-hostname-N.yml \
+  -f logs/compose-control-plane-N.yml \
+  up -d --no-deps --force-recreate vpn-gluetun-N
+```
+
+Vérifier sans publier la clé :
+
+```bash
+docker exec opencode-vpn-N sh -c \
+  'wget -qO- --header "X-API-Key: $VPN_CONTROL_API_KEY" \
+  http://127.0.0.1:8000/v1/control/capabilities'
+```
+
+`capabilities` doit annoncer `switch`, `rotate`, `transport_ladder` et
+`state_persistence`. Une cible non résolvable doit renvoyer
+`422 invalid_target` avec `reason=resolution_failed`, sans toucher au tunnel.
+
+## 3. Activer une station (6 → 1)
 
 1. Passer **cette seule station** en `control_plane.mode=active`
    (`config.yaml` ou l'environnement du proxy), sans toucher aux cinq autres.
@@ -47,7 +84,7 @@ stations restantes ne sont pas modifiées.
 4. Répéter pour 5, 4, 3, 2, 1, **une station à la fois**, avec la même
    vérification avant de passer à la suivante.
 
-## 3. Vérifications pendant le rollout
+## 4. Vérifications pendant le rollout
 
 - `client_usable` reste vrai pour chaque station active.
 - Aucune septième station/session n'apparaît : le rollout ne traite que les
@@ -60,7 +97,7 @@ stations restantes ne sont pas modifiées.
   `tunnel.repair_needed` apparaissent dans `/v1/events`.
 - Le chemin chaud n'appelle ni `docker exec` ni `docker cp`.
 
-## 4. Rollback
+## 5. Rollback
 
 1. Repasser la station (ou toutes) en `control_plane.mode=legacy`.
 2. Repiner le digest précédent de l'image Gluetun.
@@ -68,7 +105,7 @@ stations restantes ne sont pas modifiées.
 4. Vérifier `client_usable` et le SLO ; le registre n'a jamais été modifié par
    le plan de contrôle (les claims restent dans `registry.db`).
 
-## 5. Incidents
+## 6. Incidents
 
 | Symptôme | Réaction |
 |---|---|
@@ -93,3 +130,7 @@ Aucun fallback ne propose le payant, un second compte ou une attente.
   station.
 - T095 reste inactif tant que `VPN_TYPE` est explicite, ce qui est le cas des
   stations actuelles : retirer `VPN_TYPE` pour activer le ladder.
+- Le pilote station 6 tourne avec l'image fork mais son pin `br137` est mort :
+  le plan de contrôle répond, et les jobs échouent proprement en
+  `resolution_failed` tant que la connectivité n'est pas réparée par le chemin
+  legacy.
