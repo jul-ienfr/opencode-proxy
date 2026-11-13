@@ -7,7 +7,9 @@ registre (`registry.db`), les claims et les scores.
 
 ## Pré-requis
 
-- Image Gluetun 016 déployée sur la station ciblée, `CONTROL_PLANE_ENABLED=true`.
+- Image Gluetun 016 construite depuis le fork et déployée sur la station ciblée
+  (`docker build -t gluetun-016:local gluetun`, puis remplacer l'image du
+  service station, une station à la fois), `CONTROL_PLANE_ENABLED=true`.
 - `GLUETUN_CONTROL_API_KEY` présent dans l'environnement du proxy (jamais dans
   `config.yaml`).
 - `TRANSPORT_ENABLED=true` (défaut) et `VPN_TYPE` **non défini** pour laisser le

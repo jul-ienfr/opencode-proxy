@@ -233,6 +233,7 @@ de rollout (T078), station par station.
 
 ```text
 go build ./...                                                               -> ok
+docker build -t gluetun-016:local gluetun                                    -> ok (image 46.7 MB)
 go test ./internal/control/... ./internal/server ./internal/configuration/settings ./internal/vpn/transport -count=1 -> ok
 go test ./internal/configuration/settings ./internal/control/... ./internal/server ./tests/integration/harness -> ok
 go test ./internal/egress/... ./internal/control/... ./internal/server ./internal/configuration/settings -> ok
@@ -292,6 +293,11 @@ changements (`internal/storage` avec `airvpn.json` absent, `internal/dns`,
   est explicite, ce qui est le cas de toutes les stations du compose actuel.
   `GET /v1/vpn/transport` et `capabilities.transport_ladder` reflètent le
   service réellement attaché.
+- La flotte live tourne encore l'image upstream `qmcgaw/gluetun` épinglée par
+  digest : T078 exige d'abord de déployer l'image du fork station par station
+  (build local `gluetun-016:local` validé le 2026-11-13) puis d'activer
+  `CONTROL_PLANE_ENABLED`. Le rollout ne peut pas être exécuté sur l'image
+  upstream actuelle.
 - T049 (mesure live DoH/TCP 853 bloqués) reste ouvert : le script existe et sa
   syntaxe est vérifiée, mais il demande un réseau réellement filtré.
 - T099 est partiel : les tests Go du ladder et de l'intégration passent, la
