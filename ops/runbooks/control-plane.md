@@ -10,6 +10,9 @@ registre (`registry.db`), les claims et les scores.
 - Image Gluetun 016 déployée sur la station ciblée, `CONTROL_PLANE_ENABLED=true`.
 - `GLUETUN_CONTROL_API_KEY` présent dans l'environnement du proxy (jamais dans
   `config.yaml`).
+- `TRANSPORT_ENABLED=true` (défaut) et `VPN_TYPE` **non défini** pour laisser le
+  ladder choisir le transport ; un `VPN_TYPE` explicite désactive le ladder et
+  conserve le comportement upstream.
 - `control_plane.mode=shadow` depuis au moins 24 h sur la station : zéro
   divergence IP, zéro job réel, zéro incident.
 - Les routes `/v1/vpn/state`, `/v1/egress`, `/v1/events` répondent.
@@ -49,6 +52,10 @@ stations restantes ne sont pas modifiées.
   stations listées (maximum six).
 - `GET /v1/vpn/state` répond en p95 < 100 ms.
 - Les événements SSE arrivent < 1 s après un changement.
+- `GET /v1/vpn/transport` renvoie un `active_transport` cohérent et un breaker
+  `closed` pour le transport utilisé ; `capabilities.transport_ladder=true`.
+- Les événements `transport.connected`, `transport.failed` et
+  `tunnel.repair_needed` apparaissent dans `/v1/events`.
 - Le chemin chaud n'appelle ni `docker exec` ni `docker cp`.
 
 ## 4. Rollback
@@ -69,6 +76,8 @@ stations restantes ne sont pas modifiées.
 | 403 | Erreur de configuration : arrêt du rollout et alerte. |
 | `exhausted` | Repair request ; la station reste conservée, aucun « aucune IP disponible ». |
 | `failed_degraded` | Incident critique ; réparation par 015, pas de boucle locale. |
+| `transport.breaker_open` | Le transport est en cooldown ; vérifier `GET /v1/vpn/transport`, laisser le ladder passer au suivant, `POST /v1/vpn/transport/reset` seulement après correction. |
+| `tunnel.repair_needed` | Le watchdog a épuisé ses reconnexions même-serveur ; le ladder reprend au transport suivant et ouvre un repair request. |
 | `capabilities` absentes | Le fork n'est pas 016 : forcer `mode=legacy` et alerter. |
 
 Aucun fallback ne propose le payant, un second compte ou une attente.
@@ -77,8 +86,8 @@ Aucun fallback ne propose le payant, un second compte ou une attente.
 
 - T049 (DoH/TCP 853 réellement bloqués) demande un réseau filtré absent du banc
   local.
-- T095/T099 : le ladder de transports est piloté par l'exécuteur de jobs ; son
-  branchement dans `internal/vpn/loop.go` et les tests `TR-AT-*` complets
-  restent ouverts.
-- T067 : les métriques de jobs sont collectées ; leur export HTTP doit être
-  branché sur le serveur Prometheus global.
+- T099 : le ladder runtime est branché et testé unitairement ; les scénarios
+  `TR-AT-*` avec tunnel réel (kill, MTU réduit, firewall) restent à exécuter sur
+  station.
+- T095 reste inactif tant que `VPN_TYPE` est explicite, ce qui est le cas des
+  stations actuelles : retirer `VPN_TYPE` pour activer le ladder.

@@ -118,9 +118,9 @@
 | T046 — métriques et événements DNS | fait | Compteurs de tentatives/échecs par tier et endpoint dans `internal/dns/ladder`, événements de bascule/remontée exposés par le snapshot ; `state.go`, `snapshot_test.go`. |
 | T047 — fail-closed | fait | `internal/dns/ladder_middleware.go` : ladder épuisé + `fail_closed=true` ⇒ SERVFAIL sans fuite ; `fail_closed=false` ⇒ délégation au handler upstream ; `ladder_integration_test.go`. |
 | T048 — NXDOMAIN et TC | fait | `internal/dns/ladder/{ladder,exchange}.go` : NXDOMAIN terminal, réponse tronquée rejouée en TCP, retour à `dot` après récupération ; `ladder_test.go`. |
-| T049 — mesure live DoH bloqué | à faire | Nécessite une station avec TCP/853 et DoH bloqués ; le banc local ne peut pas reproduire le blocage. Commande prévue : `tests/integration/dns_live_block.sh` (script non créé). |
+| T049 — mesure live DoH bloqué | script prêt, mesure à faire | `gluetun/tests/integration/dns_live_block.sh` bloque TCP/853 et les DoH connus, mesure le p95 (seuil 2 s) et restaure les règles via `trap`. Syntaxe vérifiée (`sh -n`) ; l'exécution demande une station réellement filtrée, absente du banc local. |
 
-## Phase 2b — Ladder de transports (fait, sauf T095/T099 partiels)
+## Phase 2b — Ladder de transports (fait, sauf validation tunnel réel T099)
 
 | Tâche | Statut | Preuve |
 |---|---|---|
@@ -129,53 +129,39 @@
 | T092 — preflight et erreurs typées | fait | `internal/vpn/transport/{preflight,errors}.go` : résolution, dial TCP/UDP, credentials, mapping `auth`, `udp_blocked`, `tcp_refused`, `tls`, `handshake_timeout`, `no_egress`, `interface_down`, `config_invalid` ; `errors_test.go`, `preflight_test.go`. |
 | T093 — breaker et backoff | fait | `internal/vpn/transport/breaker.go` et `ladder.go` : seuils, cooldown doublé/plafonné, backoff de cycle avec jitter, `max_cycles` ; `breaker_test.go`. |
 | T094 — watchdog même-serveur | fait | `internal/vpn/transport/watchdog.go` : détection interface/handshake/statut, intervalle 1 s, stale 30 s, 3 reconnexions maximum puis `tunnel.repair_needed` ; `watchdog_test.go`. |
-| T095 — intégration boucle VPN, firewall, MTU | reporté (documenté) | Le ladder est utilisé par l'exécuteur de jobs pour choisir le transport d'un switch/rotate, mais n'est pas branché dans `internal/vpn/loop.go`. `VPN_TYPE` est toujours résolu en type concret par les settings upstream, donc « explicite » n'est pas distinguable sans nouveau réglage. Détail et reste à faire ci-dessous. |
-| T096 — endpoints transport | fait (API), non attaché | `internal/control/api/transport.go` : `GET /v1/vpn/transport`, `POST /v1/vpn/transport/reset` (admin), reset sans transport = `all`, transport inconnu ⇒ `422 invalid_target` ; `transport_test.go`. `Handler.SetTransport` existe mais `newControlHandler` ne l'appelle pas, donc `capabilities.transport_ladder=false` en production. |
-| T097 — événements et métriques transport | fait (package) | `internal/vpn/transport/metrics.go` : compteurs par transport, breaker, cycles, latence ; constantes `transport.attempt\|connected\|failed\|breaker_open\|breaker_reset\|cycle_exhausted\|tunnel.repair_needed` ; `metrics_test.go`. Pas encore exportés sur l'endpoint Prometheus global. |
+| T095 — intégration boucle VPN, firewall, MTU | fait | `internal/vpn/{ladder,transport_settings,run,tunnelup,cleanup}.go` branche le ladder dans la boucle : activation seulement si `TRANSPORT_ENABLED`, type non explicite, type ≠ `amneziawg`, pas d'`OpenVPN.ConfFile` et hostname pinné ; sinon upstream. Le driver applique firewall/MTU puis `VerifyEgress` avant `up`, le watchdog répare sur place puis escalade au transport suivant, et `applyTunnelUp` réutilise le chemin `onTunnelUp` avec `prepared=true`. `integration_test.go`, `transport_test.go`. |
+| T096 — endpoints transport | fait, attaché | `internal/control/api/transport.go` : `GET /v1/vpn/transport`, `POST /v1/vpn/transport/reset` (admin), reset sans transport = `all`, transport inconnu ⇒ `422 invalid_target` ; `transport_test.go`. `newControlHandler` appelle `SetTransport` quand le service existe, donc `capabilities.transport_ladder` reflète l'état réel. |
+| T097 — événements et métriques transport | fait | `internal/vpn/transport/metrics.go` : compteurs par transport, breaker, cycles, latence, exportés sur l'endpoint Prometheus global via `metricsprometheus.NewTextGatherer(vpnLooper.TransportMetrics().WritePrometheus)` ; `internal/control/events/transport.go` mappe chaque événement ladder sur le bus et `events.jsonl`, avec sévérité warning pour `failed`/`breaker_open`/`cycle_exhausted`/`repair_needed` ; `metrics_test.go`, `text_test.go`, `setup_test.go`. |
 | T098 — `transport_policy` switch/rotate | fait | `internal/control/jobs/{switch.go,executor.go,rotation.go}` et `internal/control/api/switch.go` : `auto`, transport unique ou liste ordonnée, validation synchrone, policy restreinte sans changer la cible serveur/IP, policy invalide ⇒ `422 invalid_target` ; `transport_policy_test.go`. |
-| T099 — tests ladder et shadow Python | partiel | `tests/integration/transport_ladder_test.go` couvre UDP bloqué → TCP, TCP refusé, auth invalide, tunnel mort, second cycle, reset breaker ; `internal/vpn/transport/ladder_test.go` couvre le reste. Parité shadow Python : `TransportShadowObserver` lit `GET /v1/vpn/transport` (aucun POST, aucune policy, aucun `PUT /v1/vpn/settings`) et écrit `control_plane_transport_shadow` dans `telemetry.db` ; `tests/test_transport_ladder_shadow.py` (4 cas). `TR-AT-08`/`TR-AT-09` restent dépendants de T095. |
+| T099 — tests ladder et shadow Python | partiel (live restant) | `tests/integration/transport_ladder_test.go` couvre UDP bloqué → TCP, TCP refusé, auth invalide, tunnel mort, second cycle, reset breaker ; `internal/vpn/transport/ladder_test.go`, `integration_test.go` et `internal/vpn/ladder.go` couvrent le reste. Parité shadow Python : `TransportShadowObserver` lit `GET /v1/vpn/transport` (aucun POST, aucune policy, aucun `PUT /v1/vpn/settings`) et écrit `control_plane_transport_shadow` dans `telemetry.db` ; `tests/test_transport_ladder_shadow.py` (4 cas). `TR-AT-08`/`TR-AT-09` demandent encore un tunnel réel (bascule et réparation observées). |
 
-### Décision T095 — report assumé
+### Mise en œuvre T095
 
-Le ladder de transports (T090–T094) est complet et testé, et il est déjà
-utilisé par l'exécuteur de jobs pour choisir le transport d'un `switch` ou d'un
-`rotate` (T098). Il n'est en revanche pas branché dans la boucle VPN runtime
-(`internal/vpn/loop.go`), pour trois raisons :
+Le ladder runtime est construit dans `cmd/gluetun/main.go` après le service
+egress partagé : `SetEgressVerifier` puis `SetTransportLadder`. La boucle
+`internal/vpn/run.go` choisit le chemin ladder par `shouldRunLadder` ; le
+driver `internal/vpn/ladder.go` pinne le hostname/IP de `ServerSelection`,
+applique le transport, attend le tunnel, réapplique firewall/MTU et ne déclare
+`up` qu'après `VerifyEgress`. Le même driver fournit `Health`/`Reconnect` au
+watchdog, qui répare sur le même serveur avant de rendre `ErrRepairNeeded` ;
+`Integration.Run` rapporte alors l'échec au breaker et relance le transport
+suivant.
 
-1. `settings.VPN.Type` est toujours résolu (`openvpn` par défaut) avant
-   d'atteindre la boucle ; « `VPN_TYPE` explicite » n'est pas distinguable sans
-   ajouter un réglage dédié. La condition d'acceptation de T095 (« comportement
-   upstream inchangé si `VPN_TYPE` est explicite ») exige donc un nouveau flag,
-   pas un simple `if settings.Type == ""`.
-2. La boucle actuelle construit un seul runner à partir d'un snapshot immuable
-   de settings ; le `Runner` du ladder doit appliquer un transport, attendre le
-   tunnel puis vérifier l'egress. Le faire depuis `Run` impose de rappeler
-   `state.SetSettings` et de relancer la boucle depuis l'intérieur du ladder :
-   risque de deadlock et de double tunnel si le firewall/MTU n'est pas
-   re-synchronisé entre deux tentatives.
-3. T095 demande aussi de réappliquer firewall et MTU/PMTUD avant de déclarer
-   `up`. Ces hooks existent (`tunnelUpData`, `onTunnelUp`), mais les enchaîner
-   dans le ladder demande une refonte de `Run` et des tests d'intégration avec
-   un vrai tunnel, absents de l'environnement local.
+Le comportement upstream reste intact dans les cas suivants, documentés par
+`shouldRunLadder` :
 
-Conséquence : le comportement runtime reste celui d'upstream (un seul type VPN
-choisi par `VPN_TYPE`), et le ladder s'applique aux changements pilotés par le
-plan de contrôle. `GET /v1/vpn/transport` renvoie `503 not_ready` tant que
-`SetTransport` n'est pas appelé.
+- `TRANSPORT_ENABLED=false` ou ladder non construit ;
+- `VPN_TYPE` explicitement fourni (toutes les stations du compose actuel) ;
+- type `amneziawg` ou `OpenVPN.ConfFile` personnalisé ;
+- aucun hostname pinné.
 
-Reste à faire pour clôturer T095 :
+La policy du ladder runtime vient de `TRANSPORT_*` ; `transport_policy` d'un
+job continue de piloter la cible du job (T098), pas le choix interne du
+transport. Les tests d'intégration avec un vrai tunnel (kill, MTU réduit,
+firewall) restent à exécuter sur station : ils ne peuvent pas l'être sur le
+banc local sans interface VPN.
 
-- ajouter un réglage `CONTROL_TRANSPORT_POLICY` (ou réutiliser
-  `transport_policy`) et un flag « type explicite » dans `settings.VPN` ;
-- extraire de `Run` une fonction `runOnce(settings)` réutilisable par un
-  `Runner` qui applique, attend, vérifie et rejoue le firewall/MTU ;
-- construire le `transport.Ladder` dans `cmd/`/`internal/server` avec ce
-  runner, l'attacher via `SetTransport`, puis démarrer/mettre en veille le
-  watchdog ;
-- ajouter `tests/integration/transport_loop_test.go` (tunnel réel, kill
-  tunnel, MTU réduit, firewall) et brancher `TR-AT-*`.
-
-## Phase 4 — Catalogue et rotation (fait, sauf T049/T067 sans objet)
+## Phase 4 — Catalogue et rotation (fait, sauf mesure live T049)
 
 | Tâche | Statut | Preuve |
 |---|---|---|
@@ -188,7 +174,7 @@ Reste à faire pour clôturer T095 :
 | T056 — refresh catalogue | fait | `POST /v1/servers/refresh`, rate limit 1 min, `ErrRefreshUnsupported` ⇒ `501` ; `servers.go`. |
 | T057 — tests rotation 3 candidats | fait | `tests/integration/rotation_test.go` : trois candidats puis trois échecs ; `internal/control/jobs/rotation_test.go`. |
 
-## Phase 5 — Événements, sécurité, observabilité (fait, sauf export T067/T097)
+## Phase 5 - Événements, sécurité, observabilité (fait)
 
 | Tâche | Statut | Preuve |
 |---|---|---|
@@ -199,9 +185,9 @@ Reste à faire pour clôturer T095 :
 | T064 — scopes complets | fait | `internal/control/auth/scopes.go` et middleware : `reader`/`controller`/`admin`, table route→scope, `403 forbidden_scope`, journalisation sans secret ; tests de middleware. |
 | T065 — limites de corps et rate | fait | corps max 1 MiB ⇒ `413 payload_too_large`, `/vpn/switch` et `/vpn/rotate` partagent 6/min ⇒ `429 rate_limited` + `Retry-After` ; `limits_test.go`. |
 | T066 — capabilities effectives | fait | `Handler.capabilities()` : `Switch/Rotate/Rollback/DryRun/Drain` selon `h.jobs`, `DNSLadder` selon `h.dns`, `TransportLadder` selon `h.transport`, `EgressConsensus` selon `h.egress`, `EventsSSE` selon le bus, `StatePersistence` selon `StateDir` ; `capabilities_test.go`. |
-| T067 — métriques de jobs | fait (collecte) | `internal/control/observability/metrics.go` : `gluetun_control_jobs_total{kind,state}`, `..._job_duration_seconds_{count,sum,min,max}{kind}`, `..._job_phase_duration_seconds_{total,count}{phase}`, `..._job_attempts_total{kind,result}` ; labels bornés (`other` pour toute valeur inconnue), aucun hostname/job_id. Alimenté par `eventSink` sur les événements terminaux (`committed`, `rejected`, `cancelled`, `rolled_back`, `failed_degraded`, `switch.noop`) ; `jobs_metrics_test.go`, `internal/server/control_metrics_test.go`. L'export HTTP reste à brancher sur le serveur Prometheus global. |
+| T067 — métriques de jobs | fait | `internal/control/observability/metrics.go` : `gluetun_control_jobs_total{kind,state}`, `..._job_duration_seconds_{count,sum,min,max}{kind}`, `..._job_phase_duration_seconds_{total,count}{phase}`, `..._job_attempts_total{kind,result}` ; labels bornés (`other` pour toute valeur inconnue), aucun hostname/job_id. Alimenté par `eventSink` sur les événements terminaux (`committed`, `rejected`, `cancelled`, `rolled_back`, `failed_degraded`, `switch.noop`) et exporté sur l'endpoint Prometheus global via `metricsprometheus.NewTextGatherer(controlMetrics.WritePrometheus)` ; `jobs_metrics_test.go`, `internal/server/control_metrics_test.go`, `internal/metrics/prometheus/text_test.go`. |
 | T068 — scrub des logs | fait | `internal/control/observability/{scrub,log}.go` : scrub récursif (Bearer, `api_key`, userinfo), logger JSON `job_id`/`event` sans secret ; `scrub_test.go`, `log_test.go`. |
-| T069 — tests de sécurité | partiel | Couverture scopes, masquage, scrub et limites ; il manque un test d'intégration « aucune fuite de secret dans les logs/SSE/état » sur un scénario complet. |
+| T069 — tests de sécurité | fait | `tests/contract/security_test.go` démarre le serveur HTTP réel (auth TOML, état temporaire) et couvre : 401 sans clé, 403 `forbidden_scope` pour `reader` sur `POST /v1/vpn/switch`, `reveal=true` réservé admin, masquage de tous les secrets par défaut, corps > 1 MiB ⇒ `413 payload_too_large` sans toucher au tunnel, scrub des clés API/tokens dans les logs d'accès, scrub des événements avant SSE et `events.jsonl`, mode `0600` du fichier d'état et `0700` du répertoire, et erreurs qui ne reflètent jamais les valeurs secrètes. Le routage `/v1` retire désormais la query avant dispatch (`/v1/vpn/settings?reveal=true`) et le handler settings renvoie `application/json`. |
 
 ### `/v1/vpn/state` et câblage runtime (fait)
 
@@ -254,6 +240,8 @@ go test ./internal/control/state -count=1                                     ->
 go test ./internal/control/jobs -count=1                                      -> ok
 go test ./tests/integration -run Test_EgressChaos                             -> ok
 go test ./internal/server/middlewares/auth -run 'Test_authHandler_ServeHTTP|Test_Role|Test_Settings' -> ok
+go test ./tests/contract -run Security -count=1                              -> ok
+go test ./internal/control/events ./internal/server/... ./internal/control/state ./internal/control/api ./tests/contract -count=1 -> ok
 python -m pytest tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py tests/test_control_plane_events.py tests/test_rotation_contract.py tests/test_egress_adapter.py tests/test_dashboard_station_control.py tests/test_control_plane_fallback.py tests/test_no_docker_exec_hot_path.py tests/test_rollout_control_plane.py tests/test_transport_ladder_shadow.py -q -> 79 passed
 python -m pytest tests/test_station_control_routes.py tests/test_ip_registry_egress.py -q -> 11 passed
 python -m ruff check free/control_plane free/ip_registry/registry_db.py free/ip_registry/adapters/gluetun_control_v2.py free/ip_registry/adapters/gluetun_control.py free/ip_registry/adapters/egress.py dashboard/routers/station_control_routes.py scripts/rollout_control_plane.py tests/test_rotation_contract.py tests/test_egress_adapter.py tests/test_dashboard_station_control.py tests/test_control_plane_fallback.py tests/test_no_docker_exec_hot_path.py tests/test_rollout_control_plane.py -> ok
@@ -270,13 +258,17 @@ docker compose -f tests/integration/docker-compose.yml up -d --wait ...      -> 
 docker compose -f tests/integration/docker-compose.yml run --rm check        -> all harness services are ready
 ```
 
-`markdownlint-cli2` n'est pas installé dans l'environnement courant ; le
-contrôle Markdown n'a donc pas été exécuté. Commande à lancer une fois
-disponible : `markdownlint-cli2 "**/*.md"`.
+`markdownlint-cli2` et `golangci-lint` ne sont pas installés dans
+l'environnement courant ; les contrôles Markdown et lint Go n'ont donc pas été
+exécutés. Commandes à lancer une fois disponibles :
+`markdownlint-cli2 "**/*.md"` et `golangci-lint run`.
 
-`internal/server/middlewares/auth` passe mais échoue au nettoyage `TempDir` sous
-Windows (fichier encore ouvert) : limitation de l'environnement, sans rapport
-avec les changements.
+`internal/server/middlewares/auth` ferme désormais son fichier de configuration
+après lecture : le nettoyage `TempDir` sous Windows ne bloque plus.
+`go test ./...` conserve des échecs Windows/network sans rapport avec ces
+changements (`internal/storage` avec `airvpn.json` absent, `internal/dns`,
+`internal/natpmp`, `internal/netlink`, `internal/portforward`,
+`internal/pmtud/tcp`, `internal/configuration/sources/files`).
 
 ## Écarts assumés
 
@@ -296,15 +288,16 @@ avec les changements.
 - La validation multi-arch complète (buildx `amd64`+`arm64`) et le scan Trivy
   sont délégués à la CI GitHub : l'environnement local ne permet pas de
   reproduire le push GHCR ni l'authentification du runner.
-- T095 est reporté et documenté (voir sa section) : le ladder est utilisé par
-  les jobs, pas par la boucle VPN runtime. `transport_ladder` reste donc
-  `false` en production et `GET /v1/vpn/transport` répond `503 not_ready`.
-- T049 (mesure live DoH/TCP 853 bloqués) reste ouvert : il demande un réseau
-  réellement filtré. L'export HTTP des métriques T067/T097 reste à brancher sur
-  le serveur Prometheus global ; la collecte et les noms sont déjà testés.
-- T099 est partiel : les tests Go du ladder passent et la parité shadow Python
-  est couverte par `TransportShadowObserver` (`tests/test_transport_ladder_shadow.py`) ;
-  `TR-AT-08`/`TR-AT-09` dépendent encore de T095.
+- T095 est branché dans la boucle VPN ; il reste inactif tant que `VPN_TYPE`
+  est explicite, ce qui est le cas de toutes les stations du compose actuel.
+  `GET /v1/vpn/transport` et `capabilities.transport_ladder` reflètent le
+  service réellement attaché.
+- T049 (mesure live DoH/TCP 853 bloqués) reste ouvert : le script existe et sa
+  syntaxe est vérifiée, mais il demande un réseau réellement filtré.
+- T099 est partiel : les tests Go du ladder et de l'intégration passent, la
+  parité shadow Python est couverte par `TransportShadowObserver`
+  (`tests/test_transport_ladder_shadow.py`) ; `TR-AT-08`/`TR-AT-09` demandent
+  encore un tunnel réel pour observer bascule et réparation.
 
 ## Activation
 
@@ -323,5 +316,7 @@ les capacités effectivement attachées :
   `/v1/vpn/state` est attaché ;
 - `secret_reveal` : `true` (le middleware auth admin reste seul juge de
   `reveal=true`) ;
-- `transport_ladder` : `false` en production tant que T095 n'est pas branché
-  (l'API et le service existent, mais `SetTransport` n'est pas appelé).
+- `transport_ladder` : `true` quand le service runtime est attaché
+  (`TRANSPORT_ENABLED=true`) ; `false` sinon. Le service peut être attaché sans
+  piloter un run donné si `shouldRunLadder` est faux (`VPN_TYPE` explicite,
+  `amneziawg`, `OpenVPN.ConfFile`, hostname non pinné).
