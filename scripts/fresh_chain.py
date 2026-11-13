@@ -2523,6 +2523,9 @@ async def run(args) -> int:
     compose_binder = ComposeHostnameBinder(
         ROOT,
         override_path=f"logs/compose-hostname-{args.station}.yml",
+        extra_compose_files=(
+            f"logs/compose-control-plane-{args.station}.yml",
+        ),
         profile="multi-station",
         settle_s=settle_s,
         egress_wait_s=egress_wait_s,

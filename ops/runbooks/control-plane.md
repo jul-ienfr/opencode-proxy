@@ -46,6 +46,12 @@ services:
       CONTROL_PLANE_ENABLED: "true"
       CONTROL_STATE_DIR: /gluetun/control-state
       CONTROL_STATE_MODE: env
+      CONTROL_EGRESS_SOURCES: http:ipify,http:ifconfig,http:icanhazip,publicip:internal
+      CONTROL_EGRESS_SOURCE_TIMEOUT_MS: "5000"
+      CONTROL_EGRESS_SOURCE_BACKOFF_MS: "1000"
+      CONTROL_EGRESS_SOURCE_BACKOFF_MAX_MS: "5000"
+      DNS_HEALTH_COOLDOWN_MS: "2000"
+      DNS_HEALTH_COOLDOWN_MAX_MS: "15000"
 EOF
 
 docker compose --profile multi-station \
@@ -53,6 +59,16 @@ docker compose --profile multi-station \
   -f logs/compose-control-plane-N.yml \
   up -d --no-deps --force-recreate vpn-gluetun-N
 ```
+
+Les quatre sources d'egress et le timeout à 5 s évitent un faux
+`no_quorum` sur un tunnel à forte latence. Les backoffs courts (1 s → 5 s) et
+les cooldowns DNS bornés (2 s → 15 s) empêchent une bascule de laisser la
+station fail-closed pendant plusieurs minutes.
+
+Le superviseur de flotte (`scripts/fresh_chain.py`) ajoute automatiquement
+`logs/compose-control-plane-N.yml` après son override de hostname quand ce
+fichier existe : une rotation ne fait donc plus retomber la station sur l'image
+upstream.
 
 Vérifier sans publier la clé :
 
@@ -130,7 +146,9 @@ Aucun fallback ne propose le payant, un second compte ou une attente.
   station.
 - T095 reste inactif tant que `VPN_TYPE` est explicite, ce qui est le cas des
   stations actuelles : retirer `VPN_TYPE` pour activer le ladder.
-- Le pilote station 6 tourne avec l'image fork mais son pin `br137` est mort :
-  le plan de contrôle répond, et les jobs échouent proprement en
-  `resolution_failed` tant que la connectivité n'est pas réparée par le chemin
-  legacy.
+- Le pilote station 6 tourne avec l'image fork en WireGuard. Un switch réel
+  `br143 → br150` a été validé : job `committed`, egress vérifié
+  (`187.15.85.191`, quorum 3) et proxies HTTP/SOCKS5 opérationnels. Les pins
+  restent locaux (`logs/compose-hostname-6.yml`) et le superviseur les layered
+  avec `logs/compose-control-plane-6.yml`. Les autres stations restent en
+  upstream jusqu'au rollout T078.

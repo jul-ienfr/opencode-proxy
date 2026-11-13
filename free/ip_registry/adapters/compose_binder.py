@@ -33,6 +33,7 @@ class ComposeHostnameBinder:
         *,
         compose_file: str = "docker-compose.yml",
         override_path: str = "logs/compose-hostname.yml",
+        extra_compose_files: tuple[str, ...] = (),
         profile: str = "multi-station",
         recreate_timeout_s: float = 180.0,
         settle_s: float = 10.0,
@@ -46,6 +47,7 @@ class ComposeHostnameBinder:
         self._root = Path(root)
         self._compose_file = compose_file
         self._override_path = self._root / override_path
+        self._extra_compose_files = tuple(str(path) for path in extra_compose_files)
         self._profile = profile
         self._recreate_timeout_s = max(1.0, float(recreate_timeout_s))
         self._settle_s = max(0.0, float(settle_s))
@@ -174,6 +176,14 @@ class ComposeHostnameBinder:
             self._compose_file,
             "-f",
             str(override_path),
+        ]
+        for extra_file in self._extra_compose_files:
+            extra_path = Path(extra_file)
+            if not extra_path.is_absolute():
+                extra_path = self._root / extra_path
+            if extra_path.is_file():
+                command += ["-f", str(extra_path)]
+        command += [
             "up",
             "-d",
             "--force-recreate",

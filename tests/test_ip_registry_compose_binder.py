@@ -202,6 +202,28 @@ def test_override_path_is_per_station(tmp_path):
     assert p2.name.endswith("-2.yml")
 
 
+async def test_assign_layers_existing_extra_compose_files(tmp_path):
+    runner = FakeRunner()
+    extra = tmp_path / "logs" / "compose-control-plane-2.yml"
+    extra.parent.mkdir(parents=True)
+    extra.write_text("services: {}\n", encoding="utf-8")
+    missing = tmp_path / "logs" / "compose-control-plane-3.yml"
+    binder = ComposeHostnameBinder(
+        tmp_path,
+        settle_s=0,
+        runner=runner,
+        extra_compose_files=(str(extra), str(missing)),
+    )
+
+    result = await binder.assign(2, "al110.nordvpn.com")
+
+    assert result.ok
+    command, _ = runner.calls[0]
+    assert command.count("-f") == 3
+    assert str(extra) in command
+    assert str(missing) not in command
+
+
 def test_override_path_already_station_suffixed_is_kept(tmp_path):
     binder = ComposeHostnameBinder(
         tmp_path,
