@@ -276,6 +276,39 @@ changements (`internal/storage` avec `airvpn.json` absent, `internal/dns`,
 `internal/natpmp`, `internal/netlink`, `internal/portforward`,
 `internal/pmtud/tcp`, `internal/configuration/sources/files`).
 
+### Validation live étendue (station 6)
+
+Testé en direct sur la station 6, en plus des switchs `br143 → br150`,
+`br150 → br149` et `br149 → br150` :
+
+- `POST /v1/vpn/switch` avec `wait=true` (200), `wait=false` (202 +
+  `Location`), idempotence (replay 200, même job), cible identique
+  (`200 noop`), second job concurrent (409), 7 requêtes en une minute
+  (429 + `Retry-After: 59`), corps de 1,2 Mo (413 `payload_too_large`).
+- `POST /v1/vpn/rotate` : rotation mono-candidat `br149 → br150`,
+  `state=committed`, egress `187.15.85.187`.
+- `POST /v1/vpn/rollback` : `state=rolled_back` sur le dernier snapshot
+  commité, egress re-vérifié.
+- `GET /v1/dns/state`, `/v1/dns/tiers`, `POST /v1/dns/probe` (dry-run),
+  `GET /v1/egress/verify`, `/v1/egress/history`, `/v1/vpn/jobs` avec
+  pagination, `/v1/servers/facets`, `/v1/servers/{hostname}`.
+- Proxies HTTP (8893) et SOCKS5 (1085) : egress identique à l'IP vérifiée.
+
+Constats de cette campagne :
+
+- `GET /v1/vpn/settings?reveal=true` renvoie les secrets réels avec le rôle
+  par défaut actuel. `RequiredScope` exige bien `ScopeAdmin`, mais `ScopeNone`
+  (rôle sans `scope`) contourne le contrôle par compatibilité legacy. Avec une
+  seule clé non scopée, tout détenteur de la clé peut révéler la clé WireGuard.
+  Mitigation : séparer les rôles (controller pour l'orchestrateur, admin pour
+  le dashboard/reveal) ou ne jamais exposer ce port hors du réseau Docker.
+- `/v1/egress/canary` renvoie 400 `canary disabled` : aucune URL canary n'est
+  configurée sur le pilote.
+- Restent non testés en live : ladder de transports (inactif car `VPN_TYPE`
+  explicite), annulation de job, SSE/`Last-Event-ID`, modes d'état
+  `state`/`merge` et reprise après redémarrage, kill-switch sous tunnel mort,
+  contraintes `expected_egress_ip`/`require_new_ip`, IPv6, charge et soak.
+
 ## Écarts assumés
 
 - T004/T005 ne modifient pas les workflows upstream : le harnais et la CI du
