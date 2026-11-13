@@ -1101,9 +1101,18 @@ def build_candidates(
             )
         # Performance first; source is only a tiebreaker (API before
         # Gluetun-only), then API load, then the round-robin rank BEFORE the
-        # hostname. The rank must precede ``host`` or the sort falls back to
-        # alphabetical order and tests six Swiss hosts in a row.
-        tier = 1 if source == "public-1-per-24" else 2 if source == "public-rest" else 0
+        # hostname. Embedded hosts are a last resort: they are old entries the
+        # public API no longer advertises, and ranking them first made every
+        # repair bind dead servers before reaching the live catalogue.
+        tier = (
+            1
+            if source == "public-1-per-24"
+            else 2
+            if source == "public-rest"
+            else 3
+            if source == "embedded"
+            else 0
+        )
         return (
             0,
             -float(row.get("score") or 0.0),
@@ -2092,9 +2101,10 @@ async def _run_claims(
                     await asyncio.sleep(2)
                 claims.renew(host, args.station)
                 _clean_station_container(args.station)
-                if str(args.transport) == "auto":
-                    # The fork owns the tri-stack ladder. Writing an explicit
-                    # VPN_TYPE would disable it after every recreate.
+                if tri_stack:
+                    # The fork owns the tri-stack ladder; its switch has no
+                    # per-transport argument. The legacy binder still needs
+                    # the transport to choose the container stack.
                     vpn_type, openvpn_protocol = "auto", None
                 else:
                     vpn_type, openvpn_protocol = _transport_parts(str(transport))
