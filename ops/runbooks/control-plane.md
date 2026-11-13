@@ -70,6 +70,40 @@ Le superviseur de flotte (`scripts/fresh_chain.py`) ajoute automatiquement
 fichier existe : une rotation ne fait donc plus retomber la station sur l'image
 upstream.
 
+Pour que le superviseur, qui tourne sur l'hôte, joigne l'API de contrôle, chaque
+override publie le port en loopback (`8001` … `8006`) :
+
+```yaml
+services:
+  vpn-gluetun-N:
+    ports:
+      - "127.0.0.1:800N:8000"
+```
+
+Puis `config.yaml` active le client v2 côté superviseur :
+
+```yaml
+control_plane:
+  mode: active
+  base_url: http://127.0.0.1:800{station}
+  api_key_env: VPN_CONTROL_API_KEY
+  transport_owner: fork
+  switch_timeout_s: 180
+  rotate_timeout_s: 300
+```
+
+Règles de réparation :
+
+- le superviseur ne recrée que les stations qu'il juge inutilisables
+  (`station_usable` ou `model_usable` faux, ou aucune IP) ; une station saine
+  n'est jamais recréée pour une simple mise à jour ;
+- sur une station cassée, un switch v2 qui renvoie `resolution_failed` ou un
+  loop VPN `crashed`/`awaiting tunnel` déclenche un recreate Compose avec
+  l'image courante ; le ladder runtime choisit alors WireGuard, OpenVPN UDP ou
+  OpenVPN TCP sans dépendre du DNS du tunnel mort ;
+- `VPN_TYPE=` (vide) est écrit dans l'override de hostname pour laisser le
+  ladder complet actif ; un `VPN_TYPE` explicite le désactiverait.
+
 Vérifier sans publier la clé :
 
 ```bash
