@@ -18,6 +18,7 @@ from app.protocol.tool_aliases import (
     adapt_tool_call,
     adapt_tool_name,
     build_tool_alias_map,
+    needs_argument_rewrite,
     tool_call_target,
 )
 
@@ -682,6 +683,124 @@ def test_stream_defers_webfetch_args_and_emits_shell_command():
     emitted += "".join(state.finalize_events())
     assert "curl -sL" in emitted
     assert "https://example.com" in emitted
+
+
+def test_needs_argument_rewrite_detects_codex_cmd_key():
+    aliases = build_tool_alias_map(_codex_tools())
+    assert needs_argument_rewrite("bash", aliases) is True
+
+
+def test_needs_argument_rewrite_ignores_plain_case_change():
+    aliases = build_tool_alias_map(_claude_tools())
+    assert needs_argument_rewrite("bash", aliases) is False
+
+
+def test_needs_argument_rewrite_detects_harness_required_description():
+    aliases = build_tool_alias_map(_harness_tools())
+    assert needs_argument_rewrite("bash", aliases) is True
+
+
+def test_stream_codex_bash_is_deferred_and_gets_cmd_key():
+    state = ChatSseToAnthropicState(
+        tool_aliases=build_tool_alias_map(_codex_tools())
+    )
+    chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "bash",
+                                "arguments": '{"command":"echo hi"}',
+                            },
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    emitted = "".join(state.feed_chunk(chunk))
+    assert '"name":"exec_command"' in emitted
+    assert '\\"cmd\\":\\"echo hi\\"' in emitted
+    assert '\\"command\\"' not in emitted
+
+
+def test_stream_harness_bash_gets_required_description():
+    state = ChatSseToAnthropicState(
+        tool_aliases=build_tool_alias_map(_harness_tools()),
+        shell_kind="powershell",
+    )
+    chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "bash",
+                                "arguments": '{"command":"echo hi"}',
+                            },
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    emitted = "".join(state.feed_chunk(chunk))
+    assert '"name":"pwsh"' in emitted
+    assert '\\"description\\"' in emitted
+
+
+def test_websearch_falls_back_to_claude_bash_with_duckduckgo():
+    aliases = build_tool_alias_map(_claude_tools())
+    assert tool_call_target("websearch", aliases) == "Bash"
+    name, args = adapt_tool_call("websearch", '{"query":"python 3.13"}', aliases)
+    assert name == "Bash"
+    command = json.loads(args)["command"]
+    assert command.startswith("curl -sL")
+    assert "html.duckduckgo.com" in command
+    assert "python+3.13" in command
+
+
+def test_stream_websearch_is_deferred_and_converted():
+    state = ChatSseToAnthropicState(
+        tool_aliases=build_tool_alias_map(_claude_tools()),
+        shell_kind="posix",
+    )
+    chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "websearch",
+                                "arguments": '{"query":"python 3.13"}',
+                            },
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    emitted = "".join(state.feed_chunk(chunk))
+    assert '"name":"Bash"' in emitted
+    assert "html.duckduckgo.com" in emitted
+
+
+def test_needs_argument_rewrite_detects_harness_websearch_queries():
+    aliases = build_tool_alias_map(_harness_tools())
+    assert needs_argument_rewrite("websearch", aliases) is True
 
 
 def test_openai_to_anthropic_webfetch_falls_back_to_bash():

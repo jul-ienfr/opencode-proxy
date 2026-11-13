@@ -16,8 +16,9 @@ intact) :
 * même famille (``bash`` → ``shell`` / ``exec_command`` / ``Bash``) ;
 * clé d'argument attendue (``command`` ↔ ``cmd``, ``path`` ↔ ``file_path``) ;
 * repli shell pour ``read`` / ``glob`` / ``grep`` / ``write`` / ``edit`` /
-  ``webfetch`` quand le client n'a que ``exec_command`` (Codex) ou ``Bash``
-  (Claude Code sans ``WebFetch``), avec la syntaxe PowerShell ou POSIX.
+  ``webfetch`` / ``websearch`` quand le client n'a que ``exec_command``
+  (Codex) ou ``Bash`` (Claude Code sans ``WebFetch``/``WebSearch``), avec la
+  syntaxe PowerShell ou POSIX.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from __future__ import annotations
 import base64
 import json
 import sys
+from urllib.parse import quote_plus
 
 _FAMILY_MEMBERS = {
     "shell": {
@@ -303,13 +305,51 @@ def needs_shell_fallback(name: str, aliases: dict | None) -> bool:
     ``{"url": …}`` fragment par fragment).
     """
     family = _FAMILY_OF.get(str(name or "").strip().lower())
-    if family not in ("read", "glob", "grep", "write", "edit", "webfetch"):
+    if family not in ("read", "glob", "grep", "write", "edit", "webfetch", "websearch"):
         return False
     if not aliases:
         return False
     if aliases.get("families", {}).get(family):
         return False
     return bool(aliases.get("shell"))
+
+
+def needs_argument_rewrite(name: str, aliases: dict | None) -> bool:
+    """True si le remap change les clés d'arguments (pas seulement le nom).
+
+    Les flux émettent les arguments fragment par fragment : renommer le bloc
+    sans attendre le JSON complet laisserait ``exec_command`` avec
+    ``{"command": …}`` au lieu de ``{"cmd": …}``, ou ``pwsh`` sans sa
+    ``description`` requise. On retient alors l'appel jusqu'à la clôture.
+    """
+    raw = str(name or "").strip()
+    if not raw or not aliases:
+        return False
+    family = _FAMILY_OF.get(raw.lower())
+    if not family:
+        return False
+    target = adapt_tool_name(raw, aliases)
+    if not target or target == raw:
+        return False
+    target_family = _FAMILY_OF.get(target.lower())
+    if target_family != family:
+        return True
+    key = (aliases.get("args") or {}).get(target)
+    if family == "shell":
+        # Le nom officiel ``bash`` porte ``command`` : tout autre nom de clé
+        # (``cmd`` chez Codex) impose de réécrire les arguments.
+        if key and key != "command":
+            return True
+        required = aliases.get("required", {}).get(target) or ()
+        return "description" in required
+    if family in ("read", "write", "edit"):
+        return bool(key and key not in ("file_path", "path", "filePath"))
+    if family == "websearch":
+        # Harness expose ``web_search`` avec ``queries`` (liste) là où la
+        # grille officielle n'envoie qu'une ``query``.
+        props = aliases.get("props", {}).get(target) or set()
+        return "queries" in props
+    return False
 
 
 def tool_call_target(name: str, aliases: dict | None) -> str:
@@ -432,6 +472,25 @@ def _synthesize_shell(family: str, obj: dict, shell_kind: str) -> dict | None:
         url = _first(obj, ("url", "uri", "href", "link", "path"))
         if not url:
             return None
+        if shell_kind in ("powershell", "pwsh"):
+            command = f"(Invoke-WebRequest -UseBasicParsing -Uri {quote(url)}).Content"
+        else:
+            command = f"curl -sL --max-time 60 {quote(url)}"
+        return {"command": command}
+    if family == "websearch":
+        # Même situation que ``webfetch`` : la grille officielle déclare
+        # ``websearch``, Claude Code n'a pas ``WebSearch``. On interroge
+        # DuckDuckGo en HTML via le shell du client ; le modèle reçoit les
+        # résultats bruts, qu'il peut lire ou affiner.
+        query = ""
+        queries = obj.get("queries")
+        if isinstance(queries, list):
+            query = " ".join(str(q) for q in queries if str(q).strip())
+        if not query:
+            query = str(_first(obj, ("query", "q", "search", "text")) or "")
+        if not query:
+            return None
+        url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
         if shell_kind in ("powershell", "pwsh"):
             command = f"(Invoke-WebRequest -UseBasicParsing -Uri {quote(url)}).Content"
         else:
@@ -622,7 +681,7 @@ def adapt_tool_call(
     before = dict(obj)
 
     if (
-        family in ("read", "glob", "grep", "write", "edit", "webfetch")
+        family in ("read", "glob", "grep", "write", "edit", "webfetch", "websearch")
         and not aliases.get("families", {}).get(family)
         and allow_shell_fallback
         and aliases.get("shell")

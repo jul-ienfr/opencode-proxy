@@ -8799,6 +8799,7 @@ class _ChatToolCallHealer:
                 "index": idx,
                 "id": "",
                 "name": "",
+                "raw_name": "",
                 "args": "",
                 "pending": False,
                 "defer": False,
@@ -8932,22 +8933,34 @@ class _ChatToolCallHealer:
                 if st["args"] and not st["args"].lstrip().startswith(("{", "[")):
                     st["args"] = _repair_tool_arguments_prefix(st["args"])
                 name = fn.get("name")
-                if isinstance(name, str) and name.strip() and not st["name"]:
-                    st["name"] = name.strip()
+                if isinstance(name, str) and name.strip() and not st["raw_name"]:
+                    # Nom amont d'origine, conservé tel quel : ``st["name"]``
+                    # devient le nom client et ne doit pas resservir de base au
+                    # calcul du repli (sinon ``exec_command`` n'est plus reconnu
+                    # comme ``bash`` et les args partent une seconde fois).
+                    st["raw_name"] = name.strip()
+                if not st["name"] and st["raw_name"]:
+                    st["name"] = st["raw_name"]
                 if not st["name"]:
                     st["name"] = _infer_tool_name_from_arguments(st["args"], self._tools)
                 if st["name"]:
                     st["args"] = _heal_tool_call_paths(
                         st["name"], st["args"], self._path_map
                     )
-                    _raw_name = st["name"]
+                    _raw_name = st["raw_name"] or st["name"]
                     st["name"] = adapt_tool_name(_raw_name, self._aliases)
-                    if needs_shell_fallback(_raw_name, self._aliases):
+                    if needs_shell_fallback(
+                        _raw_name, self._aliases
+                    ) or needs_argument_rewrite(_raw_name, self._aliases):
                         # Famille absente du client (``webfetch`` chez Claude
-                        # Code) : on accumule et on émettra la commande shell
-                        # complète au ``finish_reason``.
+                        # Code) ou clés d'arguments à réécrire (``cmd`` chez
+                        # Codex) : on accumule et on émettra l'appel complet au
+                        # ``finish_reason``.
                         st["defer"] = True
                         st["pending"] = True
+                        continue
+                    if st["defer"]:
+                        # Appel déjà retenu : aucun delta partiel ne doit partir.
                         continue
                 if not st["name"]:
                     # Nom inconnu : on retient le delta, jamais de tool_call vide.
@@ -19346,6 +19359,7 @@ from app.protocol.tool_aliases import (  # noqa: E402,I001  # re-export after fu
     adapt_tool_name,
     build_tool_alias_map,
     detect_shell_kind,
+    needs_argument_rewrite,
     needs_shell_fallback,
     tool_call_target,
 )
@@ -22974,7 +22988,7 @@ async def messages(request: Request):
                                 # sous l'outil shell, args convertis à la clôture.
                                 _fallback = needs_shell_fallback(
                                     _raw_name, _stream_aliases
-                                )
+                                ) or needs_argument_rewrite(_raw_name, _stream_aliases)
                                 tc_name = tool_call_target(_raw_name, _stream_aliases)
                                 if not tc_name:
                                     # [2026-10-26] Un tool_use au nom vide casse

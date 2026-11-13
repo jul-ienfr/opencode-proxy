@@ -38,6 +38,7 @@ from app.protocol.mapping import (
 )
 from app.protocol.tool_aliases import (
     adapt_tool_call,
+    needs_argument_rewrite,
     needs_shell_fallback,
     tool_call_target,
 )
@@ -773,7 +774,9 @@ class ChatSseToAnthropicState:
                 # [2026-11-12] Famille absente du runtime client (``webfetch``
                 # sans ``WebFetch``) : le bloc part sous l'outil shell et les
                 # arguments seront convertis en commande à la clôture.
-                _deferred = needs_shell_fallback(_restored, self.tool_aliases)
+                _deferred = needs_shell_fallback(
+                    _restored, self.tool_aliases
+                ) or needs_argument_rewrite(_restored, self.tool_aliases)
                 tc_name = tool_call_target(_restored, self.tool_aliases)
                 if not tc_name:
                     # Parité officielle : jamais de bloc fantôme `tool_pending_*`.
