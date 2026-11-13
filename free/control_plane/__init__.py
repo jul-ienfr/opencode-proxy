@@ -33,6 +33,8 @@ from .models import (
     TunnelState,
     TunnelTarget,
 )
+from .shadow import ShadowComparison, ShadowObserver, ShadowPlan
+from .telemetry import ShadowTelemetry
 
 __all__ = [
     "ActiveJob",
@@ -51,6 +53,10 @@ __all__ = [
     "GluetunControlClient",
     "LegacyFallback",
     "ServerCandidate",
+    "ShadowComparison",
+    "ShadowObserver",
+    "ShadowPlan",
+    "ShadowTelemetry",
     "SwitchJob",
     "TransportState",
     "TunnelState",
