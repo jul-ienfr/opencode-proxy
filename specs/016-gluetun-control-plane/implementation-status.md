@@ -222,14 +222,15 @@ Reste à faire pour clôturer T095 :
 - `eventSink` publie sur le bus et dans `events.FileLog`, avec sévérité warn
   pour rejet, annulation, rollback, `failed_degraded` et drain timeout.
 
-## Phase 6 — Intégration orchestrateur (T070–T072 faits, T073–T079 à faire)
+## Phase 6 — Intégration orchestrateur (T070–T073 faits, T074–T079 à faire)
 
 | Tâche | Statut | Preuve |
 |---|---|---|
 | T070 — client Python | fait | `free/control_plane/{client,models,errors}.py` : méthodes du contrat (`capabilities`, `state`, `switch`, `rotate`, `rollback`, `job`, `cancel`, `egress`, `dns_state`, `transport_state`, `transport_reset`, `events`), dataclasses typées, retries bornés (`429/502/503/504` + connexion/timeout), `Idempotency-Key` obligatoire sur switch/rotate, erreurs `ActiveJob`/`UnknownTarget`/`VerificationFailed`/`Exhausted`/`ControlPlaneUnavailable`, aucun `docker exec`. Adaptateur `free/ip_registry/adapters/gluetun_control_v2.py` (binder async, clé `action-station-cycle_id`, aucun re-score) ; `tests/test_gluetun_control_v2.py` (24 cas, faux serveur `httpx.MockTransport`). |
 | T071 — configuration Python | fait | `free/control_plane/config.py` : `mode` (`legacy|shadow|active`), `base_url` avec `{station}`, `api_key_env` résolue à l'appel et jamais rendue, timeouts, retry, shadow, events, `transport_owner` (`python|fork`) ; `config.yaml` porte le bloc `control_plane` (mode `legacy` par défaut) ; `tests/test_control_plane_config.py`. |
 | T072 — shadow mode | fait | `free/control_plane/{shadow,telemetry}.py` : `ShadowObserver` n'émet que des `switch(dry_run=true, wait=false)` et n'est jamais autoritaire ; `ShadowPlan`/`ShadowComparison` comparent cible/IP legacy avec l'état et l'egress du fork ; toute erreur du plan de contrôle est capturée dans la ligne (`control-plane-error`) et aucune exception de télémétrie ne remonte ; `ShadowTelemetry` écrit une table additive `control_plane_shadow` dans `telemetry.db` (jamais `registry.db`) ; `tests/test_control_plane_shadow.py` (8 cas). |
-| T073–T079 | à faire | Ingestion d'événements, adaptateur de rotation, adaptateur egress, dashboard, fallback legacy, activation 1→6 et décommissionnement du chemin chaud restent à implémenter. |
+| T073 — ingestion d'événements | fait | `free/control_plane/events.py` : `EventIngestor.poll` lit `GET /v1/events?since=<curseur>`, applique chaque `(station, seq)` une seule fois et persiste le curseur ; `free/ip_registry/registry_db.py` ajoute `control_cursor` et `control_events` (migration additive) et applique le lot dans une transaction `BEGIN IMMEDIATE` (un échec de mapping ne saute jamais un événement). Mapping : `job.committed`/`egress.verified`/`transport.*` → `observations`, `job.failed_degraded`/`dns.*`/`state.*` → `incidents`, `job.exhausted`/`transport.cycle_exhausted`/`tunnel.repair_needed` → `repair_requests` (jamais de désactivation de station), `job.rolled_back` répété → repair ; `tests/test_control_plane_events.py` (9 cas). |
+| T074–T079 | à faire | Adaptateur de rotation, adaptateur egress, dashboard, fallback legacy, activation 1→6 et décommissionnement du chemin chaud restent à implémenter. |
 
 Le client est volontairement inerte tant que `control_plane.mode=legacy` :
 aucun chemin chaud ne l'appelle encore. Le passage en `shadow` puis `active`
@@ -246,9 +247,9 @@ go test ./internal/control/state -count=1                                     ->
 go test ./internal/control/jobs -count=1                                      -> ok
 go test ./tests/integration -run Test_EgressChaos                             -> ok
 go test ./internal/server/middlewares/auth -run 'Test_authHandler_ServeHTTP|Test_Role|Test_Settings' -> ok
-python -m pytest tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py -q -> 34 passed
-python -m ruff check free/control_plane free/ip_registry/adapters/gluetun_control_v2.py tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py -> ok
-python -m ruff format --check free/control_plane tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py -> ok
+python -m pytest tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py tests/test_control_plane_events.py -q -> 43 passed
+python -m ruff check free/control_plane free/ip_registry/registry_db.py free/ip_registry/adapters/gluetun_control_v2.py tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py tests/test_control_plane_events.py -> ok
+python -m ruff format --check free/control_plane free/ip_registry/registry_db.py tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py tests/test_control_plane_events.py -> ok
 go vet ./internal/control/... ./internal/server/... ./internal/configuration/settings/... ./tests/integration/harness -> ok
 GOOS=linux GOARCH=amd64 go build ./...                                       -> ok
 golangci-lint v2.14.0 (harness, control, settings, server, egress, tests, cmd) -> 0 issues
