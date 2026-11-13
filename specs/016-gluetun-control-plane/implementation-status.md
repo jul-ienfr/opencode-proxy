@@ -387,3 +387,15 @@ les capacités effectivement attachées :
   (`TRANSPORT_ENABLED=true`) ; `false` sinon. Le service peut être attaché sans
   piloter un run donné si `shouldRunLadder` est faux (`VPN_TYPE` explicite,
   `amneziawg`, `OpenVPN.ConfFile`, hostname non pinné).
+
+## Migration douce (feature 017)
+
+La migration de la flotte vers `gluetun-016:local` et le câblage du superviseur
+sont suivis dans `specs/017-fork-soft-migration/`. Correctifs fork associés :
+`6ea9b9ba` (ladder avant tunnel, budgets de switch/rollback) et `21bf39dd`
+(catalogue agrégé par hostname). Correctifs superviseur : `2b2a1e2` (binder v2,
+ports loopback, idempotence par cible, override auto) et `a7a0539` (repli
+Compose quand la boucle VPN d'une station est crashée). Règle appliquée : une
+station saine n'est jamais recréée pour une migration ; seules les stations
+inutilisables sont réparées, avec le ladder complet conservé.
+
