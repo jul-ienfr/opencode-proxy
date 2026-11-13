@@ -22,7 +22,6 @@ from app.protocol.tool_aliases import (
     tool_call_target,
 )
 
-
 def _claude_tools():
     return [
         {
@@ -51,6 +50,45 @@ def _claude_tools():
                 "type": "object",
                 "properties": {"pattern": {"type": "string"}},
                 "required": ["pattern"],
+            },
+        },
+    ]
+
+
+def _claude_grep_tools():
+    """Schéma Grep/Glob réel de Claude Code 2.1.32x (additionalProperties=false)."""
+    return [
+        {
+            "name": "Grep",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                    "glob": {"type": "string"},
+                    "output_mode": {"type": "string"},
+                    "-B": {"type": "number"},
+                    "-A": {"type": "number"},
+                    "-C": {"type": "number"},
+                    "context": {"type": "number"},
+                    "-n": {"type": "boolean"},
+                    "-i": {"type": "boolean"},
+                    "type": {"type": "string"},
+                    "head_limit": {"type": "number"},
+                    "offset": {"type": "number"},
+                    "multiline": {"type": "boolean"},
+                },
+                "required": ["pattern"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "Glob",
+            "input_schema": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}},
+                "required": ["pattern"],
+                "additionalProperties": False,
             },
         },
     ]
@@ -222,6 +260,246 @@ def test_grep_include_becomes_claude_glob():
     )
     assert name == "Grep"
     assert json.loads(args) == {"pattern": "foo", "path": ".", "glob": "*.py"}
+
+
+def test_grep_unknown_keys_are_filtered_for_claude():
+    """Claude refuse ``_n``, ``literal``, ``caseSensitive`` et ``limit``.
+
+    Mesure 2026-11-13 : ``InputValidationError: An unexpected parameter `_n`
+    was provided``. Le modèle produit ``_n`` en voulant ``-n``.
+    """
+    aliases = build_tool_alias_map(_claude_grep_tools())
+    name, args = adapt_tool_call(
+        "grep",
+        json.dumps(
+            {
+                "pattern": "foo.bar",
+                "path": ".",
+                "include": "*.py",
+                "output_mode": "content",
+                "_n": "true",
+                "literal": True,
+                "caseSensitive": False,
+                "limit": 5,
+            }
+        ),
+        aliases,
+    )
+    assert name == "Grep"
+    assert json.loads(args) == {
+        "pattern": r"foo\.bar",
+        "path": ".",
+        "glob": "*.py",
+        "output_mode": "content",
+        "-n": True,
+        "-i": True,
+        "head_limit": 5,
+    }
+
+
+def test_grep_query_becomes_pattern():
+    aliases = build_tool_alias_map(_claude_grep_tools())
+    name, args = adapt_tool_call("grep", '{"query":"TODO"}', aliases)
+    assert name == "Grep"
+    assert json.loads(args) == {"pattern": "TODO"}
+
+
+def test_grep_keeps_limit_for_client_with_limit_schema():
+    """opencode desktop déclare ``limit`` : ne pas le convertir en head_limit."""
+    aliases = build_tool_alias_map(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "grep",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {},
+                            "path": {},
+                            "include": {},
+                            "literal": {},
+                            "caseSensitive": {},
+                            "limit": {},
+                        },
+                    },
+                },
+            }
+        ]
+    )
+    name, args = adapt_tool_call(
+        "grep",
+        '{"pattern":"x","include":"*.py","literal":true,"caseSensitive":false,"limit":5}',
+        aliases,
+    )
+    assert name == "grep"
+    assert json.loads(args) == {
+        "pattern": "x",
+        "include": "*.py",
+        "literal": True,
+        "caseSensitive": False,
+        "limit": 5,
+    }
+
+
+def test_glob_unknown_official_args_are_filtered_for_claude():
+    aliases = build_tool_alias_map(_claude_grep_tools())
+    name, args = adapt_tool_call(
+        "glob", '{"pattern":"*.py","path":".","hidden":true,"limit":10}', aliases
+    )
+    assert name == "Glob"
+    assert json.loads(args) == {"pattern": "*.py", "path": "."}
+
+
+def test_needs_argument_rewrite_detects_grep_target_schema():
+    aliases = build_tool_alias_map(_claude_grep_tools())
+    assert needs_argument_rewrite("grep", aliases) is True
+    assert needs_argument_rewrite("glob", aliases) is True
+    # Mesure 2026-11-13 : le modèle émettait déjà ``Grep`` ; le retour
+    # anticipé ``target == raw`` sautait alors tout remap d'arguments et
+    # Claude Code rejetait ``line_numbers`` (additionalProperties: false).
+    assert needs_argument_rewrite("Grep", aliases) is True
+    assert needs_argument_rewrite("Glob", aliases) is True
+
+
+def test_grep_with_exact_target_name_still_remaps_arguments():
+    aliases = build_tool_alias_map(_claude_grep_tools())
+    name, args = adapt_tool_call(
+        "Grep",
+        '{"pattern":"OpenCode","output_mode":"content","head_limit":5,'
+        '"line_numbers":"true"}',
+        aliases,
+    )
+    assert name == "Grep"
+    assert json.loads(args) == {
+        "pattern": "OpenCode",
+        "output_mode": "content",
+        "head_limit": 5,
+        "-n": True,
+    }
+    # Le chemin non-stream adapte deux fois (Chat puis openai_to_anthropic) :
+    # le second passage doit être un no-op.
+    assert adapt_tool_call("Grep", args, aliases) == ("Grep", args)
+
+
+def test_adapt_chat_completion_remaps_exact_grep_name():
+    """Chemin non-stream : ``adapt_chat_completion`` tourne sur le JSON complet."""
+    resp = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "Grep",
+                                "arguments": (
+                                    '{"pattern":"OpenCode","output_mode":"content",'
+                                    '"head_limit":5,"line_numbers":"true"}'
+                                ),
+                            },
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    changed = adapt_chat_completion(
+        resp, build_tool_alias_map(_claude_grep_tools())
+    )
+    assert changed is True
+    args = json.loads(
+        resp["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    )
+    assert args == {
+        "pattern": "OpenCode",
+        "output_mode": "content",
+        "head_limit": 5,
+        "-n": True,
+    }
+
+
+def test_stream_grep_with_exact_target_name_is_deferred():
+    """Le nom émis est déjà ``Grep`` : les args doivent quand même être retenus."""
+    state = ChatSseToAnthropicState(
+        tool_aliases=build_tool_alias_map(_claude_grep_tools()),
+        shell_kind="posix",
+    )
+    chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "Grep",
+                                "arguments": (
+                                    '{"pattern":"OpenCode","output_mode":"content",'
+                                    '"head_limit":5,"line_numbers":"true"}'
+                                ),
+                            },
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+    emitted = "".join(state.feed_chunk(chunk))
+    assert "\"name\":\"Grep\"" in emitted
+    assert "input_json_delta" not in emitted
+    done = {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}
+    combined = (
+        emitted
+        + "".join(state.feed_chunk(done))
+        + "".join(state.finalize_events())
+    )
+    assert "line_numbers" not in combined
+    assert '\\"-n\\":true' in combined
+
+
+def test_stream_grep_is_deferred_and_strips_unknown_keys():
+    state = ChatSseToAnthropicState(
+        tool_aliases=build_tool_alias_map(_claude_grep_tools()),
+        shell_kind="posix",
+    )
+    chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "grep",
+                                "arguments": (
+                                    '{"pattern":"foo","path":".","_n":"true",'
+                                    '"literal":true,"limit":5}'
+                                ),
+                            },
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+    emitted = "".join(state.feed_chunk(chunk))
+    assert '"name":"Grep"' in emitted
+    assert "input_json_delta" not in emitted
+    done = {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}
+    combined = (
+        emitted
+        + "".join(state.feed_chunk(done))
+        + "".join(state.finalize_events())
+    )
+    assert '\\"_n\\"' not in combined
+    assert '\\"literal\\"' not in combined
+    assert '\\"limit\\"' not in combined
+    assert '\\"-n\\":true' in combined
+    assert '\\"head_limit\\":5' in combined
 
 
 # ─────────────────────── repli shell ───────────────────────

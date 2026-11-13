@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import sys
 from urllib.parse import quote_plus
 
@@ -329,11 +330,19 @@ def needs_argument_rewrite(name: str, aliases: dict | None) -> bool:
     if not family:
         return False
     target = adapt_tool_name(raw, aliases)
-    if not target or target == raw:
+    if not target:
         return False
     target_family = _FAMILY_OF.get(target.lower())
     if target_family != family:
         return True
+    if family in ("glob", "grep"):
+        # Même quand le modèle a déjà émis le nom exact du client (``Grep``),
+        # son schéma reste strict : les alias d'arguments (``line_numbers`` →
+        # ``-n``, ``limit`` → ``head_limit``, ``include`` → ``glob``…) et le
+        # filtrage des clés inconnues doivent s'appliquer.
+        return bool(aliases.get("props", {}).get(target))
+    if target == raw:
+        return False
     key = (aliases.get("args") or {}).get(target)
     if family == "shell":
         # Le nom officiel ``bash`` porte ``command`` : tout autre nom de clé
@@ -383,6 +392,15 @@ def _first(obj: dict, keys) -> object:
         if isinstance(value, str) and value.strip():
             return value
     return ""
+
+
+def _truthy(value) -> bool:
+    """Booléen tolérant : les petits modèles envoient ``"true"`` en chaîne."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _ps_quote(value) -> str:
@@ -623,10 +641,105 @@ def _remap_args(
                     out[snake] = out.pop(camel)
     elif family == "grep":
         # Claude Code nomme ``glob`` le filtre de fichiers que la grille
-        # officielle appelle ``include``.
+        # officielle appelle ``include``, ``-n``/``-i``/``-A``/``-B``/``-C``
+        # les options de ripgrep, et ``head_limit`` la limite de sortie.
+        # Les petits modèles produisent aussi des clés proches (``query``,
+        # ``limit``, ``_n``…) : on les ramène sur le vocabulaire cible avant
+        # le filtrage strict, sinon le client répond InputValidationError.
         props = aliases.get("props", {}).get(target) or set()
-        if "glob" in props and "include" in out:
-            out["glob"] = out.pop("include")
+        pattern = _first(out, ("pattern", "query", "q", "regex", "search", "text"))
+        if pattern and not isinstance(out.get("pattern"), str):
+            out["pattern"] = pattern
+        for source in ("query", "q", "regex", "search", "text"):
+            out.pop(source, None)
+
+        include = _first(
+            out, ("include", "file_glob", "fileGlob", "file_pattern", "filePattern")
+        )
+        if include and "glob" in props:
+            if not isinstance(out.get("glob"), str):
+                out["glob"] = include
+            for source in (
+                "include",
+                "file_glob",
+                "fileGlob",
+                "file_pattern",
+                "filePattern",
+            ):
+                out.pop(source, None)
+
+        if "caseSensitive" in out and "-i" in props:
+            if not _truthy(out.pop("caseSensitive")):
+                out["-i"] = True
+        if "literal" in out and "literal" not in props:
+            if _truthy(out.pop("literal")) and isinstance(out.get("pattern"), str):
+                out["pattern"] = re.escape(out["pattern"])
+
+        # Alias de clés produits par la grille officielle ou par le modèle.
+        key_aliases = {
+            "outputMode": "output_mode",
+            "mode": "output_mode",
+            "headLimit": "head_limit",
+            "limit": "head_limit",
+            "max_results": "head_limit",
+            "maxResults": "head_limit",
+            "head": "head_limit",
+            "case_insensitive": "-i",
+            "caseInsensitive": "-i",
+            "ignore_case": "-i",
+            "ignoreCase": "-i",
+            "line_numbers": "-n",
+            "lineNumbers": "-n",
+            "show_line_numbers": "-n",
+            "context_lines": "-C",
+            "contextLines": "-C",
+            "context": "-C",
+            "before_context": "-B",
+            "beforeContext": "-B",
+            "lines_before": "-B",
+            "after_context": "-A",
+            "afterContext": "-A",
+            "lines_after": "-A",
+            "_n": "-n",
+            "_i": "-i",
+            "_A": "-A",
+            "_B": "-B",
+            "_C": "-C",
+        }
+        for source, canonical in key_aliases.items():
+            if source not in out:
+                continue
+            if canonical in props:
+                value = out.pop(source)
+                if canonical not in out:
+                    out[canonical] = value
+            elif source not in props:
+                # Ni le nom cible ni le nom source ne sont acceptés : la clé
+                # serait de toute façon retirée par le filtrage strict.
+                out.pop(source, None)
+
+        mode = out.get("output_mode")
+        if isinstance(mode, str):
+            normalized = {
+                "files": "files_with_matches",
+                "files_only": "files_with_matches",
+                "files_with_match": "files_with_matches",
+                "paths": "files_with_matches",
+                "lines": "content",
+                "matches": "content",
+                "text": "content",
+                "counts": "count",
+            }.get(mode.strip().lower())
+            if normalized:
+                out["output_mode"] = normalized
+
+        for flag in ("-n", "-i", "multiline"):
+            if flag in out and not isinstance(out[flag], bool):
+                out[flag] = _truthy(out[flag])
+        for key in ("-A", "-B", "-C", "head_limit", "offset"):
+            value = out.get(key)
+            if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+                out[key] = int(value)
     elif family == "websearch":
         props = aliases.get("props", {}).get(target) or set()
         if "queries" in props and "query" in out:
