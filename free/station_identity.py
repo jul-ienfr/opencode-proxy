@@ -49,6 +49,28 @@ _INSTRUCTIONS_RE = re.compile(
 )
 _WIN_USER_PATH_RE = re.compile(r"[A-Za-z]:[\\/]Users[\\/][^\s`\"'<>|]+(?:[\\/][^\s`\"'<>|]+)*")
 _ENV_CWD_RE = re.compile(r"<env>\s*Working directory:\s*([^\n<]+)")
+#: Indices de cwd dans les messages : Claude Code 2.x ne met plus toujours
+#: ``<env>`` dans le prompt système (mémoire/summary en rôle user), et sans
+#: racine réelle le remap des tool_calls ne s'applique pas — le modèle continue
+#: d'émettre ``/workspace/...``, inexistant chez un client Windows.
+_CWD_HINT_RE = re.compile(
+    r"(?:working\s+dir(?:ectory)?|actual\s+cwd|current\s+(?:working\s+)?dir(?:ectory)?|\bcwd\b)",
+    re.IGNORECASE,
+)
+_QUOTED_PATH_RE = re.compile(
+    r"[`\"']((?:[A-Za-z]:[\\/]|/[A-Za-z]/)[^`\"'\r\n]+)[`\"']"
+)
+_BARE_PATH_RE = re.compile(
+    r"((?:[A-Za-z]:[\\/]|/[A-Za-z]/)[^`\"'\r\n<>|]+)"
+)
+_TRAILING_PROSE_RE = re.compile(
+    r"\s+(?:and|then|but|which|where|while|because|so)\b",
+    re.IGNORECASE,
+)
+_MEMORY_HOME_RE = re.compile(
+    r"([A-Za-z]:[\\/]Users[\\/][^\\/\s`\"'<>|]+)[\\/]\.claude[\\/]projects[\\/]",
+    re.IGNORECASE,
+)
 _LABEL_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 _HEX32_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -111,16 +133,83 @@ def sanitize_text(text: str, env_cwd: str) -> str:
     return _WIN_USER_PATH_RE.sub(lambda _match: env_cwd, out)
 
 
+def _looks_windows(text: str) -> bool:
+    low = str(text or "").lower()
+    return (
+        "c:\\users\\" in low
+        or "git bash" in low
+        or "windows powershell" in low
+        or "<shell>powershell" in low
+        or "platform: win32" in low
+    )
+
+
+def _windows_from_posix(path: str) -> str:
+    """``/c/Users/ASUS/...`` (Git Bash) → ``C:\\Users\\ASUS\\...``."""
+    match = re.match(r"^/([A-Za-z])/(.*)$", str(path or ""))
+    if not match:
+        return str(path or "")
+    return f"{match.group(1).upper()}:\\" + match.group(2).replace("/", "\\")
+
+
+def _trim_path_tail(candidate: str) -> str:
+    """Retire la prose qui suit un chemin non quoté (« … gli and bash … »).
+
+    Un dossier Windows peut contenir des espaces (``Savegare gli``) : on ne
+    peut donc pas s'arrêter au premier espace. On coupe aux conjonctions et à
+    la ponctuation de fin, puis aux points/espaces terminaux.
+    """
+    value = str(candidate or "").strip()
+    value = _TRAILING_PROSE_RE.split(value, maxsplit=1)[0]
+    value = re.split(r"[,;]", value, maxsplit=1)[0]
+    return value.strip().rstrip(" .")
+
+
+def _valid_path_candidate(candidate: str, windows: bool) -> str:
+    """Filtre les faux chemins (fragments JSON type ``s:\\n``, ``/workspace``).
+
+    On exige au moins un sous-dossier : une racine de workspace réelle en a
+    toujours un (``C:\\Users\\ASUS\\Desktop\\...``), alors qu'un fragment
+    d'échappement n'en a pas. Mieux vaut ne rien remapper que d'envoyer les
+    outils vers ``s:\n-``.
+    """
+    value = _trim_path_tail(str(candidate or "").strip().strip("`\"'"))
+    if not value or value.startswith("/workspace"):
+        return ""
+    if re.match(r"^[A-Za-z]:[\\/]", value):
+        if not re.match(r"^[A-Za-z]:[\\/][^\\/\r\n]+[\\/]", value):
+            return ""
+        return value.replace("/", "\\")
+    if re.match(r"^/[A-Za-z]/", value):
+        if not windows:
+            return ""
+        if not re.match(r"^/[A-Za-z]/[^/\r\n]+/", value):
+            return ""
+        return _windows_from_posix(value)
+    return ""
+
+
 def workspace_root_from_messages(messages) -> str:
     """Extrait le vrai ``Working directory`` du prompt client.
 
     Le corps envoyé au provider est templaté (``/workspace/oc-<station>``) pour
     cacher le nom d'utilisateur. Pour que les tool_calls du modèle restent
     exécutables, le proxy doit connaître le chemin réel et le remapper au
-    retour. On lit le premier bloc ``<env>`` des messages système du client.
+    retour.
+
+    Trois sources, dans cet ordre :
+      1. bloc ``<env>Working directory:`` (n'importe quel rôle — Claude Code 2.x
+         peut le placer dans un rappel utilisateur) ;
+      2. indice explicite « working dir / cwd is … » dans les messages,
+         notamment les summaries de compaction (``/c/Users/...`` converti en
+         ``C:\\Users\\...`` pour un client Windows) ;
+      3. dernier recours : dossier home déduit du chemin mémoire
+         ``C:\\Users\\<user>\\.claude\\projects\\...``.
     """
+    texts: list[str] = []
+    system_texts: list[str] = []
     for message in messages or []:
-        if not isinstance(message, dict) or message.get("role") != "system":
+        if not isinstance(message, dict):
             continue
         content = message.get("content")
         if isinstance(content, list):
@@ -131,11 +220,33 @@ def workspace_root_from_messages(messages) -> str:
             )
         if not isinstance(content, str):
             continue
+        texts.append(content)
+        if message.get("role") == "system":
+            system_texts.append(content)
+    for content in (*system_texts, *texts):
         match = _ENV_CWD_RE.search(content)
         if match:
             value = match.group(1).strip()
-            if value:
+            if value and not value.startswith(ENV_PREFIX):
                 return value
+    blob = "\n".join(texts)
+    if not blob:
+        return ""
+    windows = _looks_windows(blob)
+    for hint in _CWD_HINT_RE.finditer(blob):
+        window = blob[hint.start() : hint.start() + 400]
+        for match in _QUOTED_PATH_RE.finditer(window):
+            candidate = _valid_path_candidate(match.group(1), windows)
+            if candidate:
+                return candidate
+        for match in _BARE_PATH_RE.finditer(window):
+            candidate = _valid_path_candidate(match.group(1), windows)
+            if candidate:
+                return candidate
+    if windows:
+        home = _MEMORY_HOME_RE.search(blob)
+        if home:
+            return home.group(1).replace("/", "\\")
     return ""
 
 
@@ -162,6 +273,16 @@ def translate_paths(
             else real_s
         )
         out = out.replace(fake_s, target)
+        # Racines factices HISTORIQUES : un tour précédent a pu utiliser un
+        # autre suffixe de hash pour la même station (ou aucun suffixe). Toute
+        # racine ``/workspace/oc-<station>`` est inventée par le proxy, on la
+        # ramène donc aussi vers la racine réelle.
+        if fake_s.startswith("/workspace"):
+            out = re.sub(
+                r"/workspace/oc-[A-Za-z0-9._-]+",
+                lambda _match: target,
+                out,
+            )
         # La racine factice est en style Unix ; le suffixe doit prendre les
         # séparateurs Windows de la racine réelle (C:\...\file, pas C:\.../file).
         if re.match(r"^[A-Za-z]:[\\/]", real_s):

@@ -48,6 +48,97 @@ def _edit_tool() -> dict:
     }
 
 
+def test_workspace_root_reads_cwd_hint_from_user_summary() -> None:
+    messages = [
+        {"role": "system", "content": "You are a coding agent."},
+        {
+            "role": "user",
+            "content": (
+                "`cd /workspace/oc-WARP-8-...` failed. "
+                "Learned working dir is `/c/Users/ASUS/Desktop/Savegare gli` "
+                "and bash runs Git Bash."
+            ),
+        },
+    ]
+    assert workspace_root_from_messages(messages) == (
+        r"C:\Users\ASUS\Desktop\Savegare gli"
+    )
+
+
+def test_workspace_root_ignores_escape_like_fragments() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                'cwd is "s:\\n-" then working dir is '
+                "`/c/Users/ASUS/Desktop/Savegare gli` (Git Bash)."
+            ),
+        }
+    ]
+    assert workspace_root_from_messages(messages) == (
+        r"C:\Users\ASUS\Desktop\Savegare gli"
+    )
+
+
+def test_workspace_root_falls_back_to_memory_home() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                r"Memory at `C:\Users\ASUS\.claude\projects\c--Users-ASUS-"
+                r"Desktop-Savegare-gli\memory` (Windows PowerShell)."
+            ),
+        }
+    ]
+    assert workspace_root_from_messages(messages) == r"C:\Users\ASUS"
+
+
+def test_translate_paths_handles_historical_station_hash() -> None:
+    mapping = _free_path_map_for("/workspace/oc-WARP-8-current", REAL)
+    assert translate_paths(
+        "/workspace/oc-WARP-8-oldhash/file", mapping
+    ) == REAL + r"\file"
+
+
+def test_free_path_map_covers_legacy_base_root() -> None:
+    mapping = _free_path_map_for(
+        "/workspace/oc-WARP-8-abc12345", REAL, "/workspace/oc-WARP-8"
+    )
+    assert (
+        translate_paths("/workspace/oc-WARP-8-abc12345/file", mapping)
+        == REAL + r"\file"
+    )
+    assert translate_paths("/workspace/oc-WARP-8/file", mapping) == REAL + r"\file"
+
+
+def test_free_path_map_without_identity_uses_bare_workspace() -> None:
+    assert _free_path_map_for("", REAL) == {"/workspace": REAL}
+
+
+def test_set_free_path_map_extracts_cwd_without_identity() -> None:
+    from opencode import _free_path_map, _set_free_path_map
+
+    token = _free_path_map.set(None)
+    try:
+        body = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Platform: win32. The actual cwd is "
+                        "`/c/Users/ASUS/Desktop/Savegare gli` (Git Bash)."
+                    ),
+                }
+            ]
+        }
+        _set_free_path_map(body, None)
+        assert _free_path_map.get() == {
+            "/workspace": r"C:\Users\ASUS\Desktop\Savegare gli"
+        }
+    finally:
+        _free_path_map.reset(token)
+
+
 def test_free_path_map_also_covers_bare_workspace_on_windows() -> None:
     mapping = _free_path_map_for("/workspace/oc-WARP-1-abc", REAL)
     assert mapping["/workspace/oc-WARP-1-abc"] == REAL
@@ -150,13 +241,19 @@ def test_healer_emits_real_path_and_path_key() -> None:
                         }
                     ]
                 },
-                "finish_reason": None,
+                # Le remap de chemin attend le JSON complet : le healer émet
+                # au finish, jamais fragment par fragment.
+                "finish_reason": "tool_calls",
             }
         ]
     }
     out = healer.feed(chunk)
     assert out
-    emitted = out[-1]["choices"][0]["delta"]["tool_calls"][0]["function"]
+    emitted = next(
+        _c["choices"][0]["delta"]["tool_calls"][0]["function"]
+        for _c in out
+        if _c.get("choices") and _c["choices"][0].get("delta", {}).get("tool_calls")
+    )
     args = json.loads(emitted["arguments"])
     assert args["path"] == REAL + r"\.env"
     assert "filePath" not in args

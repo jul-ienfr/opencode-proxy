@@ -8949,9 +8949,14 @@ class _ChatToolCallHealer:
                     )
                     _raw_name = st["raw_name"] or st["name"]
                     st["name"] = adapt_tool_name(_raw_name, self._aliases)
-                    if needs_shell_fallback(
-                        _raw_name, self._aliases
-                    ) or needs_argument_rewrite(_raw_name, self._aliases):
+                    if (
+                        needs_shell_fallback(_raw_name, self._aliases)
+                        or needs_argument_rewrite(_raw_name, self._aliases)
+                        # Une racine factice peut être coupée entre deux
+                        # fragments : on attend le JSON complet pour la
+                        # remapper (sinon « p /workspace/pk » part tel quel).
+                        or bool(self._path_map)
+                    ):
                         # Famille absente du client (``webfetch`` chez Claude
                         # Code) ou clés d'arguments à réécrire (``cmd`` chez
                         # Codex) : on accumule et on émettra l'appel complet au
@@ -10419,7 +10424,32 @@ def _station_free_body(body, runtime, client_body=None):
     return build_body(body, runtime, client_body=client_body)
 
 
-def _free_path_map_for(fake_root: str, real_root: str) -> dict[str, str]:
+def _path_map_from_body(body) -> dict[str, str]:
+    """Map de secours calculée hors ContextVar (générateurs de flux).
+
+    Les générateurs SSE ne voient pas toujours la ContextVar posée par
+    ``_set_free_path_map`` (contexte copié). On ré-extrait le cwd du corps
+    client et on mappe tout le préfixe ``/workspace`` vers celui-ci.
+    """
+    try:
+        from free.station_identity import workspace_root_from_messages
+
+        if not isinstance(body, dict):
+            return {}
+        messages = list(body.get("messages") or [])
+        # Corps Anthropic : le prompt système est top-level, pas dans messages.
+        system = body.get("system")
+        if system:
+            messages.insert(0, {"role": "system", "content": system})
+        real = workspace_root_from_messages(messages)
+    except Exception:
+        return {}
+    return {"/workspace": real} if real else {}
+
+
+def _free_path_map_for(
+    fake_root: str, real_root: str, base_fake: str | None = None
+) -> dict[str, str]:
     """Racine factice → racine réelle, plus le préfixe ``/workspace`` brut.
 
     Un modèle peut n'émettre que ``/workspace`` (sans le suffixe de station).
@@ -10427,13 +10457,31 @@ def _free_path_map_for(fake_root: str, real_root: str) -> dict[str, str]:
     dossier d'installation (souvent ``C:\\Program Files\\Git\\workspace``), non
     inscriptible — d'où « mkdir: Permission denied ». On ramène donc aussi ce
     préfixe vers la racine réelle, uniquement quand elle est Windows.
+
+    ``base_fake`` couvre les tours où la racine factice n'avait pas encore son
+    suffixe de hash : les anciens tool_calls du client continuent depointer
+    vers la même racine réelle. Les clés les plus longues passent en premier
+    pour que le préfixe court ne tronque pas le chemin complet.
     """
-    fake = str(fake_root or "")
     real = str(real_root or "")
-    if not fake or not real:
+    if not real:
         return {}
-    mapping = {fake: real}
-    if fake.startswith("/workspace/") and re.match(r"^[A-Za-z]:[\\/]", real):
+    keys = {
+        key
+        for key in (str(fake_root or ""), str(base_fake or ""))
+        if key
+    }
+    if not keys:
+        # Pas d'identité de station : aucune racine factice propre, mais le
+        # prompt officiel fait quand même émettre ``/workspace/...``. On le
+        # ramène vers le cwd réel du client.
+        return {"/workspace": real}
+    mapping: dict[str, str] = {}
+    for key in sorted(keys, key=len, reverse=True):
+        mapping[key] = real
+    if any(key.startswith("/workspace/") for key in keys) and re.match(
+        r"^[A-Za-z]:[\\/]", real
+    ):
         mapping.setdefault("/workspace", real)
     return mapping
 
@@ -10444,21 +10492,26 @@ def _set_free_path_map(body, station_runtime) -> None:
     base_fake = str(getattr(identity, "env_cwd", "") or "")
     real_root = ""
     fake_root = base_fake
-    if base_fake:
-        try:
-            from free.station_identity import (
-                workspace_env_cwd,
-                workspace_root_from_messages,
-            )
+    # [2026-11-13] Extraire le cwd MÊME sans identité de station : les egress
+    # WARP/public n'ont pas de racine factice propre, mais le prompt officiel
+    # fait quand même émettre ``/workspace/...``. Sans cette extraction, la map
+    # restait vide et les tool_calls partaient avec un chemin inexistant chez
+    # le client Windows (« mkdir: Permission denied »).
+    try:
+        from free.station_identity import (
+            workspace_env_cwd,
+            workspace_root_from_messages,
+        )
 
-            real_root = workspace_root_from_messages(
-                body.get("messages") if isinstance(body, dict) else None
-            )
+        real_root = workspace_root_from_messages(
+            body.get("messages") if isinstance(body, dict) else None
+        )
+        if base_fake:
             fake_root = workspace_env_cwd(identity, real_root) if real_root else base_fake
-        except Exception:
-            real_root = ""
-            fake_root = base_fake
-    _free_path_map.set(_free_path_map_for(fake_root, real_root))
+    except Exception:
+        real_root = ""
+        fake_root = base_fake
+    _free_path_map.set(_free_path_map_for(fake_root, real_root, base_fake))
     if fake_root and real_root:
         try:
             from free.station_identity import ensure_workspace_alias
@@ -13490,6 +13543,10 @@ async def _open_free_stream(
                     f"(proxy_mode={_free_proxy_mode()}) → no direct stream, caller retries/paid"
                 )
                 raise _FreeTunnelFailure(station, RuntimeError("no usable VPN station"))
+        # [2026-11-13] Même sans station (free direct), le prompt officiel fait
+        # émettre ``/workspace/...`` : la map doit exister avant le premier
+        # chunk pour que les tool_calls soient remappés vers le cwd client.
+        _set_free_path_map(body, None)
         _slot_token = None
         _wrapped_stream = None
         if proxy_url:
@@ -19655,6 +19712,7 @@ async def _finalize_and_close_stream(
     deferred_args=None,
     tool_aliases=None,
     shell_kind="powershell",
+    path_map=None,
 ):
     """Yield closing SSE events for a stream and persist the request.
 
@@ -19705,6 +19763,12 @@ async def _finalize_and_close_stream(
         # émet ici la commande shell complète avant de fermer le bloc.
         if deferred_args and idx in deferred_args:
             _raw_name, _raw_args = deferred_args[idx]
+            # [2026-11-13] Le JSON est complet ici : on remappe enfin les
+            # racines factices ``/workspace/...`` vers le cwd réel du client
+            # (un chemin coupé entre deux fragments ne pouvait pas l'être).
+            _raw_args = _heal_tool_call_paths(
+                _raw_name, _raw_args, path_map or {}
+            )
             _adapted_name, _adapted_args = adapt_tool_call(
                 _raw_name, _raw_args, tool_aliases, shell_kind=shell_kind
             )
@@ -22366,6 +22430,9 @@ async def messages(request: Request):
         # Use local variable to avoid sharing model_id across concurrent requests
         _req_model_id = model_id
         _mark_requested_model(_req_model_id)
+        # [2026-11-13] La ContextVar n'est pas visible depuis ce générateur
+        # (contexte copié) : on recalcule la map depuis le corps client.
+        _stream_path_map = _free_path_map.get() or _path_map_from_body(body)
         # Try free model for streaming
         _paid_model_id = _req_model_id  # Save original for fallback
         free_model = _resolve_free_model(_req_model_id)
@@ -22819,6 +22886,7 @@ async def messages(request: Request):
                                 deferred_args=_deferred_out,
                                 tool_aliases=_stream_aliases,
                                 shell_kind=_client_shell_kind,
+                                path_map=_stream_path_map,
                             ):
                                 yield ev
                             emitted_finish = True
@@ -23003,9 +23071,16 @@ async def messages(request: Request):
                                 # [2026-11-12] Famille absente du runtime client
                                 # (``webfetch`` chez Claude Code) : le bloc part
                                 # sous l'outil shell, args convertis à la clôture.
-                                _fallback = needs_shell_fallback(
-                                    _raw_name, _stream_aliases
-                                ) or needs_argument_rewrite(_raw_name, _stream_aliases)
+                                _fallback = (
+                                    needs_shell_fallback(_raw_name, _stream_aliases)
+                                    or needs_argument_rewrite(
+                                        _raw_name, _stream_aliases
+                                    )
+                                    # Une racine factice doit être remappée sur
+                                    # le JSON complet, jamais fragment par
+                                    # fragment (``/work`` + ``space/...``).
+                                    or bool(_stream_path_map)
+                                )
                                 tc_name = tool_call_target(_raw_name, _stream_aliases)
                                 if not tc_name:
                                     # [2026-10-26] Un tool_use au nom vide casse
@@ -23412,6 +23487,7 @@ async def messages(request: Request):
                 deferred_args=_deferred_post,
                 tool_aliases=_stream_aliases,
                 shell_kind=_client_shell_kind,
+                path_map=_stream_path_map,
             ):
                 yield ev
             emitted_finish = True
@@ -27046,8 +27122,11 @@ async def chat_completions(request: Request):
                         # [2026-10-26] Répare les tool_calls amont sans nom/id
                         # AVANT tout yield (cf. _ChatToolCallHealer). Le client
                         # harness refuse ensuite de rejouer le tour.
+                        _tool_path_map = _free_path_map.get() or _path_map_from_body(
+                            body
+                        )
                         _tool_healer = _ChatToolCallHealer(
-                            body.get("tools"), path_map=_free_path_map.get()
+                            body.get("tools"), path_map=_tool_path_map
                         )
 
                         def _sync_healer() -> None:
