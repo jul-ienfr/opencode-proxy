@@ -738,8 +738,14 @@ def _refresh_credentials_if_due(now: float | None = None) -> bool:
 
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
+        # A failed refresh is retried after 15 min, not after the full cooldown.
+        marker_at = (
+            timestamp
+            if ok
+            else timestamp - CREDENTIAL_REFRESH_COOLDOWN_S + 900.0
+        )
         marker.write_text(
-            json.dumps({"at": timestamp, "ok": ok}),
+            json.dumps({"at": marker_at, "ok": ok}),
             encoding="utf-8",
         )
     except OSError:
@@ -794,6 +800,17 @@ def _repair_holds(usable_now: int, active_serving: int, *, refresh: bool) -> boo
     return int(usable_now) - int(active_serving) <= 3
 
 
+def _station_has_model_proof(station: dict) -> bool:
+    """True when at least one free model has a fresh real 200 proof."""
+
+    by_model = station.get("model_usable_by_model")
+    if isinstance(by_model, dict):
+        for entry in by_model.values():
+            if isinstance(entry, dict) and entry.get("usable"):
+                return True
+    return bool(station.get("model_usable"))
+
+
 def _needs_chain(station: dict) -> bool:
     """A station that cannot serve a free request needs a fresh egress.
 
@@ -845,7 +862,7 @@ def _needs_chain(station: dict) -> bool:
             return False
     if not str(station.get("current_ip") or "").strip():
         return True
-    if station.get("station_usable") and station.get("model_usable"):
+    if station.get("station_usable") and _station_has_model_proof(station):
         return False
     # [2026-11-03] Operator policy: an unusable station is an unusable IP.
     # Change it, whatever the reason or the tunnel state. The only exception
@@ -871,7 +888,7 @@ def _station_recovered(station: dict) -> bool:
         return False
     # A connected tunnel is not a usable station. Only a fresh real free-model
     # 200 counts; a healthy container without that proof stays a repair target.
-    return bool(station.get("model_usable"))
+    return _station_has_model_proof(station)
 
 
 def _station_hopeless(station: dict) -> bool:
@@ -1717,6 +1734,8 @@ def _supervise() -> None:
                 log(
                     f"auth pause {int(auth_pause)}s — one probe at a time"
                 )
+            if _auth_recent(stations):
+                _refresh_credentials_if_due()
             functional = any(
                 bool(station.get("model_usable"))
                 for station in stations.values()

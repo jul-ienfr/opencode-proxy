@@ -65,6 +65,26 @@ def test_needs_chain_only_for_unusable_stations():
     )
 
 
+def test_any_model_proof_counts_as_usable():
+    station = _station(
+        model_usable=False,
+        model_usable_by_model={"m2": {"usable": True}},
+    )
+    assert supervisor._station_recovered(station) is True
+    assert (
+        supervisor._needs_chain(
+            {
+                "current_ip": "203.0.113.7",
+                "station_usable": True,
+                "model_usable": False,
+                "model_usable_by_model": {"m2": {"usable": True}},
+                "health": {"state": "healthy"},
+            }
+        )
+        is False
+    )
+
+
 def test_credential_refresh_respects_the_cooldown(tmp_path, monkeypatch):
     script = tmp_path / "scripts" / "refresh_nord_credentials.py"
     script.parent.mkdir(parents=True)
