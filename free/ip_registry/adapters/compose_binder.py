@@ -86,6 +86,73 @@ class ComposeHostnameBinder:
     def service_name(self, station: int) -> str:
         return "vpn-gluetun" if int(station) == 1 else f"vpn-gluetun-{int(station)}"
 
+    def credentials_stale(self, station: int) -> bool:
+        """True when the container runs with older credentials than the files.
+
+        A credential rotation (OpenVPN user/password or NordLynx key) only
+        reaches a container through a recreate. The supervisor must detect it
+        instead of retrying a dead in-place switch with revoked credentials.
+        """
+
+        desired = self._desired_credentials()
+        if not desired:
+            return False
+        current = self._container_env(station)
+        if not current:
+            return False
+        for key in ("OPENVPN_USER", "OPENVPN_PASSWORD", "WIREGUARD_PRIVATE_KEY"):
+            wanted = desired.get(key, "")
+            if wanted and current.get(key, "") != wanted:
+                return True
+        return False
+
+    def _desired_credentials(self) -> dict[str, str]:
+        values: dict[str, str] = {}
+        paths = (
+            self._root / "credentials.env",
+            self._root / "vpn_configs" / "wireguard.env",
+        )
+        for path in paths:
+            try:
+                text = path.read_text(encoding="utf-8-sig")
+            except OSError:
+                continue
+            for raw in text.splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip().strip('"').strip("'")
+        return values
+
+    def _container_env(self, station: int) -> dict[str, str]:
+        container = (
+            "opencode-vpn"
+            if int(station) == 1
+            else f"opencode-vpn-{int(station)}"
+        )
+        try:
+            proc = self._runner(
+                [
+                    "docker",
+                    "inspect",
+                    container,
+                    "--format",
+                    "{{range .Config.Env}}{{println .}}{{end}}",
+                ],
+                10.0,
+            )
+        except Exception:
+            return {}
+        if int(getattr(proc, "returncode", 1)) != 0:
+            return {}
+        values: dict[str, str] = {}
+        for line in str(getattr(proc, "stdout", "") or "").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+        return values
+
     def override_path_for(self, station: int) -> Path:
         """One override file per station: parallel chains must never race.
 

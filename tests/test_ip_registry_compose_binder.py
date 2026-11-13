@@ -204,6 +204,54 @@ def test_auto_override_leaves_vpn_type_for_the_fork_ladder(tmp_path):
     assert "OPENVPN_PROTOCOL" not in override
 
 
+def test_credentials_stale_detects_a_rotation(tmp_path):
+    (tmp_path / "credentials.env").write_text(
+        "OPENVPN_USER=new-user\nOPENVPN_PASSWORD=new-pass\n", encoding="utf-8"
+    )
+    wireguard = tmp_path / "vpn_configs"
+    wireguard.mkdir()
+    (wireguard / "wireguard.env").write_text(
+        "WIREGUARD_PRIVATE_KEY=new-key\n", encoding="utf-8"
+    )
+
+    class Runner:
+        def __call__(self, command, timeout):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "OPENVPN_USER=old-user\nOPENVPN_PASSWORD=old-pass\n"
+                "WIREGUARD_PRIVATE_KEY=old-key\n",
+                "",
+            )
+
+    binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=Runner())
+    assert binder.credentials_stale(2) is True
+
+
+def test_credentials_fresh_does_not_force_a_recreate(tmp_path):
+    (tmp_path / "credentials.env").write_text(
+        "OPENVPN_USER=same-user\nOPENVPN_PASSWORD=same-pass\n", encoding="utf-8"
+    )
+    wireguard = tmp_path / "vpn_configs"
+    wireguard.mkdir()
+    (wireguard / "wireguard.env").write_text(
+        "WIREGUARD_PRIVATE_KEY=same-key\n", encoding="utf-8"
+    )
+
+    class Runner:
+        def __call__(self, command, timeout):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "OPENVPN_USER=same-user\nOPENVPN_PASSWORD=same-pass\n"
+                "WIREGUARD_PRIVATE_KEY=same-key\n",
+                "",
+            )
+
+    binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=Runner())
+    assert binder.credentials_stale(2) is False
+
+
 def test_override_path_is_per_station(tmp_path):
     binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=FakeRunner())
     p1 = binder.override_path_for(1)
