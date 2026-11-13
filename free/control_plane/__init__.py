@@ -20,6 +20,7 @@ from .errors import (
     UnknownTarget,
     VerificationFailed,
 )
+from .events import EventIngestor, EventPollResult
 from .models import (
     Attempt,
     Capabilities,
@@ -49,6 +50,8 @@ __all__ = [
     "ControlPlaneUnavailable",
     "DNSState",
     "EgressVerification",
+    "EventIngestor",
+    "EventPollResult",
     "Exhausted",
     "GluetunControlClient",
     "LegacyFallback",

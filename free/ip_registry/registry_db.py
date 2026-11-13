@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,36 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = ROOT / "logs" / "registry.db"
 _SOURCE = "runtime"
 _LEASE_TTL_S = 6 * 3600.0
+
+# [feature 016] Additive control plane ingestion tables. They never store a
+# claim or a lease: they only remember which fork events were already applied.
+_CONTROL_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS control_cursor ("
+    " station INTEGER PRIMARY KEY,"
+    " last_seq INTEGER NOT NULL DEFAULT 0,"
+    " updated_at REAL NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS control_events ("
+    " station INTEGER NOT NULL,"
+    " seq INTEGER NOT NULL,"
+    " event_type TEXT NOT NULL DEFAULT '',"
+    " event_ts REAL NOT NULL DEFAULT 0,"
+    " ingested_at REAL NOT NULL DEFAULT 0,"
+    " PRIMARY KEY (station, seq))",
+)
+
+
+def _ensure_control_schema(conn: sqlite3.Connection) -> None:
+    for statement in _CONTROL_SCHEMA:
+        conn.execute(statement)
+
+
+def _epoch(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value or "").strip() or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def registry_db_path(path: str | Path | None = None) -> Path:
@@ -52,9 +83,7 @@ def _released_state_sql(now: float) -> str:
     )
 
 
-def assigned_for_station(
-    station: int, *, db_path: str | Path | None = None
-) -> dict[str, Any] | None:
+def assigned_for_station(station: int, *, db_path: str | Path | None = None) -> dict[str, Any] | None:
     conn = _connect(registry_db_path(db_path))
     try:
         row = conn.execute(
@@ -95,8 +124,7 @@ def release_station(
                 (ts, str(reason), int(station), ip),
             )
             conn.execute(
-                "UPDATE egress_ips SET state=" + _released_state_sql(ts) + ", "
-                "last_seen_at=? WHERE ip=?",
+                "UPDATE egress_ips SET state=" + _released_state_sql(ts) + ", last_seen_at=? WHERE ip=?",
                 (ts, ip),
             )
         conn.commit()
@@ -213,9 +241,7 @@ def assign_observed(
         conn.close()
 
 
-def reconcile(
-    *, now: float | None = None, db_path: str | Path | None = None
-) -> dict[str, int]:
+def reconcile(*, now: float | None = None, db_path: str | Path | None = None) -> dict[str, int]:
     """Release expired leases, revive reset IPs and clear orphan assignments."""
 
     ts = time.time() if now is None else float(now)
@@ -226,8 +252,7 @@ def reconcile(
     try:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
-            "SELECT station, ip FROM leases "
-            "WHERE status='active' AND expires_at <= ?",
+            "SELECT station, ip FROM leases WHERE status='active' AND expires_at <= ?",
             (ts,),
         ).fetchall()
         for row in rows:
@@ -237,8 +262,7 @@ def reconcile(
                 (ts, int(row["station"]), str(row["ip"])),
             )
             conn.execute(
-                "UPDATE egress_ips SET state=" + _released_state_sql(ts) + ", "
-                "last_seen_at=? WHERE ip=?",
+                "UPDATE egress_ips SET state=" + _released_state_sql(ts) + ", last_seen_at=? WHERE ip=?",
                 (ts, str(row["ip"])),
             )
             released_leases += 1
@@ -277,10 +301,106 @@ def reconcile(
     }
 
 
+def load_control_cursor(station: int, *, db_path: str | Path | None = None) -> int:
+    """Return the last applied fork sequence for ``station`` (0 when absent)."""
+
+    conn = _connect(registry_db_path(db_path))
+    try:
+        _ensure_control_schema(conn)
+        row = conn.execute(
+            "SELECT last_seq FROM control_cursor WHERE station=?",
+            (int(station),),
+        ).fetchone()
+        return int(row["last_seq"]) if row is not None else 0
+    except Exception:
+        return 0
+    finally:
+        conn.close()
+
+
+def ingest_control_events(
+    station: int,
+    events: list[dict[str, Any]],
+    *,
+    apply: Callable[[sqlite3.Connection, int, dict[str, Any]], None] | None = None,
+    now: float | None = None,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Apply new fork events once, atomically, and advance the cursor.
+
+    ``events`` must be ordered by ``seq`` and contain ``seq``, ``type``,
+    ``ts`` (epoch seconds) and optionally ``data``.  ``apply`` is called with
+    ``(conn, station, event)`` inside the same transaction for every event that
+    is seen for the first time; a failure rolls the whole batch back so the
+    cursor never skips an unmapped event.
+    """
+
+    ts_now = time.time() if now is None else float(now)
+    conn = _connect(registry_db_path(db_path))
+    result: dict[str, Any] = {
+        "ingested": 0,
+        "duplicates": 0,
+        "skipped": 0,
+        "last_seq": 0,
+    }
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_control_schema(conn)
+        row = conn.execute(
+            "SELECT last_seq FROM control_cursor WHERE station=?",
+            (int(station),),
+        ).fetchone()
+        last_seq = int(row["last_seq"]) if row is not None else 0
+        for event in events:
+            seq = int(event.get("seq", 0) or 0)
+            if seq <= 0:
+                result["skipped"] += 1
+                continue
+            if seq <= last_seq:
+                result["duplicates"] += 1
+                continue
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO control_events("
+                "station, seq, event_type, event_ts, ingested_at"
+                ") VALUES(?,?,?,?,?)",
+                (
+                    int(station),
+                    seq,
+                    str(event.get("type", "")),
+                    _epoch(event.get("ts")),
+                    ts_now,
+                ),
+            ).rowcount
+            if not inserted:
+                result["duplicates"] += 1
+                last_seq = seq
+                continue
+            if apply is not None:
+                apply(conn, int(station), event)
+            last_seq = seq
+            result["ingested"] += 1
+        conn.execute(
+            "INSERT INTO control_cursor(station, last_seq, updated_at) "
+            "VALUES(?,?,?) ON CONFLICT(station) DO UPDATE SET "
+            "last_seq=excluded.last_seq, updated_at=excluded.updated_at",
+            (int(station), last_seq, ts_now),
+        )
+        conn.commit()
+        result["last_seq"] = last_seq
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 __all__ = [
     "DEFAULT_DB",
     "assign_observed",
     "assigned_for_station",
+    "ingest_control_events",
+    "load_control_cursor",
     "reconcile",
     "registry_db_path",
     "release_station",
