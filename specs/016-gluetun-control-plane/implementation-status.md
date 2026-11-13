@@ -236,9 +236,12 @@ go build ./...                                                               -> 
 docker build -t gluetun-016:local gluetun                                    -> ok (image 46.7 MB)
 pilote station 6 (gluetun-016:local) : capabilities, state, transport,
 events, servers, settings masqués -> ok ; cible injoignable ->
-422 invalid_target/resolution_failed ; switchs réels br143 -> br150 et
-br150 -> br149 : state=committed, egress vérifié (187.15.85.191 puis
-187.15.85.149, quorum 3), proxies HTTP/SOCKS5 -> ok
+422 invalid_target/resolution_failed ; switchs réels br143 -> br150,
+br150 -> br149, br149 -> br150 puis us12912 -> us12779 :
+state=committed, egress vérifié à chaque fois (dernier 186.247.37.11,
+quorum 3), proxies HTTP/SOCKS5 -> ok ; catalogue Brésil agrégé par
+hostname : 48 serveurs, 48 lignes (avant : 96 lignes, WireGuard absent du
+détail)
 go test ./internal/control/... ./internal/server ./internal/configuration/settings ./internal/vpn/transport -count=1 -> ok
 go test ./internal/configuration/settings ./internal/control/... ./internal/server ./tests/integration/harness -> ok
 go test ./internal/egress/... ./internal/control/... ./internal/server ./internal/configuration/settings -> ok
@@ -279,7 +282,12 @@ changements (`internal/storage` avec `airvpn.json` absent, `internal/dns`,
 ### Validation live étendue (station 6)
 
 Testé en direct sur la station 6, en plus des switchs `br143 → br150`,
-`br150 → br149` et `br149 → br150` :
+`br150 → br149`, `br149 → br150` et `us12912 → us12779` :
+
+- `GET /v1/servers?country=Brazil` renvoie 48 serveurs uniques après
+  agrégation des entrées OpenVPN/WireGuard par hostname (96 lignes avant), et
+  `GET /v1/servers/br143.nordvpn.com` annonce bien
+  `wireguard,openvpn-udp,openvpn-tcp`.
 
 - `POST /v1/vpn/switch` avec `wait=true` (200), `wait=false` (202 +
   `Location`), idempotence (replay 200, même job), cible identique
@@ -336,17 +344,21 @@ Constats de cette campagne :
   (plan de contrôle actif, `CONTROL_STATE_MODE=env`). Les stations 1-5 restent
   en upstream : T078 exige de les migrer une par une, puis d'activer
   `CONTROL_PLANE_ENABLED`. Le pilote 6 valide désormais des switchs complets :
-  `br143 → br150` puis `br150 → br149` en WireGuard, jobs `committed`, egress
-  vérifié (`187.15.85.191` puis `187.15.85.149`, quorum 3), proxies
-  HTTP/SOCKS5 fonctionnels. Trois correctifs ont été nécessaires : les filtres
-  pays/région/ville sont effacés quand un hostname est pinné, la vérification
-  d'egress est retentée après la bascule, et un rollback sans baseline egress
-  restaure quand même le snapshot puis prouve l'egress à neuf. Le superviseur
-  (`scripts/fresh_chain.py`) ajoute l'override du plan de contrôle à ses
-  recreates, sinon chaque rotation retombait sur l'image upstream. Les
-  endpoints WG brésiliens restent fluctuants : `br101`, `br127`, `br71`,
-  `br72` ne passaient pas de trafic au moment du test, tandis que `br53`,
-  `br143`, `br149` et `br150` répondaient.
+  `br143 → br150`, `br150 → br149`, `br149 → br150` puis
+  `us12912 → us12779` en WireGuard, jobs `committed`, egress vérifié
+  (`187.15.85.191`, `187.15.85.149`, puis `186.247.37.11`, quorum 3),
+  proxies HTTP/SOCKS5 fonctionnels. Quatre correctifs ont été nécessaires : les
+  filtres pays/région/ville sont effacés quand un hostname est pinné, la
+  vérification d'egress est retentée après la bascule, un rollback sans
+  baseline egress restaure quand même le snapshot puis prouve l'egress à neuf,
+  et le catalogue agrège les entrées OpenVPN/WireGuard qui partagent un
+  hostname (sinon le détail perdait `wireguard` et la liste doublait chaque
+  serveur). Le superviseur (`scripts/fresh_chain.py`) ajoute l'override du
+  plan de contrôle à ses recreates, sinon chaque rotation retombait sur l'image
+  upstream. Les endpoints WG brésiliens restent fluctuants : `br101`, `br127`,
+  `br71`, `br72`, `br149`, `br150`, `br143` ne passaient pas de trafic au
+  moment du test, tandis que `br53` répondait ; la station 6 a donc été
+  repinnée sur `us12779` (WireGuard), joignable et vérifiée en continu.
 - T049 (mesure live DoH/TCP 853 bloqués) reste ouvert : le script existe et sa
   syntaxe est vérifiée, mais il demande un réseau réellement filtré.
 - T099 est partiel : les tests Go du ladder et de l'intégration passent, la
