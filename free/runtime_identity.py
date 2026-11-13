@@ -143,6 +143,8 @@ def _build_capture_body(
     client_body: dict,
     capture: dict,
     identity: StationIdentity,
+    *,
+    mask_paths: bool = True,
 ) -> dict:
     out = deepcopy(capture)
     model = str((client_body or {}).get("model") or out.get("model") or "")
@@ -164,7 +166,7 @@ def _build_capture_body(
     for key in ("max_tokens", "max_completion_tokens"):
         if isinstance(capture.get(key), int) and not isinstance(capture.get(key), bool):
             out[key] = capture[key]
-    return template_official_body(out, identity)
+    return template_official_body(out, identity, mask_paths=mask_paths)
 
 
 def build_body(
@@ -172,17 +174,20 @@ def build_body(
     runtime: StationRuntimeIdentity,
     *,
     client_body: dict | None = None,
+    mask_paths: bool = True,
 ) -> dict:
     if not isinstance(body, dict):
         return body
     profile = runtime.profile
     if profile is None or profile.version == "2.2.5":
-        return template_official_body(body, runtime.identity)
+        return template_official_body(body, runtime.identity, mask_paths=mask_paths)
     capture = _capture_body(profile)
     if capture is None:
-        return template_official_body(body, runtime.identity)
+        return template_official_body(body, runtime.identity, mask_paths=mask_paths)
     source = client_body if isinstance(client_body, dict) else body
-    return _build_capture_body(source, capture, runtime.identity)
+    return _build_capture_body(
+        source, capture, runtime.identity, mask_paths=mask_paths
+    )
 
 
 __all__ = [

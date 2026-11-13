@@ -10421,7 +10421,34 @@ def _safe_proxy_label(proxy_url: str | None) -> str:
 def _station_free_body(body, runtime, client_body=None):
     from free.runtime_identity import build_body
 
-    return build_body(body, runtime, client_body=client_body)
+    return build_body(
+        body,
+        runtime,
+        client_body=client_body,
+        mask_paths=_workspace_path_masking_enabled(),
+    )
+
+
+def _workspace_path_masking_enabled() -> bool:
+    """Interrupteur de l'impersonnalisation du chemin de workspace.
+
+    ``false`` = mode classique : le free reçoit le vrai cwd du client, aucune
+    racine factice n'est injectée, aucune jonction n'est créée et le remap
+    retour est inactif. Le reste de l'identité de station (headers, UA,
+    session) n'est pas affecté.
+    """
+    try:
+        raw = os.getenv("FREE_WORKSPACE_PATH_MASKING", "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+    except Exception:
+        pass
+    try:
+        return bool(yaml_get("free", "workspace_path_masking", True))
+    except Exception:
+        return True
 
 
 def _path_map_from_body(body) -> dict[str, str]:
@@ -10431,6 +10458,8 @@ def _path_map_from_body(body) -> dict[str, str]:
     ``_set_free_path_map`` (contexte copié). On ré-extrait le cwd du corps
     client et on mappe tout le préfixe ``/workspace`` vers celui-ci.
     """
+    if not _workspace_path_masking_enabled():
+        return {}
     try:
         from free.station_identity import workspace_root_from_messages
 
@@ -10488,6 +10517,10 @@ def _free_path_map_for(
 
 def _set_free_path_map(body, station_runtime) -> None:
     """Mémorise la racine factice → la racine réelle pour ce corps free."""
+    if not _workspace_path_masking_enabled():
+        # Mode classique : le free voit le vrai chemin, rien à remapper.
+        _free_path_map.set({})
+        return
     identity = getattr(station_runtime, "identity", None) if station_runtime is not None else None
     base_fake = str(getattr(identity, "env_cwd", "") or "")
     real_root = ""

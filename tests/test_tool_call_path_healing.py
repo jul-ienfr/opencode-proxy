@@ -6,12 +6,20 @@ import json
 
 from free.station_identity import (
     StationIdentity,
+    sanitize_text,
     template_official_body,
     translate_paths,
     workspace_env_cwd,
     workspace_root_from_messages,
 )
-from opencode import _ChatToolCallHealer, _free_path_map_for, _heal_tool_call_paths
+from opencode import (
+    _ChatToolCallHealer,
+    _free_path_map,
+    _free_path_map_for,
+    _heal_tool_call_paths,
+    _set_free_path_map,
+    _workspace_path_masking_enabled,
+)
 from streaming.tool_path_healing import ToolPathHealingMiddleware
 from streaming.tool_paths import (
     CLIENT_TOOL_NAMES,
@@ -123,9 +131,8 @@ def test_free_path_map_without_identity_uses_bare_workspace() -> None:
     assert _free_path_map_for("", REAL) == {"/workspace": REAL}
 
 
-def test_set_free_path_map_extracts_cwd_without_identity() -> None:
-    from opencode import _free_path_map, _set_free_path_map
-
+def test_set_free_path_map_extracts_cwd_without_identity(monkeypatch) -> None:
+    monkeypatch.setenv("FREE_WORKSPACE_PATH_MASKING", "true")
     token = _free_path_map.set(None)
     try:
         body = {
@@ -519,4 +526,53 @@ def test_heal_openai_payload_renames_bash_to_shell() -> None:
         assert fn["name"] == "shell"
     finally:
         set_client_tool_names([])
+
+
+def test_sanitize_text_keeps_real_path_when_masking_disabled() -> None:
+    text = "cwd C:\\Users\\alice\\project and files"
+    assert sanitize_text(text, FAKE, mask_paths=False) == text
+    assert FAKE in sanitize_text(text, FAKE, mask_paths=True)
+
+
+def test_template_official_body_keeps_real_cwd_when_masking_disabled() -> None:
+    identity = StationIdentity("warp-ipv6-2", b"x" * 32)
+    real = "C:" + "\\Users\\alice\\project"
+    body = {
+        "messages": [
+            {
+                "role": "system",
+                "content": f"<env>\n  Working directory: {real}\n</env>",
+            }
+        ]
+    }
+    out = template_official_body(body, identity, mask_paths=False)
+    content = out["messages"][0]["content"]
+    assert real in content
+    assert identity.env_cwd not in content
+
+
+def test_workspace_path_masking_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("FREE_WORKSPACE_PATH_MASKING", "false")
+    assert _workspace_path_masking_enabled() is False
+    monkeypatch.setenv("FREE_WORKSPACE_PATH_MASKING", "true")
+    assert _workspace_path_masking_enabled() is True
+
+
+def test_set_free_path_map_disabled_stays_empty(monkeypatch) -> None:
+    monkeypatch.setenv("FREE_WORKSPACE_PATH_MASKING", "false")
+    real = "C:" + "\\Users\\alice\\project"
+    body = {
+        "messages": [
+            {
+                "role": "system",
+                "content": f"<env>\n  Working directory: {real}\n</env>",
+            }
+        ]
+    }
+    token = _free_path_map.set(None)
+    try:
+        _set_free_path_map(body, None)
+        assert _free_path_map.get() == {}
+    finally:
+        _free_path_map.reset(token)
 

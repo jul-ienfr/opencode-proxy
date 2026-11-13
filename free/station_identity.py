@@ -127,9 +127,15 @@ def _utc_date(now: datetime | None = None) -> str:
     return value.strftime("%a %b %d %Y")
 
 
-def sanitize_text(text: str, env_cwd: str) -> str:
-    """Retire le bloc d'instructions locales et remplace les chemins réels."""
+def sanitize_text(text: str, env_cwd: str, *, mask_paths: bool = True) -> str:
+    """Retire le bloc d'instructions locales et, si demandé, masque les chemins.
+
+    ``mask_paths=False`` conserve le chemin réel du client : c'est le mode
+    « chemin classique », sans racine factice de workspace.
+    """
     out = _INSTRUCTIONS_RE.sub("", str(text or ""), count=1)
+    if not mask_paths:
+        return out
     return _WIN_USER_PATH_RE.sub(lambda _match: env_cwd, out)
 
 
@@ -393,16 +399,18 @@ def render_system_prompt(
     env_cwd: str,
     *,
     now: datetime | None = None,
+    mask_paths: bool = True,
 ) -> str:
     """Conserve le marqueur officiel, remplace la date et le bloc `<env>`."""
-    if not str(env_cwd).startswith(ENV_PREFIX):
+    if mask_paths and not str(env_cwd).startswith(ENV_PREFIX):
         raise ValueError(f"env_cwd doit commencer par {ENV_PREFIX!r}: {env_cwd!r}")
-    text = sanitize_text(base, env_cwd)
-    env_block = f"<env>\n  Working directory: {env_cwd}\n</env>"
-    if _ENV_RE.search(text):
-        text = _ENV_RE.sub(lambda _match: env_block, text, count=1)
-    else:
-        text = text.rstrip() + "\n\n" + env_block
+    text = sanitize_text(base, env_cwd, mask_paths=mask_paths)
+    if str(env_cwd).strip():
+        env_block = f"<env>\n  Working directory: {env_cwd}\n</env>"
+        if _ENV_RE.search(text):
+            text = _ENV_RE.sub(lambda _match: env_block, text, count=1)
+        else:
+            text = text.rstrip() + "\n\n" + env_block
     date_line = f"Today's date: {_utc_date(now)}"
     if _DATE_RE.search(text):
         text = _DATE_RE.sub(lambda _match: date_line, text, count=1)
@@ -416,13 +424,18 @@ def audit_prompt(prompt: str, forbidden: Iterable[str]) -> list[str]:
     return [str(marker) for marker in forbidden if marker and str(marker) in text]
 
 
-def _sanitize_value(value, env_cwd: str):
+def _sanitize_value(value, env_cwd: str, *, mask_paths: bool = True):
     if isinstance(value, str):
-        return sanitize_text(value, env_cwd)
+        return sanitize_text(value, env_cwd, mask_paths=mask_paths)
     if isinstance(value, list):
-        return [_sanitize_value(item, env_cwd) for item in value]
+        return [
+            _sanitize_value(item, env_cwd, mask_paths=mask_paths) for item in value
+        ]
     if isinstance(value, dict):
-        return {key: _sanitize_value(item, env_cwd) for key, item in value.items()}
+        return {
+            key: _sanitize_value(item, env_cwd, mask_paths=mask_paths)
+            for key, item in value.items()
+        }
     return value
 
 
@@ -431,23 +444,38 @@ def template_official_body(
     identity: StationIdentity,
     *,
     now: datetime | None = None,
+    mask_paths: bool = True,
 ) -> dict:
     """Copie le corps, nettoie tous les chemins et remplace le prompt système
     par sa version templatée. Les messages utilisateur/outils sont conservés
-    après sanitation."""
+    après sanitation.
+
+    ``mask_paths=False`` garde le chemin réel du client (mode classique) :
+    aucune racine factice n'est injectée et aucun remap retour n'est requis.
+    """
     real_root = workspace_root_from_messages(
         body.get("messages") if isinstance(body, dict) else None
     )
-    env_cwd = workspace_env_cwd(identity, real_root)
-    out = _sanitize_value(body, env_cwd)
+    env_cwd = (
+        workspace_env_cwd(identity, real_root)
+        if mask_paths
+        else str(real_root or "").strip()
+    )
+    out = _sanitize_value(body, env_cwd, mask_paths=mask_paths)
     messages = out.get("messages") if isinstance(out, dict) else None
     if not isinstance(messages, list):
         return out
     for message in messages:
         if isinstance(message, dict) and message.get("role") == "system":
             content = str(message.get("content") or "")
-            if "<env>" in content or "Today's date:" in content or "Instructions from:" in content:
-                message["content"] = identity.prompt(content, now=now, env_cwd=env_cwd)
+            if env_cwd and (
+                "<env>" in content
+                or "Today's date:" in content
+                or "Instructions from:" in content
+            ):
+                message["content"] = identity.prompt(
+                    content, now=now, env_cwd=env_cwd, mask_paths=mask_paths
+                )
             break
     return out
 
@@ -499,8 +527,12 @@ class StationIdentity:
         *,
         now: datetime | None = None,
         env_cwd: str | None = None,
+        mask_paths: bool = True,
     ) -> str:
-        return render_system_prompt(base, env_cwd or self.env_cwd, now=now)
+        target = self.env_cwd if env_cwd is None else env_cwd
+        return render_system_prompt(
+            base, target, now=now, mask_paths=mask_paths
+        )
 
     def headers(
         self,
