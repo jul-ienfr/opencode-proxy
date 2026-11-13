@@ -114,6 +114,7 @@ def test_exhausted_egress_skips_only_known_burned_ip():
 
 def test_registry_hosts_filters_by_transport(tmp_path, monkeypatch):
     import sqlite3
+    import time
 
     from scripts import fresh_chain
 
@@ -135,17 +136,20 @@ def test_registry_hosts_filters_by_transport(tmp_path, monkeypatch):
     )
     conn.executemany(
         "INSERT INTO servers(hostname) VALUES (?)",
-        [("wg.nordvpn.com",), ("tcp.nordvpn.com",)],
+        [("wg.nordvpn.com",), ("tcp.nordvpn.com",), ("stale.nordvpn.com",)],
     )
     conn.executemany(
         "INSERT INTO ip_server_map(ip, hostname, transport) VALUES (?,?,?)",
         [("1.1.1.1", "wg.nordvpn.com", "wireguard"),
-         ("2.2.2.2", "tcp.nordvpn.com", "openvpn-tcp")],
+         ("2.2.2.2", "tcp.nordvpn.com", "openvpn-tcp"),
+         ("3.3.3.3", "stale.nordvpn.com", "wireguard")],
     )
+    now = time.time()
     conn.executemany(
         "INSERT INTO egress_ips(ip, last_ok_at, state, reset_at) VALUES (?,?,?,?)",
-        [("1.1.1.1", 100.0, "assigned", 0.0),
-         ("2.2.2.2", 100.0, "assigned", 0.0)],
+        [("1.1.1.1", now - 60.0, "assigned", 0.0),
+         ("2.2.2.2", now - 60.0, "assigned", 0.0),
+         ("3.3.3.3", 100.0, "assigned", 0.0)],
     )
     conn.commit()
     conn.close()

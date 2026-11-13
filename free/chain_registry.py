@@ -12,12 +12,21 @@ import time
 from pathlib import Path
 
 
-def registry_hosts(root: str | Path, transport: str | None = None) -> list[str]:
+def registry_hosts(
+    root: str | Path,
+    transport: str | None = None,
+    *,
+    max_age_s: float | None = 6 * 3600,
+) -> list[str]:
     """Known hostnames from the quota inventory, best quota first.
 
     ``transport`` limits the 200 evidence to the transport actually being
     tried: a host proven only on WireGuard must not outrank the field for an
     OpenVPN-TCP repair.
+
+    ``max_age_s`` drops stale 200 evidence. A hostname that worked yesterday
+    says nothing about the current tunnel; keeping it at the top of the list
+    made every repair bind dead servers before reaching the live catalogue.
     """
 
     path = Path(root) / "logs" / "registry.db"
@@ -29,6 +38,14 @@ def registry_hosts(root: str | Path, transport: str | None = None) -> list[str]:
         if str(transport or "").strip().lower() in ("", "auto")
         else str(transport).strip().lower()
     )
+    max_age = float(max_age_s or 0.0)
+    min_ok_at = now - max_age if max_age > 0 else None
+    if min_ok_at is None:
+        freshness = "1 = 1"
+        freshness_params: tuple[float, ...] = ()
+    else:
+        freshness = "e.last_ok_at is not null and e.last_ok_at >= ?"
+        freshness_params = (min_ok_at,)
     try:
         with sqlite3.connect(path) as conn:
             rows = list(
@@ -41,12 +58,11 @@ def registry_hosts(root: str | Path, transport: str | None = None) -> list[str]:
                     "left join egress_ips e on e.ip = m.ip "
                     "where s.hostname != '' "
                     "and (? is null or m.transport = ?) "
-                    "and (e.last_ok_at is not null "
-                    "or e.state in ('fresh','candidate','assigned')) "
+                    "and " + freshness + " "
                     "and coalesce(e.reset_at, 0) <= ? "
                     "group by s.hostname "
                     "order by has_200 desc, ok_at desc",
-                    (wanted, wanted, now),
+                    (wanted, wanted, *freshness_params, now),
                 )
             )
         return [str(row[0]) for row in rows if row and row[0]]

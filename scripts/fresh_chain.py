@@ -408,7 +408,10 @@ def _registry_hosts(transport: str | None = None) -> list[str]:
 
     from free.chain_registry import registry_hosts
 
-    return registry_hosts(ROOT, transport)
+    max_age_s = float(
+        yaml_get("ip_rotation", "registry_ok_max_age_s", 21600) or 21600
+    )
+    return registry_hosts(ROOT, transport, max_age_s=max_age_s)
 
 
 def _ensure_registry_schema(path: Path) -> None:
