@@ -818,19 +818,9 @@ def _station_recovered(station: dict) -> bool:
         return False
     if not bool(station.get("station_usable")):
         return False
-    if bool(station.get("model_usable")):
-        return True
-    reason = str(station.get("model_usable_reason") or "")
-    # model_usable is evaluated for one model only.  A per-model quota block
-    # still needs a fresh IP, so the chain must keep going.
-    return reason not in (
-        "daily-bucket-exhausted",
-        "bad-ip",
-        "quota",
-        "quota-429",
-        "tunnel-down",
-        "station-unusable",
-    )
+    # A connected tunnel is not a usable station. Only a fresh real free-model
+    # 200 counts; a healthy container without that proof stays a repair target.
+    return bool(station.get("model_usable"))
 
 
 def _station_hopeless(station: dict) -> bool:

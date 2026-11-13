@@ -30,6 +30,7 @@
 - [ ] T214 — SLO détection/réparation/switch mesurés.
 - [ ] T215 — benchmark p95 ≤ 45 s.
 - [ ] T216 — 6/6 `client_usable`, IP distinctes, proxies, soak 24 h.
+- [x] T217 — aucune station comptée sans preuve 200 fraîche.
 
 ## Definition of Done
 

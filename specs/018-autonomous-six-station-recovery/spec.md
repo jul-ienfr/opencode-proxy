@@ -154,6 +154,9 @@ et des proxies fonctionnels, pendant au moins une heure puis 24 h de soak.
   durée).
 - **FR-011** : aucune station/session supplémentaire ; free uniquement.
 - **FR-012** : le superviseur n'est jamais gelé pour une migration.
+- **FR-013** : seul `client_usable` compte. Une station `healthy` sans preuve
+  réelle de 200 free frais est un **target de réparation**, jamais un succès ;
+  elle n'est ni comptée ni protégée.
 
 ## Exigences non fonctionnelles
 

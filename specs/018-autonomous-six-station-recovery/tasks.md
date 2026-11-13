@@ -147,6 +147,16 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : SC-001..006.
 - **Test** : contrôle live + SLO.
 
+### T217 — Une station sans 200 frais n'est pas « récupérée » (P0) — fait
+- **Fichiers** : `scripts/fresh_chain_supervisor.py`,
+  `tests/test_fresh_chain_supervisor.py`.
+- **Action** : `_station_recovered` exige `model_usable=true` ; aucune exception
+  par raison de panne. Une station `healthy` sans preuve 200 reste dans la
+  chaîne de réparation.
+- **Acceptation** : aucune station n'est comptée `client_usable` sans 200 frais.
+- **Test** : `test_recovered_requires_a_fresh_model_proof`,
+  `test_recovered_rejects_an_unusable_tunnel`.
+
 ---
 
 ## Ordre d'exécution
