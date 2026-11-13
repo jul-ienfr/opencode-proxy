@@ -102,6 +102,7 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Test** : `test_auto_override_leaves_vpn_type_for_the_fork_ladder`.
 
 ### T119 — Un seul `/rotate` par chaîne, exécuté par le fork (P0) — à faire
+- **Suivi d'exécution** : `specs/018-autonomous-six-station-recovery/` (T201).
 - **Fichiers** : `scripts/fresh_chain.py`,
   `free/ip_registry/adapters/gluetun_control_v2.py`,
   `tests/test_rotation_contract.py`, `tests/test_fresh_chain_auto_transport.py`.
