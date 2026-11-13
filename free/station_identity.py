@@ -272,23 +272,37 @@ def translate_paths(
             if json_escape
             else real_s
         )
-        out = out.replace(fake_s, target)
+        # La racine factice est en style Unix ; le suffixe doit prendre les
+        # séparateurs de la racine réelle — TOUT le suffixe, pas seulement le
+        # premier slash (sinon ``…/gluetun/internal/jobs`` garde ses ``/``).
+        windows_real = bool(re.match(r"^[A-Za-z]:[\\/]", real_s))
+        sep = ("\\\\" if json_escape else "\\") if windows_real else "/"
+
+        def _rewrite(token: str, _fake: str = fake_s) -> str:
+            return target + token[len(_fake) :].replace("/", sep)
+
         # Racines factices HISTORIQUES : un tour précédent a pu utiliser un
         # autre suffixe de hash pour la même station (ou aucun suffixe). Toute
-        # racine ``/workspace/oc-<station>`` est inventée par le proxy, on la
-        # ramène donc aussi vers la racine réelle.
+        # racine ``/workspace/oc-<station>`` est inventée par le proxy ; on
+        # remplace le segment de station ET son suffixe d'un seul coup, avant
+        # le préfixe nu ``/workspace`` (sinon le segment resterait collé à la
+        # racine réelle : ``…\opencode-proxy-one\oc-WARP-10-…/gluetun/...``).
         if fake_s.startswith("/workspace"):
             out = re.sub(
-                r"/workspace/oc-[A-Za-z0-9._-]+",
-                lambda _match: target,
+                r"/workspace/oc-[A-Za-z0-9._-]+[^\s\"',;}\]]*",
+                lambda _match: target
+                + re.sub(
+                    r"^/workspace/oc-[A-Za-z0-9._-]+",
+                    "",
+                    _match.group(0),
+                ).replace("/", sep),
                 out,
             )
-        # La racine factice est en style Unix ; le suffixe doit prendre les
-        # séparateurs Windows de la racine réelle (C:\...\file, pas C:\.../file).
-        if re.match(r"^[A-Za-z]:[\\/]", real_s):
-            sep = "\\\\" if json_escape else "\\"
-            while target + "/" in out:
-                out = out.replace(target + "/", target + sep)
+        out = re.sub(
+            re.escape(fake_s) + r"[^\s\"',;}\]]*",
+            lambda _match: _rewrite(_match.group(0)),
+            out,
+        )
     return out
 
 

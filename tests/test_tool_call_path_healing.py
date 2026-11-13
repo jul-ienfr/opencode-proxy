@@ -93,6 +93,14 @@ def test_workspace_root_falls_back_to_memory_home() -> None:
     assert workspace_root_from_messages(messages) == r"C:\Users\ASUS"
 
 
+def test_translate_bare_workspace_strips_station_segment() -> None:
+    mapping = {"/workspace": REAL}
+    assert translate_paths(
+        "/workspace/oc-WARP-10-IPv6-9a8b65dd/gluetun/internal/control/jobs/manager.go",
+        mapping,
+    ) == REAL + r"\gluetun\internal\control\jobs\manager.go"
+
+
 def test_translate_paths_handles_historical_station_hash() -> None:
     mapping = _free_path_map_for("/workspace/oc-WARP-8-current", REAL)
     assert translate_paths(
