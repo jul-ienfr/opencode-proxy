@@ -106,6 +106,36 @@ class ComposeHostnameBinder:
                 return True
         return False
 
+    def image_stale(self, station: int) -> bool:
+        """True when the container image is older than the fork tag."""
+
+        container = (
+            "opencode-vpn"
+            if int(station) == 1
+            else f"opencode-vpn-{int(station)}"
+        )
+        current = self._inspect_value(container, "{{.Image}}")
+        tag = self._inspect_value(container, "{{.Config.Image}}")
+        if not current or not tag or not tag.startswith("gluetun-016:"):
+            return False
+        desired = self._inspect_value(tag, "{{.Id}}", image=True)
+        return bool(desired and current != desired)
+
+    def _inspect_value(self, target: str, format_string: str, *,
+        image: bool = False,
+    ) -> str:
+        command = ["docker"]
+        if image:
+            command.append("image")
+        command += ["inspect", target, "--format", format_string]
+        try:
+            proc = self._runner(command, 10.0)
+        except Exception:
+            return ""
+        if int(getattr(proc, "returncode", 1)) != 0:
+            return ""
+        return str(getattr(proc, "stdout", "") or "").strip()
+
     def _desired_credentials(self) -> dict[str, str]:
         values: dict[str, str] = {}
         paths = (

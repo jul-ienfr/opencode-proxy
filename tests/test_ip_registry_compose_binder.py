@@ -252,6 +252,23 @@ def test_credentials_fresh_does_not_force_a_recreate(tmp_path):
     assert binder.credentials_stale(2) is False
 
 
+def test_image_stale_detects_an_old_container(tmp_path):
+    class Runner:
+        def __call__(self, command, timeout):
+            if command[:2] == ["docker", "image"]:
+                output = "sha256:new"
+            elif "{{.Image}}" in command:
+                output = "sha256:old"
+            elif "{{.Config.Image}}" in command:
+                output = "gluetun-016:local"
+            else:
+                output = ""
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+    binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=Runner())
+    assert binder.image_stale(2) is True
+
+
 def test_override_path_is_per_station(tmp_path):
     binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=FakeRunner())
     p1 = binder.override_path_for(1)

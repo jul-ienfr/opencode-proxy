@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import types
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,180 @@ def _module():
 
 
 @pytest.mark.asyncio
+async def test_auto_chain_uses_one_rotate_batch(tmp_path, monkeypatch):
+    module = _module()
+    rotate_calls = []
+    assign_calls = []
+
+    class Binder:
+        tri_stack = True
+
+        async def rotate_outcome(self, candidates, constraints=None, *, wait=True):
+            rotate_calls.append((candidates, constraints, wait))
+            return types.SimpleNamespace(
+                ok=True,
+                state="committed",
+                hostname=candidates[0].hostname,
+                egress_ip="1.2.3.4",
+                error="",
+            )
+
+        async def assign(self, station, hostname, country=None, **kwargs):
+            assign_calls.append(hostname)
+            return BindResult(True, hostname, egress_ip="1.2.3.4")
+
+    class Probe:
+        async def probe(self, station, model):
+            return ProbeResult(status=200, tested_at=0.0, valid=True)
+
+    async def probe_with_fallbacks(probe, station, model, fallbacks):
+        return ProbeResult(status=200, tested_at=0.0, valid=True), model
+
+    async def restore(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(module, "_active_hosts", lambda *a, **k: set())
+    monkeypatch.setattr(module, "_active_egress_ips", lambda *a, **k: set())
+    monkeypatch.setattr(module, "_ledger_exhausted_ips", lambda *a, **k: set())
+    monkeypatch.setattr(module, "_clean_station_container", lambda *a, **k: None)
+    monkeypatch.setattr(module, "mark", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_record_registry_winner", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_record_verified_spare", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_persist_env_pin", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_station_snapshot", lambda *a, **k: {})
+    monkeypatch.setattr(module, "_restore_previous_host", restore)
+    monkeypatch.setattr(module, "_probe_with_fallbacks", probe_with_fallbacks)
+    monkeypatch.setattr(
+        module,
+        "yaml_get",
+        lambda section, key, default=None: False
+        if key == "allocator.scan_audit_enabled"
+        else default,
+    )
+
+    args = argparse.Namespace(
+        station=2,
+        transport="auto",
+        claims_db=str(tmp_path / "claims.db"),
+        rebind_limit=100,
+        delay=0.0,
+        max=1,
+        model="m",
+        probe_models=[],
+        api_base="http://127.0.0.1:4000",
+        claims=True,
+    )
+    candidates = [
+        {
+            "host": "both.nordvpn.com",
+            "country": "Germany",
+            "transports": ["wireguard", "openvpn-tcp"],
+        }
+    ]
+    binder = Binder()
+
+    rc = await module._run_claims(
+        args,
+        candidates,
+        binder,
+        Probe(),
+        tmp_path / "state.json",
+        {},
+        set(),
+        {},
+    )
+
+    assert rc == 0
+    assert len(rotate_calls) == 1
+    assert [c.hostname for c in rotate_calls[0][0]] == ["both.nordvpn.com"]
+    assert assign_calls == ["both.nordvpn.com"]
+
+
+async def test_auto_chain_rejects_an_exhausted_rotate_without_assign(
+    tmp_path, monkeypatch
+):
+    module = _module()
+    rotate_calls = []
+    assign_calls = []
+
+    class Binder:
+        tri_stack = True
+
+        async def rotate_outcome(self, candidates, constraints=None, *, wait=True):
+            rotate_calls.append(candidates)
+            return types.SimpleNamespace(
+                ok=False,
+                state="exhausted",
+                hostname="",
+                egress_ip="",
+                error="all candidates exhausted",
+            )
+
+        async def assign(self, station, hostname, country=None, **kwargs):
+            assign_calls.append(hostname)
+            return BindResult(True, hostname, egress_ip="1.2.3.4")
+
+    class Probe:
+        async def probe(self, station, model):
+            return ProbeResult(status=200, tested_at=0.0, valid=True)
+
+    async def restore(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(module, "_active_hosts", lambda *a, **k: set())
+    monkeypatch.setattr(module, "_active_egress_ips", lambda *a, **k: set())
+    monkeypatch.setattr(module, "_ledger_exhausted_ips", lambda *a, **k: set())
+    monkeypatch.setattr(module, "_clean_station_container", lambda *a, **k: None)
+    monkeypatch.setattr(module, "mark", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_record_registry_winner", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_record_verified_spare", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_persist_env_pin", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_station_snapshot", lambda *a, **k: {})
+    monkeypatch.setattr(module, "_restore_previous_host", restore)
+    monkeypatch.setattr(
+        module,
+        "yaml_get",
+        lambda section, key, default=None: False
+        if key == "allocator.scan_audit_enabled"
+        else default,
+    )
+
+    args = argparse.Namespace(
+        station=2,
+        transport="auto",
+        claims_db=str(tmp_path / "claims.db"),
+        rebind_limit=100,
+        delay=0.0,
+        max=1,
+        model="m",
+        probe_models=[],
+        api_base="http://127.0.0.1:4000",
+        claims=True,
+    )
+    candidates = [
+        {
+            "host": "dead.nordvpn.com",
+            "country": "Germany",
+            "transports": ["wireguard"],
+        }
+    ]
+
+    rc = await module._run_claims(
+        args,
+        candidates,
+        Binder(),
+        Probe(),
+        tmp_path / "state.json",
+        {},
+        set(),
+        {},
+    )
+
+    assert rc == 2
+    assert len(rotate_calls) == 1
+    assert assign_calls == []
+
+
 async def test_auto_chain_tries_next_transport_for_same_host(tmp_path, monkeypatch):
     module = _module()
     calls = []

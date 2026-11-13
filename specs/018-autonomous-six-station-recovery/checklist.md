@@ -5,27 +5,27 @@
 
 ## Primitive
 
-- [ ] T201 — un seul `/v1/vpn/rotate` par chaîne.
-- [ ] T202 — `committed`/`exhausted`/`rolled_back` sans disable.
-- [ ] T203 — le fork épuise candidats et transports.
+- [x] T201 — un seul `/v1/vpn/rotate` par chaîne.
+- [x] T202 — `committed`/`exhausted`/`rolled_back` sans disable.
+- [x] T203 — le fork épuise candidats et transports.
 
 ## Candidats
 
 - [x] T204 — preuves < 6 h, warm pool frais.
-- [ ] T205 — qualification live tunnel + DNS.
+- [x] T205 — qualification live tunnel + DNS.
 - [x] T206 — budgets et timeouts bornés.
 - [x] T207 — ordre du registre, aucun re-score fork.
 
 ## Auth et conteneur
 
-- [ ] T208 — `AUTH_FAILED` : refresh + cooldown + WG, pas de boucle.
+- [x] T208 — `AUTH_FAILED` : refresh + cooldown + WG, pas de boucle.
 - [x] T209 — identifiants/image périmés ⇒ recreate.
-- [ ] T210 — conteneur crashé/API down ⇒ recreate autonome.
+- [x] T210 — conteneur crashé/API down ⇒ recreate autonome.
 - [ ] T211 — DNS transitoire ne tue pas un tunnel sain.
 
 ## Preuves
 
-- [ ] T212 — 0 recreate d'une station saine sur 24 h.
+- [x] T212 — 0 recreate d'une station saine sur 24 h.
 - [ ] T213 — réparation autonome live, sans commande manuelle.
 - [ ] T214 — SLO détection/réparation/switch mesurés.
 - [ ] T215 — benchmark p95 ≤ 45 s.

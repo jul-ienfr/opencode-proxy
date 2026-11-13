@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+
 from scripts import fresh_chain_supervisor as supervisor
 
 
@@ -44,3 +46,38 @@ def test_recovered_rejects_a_transitional_health_state():
             supervisor._station_recovered(_station(health={"state": state}))
             is False
         )
+
+
+def test_needs_chain_only_for_unusable_stations():
+    healthy = {
+        "current_ip": "203.0.113.7",
+        "station_usable": True,
+        "model_usable": True,
+        "health": {"state": "healthy"},
+    }
+    assert supervisor._needs_chain(healthy) is False
+    assert (
+        supervisor._needs_chain({**healthy, "model_usable": False}) is True
+    )
+    assert supervisor._needs_chain({**healthy, "current_ip": ""}) is True
+    assert (
+        supervisor._needs_chain({**healthy, "station_usable": False}) is True
+    )
+
+
+def test_credential_refresh_respects_the_cooldown(tmp_path, monkeypatch):
+    script = tmp_path / "scripts" / "refresh_nord_credentials.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("", encoding="utf-8")
+    monkeypatch.setattr(supervisor, "ROOT", tmp_path)
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args[0] if args else [], 0, "", "")
+
+    monkeypatch.setattr(supervisor.subprocess, "run", fake_run)
+
+    assert supervisor._refresh_credentials_if_due(now=1_800_000_000.0) is True
+    assert supervisor._refresh_credentials_if_due(now=1_800_000_001.0) is False
+    assert len(calls) == 1

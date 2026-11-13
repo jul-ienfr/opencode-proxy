@@ -62,7 +62,7 @@ class HybridBinder:
         current = "" if self.tri_stack else self._current(station)
         # A DNS mode change or stale credentials are environment changes: the
         # control API cannot apply them, so force the Compose recreate.
-        if not dns_mode and self._credentials_fresh(station):
+        if not dns_mode and self._environment_fresh(station):
             control_first = self.tri_stack or current == requested
             if control_first:
                 result = await self._control.assign(
@@ -101,12 +101,31 @@ class HybridBinder:
     async def current(self, station: int) -> str | None:
         return await self._control.current(station)
 
+    async def rotate_outcome(
+        self,
+        candidates,
+        constraints=None,
+        *,
+        wait: bool = True,
+    ):
+        """Delegate an ordered batch rotation to the control plane.
+
+        The legacy binder has no batch rotation; returning ``None`` lets the
+        chain fall back to its per-host assign path.
+        """
+
+        rotate = getattr(self._control, "rotate_outcome", None)
+        if rotate is None:
+            return None
+        return await rotate(candidates, constraints, wait=wait)
+
     # ── internals ─────────────────────────────────────────────────────
-    def _credentials_fresh(self, station: int) -> bool:
+    def _environment_fresh(self, station: int) -> bool:
         station = int(station)
         if station not in self._credentials_checked:
             self._credentials_checked[station] = not (
                 self._compose.credentials_stale(station)
+                or self._compose.image_stale(station)
             )
         return self._credentials_checked[station]
 

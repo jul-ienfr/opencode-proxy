@@ -697,6 +697,57 @@ def _auth_recent(stations: dict[int, dict]) -> bool:
     return False
 
 
+CREDENTIAL_REFRESH_COOLDOWN_S = 6 * 3600.0
+
+
+def _refresh_credentials_if_due(now: float | None = None) -> bool:
+    """Refresh the NordVPN service credentials after repeated AUTH failures.
+
+    A revoked/rotated service password produces AUTH_FAILED on every new
+    OpenVPN session, and a stale NordLynx key produces silent WireGuard
+    handshakes. The existing refresh script uses the account token already in
+    ``credentials.env``; the cooldown prevents hammering the provider API.
+    """
+
+    marker = ROOT / "logs" / "nord_credentials_refresh.json"
+    timestamp = float(now if now is not None else time.time())
+    try:
+        previous = float(json.loads(marker.read_text(encoding="utf-8")).get("at", 0))
+    except (OSError, ValueError, TypeError):
+        previous = 0.0
+    if timestamp - previous < CREDENTIAL_REFRESH_COOLDOWN_S:
+        return False
+
+    script = ROOT / "scripts" / "refresh_nord_credentials.py"
+    if not script.exists():
+        return False
+
+    log("auth failures detected: refreshing NordVPN service credentials")
+    ok = False
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--apply"],
+            capture_output=True,
+            text=True,
+            timeout=90.0,
+            creationflags=_NO_WINDOW,
+        )
+        ok = int(getattr(proc, "returncode", 1)) == 0
+    except Exception as exc:  # noqa: BLE001 - a refresh failure must not stop repairs
+        log(f"credential refresh failed: {type(exc).__name__}: {exc}")
+
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps({"at": timestamp, "ok": ok}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    log(f"credential refresh {'ok' if ok else 'failed'}")
+    return ok
+
+
 def _effective_max_parallel(
     stations: dict[int, dict], base: int, *, auth_pause: float = 0.0
 ) -> int:
@@ -2078,6 +2129,8 @@ def _supervise() -> None:
                 # réparation à une station par minute : la guard AUTH est
                 # désormais bornée et par transport, donc le seul risque réel
                 # est le départ simultané de plusieurs chaînes.
+                if _auth_recent(stations):
+                    _refresh_credentials_if_due()
                 if (
                     _auth_recent(stations)
                     and time.time() - last_chain_started_at < 5.0

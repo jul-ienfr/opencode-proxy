@@ -12,7 +12,7 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 1 — Primitive rotate
 
-### T201 — Un seul `/v1/vpn/rotate` par chaîne (P0) — à faire
+### T201 — Un seul `/v1/vpn/rotate` par chaîne (P0) — fait
 - **Fichiers** : `scripts/fresh_chain.py`,
   `free/ip_registry/adapters/gluetun_control_v2.py`,
   `tests/test_rotation_contract.py`.
@@ -22,7 +22,7 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : un seul job `rotate` par chaîne ; aucun switch par host.
 - **Test** : binder factice qui vérifie un appel et l'ordre des candidats.
 
-### T202 — Traiter tous les états terminaux sans disable (P0) — à faire
+### T202 — Traiter tous les états terminaux sans disable (P0) — fait
 - **Fichiers** : `scripts/fresh_chain.py`,
   `free/ip_registry/adapters/gluetun_control_v2.py`.
 - **Action** : `committed` ⇒ winner ; `exhausted`/`rolled_back` ⇒ nouvelle liste
@@ -30,7 +30,7 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : `exhausted` ne bloque pas la station suivante.
 - **Test** : contrat rotate + test de chaîne.
 
-### T203 — Le fork épuise candidats et transports (P0) — en cours
+### T203 — Le fork épuise candidats et transports (P0) — fait
 - **Fichiers** : `gluetun/internal/control/jobs/rotation.go`,
   `executor.go`, `preflight.go`.
 - **Action** : vérifier que le job rotate essaie WG → UDP → TCP par candidat,
@@ -50,7 +50,7 @@ Statut : `fait`, `en cours`, `à faire`.
   classé premier.
 - **Test** : `test_registry_hosts_filters_by_transport` + test de tri.
 
-### T205 — Qualification live avant classement (P1) — en cours
+### T205 — Qualification live avant classement (P1) — fait
 - **Fichiers** : `scripts/fresh_chain.py`, `free/pool`,
   `free/qualification`.
 - **Action** : mesurer le tunnel et le DNS, pas seulement un score historique ;
@@ -75,7 +75,7 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 3 — Authentification et conteneur
 
-### T208 — Politique AUTH_FAILED (P0) — en cours
+### T208 — Politique AUTH_FAILED (P0) — fait
 - **Fichiers** : `scripts/fresh_chain_supervisor.py`,
   `scripts/refresh_nord_credentials.py`, `config.yaml`.
 - **Action** : refresh des identifiants de service sur `AUTH_FAILED`, cooldown
@@ -93,7 +93,7 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Test** : `test_credentials_stale_detects_a_rotation`,
   `test_stale_credentials_force_a_compose_recreate`.
 
-### T210 — Récupération conteneur (P0) — en cours
+### T210 — Récupération conteneur (P0) — fait
 - **Fichiers** : `gluetun_control_v2.py`, `hybrid_binder.py`,
   `fresh_chain.py`.
 - **Action** : `control-unavailable`, `crashed`, `awaiting tunnel` ⇒ recreate
@@ -113,7 +113,7 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 4 — Acceptance et SLO
 
-### T212 — Test zéro churn sur station saine (P1) — à faire
+### T212 — Test zéro churn sur station saine (P1) — fait
 - **Fichiers** : `tests/test_fresh_chain_supervisor.py` (ou équivalent).
 - **Action** : station saine + image plus récente ⇒ aucune chaîne, aucun
   recreate, `StartedAt` inchangé.

@@ -1941,6 +1941,22 @@ async def _run_claims(
             "openvpn-tcp",
         ):
             discovery_transport = "openvpn-udp"
+        rotate_batch_candidates = max(
+            1,
+            int(
+                yaml_get(
+                    "ip_registry", "allocator.rotate_batch_candidates", 10
+                )
+                or 10
+            ),
+        )
+        rotate_batch_attempts = max(
+            1,
+            int(
+                yaml_get("ip_registry", "allocator.rotate_batch_attempts", 5)
+                or 5
+            ),
+        )
         dns_fallback = DnsFallback(
             order=tuple(
                 yaml_get(
@@ -1961,14 +1977,103 @@ async def _run_claims(
                 _close_run("max_candidates")
                 await _restore_previous_host(args, binder, snapshot or {})
                 return 2
-            claim = claims.claim_next(args.station, forbidden_ips=exhausted)
-            if claim is None:
-                log("catalog exhausted or every candidate is claimed/reset")
-                _close_run("catalog_exhausted")
-                await _restore_previous_host(args, binder, snapshot or {})
-                return 2
-            host = str(claim["host"])
-            country = str(claim["country"])
+            rotated = False
+            if tri_stack and hasattr(binder, "rotate_outcome"):
+                from free.control_plane.models import Constraints, ServerCandidate
+
+                batch = []
+                for _ in range(rotate_batch_candidates):
+                    batch_claim = claims.claim_next(
+                        args.station, forbidden_ips=exhausted
+                    )
+                    if batch_claim is None:
+                        break
+                    batch_host = str(batch_claim["host"])
+                    if batch_host not in by_host or batch_host in active_hosts:
+                        claims.record(
+                            batch_host,
+                            args.station,
+                            "duplicate",
+                            error="filtered-candidate",
+                        )
+                        continue
+                    batch.append(batch_claim)
+                if not batch:
+                    log("catalog exhausted or every candidate is claimed/reset")
+                    _close_run("catalog_exhausted")
+                    await _restore_previous_host(args, binder, snapshot or {})
+                    return 2
+                outcome = await binder.rotate_outcome(
+                    [
+                        ServerCandidate(hostname=str(item["host"]))
+                        for item in batch
+                    ],
+                    Constraints(
+                        max_candidates=len(batch),
+                        max_attempts=rotate_batch_attempts,
+                    ),
+                    wait=True,
+                )
+                if outcome is not None and outcome.ok:
+                    host = outcome.hostname or str(batch[0]["host"])
+                    country = next(
+                        (
+                            str(item["country"])
+                            for item in batch
+                            if str(item["host"]) == host
+                        ),
+                        str(batch[0]["country"]),
+                    )
+                    for item in batch:
+                        if str(item["host"]) != host:
+                            claims.record(
+                                str(item["host"]),
+                                args.station,
+                                "duplicate",
+                                error="rotate-not-selected",
+                            )
+                    tested += 1
+                    rotated = True
+                    log(
+                        f"  rotate committed {host} "
+                        f"egress={outcome.egress_ip or '-'}"
+                    )
+                elif outcome is None or "control-unavailable" in str(
+                    getattr(outcome, "error", "")
+                ):
+                    host = str(batch[0]["host"])
+                    country = str(batch[0]["country"])
+                    for item in batch[1:]:
+                        claims.record(
+                            str(item["host"]),
+                            args.station,
+                            "duplicate",
+                            error="rotate-fallback",
+                        )
+                    log(f"  rotate unavailable - fallback bind {host}")
+                else:
+                    error = (
+                        f"rotate-{getattr(outcome, 'state', 'error')}:"
+                        f"{getattr(outcome, 'error', '')}"
+                    )
+                    for item in batch:
+                        claims.record(
+                            str(item["host"]),
+                            args.station,
+                            "no_egress",
+                            error=error,
+                        )
+                    log(f"  rotate rejected: {error}")
+                    continue
+            else:
+                claim = claims.claim_next(args.station, forbidden_ips=exhausted)
+                if claim is None:
+                    log("catalog exhausted or every candidate is claimed/reset")
+                    _close_run("catalog_exhausted")
+                    await _restore_previous_host(args, binder, snapshot or {})
+                    return 2
+                host = str(claim["host"])
+                country = str(claim["country"])
             # The shared catalog keeps rows from older runs (no prune: an
             # active host must stay reclaimable). If this run's candidate
             # build filtered the host — exhausted /24, no longer in the live
@@ -1979,7 +2084,8 @@ async def _run_claims(
                 )
                 log("  filtered candidate (exhausted /24 or not live) - skip")
                 continue
-            tested += 1
+            if not rotated:
+                tested += 1
             attempt_id = (
                 audit.begin_attempt(
                     run_id,

@@ -27,13 +27,22 @@ class FakeControl:
 
 
 class FakeCompose:
-    def __init__(self, result: BindResult, credentials_stale: bool = False) -> None:
+    def __init__(
+        self,
+        result: BindResult,
+        credentials_stale: bool = False,
+        image_stale: bool = False,
+    ) -> None:
         self.result = result
         self.calls: list[tuple] = []
         self.stale = credentials_stale
+        self._image_stale = image_stale
 
     def credentials_stale(self, station: int) -> bool:
         return self.stale
+
+    def image_stale(self, station: int) -> bool:
+        return self._image_stale
 
     async def assign(self, station, hostname, country=None, **kwargs):
         self.calls.append((station, hostname, country, kwargs))
@@ -114,6 +123,22 @@ async def test_stale_credentials_force_a_compose_recreate():
     )
     compose = FakeCompose(
         BindResult(True, "a", egress_ip="2.2.2.2"), credentials_stale=True
+    )
+    binder = HybridBinder(control=control, compose=compose)
+
+    result = await binder.assign(2, "a.nordvpn.com", vpn_type="wireguard")
+
+    assert result.egress_ip == "2.2.2.2"
+    assert control.calls == []
+    assert len(compose.calls) == 1
+
+
+async def test_stale_image_forces_a_compose_recreate():
+    control = FakeControlPlane(
+        "wireguard", BindResult(True, "a", egress_ip="1.1.1.1")
+    )
+    compose = FakeCompose(
+        BindResult(True, "a", egress_ip="2.2.2.2"), image_stale=True
     )
     binder = HybridBinder(control=control, compose=compose)
 
