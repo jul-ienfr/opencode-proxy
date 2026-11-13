@@ -192,6 +192,10 @@ dépasse les budgets.
   âge de chaîne) et repartent d'un état sain après succès.
 - **FR-012** : chaque réparation émet un événement et laisse une trace
   exploitable (image, transport, IP, raison, durée).
+- **FR-013** : une rotation des identifiants NordVPN (utilisateur/mot de passe
+  OpenVPN ou clé NordLynx) doit être appliquée par un recreate ; le superviseur
+  compare les secrets du conteneur aux fichiers et force le chemin Compose s'ils
+  diffèrent.
 
 ## Exigences non fonctionnelles
 

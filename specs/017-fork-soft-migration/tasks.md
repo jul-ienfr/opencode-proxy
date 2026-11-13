@@ -101,6 +101,30 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : un recreate de réparation ne fige pas un transport.
 - **Test** : `test_auto_override_leaves_vpn_type_for_the_fork_ladder`.
 
+### T117 — Détecter une rotation d'identifiants et recréer (P0) — fait
+- **Fichiers** : `free/ip_registry/adapters/compose_binder.py`,
+  `free/ip_registry/adapters/hybrid_binder.py`,
+  `tests/test_hybrid_binder.py`,
+  `tests/test_ip_registry_compose_binder.py`.
+- **Action** : comparer `OPENVPN_USER`, `OPENVPN_PASSWORD` et
+  `WIREGUARD_PRIVATE_KEY` du conteneur aux fichiers ; si différents, forcer le
+  chemin Compose une fois, puis reprendre le chemin chaud.
+- **Acceptation** : un conteneur avec d'anciens identifiants est recréé au lieu
+  de boucler sur `AUTH_FAILED`.
+- **Test** : `test_stale_credentials_force_a_compose_recreate`,
+  `test_credentials_stale_detects_a_rotation`.
+
+### T118 — Rafraîchir les identifiants de service NordVPN (P0) — fait
+- **Fichiers** : `scripts/refresh_nord_credentials.py`, `credentials.env`,
+  `vpn_configs/wireguard.env` (hors suivi Git).
+- **Action** : `--check` puis `--apply` avec le token existant ; backups
+  horodatés ; aucun secret affiché.
+- **Acceptation** : le token répond 200, les trois secrets sont renouvelés, les
+  nouveaux conteneurs ne reçoivent plus `AUTH_FAILED`.
+- **Test** : `python scripts/refresh_nord_credentials.py --check` puis
+  validation sur un recreate fait par le superviseur.
+
+
 ---
 
 ## Phase 3 — Migration douce
