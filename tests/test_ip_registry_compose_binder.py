@@ -193,6 +193,17 @@ async def test_assign_gives_up_after_the_egress_deadline(tmp_path):
     assert len(calls) >= 2 and set(calls) == {1}
 
 
+def test_auto_override_leaves_vpn_type_for_the_fork_ladder(tmp_path):
+    binder = ComposeHostnameBinder(tmp_path)
+    override = binder.override_yaml(
+        6, "us13183.nordvpn.com", vpn_type="auto"
+    )
+    assert "VPN_TYPE=" in override
+    assert "VPN_TYPE=openvpn" not in override
+    assert "VPN_TYPE=wireguard" not in override
+    assert "OPENVPN_PROTOCOL" not in override
+
+
 def test_override_path_is_per_station(tmp_path):
     binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=FakeRunner())
     p1 = binder.override_path_for(1)

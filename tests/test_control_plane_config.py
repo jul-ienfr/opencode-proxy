@@ -15,13 +15,23 @@ from free.control_plane.errors import ConfigError
 
 
 def test_defaults_are_legacy_and_resolve_station_urls():
-    config = load_control_plane_config()
+    config = ControlPlaneConfig()
 
     assert config.mode == "legacy"
     assert not config.is_active
     assert config.transport_owner == "python"
     assert config.base_url_for(3) == "http://vpn-gluetun-3:8000"
     assert config.base_url_for("vpn-gluetun-6") == ("http://vpn-gluetun-vpn-gluetun-6:8000")
+
+
+def test_repo_config_activates_the_fork_control_plane():
+    config = load_control_plane_config()
+
+    assert config.mode == "active"
+    assert config.is_active
+    assert config.transport_owner == "fork"
+    assert config.base_url_for(6) == "http://127.0.0.1:8006"
+    assert config.base_url_for(1) == "http://127.0.0.1:8001"
 
 
 def test_station_placeholder_requires_a_station():

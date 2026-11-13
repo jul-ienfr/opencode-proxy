@@ -10,6 +10,7 @@ available as the cold fallback when the control plane is unreachable.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
@@ -56,6 +57,10 @@ class RotationOutcome:
 class GluetunControlV2Binder:
     """Async binder that drives ``POST /v1/vpn/switch`` and ``/rotate``."""
 
+    # The hybrid binder uses this marker to give the control plane the first
+    # attempt and to collapse the per-transport chain loop into one call.
+    is_control_plane = True
+
     def __init__(
         self,
         client: GluetunControlClient,
@@ -95,7 +100,7 @@ class GluetunControlV2Binder:
             hostname=hostname,
             expected_egress_ip=str(expected_egress_ip or ""),
         )
-        key = idempotency_key or self._key("switch", station)
+        key = idempotency_key or self._key("switch", station, hostname)
         try:
             job = await self._to_thread(
                 self._client.switch,
@@ -131,6 +136,17 @@ class GluetunControlV2Binder:
         hostname: str,
         country: str | None,
     ) -> BindResult:
+        # A broken station often cannot resolve a new hostname because its
+        # DNS is down. The fork cannot fix that from inside the dead tunnel;
+        # recreating the container lets the runtime ladder resolve through the
+        # provider catalogue instead. The hybrid binder sees the
+        # control-unavailable prefix and falls back to Compose.
+        if "resolution" in str(error).lower():
+            return BindResult(
+                False, hostname,
+                error="control-unavailable:resolution-failed",
+            )
+
         reason = legacy_fallback_reason(error)
         if not reason:
             return BindResult(False, hostname, error=self._error_text(error))
@@ -178,7 +194,7 @@ class GluetunControlV2Binder:
             self._client.rotate,
             list(candidates),
             constraints or Constraints(),
-            idempotency_key=self._key("rotate", self._station),
+            idempotency_key=self._rotate_key(candidates),
             wait=wait,
             transport_policy=self._transport_policy,
         )
@@ -274,14 +290,32 @@ class GluetunControlV2Binder:
         if job.committed:
             ip = job.verification.ip if job.verification else ""
             return BindResult(True, hostname, egress_ip=ip or None)
+        if "resolution" in str(job.error or "").lower():
+            # Compose fallback: a fresh container resolves the target from the
+            # provider catalogue, without depending on the dead tunnel's DNS.
+            return BindResult(
+                False, hostname,
+                error="control-unavailable:resolution-failed",
+            )
         return BindResult(
             False,
             hostname,
             error=f"control-{job.state or 'unknown'}:{job.error[:120]}",
         )
 
-    def _key(self, action: str, station: int) -> str:
-        return f"{action}-{int(station)}-{self._cycle_id}"
+    def _key(self, action: str, station: int, target: str = "") -> str:
+        # The key must be stable for one request and different for another
+        # target: reusing a chain-wide key made the fork answer
+        # ``idempotency_conflict`` on every hostname after the first.
+        suffix = f"-{target}" if target else ""
+        return f"{action}-{int(station)}-{self._cycle_id}{suffix}"
+
+    def _rotate_key(self, candidates: list[ServerCandidate]) -> str:
+        hostnames = ",".join(
+            str(candidate.hostname or "") for candidate in candidates
+        )
+        digest = hashlib.sha256(hostnames.encode("utf-8")).hexdigest()[:12]
+        return f"rotate-{self._station}-{self._cycle_id}-{digest}"
 
     @staticmethod
     def _error_text(error: ControlPlaneError) -> str:

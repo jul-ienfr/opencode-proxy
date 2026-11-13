@@ -24,6 +24,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -662,6 +663,32 @@ def _read_env_key(key: str) -> str:
     except OSError:
         return ""
     return value
+
+
+def _read_secret_key(key: str) -> str:
+    """Read a secret from ``credentials.env`` then ``.env``.
+
+    The supervisor runs on the host, outside the Compose network, so the
+    control-plane client cannot inherit the container environment. The key
+    still lives in the same untracked files Compose loads.
+    """
+
+    for filename in ("credentials.env", ".env"):
+        path = ROOT / filename
+        value = ""
+        try:
+            for raw in path.read_text(encoding="utf-8-sig").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, _, item = line.partition("=")
+                if name.strip() == key:
+                    value = item.strip().strip('"').strip("'")
+        except OSError:
+            continue
+        if value:
+            return value
+    return ""
 
 
 def _station_transport(station: int) -> str:
@@ -1814,6 +1841,13 @@ async def _run_claims(
             or 3600
         ),
     )
+    # The fork's switch executor walks wireguard, openvpn-udp and openvpn-tcp
+    # itself when the station has no explicit VPN_TYPE. One control call is
+    # enough: replaying it per transport would only duplicate the same job.
+    tri_stack = (
+        bool(getattr(binder, "tri_stack", False))
+        and str(args.transport) == "auto"
+    )
     audit = None
     run_id = ""
     run_closed = False
@@ -1998,42 +2032,46 @@ async def _run_claims(
                     await asyncio.sleep(args.delay)
                     continue
                 transports = [args.transport]
-            # [2026-11-05] Try the transport already configured in the
-            # container first: the hybrid binder switches its hostname via the
-            # control API in seconds instead of a ~2 min compose recreate.
-            # [P0 2026-11-11] This is not limited to fast-discovery mode: the
-            # user-facing transport order must still be walked on failure, but
-            # the *first* attempt should reuse the live tunnel. Forcing
-            # WireGuard first meant every rotation recreated the container and
-            # never exercised the control API.
-            try:
-                preferred = str(binder.current_transport(args.station) or "")
-            except Exception:
-                preferred = ""
-            if preferred and preferred in transports:
-                transports = [preferred] + [
-                    item for item in transports if item != preferred
-                ]
-            if fast_discovery and str(args.transport) == "auto":
-                # Discovery mode: one transport per station and move to the
-                # next hostname on any failure. Prefer the transport already
-                # configured in the container (the control API then switches
-                # hostnames in seconds); when the container is down, follow
-                # the station's own stack so a WireGuard station does not
-                # silently test only OpenVPN egresses. The full tri-stack
-                # remains available with fast_discovery=false.
-                #
-                # An explicit ``--transport`` is an operator constraint: it
-                # must win over discovery, otherwise a TCP repair silently
-                # binds WireGuard and blocks every other station through the
-                # shared key lease.
-                discovery_pref = preferred if preferred in transports else ""
-                if not discovery_pref:
-                    configured = _station_transport(args.station)
-                    discovery_pref = (
-                        configured if configured in transports else ""
-                    )
-                transports = [discovery_pref or discovery_transport]
+            if tri_stack:
+                transports = ["auto"]
+            else:
+                # [2026-11-05] Try the transport already configured in the
+                # container first: the hybrid binder switches its hostname via
+                # the control API in seconds instead of a ~2 min recreate.
+                # [P0 2026-11-11] This is not limited to fast-discovery mode:
+                # the user-facing transport order must still be walked on
+                # failure, but the *first* attempt should reuse the live
+                # tunnel. Forcing WireGuard first meant every rotation
+                # recreated the container and never exercised the control API.
+                try:
+                    preferred = str(binder.current_transport(args.station) or "")
+                except Exception:
+                    preferred = ""
+                if preferred and preferred in transports:
+                    transports = [preferred] + [
+                        item for item in transports if item != preferred
+                    ]
+                if fast_discovery and str(args.transport) == "auto":
+                    # Discovery mode: one transport per station and move to
+                    # the next hostname on any failure. Prefer the transport
+                    # already configured in the container (the control API
+                    # then switches hostnames in seconds); when the container
+                    # is down, follow the station's own stack so a WireGuard
+                    # station does not silently test only OpenVPN egresses.
+                    # The full tri-stack remains available with
+                    # fast_discovery=false.
+                    #
+                    # An explicit ``--transport`` is an operator constraint:
+                    # it must win over discovery, otherwise a TCP repair
+                    # silently binds WireGuard and blocks every other station
+                    # through the shared key lease.
+                    discovery_pref = preferred if preferred in transports else ""
+                    if not discovery_pref:
+                        configured = _station_transport(args.station)
+                        discovery_pref = (
+                            configured if configured in transports else ""
+                        )
+                    transports = [discovery_pref or discovery_transport]
             log(
                 f"claim {host} ({country}) transports="
                 + ",".join(str(item) for item in transports)
@@ -2051,7 +2089,12 @@ async def _run_claims(
                     await asyncio.sleep(2)
                 claims.renew(host, args.station)
                 _clean_station_container(args.station)
-                vpn_type, openvpn_protocol = _transport_parts(str(transport))
+                if str(args.transport) == "auto":
+                    # The fork owns the tri-stack ladder. Writing an explicit
+                    # VPN_TYPE would disable it after every recreate.
+                    vpn_type, openvpn_protocol = "auto", None
+                else:
+                    vpn_type, openvpn_protocol = _transport_parts(str(transport))
                 dns_mode = dns_fallback.mode(args.station)
                 bind = await binder.assign(
                     args.station,
@@ -2349,6 +2392,7 @@ async def _run_claims(
 
 
 async def run(args) -> int:
+    from free.control_plane import GluetunControlClient, load_control_plane_config
     from free.ip_registry import (
         ComposeHostnameBinder,
         GluetunControlBinder,
@@ -2356,6 +2400,9 @@ async def run(args) -> int:
         StationEgress,
         StationProbe,
         host_public_ip,
+    )
+    from free.ip_registry.adapters.gluetun_control_v2 import (
+        GluetunControlV2Binder,
     )
 
     if not acquire_lock(args.station, args.transport):
@@ -2536,19 +2583,63 @@ async def run(args) -> int:
     container = "opencode-vpn" if int(args.station) == 1 else (
         f"opencode-vpn-{int(args.station)}"
     )
-    binder = HybridBinder(
-        control=GluetunControlBinder(
-            container=container,
-            egress=egress.control_only,
-            settle_s=min(settle_s, 2.0),
-            egress_wait_s=min(egress_wait_s, 12.0),
-            egress_poll_s=1.0,
-        ),
-        compose=compose_binder,
+    control_binder: object = GluetunControlBinder(
+        container=container,
+        egress=egress.control_only,
+        settle_s=min(settle_s, 2.0),
+        egress_wait_s=min(egress_wait_s, 12.0),
+        egress_poll_s=1.0,
     )
+    try:
+        control_config = load_control_plane_config()
+        if control_config.is_active:
+            api_key = (
+                str(os.environ.get(control_config.api_key_env, "") or "").strip()
+                or _read_secret_key(control_config.api_key_env)
+            )
+            control_binder = GluetunControlV2Binder(
+                GluetunControlClient(
+                    control_config.base_url_for(args.station),
+                    api_key=api_key,
+                    api_key_env=control_config.api_key_env,
+                    station=args.station,
+                    timeout_s=control_config.timeout_s,
+                    switch_timeout_s=control_config.switch_timeout_s,
+                    rotate_timeout_s=control_config.rotate_timeout_s,
+                    verify_timeout_s=control_config.verify_timeout_s,
+                    retry_max_attempts=control_config.retry.max_attempts,
+                    retry_backoff_s=control_config.retry.backoff_s,
+                    retry_max_backoff_s=control_config.retry.max_backoff_s,
+                ),
+                station=args.station,
+                cycle_id=f"{int(args.station)}-{uuid.uuid4().hex[:12]}",
+                transport_policy=None,
+                legacy=control_binder,
+                on_fallback=lambda reason: log(f"control fallback: {reason}"),
+            )
+            log(
+                f"control plane active for station {args.station} "
+                f"at {control_config.base_url_for(args.station)}"
+            )
+    except Exception as exc:  # noqa: BLE001 - the legacy binder must stay usable
+        log(
+            "control plane unavailable "
+            f"({type(exc).__name__}: {exc}) - legacy binder"
+        )
+    binder = HybridBinder(control=control_binder, compose=compose_binder)
     start = int(args.start if args.start is not None else state.get("index", 0))
-    vpn_type = "openvpn" if args.transport.startswith("openvpn") else "wireguard"
-    openvpn_protocol = args.transport.split("-", 1)[1] if vpn_type == "openvpn" else None
+    if args.transport == "auto":
+        # The fork's switch executor owns the tri-stack ladder. Forcing a
+        # VPN_TYPE here would disable it and pin the station to one transport.
+        vpn_type = "auto"
+        openvpn_protocol = None
+    else:
+        vpn_type = (
+            "openvpn" if args.transport.startswith("openvpn") else "wireguard"
+        )
+        openvpn_protocol = (
+            args.transport.split("-", 1)[1] if vpn_type == "openvpn" else None
+        )
     # [P0 2026-11-11] Probe budget: a 429 is keyed by (model, IP). Trying all
     # eleven free buckets on one hostname burns the whole quota map before the
     # chain can rotate. Two fallbacks are enough to tell "this model is

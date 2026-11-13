@@ -120,10 +120,16 @@ class ComposeHostnameBinder:
         ]
         if country:
             lines.append(f"      - SERVER_COUNTRIES={country}")
-        if vpn_type:
+        vpn_type_value = str(vpn_type or "").strip().lower()
+        if vpn_type_value == "auto":
+            # The base Compose file defaults VPN_TYPE to openvpn; an empty
+            # value keeps gluetun's TypeExplicit false so the runtime transport
+            # ladder owns the choice of wireguard / openvpn-udp / openvpn-tcp.
+            lines.append("      - VPN_TYPE=")
+        elif vpn_type_value:
             lines.append(f"      - VPN_TYPE={vpn_type}")
-        if openvpn_protocol:
-            lines.append(f"      - OPENVPN_PROTOCOL={openvpn_protocol}")
+            if openvpn_protocol:
+                lines.append(f"      - OPENVPN_PROTOCOL={openvpn_protocol}")
         if dns_mode:
             lines.append(f"      - DNS_UPSTREAM_RESOLVER_TYPE={dns_mode}")
             if str(dns_mode).strip().lower() == "plain":

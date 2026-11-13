@@ -36,6 +36,13 @@ class FakeCompose:
         return self.result
 
 
+class FakeControlPlane(FakeControl):
+    is_control_plane = True
+
+    def current_transport(self, station: int) -> str:
+        return self.transport
+
+
 def test_transport_name_covers_the_three_stacks():
     assert transport_name("wireguard") == "wireguard"
     assert transport_name("openvpn", "udp") == "openvpn-udp"
@@ -95,6 +102,21 @@ async def test_transport_change_goes_straight_to_compose():
     assert result.egress_ip == "2.2.2.2"
     assert control.calls == []
     assert len(compose.calls) == 1
+
+
+async def test_control_plane_owns_the_tri_stack_before_compose():
+    control = FakeControlPlane(
+        "openvpn-udp", BindResult(True, "a", egress_ip="1.1.1.1")
+    )
+    compose = FakeCompose(BindResult(True, "a", egress_ip="2.2.2.2"))
+    binder = HybridBinder(control=control, compose=compose)
+
+    assert binder.tri_stack
+    result = await binder.assign(2, "a.nordvpn.com", vpn_type="wireguard")
+
+    assert result.egress_ip == "1.1.1.1"
+    assert len(control.calls) == 1
+    assert compose.calls == []
 
 
 async def test_current_transport_is_exposed_to_the_chain():

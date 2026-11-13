@@ -83,7 +83,7 @@ async def _inline_to_thread(function, *args, **kwargs):
 async def test_ordered_candidates_exclusions_and_budget_are_forwarded():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/vpn/rotate"
-        assert request.headers["Idempotency-Key"] == "rotate-4-cycle-11"
+        assert request.headers["Idempotency-Key"].startswith("rotate-4-cycle-11-")
         body = json.loads(request.content)
         assert [item["hostname"] for item in body["candidates"]] == [
             "first.nordvpn.com",
@@ -225,4 +225,5 @@ async def test_retry_after_a_timeout_reuses_the_same_idempotency_key():
     outcome = await binder.rotate_outcome([ServerCandidate("second.nordvpn.com")])
 
     assert outcome.ok
-    assert keys == ["rotate-4-cycle-11", "rotate-4-cycle-11"]
+    assert len(set(keys)) == 1
+    assert keys[0].startswith("rotate-4-cycle-11-")

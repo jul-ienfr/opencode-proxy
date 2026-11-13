@@ -438,7 +438,7 @@ async def test_binder_maps_a_committed_job_to_bind_result():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/vpn/switch"
         body = json.loads(request.content)
-        assert body["idempotency_key"] == "switch-3-cycle-9"
+        assert body["idempotency_key"] == "switch-3-cycle-9-nl-1.nordvpn.com"
         return httpx.Response(200, json=job_json())
 
     client, _ = make_client(handler)
@@ -466,6 +466,34 @@ async def test_binder_maps_unavailable_to_a_cold_fallback_hint():
     assert not result.ok
     assert result.error is not None
     assert result.error.startswith("control-unavailable:")
+
+
+async def test_binder_maps_resolution_failure_to_a_cold_fallback_hint():
+    from free.ip_registry.adapters.gluetun_control_v2 import (
+        GluetunControlV2Binder,
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={
+                "error": {
+                    "code": "invalid_target",
+                    "message": "resolution failed: lookup br1 on 127.0.0.1:53: server misbehaving",
+                    "details": {"reason": "resolution_failed"},
+                }
+            },
+        )
+
+    client, _ = make_client(handler, retry_max_attempts=1)
+    binder = GluetunControlV2Binder(
+        client, station=3, cycle_id="cycle-9", to_thread=_inline_to_thread
+    )
+
+    result = await binder.assign(3, "br1.nordvpn.com")
+
+    assert not result.ok
+    assert result.error == "control-unavailable:resolution-failed"
 
 
 async def _inline_to_thread(function, *args, **kwargs):

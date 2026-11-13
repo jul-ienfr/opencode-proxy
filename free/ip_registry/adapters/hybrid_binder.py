@@ -14,7 +14,6 @@ from collections.abc import Callable
 
 from ..domain import BindResult
 from .compose_binder import ComposeHostnameBinder
-from .gluetun_control import GluetunControlBinder
 
 
 def transport_name(
@@ -31,7 +30,7 @@ class HybridBinder:
     def __init__(
         self,
         *,
-        control: GluetunControlBinder,
+        control: object,
         compose: ComposeHostnameBinder,
         clock: Callable[[], float] = time.monotonic,
         cache_s: float = 300.0,
@@ -42,6 +41,11 @@ class HybridBinder:
         self._cache_s = max(0.0, float(cache_s))
         self._known: dict[int, str] = {}
         self._known_at: dict[int, float] = {}
+
+    @property
+    def tri_stack(self) -> bool:
+        """True when the control plane owns the transport ladder."""
+        return bool(getattr(self._control, "is_control_plane", False))
 
     async def assign(
         self,
@@ -54,10 +58,13 @@ class HybridBinder:
         dns_mode: str | None = None,
     ) -> BindResult:
         requested = transport_name(vpn_type, openvpn_protocol)
-        current = self._current(station)
+        current = "" if self.tri_stack else self._current(station)
         # A DNS mode change is an environment change: the control API cannot
         # apply it, so force the Compose path that writes the override.
-        if current == requested and not dns_mode:
+        # When the control plane owns the ladder, there is no requested
+        # transport to compare: it always gets the first attempt.
+        control_first = self.tri_stack or current == requested
+        if control_first and not dns_mode:
             result = await self._control.assign(
                 station,
                 hostname,
@@ -99,7 +106,12 @@ class HybridBinder:
         cached = self._known.get(station, "")
         if cached and now - self._known_at.get(station, 0.0) < self._cache_s:
             return cached
-        live = str(self._control.current_transport() or "").strip()
+        try:
+            live_value = self._control.current_transport(station)
+        except TypeError:
+            # The legacy binder takes no station argument.
+            live_value = self._control.current_transport()
+        live = str(live_value or "").strip()
         if live:
             self._remember(station, live)
         return live
