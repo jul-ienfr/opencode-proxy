@@ -222,7 +222,7 @@ Reste à faire pour clôturer T095 :
 - `eventSink` publie sur le bus et dans `events.FileLog`, avec sévérité warn
   pour rejet, annulation, rollback, `failed_degraded` et drain timeout.
 
-## Phase 6 — Intégration orchestrateur (T070–T073 faits, T074–T079 à faire)
+## Phase 6 — Intégration orchestrateur (T070–T079 faits, T078/T079 outillés)
 
 | Tâche | Statut | Preuve |
 |---|---|---|
@@ -230,11 +230,18 @@ Reste à faire pour clôturer T095 :
 | T071 — configuration Python | fait | `free/control_plane/config.py` : `mode` (`legacy|shadow|active`), `base_url` avec `{station}`, `api_key_env` résolue à l'appel et jamais rendue, timeouts, retry, shadow, events, `transport_owner` (`python|fork`) ; `config.yaml` porte le bloc `control_plane` (mode `legacy` par défaut) ; `tests/test_control_plane_config.py`. |
 | T072 — shadow mode | fait | `free/control_plane/{shadow,telemetry}.py` : `ShadowObserver` n'émet que des `switch(dry_run=true, wait=false)` et n'est jamais autoritaire ; `ShadowPlan`/`ShadowComparison` comparent cible/IP legacy avec l'état et l'egress du fork ; toute erreur du plan de contrôle est capturée dans la ligne (`control-plane-error`) et aucune exception de télémétrie ne remonte ; `ShadowTelemetry` écrit une table additive `control_plane_shadow` dans `telemetry.db` (jamais `registry.db`) ; `tests/test_control_plane_shadow.py` (8 cas). |
 | T073 — ingestion d'événements | fait | `free/control_plane/events.py` : `EventIngestor.poll` lit `GET /v1/events?since=<curseur>`, applique chaque `(station, seq)` une seule fois et persiste le curseur ; `free/ip_registry/registry_db.py` ajoute `control_cursor` et `control_events` (migration additive) et applique le lot dans une transaction `BEGIN IMMEDIATE` (un échec de mapping ne saute jamais un événement). Mapping : `job.committed`/`egress.verified`/`transport.*` → `observations`, `job.failed_degraded`/`dns.*`/`state.*` → `incidents`, `job.exhausted`/`transport.cycle_exhausted`/`tunnel.repair_needed` → `repair_requests` (jamais de désactivation de station), `job.rolled_back` répété → repair ; `tests/test_control_plane_events.py` (9 cas). |
-| T074–T079 | à faire | Adaptateur de rotation, adaptateur egress, dashboard, fallback legacy, activation 1→6 et décommissionnement du chemin chaud restent à implémenter. |
+| T074 — adaptateur rotation | fait | `GluetunControlV2Binder.rotate_outcome` envoie la liste ordonnée verbatim (aucun score/quota, seuls les hostnames vides sont retirés), transmet exclusions et budget (`max_candidates`/`max_attempts`) et normalise `committed`/`exhausted`/`rolled_back` en `RotationOutcome` sans exception ; `exhausted`/`rolled_back` conservent la station et ses tentatives ; `tests/test_rotation_contract.py` (7 cas). |
+| T075 — adaptateur egress | fait | `StationEgress` accepte `control_plane=` et consulte `/v1/egress` en priorité (preuve k-of-n du fork) dans `__call__` et `control_only` ; une preuve non vérifiée, une IP interdite ou une erreur du fork retombe sur les cinq couches froides inchangées ; `last_source=control_plane:/v1/egress` ; `tests/test_egress_adapter.py` (6 cas) + `tests/test_ip_registry_egress.py`. |
+| T076 — dashboard | fait | `dashboard/routers/station_control_routes.py` ajoute `GET .../control/{state,jobs/{id},events}` et `POST .../control/{switch,rotate,rollback,transport/reset}` : lectures `/v1/vpn/state`/jobs/événements, actions qui créent un job et renvoient `202` + suivi par id (ou `200` en `wait`/`dry_run`), aucune commande Docker ; `dashboard/api.py` câble `control_getter` avec un client mis en cache ; `tests/test_dashboard_station_control.py` (6 cas). |
+| T077 — fallback legacy | fait | `legacy_fallback_reason` n'autorise que timeout/`ControlPlaneUnavailable`/5xx après retries (jamais 403/409/422/429) ; `GluetunControlClient.wait_for_active_job` suit un 409 sans créer de second job ; le binder sonde `state.active_job_id` avant tout fallback et trace la raison via `on_fallback` ; `legacy=` rejoue le chemin froid documenté ; `tests/test_control_plane_fallback.py` (7 cas). |
+| T078 — activation 6→1 | fait (outillage) | `scripts/rollout_control_plane.py` : ordre 6→1 borné à six stations, `--dry-run` sans contact, `probe_station` exige `vpn_status=running` + egress vérifié + IP valide/non-hôte, arrêt au premier échec ; `ops/runbooks/control-plane.md` documente activation, rollback et incidents ; `tests/test_rollout_control_plane.py` (3 cas). L'exécution réelle sur les six stations reste une action opérateur. |
+| T079 — chemin chaud sans Docker | fait (test) | `tests/test_no_docker_exec_hot_path.py` inspecte l'AST des modules chauds (`free/control_plane/*`, binder v2, routes dashboard, rollout) : aucun import `subprocess`/`shlex`, aucun `os.system`/`os.popen`, aucun littéral `docker …` ; le binder v2 n'importe pas le wrapper legacy ; `gluetun_control.py` est explicitement marqué « cold path only » et reste le secours `LegacyFallback`. Le ratio SC-009 ≥ 95 % se mesure après T078. |
 
-Le client est volontairement inerte tant que `control_plane.mode=legacy` :
-aucun chemin chaud ne l'appelle encore. Le passage en `shadow` puis `active`
-reste une décision de rollout (T078), station par station.
+Le client est volontairement inerte tant que `control_plane.mode=legacy` : la
+rotation automatique reste legacy, le dashboard n'expose le plan de contrôle
+que sur des routes explicites et `scripts/rollout_control_plane.py` ne modifie
+pas la configuration. Le passage en `shadow` puis `active` reste une décision
+de rollout (T078), station par station.
 
 ## Vérifications
 
@@ -247,9 +254,11 @@ go test ./internal/control/state -count=1                                     ->
 go test ./internal/control/jobs -count=1                                      -> ok
 go test ./tests/integration -run Test_EgressChaos                             -> ok
 go test ./internal/server/middlewares/auth -run 'Test_authHandler_ServeHTTP|Test_Role|Test_Settings' -> ok
-python -m pytest tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py tests/test_control_plane_events.py -q -> 43 passed
-python -m ruff check free/control_plane free/ip_registry/registry_db.py free/ip_registry/adapters/gluetun_control_v2.py tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py tests/test_control_plane_events.py -> ok
-python -m ruff format --check free/control_plane free/ip_registry/registry_db.py tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py tests/test_control_plane_events.py -> ok
+python -m pytest tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py tests/test_control_plane_events.py tests/test_rotation_contract.py tests/test_egress_adapter.py tests/test_dashboard_station_control.py tests/test_control_plane_fallback.py tests/test_no_docker_exec_hot_path.py tests/test_rollout_control_plane.py -q -> 75 passed
+python -m pytest tests/test_station_control_routes.py tests/test_ip_registry_egress.py -q -> 11 passed
+python -m ruff check free/control_plane free/ip_registry/registry_db.py free/ip_registry/adapters/gluetun_control_v2.py free/ip_registry/adapters/gluetun_control.py free/ip_registry/adapters/egress.py dashboard/routers/station_control_routes.py scripts/rollout_control_plane.py tests/test_rotation_contract.py tests/test_egress_adapter.py tests/test_dashboard_station_control.py tests/test_control_plane_fallback.py tests/test_no_docker_exec_hot_path.py tests/test_rollout_control_plane.py -> ok
+python -m ruff format --check free/control_plane free/ip_registry/adapters/gluetun_control_v2.py free/ip_registry/adapters/gluetun_control.py free/ip_registry/adapters/egress.py dashboard/routers/station_control_routes.py scripts/rollout_control_plane.py tests/test_rotation_contract.py tests/test_egress_adapter.py tests/test_dashboard_station_control.py tests/test_control_plane_fallback.py tests/test_no_docker_exec_hot_path.py tests/test_rollout_control_plane.py -> ok
+python scripts/rollout_control_plane.py --dry-run -> ok (plan 6 -> 1, aucun contact)
 go vet ./internal/control/... ./internal/server/... ./internal/configuration/settings/... ./tests/integration/harness -> ok
 GOOS=linux GOARCH=amd64 go build ./...                                       -> ok
 golangci-lint v2.14.0 (harness, control, settings, server, egress, tests, cmd) -> 0 issues

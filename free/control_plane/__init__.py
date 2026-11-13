@@ -7,7 +7,11 @@ and scores stay in ``registry.db``.
 
 from __future__ import annotations
 
-from .client import GluetunControlClient
+from .client import (
+    GluetunControlClient,
+    legacy_fallback,
+    legacy_fallback_reason,
+)
 from .config import ControlPlaneConfig, load_control_plane_config
 from .errors import (
     ActiveJob,
@@ -66,5 +70,7 @@ __all__ = [
     "TunnelTarget",
     "UnknownTarget",
     "VerificationFailed",
+    "legacy_fallback",
+    "legacy_fallback_reason",
     "load_control_plane_config",
 ]

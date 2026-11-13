@@ -28,6 +28,7 @@ from .errors import (
     ControlPlaneError,
     ControlPlaneTimeout,
     ControlPlaneUnavailable,
+    LegacyFallback,
     UnknownTarget,
     VerificationFailed,
 )
@@ -46,6 +47,37 @@ from .models import (
 )
 
 RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
+FALLBACK_STATUS = frozenset({502, 503, 504})
+
+
+def legacy_fallback_reason(error: ControlPlaneError) -> str:
+    """Return a reason when the cold legacy path may run, else ``""``.
+
+    Only transport-grade failures are eligible: a timeout, an unreachable
+    fork, or a retryable 5xx exhausted after the retry budget.  Business
+    rejections (403, 409, 422) and 429 quotas are deterministic and must never
+    trigger a legacy cut.
+    """
+
+    if isinstance(error, ControlPlaneTimeout):
+        return "timeout"
+    if isinstance(error, ControlPlaneUnavailable):
+        return error.code or "unavailable"
+    status = int(error.status or 0)
+    if status in FALLBACK_STATUS:
+        return f"http_{status}"
+    return ""
+
+
+def legacy_fallback(error: ControlPlaneError) -> LegacyFallback:
+    """Turn an eligible error into the explicit cold-path instruction."""
+
+    reason = legacy_fallback_reason(error)
+    if not reason:
+        raise error
+    return LegacyFallback(reason, cause=error)
+
+
 TERMINAL_STATES = frozenset(
     {
         "committed",
@@ -146,6 +178,29 @@ class GluetunControlClient:
             raise ValueError("job_id must not be empty")
         payload = self._request("GET", f"/v1/vpn/jobs/{quote(job_id, safe='')}")
         return SwitchJob.from_json(payload)
+
+    def wait_for_active_job(
+        self,
+        error: ActiveJob,
+        *,
+        timeout_s: float | None = None,
+    ) -> SwitchJob:
+        """Follow the job named by a 409 instead of creating a second one."""
+
+        job_id = str(error.active_job_id or "").strip()
+        if not job_id:
+            raise error
+        budget = self._wait_timeout(timeout_s, self._switch_timeout_s)
+        deadline = self._now() + budget
+        while self._now() < deadline:
+            self._sleep(self._poll_interval_s)
+            try:
+                job = self.job(job_id)
+            except ControlPlaneUnavailable:
+                continue
+            if job.terminal:
+                return job
+        raise error
 
     def egress(self, *, fresh: bool = False) -> EgressVerification:
         params = {"fresh": "true"} if fresh else None

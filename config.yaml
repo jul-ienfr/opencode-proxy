@@ -1216,6 +1216,27 @@ egress_catalog:
     per_station_workers: true
     parallel_rotations: true
     global_pause_on_429: false
+control_plane:
+  mode: legacy
+  base_url: http://vpn-gluetun-{station}:8000
+  api_key_env: GLUETUN_CONTROL_API_KEY
+  timeout_s: 10
+  switch_timeout_s: 60
+  rotate_timeout_s: 180
+  verify_timeout_s: 10
+  idempotency_window_h: 24
+  transport_owner: python
+  retry:
+    max_attempts: 3
+    backoff_s: 0.5
+    max_backoff_s: 4
+  shadow:
+    sample_rate: 1.0
+    compare_window_s: 300
+  events:
+    ingest: true
+    batch_size: 100
+    poll_interval_s: 5
 ip_registry:
   enabled: true
   slo:

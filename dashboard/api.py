@@ -2555,6 +2555,32 @@ def register_dashboard(
             getattr(shared_state, "free_ip_pool", None),
         )
 
+    _control_clients: dict[int, Any] = {}
+
+    def _control_plane_client(station: int):
+        station = int(station)
+        cached = _control_clients.get(station)
+        if cached is not None:
+            return cached
+        from free.control_plane.client import GluetunControlClient
+        from free.control_plane.config import load_control_plane_config
+
+        settings = load_control_plane_config()
+        client = GluetunControlClient(
+            settings.base_url_for(station),
+            station=station,
+            api_key_env=settings.api_key_env,
+            timeout_s=settings.timeout_s,
+            switch_timeout_s=settings.switch_timeout_s,
+            rotate_timeout_s=settings.rotate_timeout_s,
+            verify_timeout_s=settings.verify_timeout_s,
+            retry_max_attempts=settings.retry.max_attempts,
+            retry_backoff_s=settings.retry.backoff_s,
+            retry_max_backoff_s=settings.retry.max_backoff_s,
+        )
+        _control_clients[station] = client
+        return client
+
     from dashboard.routers.station_logs_routes import register_station_logs_routes
 
     register_station_logs_routes(
@@ -2728,6 +2754,7 @@ def register_dashboard(
         managers_getter=_dashboard_managers,
         pool_getter=shared_pool,
         fleet_getter=_fleet_controller,
+        control_getter=_control_plane_client,
     )
 
     from dashboard.routers.vpn_jobs_routes import register_vpn_jobs_routes

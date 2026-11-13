@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 
-from free.control_plane.client import GluetunControlClient
+from free.control_plane.client import GluetunControlClient, legacy_fallback_reason
 from free.control_plane.errors import (
     ActiveJob,
     ControlPlaneError,
     ControlPlaneUnavailable,
+    Exhausted,
     UnknownTarget,
 )
 from free.control_plane.models import (
+    Attempt,
     Constraints,
     ServerCandidate,
     SwitchJob,
@@ -27,6 +30,27 @@ from free.control_plane.models import (
 )
 
 from ..domain import BindResult
+
+
+@dataclass(frozen=True, slots=True)
+class RotationOutcome:
+    """Terminal view of ``POST /v1/vpn/rotate``.
+
+    ``exhausted`` and ``rolled_back`` are ordinary outcomes, never exceptions
+    the caller must translate into a station disable: the station stays
+    repairable by the next cycle.
+    """
+
+    station: int
+    state: str
+    ok: bool = False
+    exhausted: bool = False
+    rolled_back: bool = False
+    hostname: str = ""
+    egress_ip: str | None = None
+    attempts: tuple[Attempt, ...] = ()
+    error: str = ""
+    job: SwitchJob | None = field(default=None, repr=False)
 
 
 class GluetunControlV2Binder:
@@ -39,6 +63,8 @@ class GluetunControlV2Binder:
         station: int,
         cycle_id: str,
         transport_policy: str | list[str] | None = None,
+        legacy: object | None = None,
+        on_fallback: Callable[[str], None] | None = None,
         to_thread: Callable[..., Awaitable[object]] = asyncio.to_thread,
     ) -> None:
         self._client = client
@@ -47,6 +73,8 @@ class GluetunControlV2Binder:
         if not self._cycle_id:
             raise ValueError("cycle_id must not be empty")
         self._transport_policy = transport_policy
+        self._legacy = legacy
+        self._on_fallback = on_fallback
         self._to_thread = to_thread
 
     async def assign(
@@ -77,9 +105,67 @@ class GluetunControlV2Binder:
                 wait=True,
                 transport_policy=self._transport_policy,
             )
+        except ActiveJob as exc:
+            return await self._wait_active(exc, hostname)
         except ControlPlaneError as exc:
-            return BindResult(False, hostname, error=self._error_text(exc))
+            return await self._fallback_or_error(exc, station, hostname, country)
         return self._bind_result(job, hostname)
+
+    async def _wait_active(self, error: ActiveJob, hostname: str) -> BindResult:
+        busy = f"control-busy:{error.active_job_id or 'unknown'}"
+        try:
+            job = await self._to_thread(
+                self._client.wait_for_active_job,
+                error,
+            )
+        except ControlPlaneError:
+            return BindResult(False, hostname, error=busy)
+        if not job.terminal:
+            return BindResult(False, hostname, error=busy)
+        return self._bind_result(job, hostname)
+
+    async def _fallback_or_error(
+        self,
+        error: ControlPlaneError,
+        station: int,
+        hostname: str,
+        country: str | None,
+    ) -> BindResult:
+        reason = legacy_fallback_reason(error)
+        if not reason:
+            return BindResult(False, hostname, error=self._error_text(error))
+
+        active_id = await self._active_job_id()
+        if active_id:
+            active = ActiveJob(
+                "an active job already owns the tunnel",
+                active_job_id=active_id,
+            )
+            return await self._wait_active(active, hostname)
+
+        if self._legacy is None:
+            return BindResult(False, hostname, error=self._error_text(error))
+
+        self._trace(reason)
+        assign = getattr(self._legacy, "assign", None)
+        if assign is None:
+            return BindResult(False, hostname, error=self._error_text(error))
+        return await assign(station, hostname, country=country)
+
+    async def _active_job_id(self) -> str:
+        try:
+            state = await self._to_thread(self._client.state)
+        except ControlPlaneError:
+            return ""
+        return str(getattr(state, "active_job_id", "") or "").strip()
+
+    def _trace(self, reason: str) -> None:
+        if self._on_fallback is None:
+            return
+        try:
+            self._on_fallback(reason)
+        except Exception:
+            pass
 
     async def rotate(
         self,
@@ -96,6 +182,77 @@ class GluetunControlV2Binder:
             wait=wait,
             transport_policy=self._transport_policy,
         )
+
+    async def rotate_outcome(
+        self,
+        candidates: list[ServerCandidate],
+        constraints: Constraints | None = None,
+        *,
+        wait: bool = True,
+    ) -> RotationOutcome:
+        """Rotate and normalize the terminal state without touching the registry."""
+
+        ordered = [candidate for candidate in candidates if str(candidate.hostname or "").strip()]
+        if not ordered:
+            return RotationOutcome(
+                station=self._station,
+                state="rejected",
+                error="no-candidates",
+            )
+        try:
+            job = await self.rotate(ordered, constraints, wait=wait)
+        except Exhausted as exc:
+            return RotationOutcome(
+                station=self._station,
+                state="exhausted",
+                exhausted=True,
+                attempts=tuple(exc.attempts),
+                error=str(exc)[:160],
+            )
+        except ControlPlaneError as exc:
+            return RotationOutcome(
+                station=self._station,
+                state="error",
+                error=self._error_text(exc),
+            )
+
+        state = job.state or "unknown"
+        outcome = RotationOutcome(
+            station=self._station,
+            state=state,
+            attempts=job.attempts,
+            error=job.error[:160],
+            job=job,
+        )
+        if job.committed:
+            return RotationOutcome(
+                station=self._station,
+                state=state,
+                ok=True,
+                hostname=job.target_hostname or ordered[0].hostname,
+                egress_ip=(job.verification.ip if job.verification else None) or None,
+                attempts=job.attempts,
+                job=job,
+            )
+        if state == "exhausted":
+            return RotationOutcome(
+                station=self._station,
+                state=state,
+                exhausted=True,
+                attempts=job.attempts,
+                error=outcome.error,
+                job=job,
+            )
+        if state == "rolled_back":
+            return RotationOutcome(
+                station=self._station,
+                state=state,
+                rolled_back=True,
+                attempts=job.attempts,
+                error=outcome.error,
+                job=job,
+            )
+        return outcome
 
     async def release(self, station: int) -> None:
         return None
@@ -138,4 +295,4 @@ class GluetunControlV2Binder:
         return f"control-error:{error.code or 'error'}:{str(error)[:120]}"
 
 
-__all__ = ["GluetunControlV2Binder"]
+__all__ = ["GluetunControlV2Binder", "RotationOutcome"]

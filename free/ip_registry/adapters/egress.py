@@ -41,9 +41,7 @@ def _container_name(station: int) -> str:
     return "opencode-vpn" if int(station) == 1 else f"opencode-vpn-{int(station)}"
 
 
-def host_public_ip(
-    *, urls: tuple[str, ...] = IP_URLS, timeout_s: float = 5.0
-) -> str:
+def host_public_ip(*, urls: tuple[str, ...] = IP_URLS, timeout_s: float = 5.0) -> str:
     """Best-effort host egress IP, bypassing any configured HTTP proxy.
 
     This is a safety input, not a health check: if it cannot be resolved the
@@ -76,6 +74,7 @@ class StationEgress:
         timeout_s: float = 8.0,
         docker_exec: Callable[..., str] | None = None,
         control_api: Callable[..., str] | None = None,
+        control_plane: Callable[[int], Any] | None = None,
         forbidden_ips: Iterable[str] = (),
     ) -> None:
         self._get = get or self._curl_get
@@ -83,14 +82,27 @@ class StationEgress:
         self._timeout_s = max(1.0, float(timeout_s))
         self._docker_exec = docker_exec or self._docker_exec_get
         self._control_api = control_api or self._control_api_get
-        self._forbidden = {
-            str(ip).strip() for ip in forbidden_ips if str(ip).strip()
-        }
+        self._control_plane = control_plane
+        self._forbidden = {str(ip).strip() for ip in forbidden_ips if str(ip).strip()}
         self._last_source = "none"
 
     def _accept(self, value: str) -> bool:
         text = str(value or "").strip()
         return bool(text) and _valid_ip(text) and text not in self._forbidden
+
+    def _control_plane_ip(self, station: int) -> str:
+        """Priority path: the fork's k-of-n consensus proof (``/v1/egress``)."""
+
+        if self._control_plane is None:
+            return ""
+        try:
+            verification = self._control_plane(int(station))
+        except Exception:
+            return ""
+        if not bool(getattr(verification, "verified", False)):
+            return ""
+        ip = str(getattr(verification, "ip", "") or "").strip()
+        return ip if self._accept(ip) else ""
 
     @property
     def last_source(self) -> str:
@@ -106,9 +118,16 @@ class StationEgress:
         """
 
         try:
-            value = await asyncio.to_thread(
-                self._control_api, int(station), self._timeout_s
-            )
+            value = await asyncio.to_thread(self._control_plane_ip, int(station))
+        except Exception:
+            value = ""
+        text = str(value or "").strip()
+        if self._accept(text):
+            self._last_source = "control_plane:/v1/egress"
+            return text
+
+        try:
+            value = await asyncio.to_thread(self._control_api, int(station), self._timeout_s)
         except Exception:
             value = ""
         text = str(value or "").strip()
@@ -119,6 +138,16 @@ class StationEgress:
         return ""
 
     async def __call__(self, station: int) -> str:
+        # 0) The fork's consensus proof: one call, no external echo site.
+        try:
+            value = await asyncio.to_thread(self._control_plane_ip, int(station))
+        except Exception:
+            value = ""
+        text = str(value or "").strip()
+        if self._accept(text):
+            self._last_source = "control_plane:/v1/egress"
+            return text
+
         # 1) SOCKS5h: hostname resolution happens inside the tunnel.
         # 2) SOCKS5: local DNS fallback.
         # 3) HTTP proxy: the station also exposes an HTTP proxy.
@@ -146,9 +175,7 @@ class StationEgress:
         # 4) Gluetun's own control API knows the tunnel's public IP and does
         #    not depend on an external IP-echo site.
         try:
-            value = await asyncio.to_thread(
-                self._control_api, int(station), self._timeout_s
-            )
+            value = await asyncio.to_thread(self._control_api, int(station), self._timeout_s)
         except Exception:
             value = ""
         text = str(value or "").strip()
@@ -160,9 +187,7 @@ class StationEgress:
         #    when the host-side proxy path is broken).
         for url in self._urls:
             try:
-                value = await asyncio.to_thread(
-                    self._docker_exec, int(station), url, self._timeout_s
-                )
+                value = await asyncio.to_thread(self._docker_exec, int(station), url, self._timeout_s)
             except Exception:
                 continue
             text = str(value or "").strip()
@@ -238,9 +263,7 @@ class StationEgress:
         status = cls._control_exec(station, "/v1/vpn/status", timeout)
         if not cls._vpn_is_running(status):
             return ""
-        return cls._public_ip(
-            cls._control_exec(station, "/v1/publicip/ip", timeout)
-        )
+        return cls._public_ip(cls._control_exec(station, "/v1/publicip/ip", timeout))
 
     @staticmethod
     def _docker_exec_get(station: int, url: str, timeout: float) -> str:

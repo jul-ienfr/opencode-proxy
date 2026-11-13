@@ -4,6 +4,13 @@ Gluetun accepts a hostname in ``PUT /v1/vpn/settings`` and reconnects in a few
 seconds, avoiding a full compose recreate (~2 min). This binder is limited to
 a hostname switch on the transport already configured in the container; the
 hybrid binder falls back to Compose for a transport change.
+
+.. note:: Cold path only.
+   This module shells out to ``docker exec``/``docker cp``.  It is kept for
+   ``control_plane.mode=legacy`` and for an explicit ``LegacyFallback``; the
+   hot path is :mod:`free.control_plane` plus
+   :class:`~free.ip_registry.adapters.gluetun_control_v2.GluetunControlV2Binder`,
+   which never shells out.
 """
 
 from __future__ import annotations
@@ -76,9 +83,7 @@ class GluetunControlBinder:
         # older builds answer "running". Both mean the settings were applied.
         answer = str(response).strip().lower()
         if answer and answer not in ("running", "ok", "200", "204"):
-            return BindResult(
-                False, hostname, error=f"control-unavailable:{str(response)[:120]}"
-            )
+            return BindResult(False, hostname, error=f"control-unavailable:{str(response)[:120]}")
         if self._settle_s:
             await asyncio.sleep(self._settle_s)
         if self._egress is None:
@@ -107,9 +112,7 @@ class GluetunControlBinder:
 
         env = self._container_env()
         vpn_type = str(env.get("VPN_TYPE", "")).strip().lower()
-        protocol = str(
-            env.get("OPENVPN_PROTOCOL", "udp") or "udp"
-        ).strip().lower()
+        protocol = str(env.get("OPENVPN_PROTOCOL", "udp") or "udp").strip().lower()
         if vpn_type == "openvpn":
             return f"openvpn-{protocol if protocol in ('udp', 'tcp') else 'udp'}"
         if vpn_type == "wireguard":
@@ -161,15 +164,11 @@ class GluetunControlBinder:
     def _put_settings(self, key: str, body: dict) -> str | None:
         tmp_path = ""
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False, encoding="utf-8"
-            ) as handle:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as handle:
                 json.dump(body, handle, separators=(",", ":"))
                 tmp_path = handle.name
             remote = "/tmp/gluetun-control-body.json"
-            cp = self._runner(
-                ["docker", "cp", tmp_path, f"{self._container}:{remote}"], 30.0
-            )
+            cp = self._runner(["docker", "cp", tmp_path, f"{self._container}:{remote}"], 30.0)
             if int(getattr(cp, "returncode", 1)) != 0:
                 return None
             script = (
@@ -178,9 +177,7 @@ class GluetunControlBinder:
                 f"--method=PUT --body-file={remote} "
                 "http://127.0.0.1:8000/v1/vpn/settings"
             )
-            proc = self._runner(
-                ["docker", "exec", self._container, "sh", "-c", script], 30.0
-            )
+            proc = self._runner(["docker", "exec", self._container, "sh", "-c", script], 30.0)
             if int(getattr(proc, "returncode", 1)) != 0:
                 return None
             return str(getattr(proc, "stdout", "") or "").strip()
