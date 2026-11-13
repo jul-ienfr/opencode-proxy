@@ -236,9 +236,9 @@ go build ./...                                                               -> 
 docker build -t gluetun-016:local gluetun                                    -> ok (image 46.7 MB)
 pilote station 6 (gluetun-016:local) : capabilities, state, transport,
 events, servers, settings masqués -> ok ; cible injoignable ->
-422 invalid_target/resolution_failed ; switch réel br143 -> br150 :
-state=committed, egress vérifié 187.15.85.191 (quorum 3), proxies
-HTTP/SOCKS5 -> ok
+422 invalid_target/resolution_failed ; switchs réels br143 -> br150 et
+br150 -> br149 : state=committed, egress vérifié (187.15.85.191 puis
+187.15.85.149, quorum 3), proxies HTTP/SOCKS5 -> ok
 go test ./internal/control/... ./internal/server ./internal/configuration/settings ./internal/vpn/transport -count=1 -> ok
 go test ./internal/configuration/settings ./internal/control/... ./internal/server ./tests/integration/harness -> ok
 go test ./internal/egress/... ./internal/control/... ./internal/server ./internal/configuration/settings -> ok
@@ -302,17 +302,18 @@ changements (`internal/storage` avec `airvpn.json` absent, `internal/dns`,
   digest, sauf la station 6 déployée en pilote avec `gluetun-016:local`
   (plan de contrôle actif, `CONTROL_STATE_MODE=env`). Les stations 1-5 restent
   en upstream : T078 exige de les migrer une par une, puis d'activer
-  `CONTROL_PLANE_ENABLED`. Le pilote 6 valide désormais un switch complet :
-  `br143 → br150` en WireGuard, job `committed`, egress vérifié
-  (`187.15.85.191`, quorum 3), proxies HTTP/SOCKS5 fonctionnels. Trois
-  correctifs ont été nécessaires : les filtres pays/région/ville sont effacés
-  quand un hostname est pinné, la vérification d'egress est retentée après la
-  bascule, et un rollback sans baseline egress restaure quand même le snapshot
-  puis prouve l'egress à neuf. Le superviseur (`scripts/fresh_chain.py`) ajoute
-  l'override du plan de contrôle à ses recreates, sinon chaque rotation
-  retombait sur l'image upstream. Les endpoints WG brésiliens restent
-  fluctuants : `br101`, `br127`, `br71`, `br72`, `br149` ne passaient pas de
-  trafic au moment du test, tandis que `br53`, `br143` et `br150` répondaient.
+  `CONTROL_PLANE_ENABLED`. Le pilote 6 valide désormais des switchs complets :
+  `br143 → br150` puis `br150 → br149` en WireGuard, jobs `committed`, egress
+  vérifié (`187.15.85.191` puis `187.15.85.149`, quorum 3), proxies
+  HTTP/SOCKS5 fonctionnels. Trois correctifs ont été nécessaires : les filtres
+  pays/région/ville sont effacés quand un hostname est pinné, la vérification
+  d'egress est retentée après la bascule, et un rollback sans baseline egress
+  restaure quand même le snapshot puis prouve l'egress à neuf. Le superviseur
+  (`scripts/fresh_chain.py`) ajoute l'override du plan de contrôle à ses
+  recreates, sinon chaque rotation retombait sur l'image upstream. Les
+  endpoints WG brésiliens restent fluctuants : `br101`, `br127`, `br71`,
+  `br72` ne passaient pas de trafic au moment du test, tandis que `br53`,
+  `br143`, `br149` et `br150` répondaient.
 - T049 (mesure live DoH/TCP 853 bloqués) reste ouvert : le script existe et sa
   syntaxe est vérifiée, mais il demande un réseau réellement filtré.
 - T099 est partiel : les tests Go du ladder et de l'intégration passent, la
