@@ -38,7 +38,13 @@ from .models import (
     TunnelState,
     TunnelTarget,
 )
-from .shadow import ShadowComparison, ShadowObserver, ShadowPlan
+from .shadow import (
+    ShadowComparison,
+    ShadowObserver,
+    ShadowPlan,
+    TransportShadowComparison,
+    TransportShadowObserver,
+)
 from .telemetry import ShadowTelemetry
 
 __all__ = [
@@ -66,6 +72,8 @@ __all__ = [
     "ShadowTelemetry",
     "SwitchJob",
     "TransportState",
+    "TransportShadowComparison",
+    "TransportShadowObserver",
     "TunnelState",
     "TunnelTarget",
     "UnknownTarget",

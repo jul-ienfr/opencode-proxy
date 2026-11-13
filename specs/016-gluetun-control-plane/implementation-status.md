@@ -133,7 +133,7 @@
 | T096 — endpoints transport | fait (API), non attaché | `internal/control/api/transport.go` : `GET /v1/vpn/transport`, `POST /v1/vpn/transport/reset` (admin), reset sans transport = `all`, transport inconnu ⇒ `422 invalid_target` ; `transport_test.go`. `Handler.SetTransport` existe mais `newControlHandler` ne l'appelle pas, donc `capabilities.transport_ladder=false` en production. |
 | T097 — événements et métriques transport | fait (package) | `internal/vpn/transport/metrics.go` : compteurs par transport, breaker, cycles, latence ; constantes `transport.attempt\|connected\|failed\|breaker_open\|breaker_reset\|cycle_exhausted\|tunnel.repair_needed` ; `metrics_test.go`. Pas encore exportés sur l'endpoint Prometheus global. |
 | T098 — `transport_policy` switch/rotate | fait | `internal/control/jobs/{switch.go,executor.go,rotation.go}` et `internal/control/api/switch.go` : `auto`, transport unique ou liste ordonnée, validation synchrone, policy restreinte sans changer la cible serveur/IP, policy invalide ⇒ `422 invalid_target` ; `transport_policy_test.go`. |
-| T099 — tests ladder et shadow Python | partiel | `tests/integration/transport_ladder_test.go` couvre UDP bloqué → TCP, TCP refusé, auth invalide, tunnel mort, second cycle, reset breaker ; `internal/vpn/transport/ladder_test.go` couvre le reste. Le test shadow Python `tests/test_transport_ladder_shadow.py` et certains `TR-AT-*` restent à écrire. |
+| T099 — tests ladder et shadow Python | partiel | `tests/integration/transport_ladder_test.go` couvre UDP bloqué → TCP, TCP refusé, auth invalide, tunnel mort, second cycle, reset breaker ; `internal/vpn/transport/ladder_test.go` couvre le reste. Parité shadow Python : `TransportShadowObserver` lit `GET /v1/vpn/transport` (aucun POST, aucune policy, aucun `PUT /v1/vpn/settings`) et écrit `control_plane_transport_shadow` dans `telemetry.db` ; `tests/test_transport_ladder_shadow.py` (4 cas). `TR-AT-08`/`TR-AT-09` restent dépendants de T095. |
 
 ### Décision T095 — report assumé
 
@@ -254,7 +254,7 @@ go test ./internal/control/state -count=1                                     ->
 go test ./internal/control/jobs -count=1                                      -> ok
 go test ./tests/integration -run Test_EgressChaos                             -> ok
 go test ./internal/server/middlewares/auth -run 'Test_authHandler_ServeHTTP|Test_Role|Test_Settings' -> ok
-python -m pytest tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py tests/test_control_plane_events.py tests/test_rotation_contract.py tests/test_egress_adapter.py tests/test_dashboard_station_control.py tests/test_control_plane_fallback.py tests/test_no_docker_exec_hot_path.py tests/test_rollout_control_plane.py -q -> 75 passed
+python -m pytest tests/test_gluetun_control_v2.py tests/test_control_plane_config.py tests/test_control_plane_shadow.py tests/test_control_plane_events.py tests/test_rotation_contract.py tests/test_egress_adapter.py tests/test_dashboard_station_control.py tests/test_control_plane_fallback.py tests/test_no_docker_exec_hot_path.py tests/test_rollout_control_plane.py tests/test_transport_ladder_shadow.py -q -> 79 passed
 python -m pytest tests/test_station_control_routes.py tests/test_ip_registry_egress.py -q -> 11 passed
 python -m ruff check free/control_plane free/ip_registry/registry_db.py free/ip_registry/adapters/gluetun_control_v2.py free/ip_registry/adapters/gluetun_control.py free/ip_registry/adapters/egress.py dashboard/routers/station_control_routes.py scripts/rollout_control_plane.py tests/test_rotation_contract.py tests/test_egress_adapter.py tests/test_dashboard_station_control.py tests/test_control_plane_fallback.py tests/test_no_docker_exec_hot_path.py tests/test_rollout_control_plane.py -> ok
 python -m ruff format --check free/control_plane free/ip_registry/adapters/gluetun_control_v2.py free/ip_registry/adapters/gluetun_control.py free/ip_registry/adapters/egress.py dashboard/routers/station_control_routes.py scripts/rollout_control_plane.py tests/test_rotation_contract.py tests/test_egress_adapter.py tests/test_dashboard_station_control.py tests/test_control_plane_fallback.py tests/test_no_docker_exec_hot_path.py tests/test_rollout_control_plane.py -> ok
@@ -302,9 +302,9 @@ avec les changements.
 - T049 (mesure live DoH/TCP 853 bloqués) reste ouvert : il demande un réseau
   réellement filtré. L'export HTTP des métriques T067/T097 reste à brancher sur
   le serveur Prometheus global ; la collecte et les noms sont déjà testés.
-- T099 est partiel : les tests Go du ladder passent et le mode shadow Python est
-  couvert par T072 (`tests/test_control_plane_shadow.py`) ; la matrice complète
-  `TR-AT-*` reste à écrire.
+- T099 est partiel : les tests Go du ladder passent et la parité shadow Python
+  est couverte par `TransportShadowObserver` (`tests/test_transport_ladder_shadow.py`) ;
+  `TR-AT-08`/`TR-AT-09` dépendent encore de T095.
 
 ## Activation
 

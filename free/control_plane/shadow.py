@@ -21,7 +21,7 @@ from typing import Any, Protocol
 
 from .client import GluetunControlClient
 from .errors import ControlPlaneError
-from .models import Constraints, TunnelTarget
+from .models import Constraints, TransportState, TunnelTarget
 
 
 class ShadowRecorder(Protocol):
@@ -69,6 +69,116 @@ class ShadowComparison:
             "warnings": list(self.warnings),
             "error": self.error,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class TransportShadowComparison:
+    station: str
+    legacy_transport: str
+    fork_transport: str
+    match: bool
+    legacy_reason: str = ""
+    fork_reason: str = ""
+    error: str = ""
+
+    def as_entry(self, *, ts: float) -> dict[str, Any]:
+        return {
+            "ts": ts,
+            "station": self.station,
+            "legacy_transport": self.legacy_transport,
+            "fork_transport": self.fork_transport,
+            "match": self.match,
+            "legacy_reason": self.legacy_reason,
+            "fork_reason": self.fork_reason,
+            "error": self.error,
+        }
+
+
+class TransportShadowObserver:
+    """Observe the fork transport without ever driving it.
+
+    Shadow mode forbids sending a ``transport_policy`` or touching
+    ``PUT /v1/vpn/settings``.  This observer only reads
+    ``GET /v1/vpn/transport`` after a legacy decision and records whether the
+    fork landed on the same transport.
+    """
+
+    def __init__(
+        self,
+        client: GluetunControlClient,
+        *,
+        station: int | str,
+        recorder: ShadowRecorder | None = None,
+        now: Callable[[], float] = time.time,
+    ) -> None:
+        self._client = client
+        self._station = str(station)
+        self._recorder = recorder
+        self._now = now
+
+    def observe(
+        self,
+        *,
+        legacy_transport: str,
+        legacy_reason: str = "",
+    ) -> TransportShadowComparison:
+        legacy = str(legacy_transport or "").strip().lower()
+        fork = ""
+        fork_reason = ""
+        error = ""
+        try:
+            state = self._client.transport_state()
+            fork = _transport_name(state)
+            fork_reason = _transport_reason(state)
+        except ControlPlaneError as exc:
+            error = self._error_text(exc)
+
+        match = bool(legacy) and not error and legacy == fork
+        if not match and not error:
+            fork_reason = fork_reason or "transport-divergence"
+        comparison = TransportShadowComparison(
+            station=self._station,
+            legacy_transport=legacy,
+            fork_transport=fork,
+            match=match,
+            legacy_reason=str(legacy_reason or ""),
+            fork_reason=fork_reason,
+            error=error,
+        )
+        self._record(comparison)
+        return comparison
+
+    def _record(self, comparison: TransportShadowComparison) -> None:
+        if self._recorder is None:
+            return
+        record_transport = getattr(self._recorder, "record_transport", None)
+        if record_transport is None:
+            return
+        try:
+            record_transport(comparison.as_entry(ts=self._now()))
+        except Exception:
+            # Telemetry must never break the legacy transport path.
+            return
+
+    @staticmethod
+    def _error_text(error: ControlPlaneError) -> str:
+        code = getattr(error, "code", "") or type(error).__name__
+        status = getattr(error, "status", None)
+        suffix = f":{status}" if status else ""
+        return f"{code}{suffix}"
+
+
+def _transport_name(state: TransportState) -> str:
+    return str(state.active_transport or "").strip().lower()
+
+
+def _transport_reason(state: TransportState) -> str:
+    breaker = state.breaker if isinstance(state.breaker, dict) else {}
+    breaker_state = str(breaker.get("state", "") or "").strip()
+    phase = str(state.phase or "").strip()
+    if breaker_state:
+        return f"breaker:{breaker_state}"
+    return phase
 
 
 class ShadowObserver:
@@ -210,4 +320,6 @@ __all__ = [
     "ShadowObserver",
     "ShadowPlan",
     "ShadowRecorder",
+    "TransportShadowComparison",
+    "TransportShadowObserver",
 ]
