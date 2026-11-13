@@ -10419,6 +10419,25 @@ def _station_free_body(body, runtime, client_body=None):
     return build_body(body, runtime, client_body=client_body)
 
 
+def _free_path_map_for(fake_root: str, real_root: str) -> dict[str, str]:
+    """Racine factice → racine réelle, plus le préfixe ``/workspace`` brut.
+
+    Un modèle peut n'émettre que ``/workspace`` (sans le suffixe de station).
+    Sur un client Windows ce chemin n'existe pas : Git Bash le résout sous son
+    dossier d'installation (souvent ``C:\\Program Files\\Git\\workspace``), non
+    inscriptible — d'où « mkdir: Permission denied ». On ramène donc aussi ce
+    préfixe vers la racine réelle, uniquement quand elle est Windows.
+    """
+    fake = str(fake_root or "")
+    real = str(real_root or "")
+    if not fake or not real:
+        return {}
+    mapping = {fake: real}
+    if fake.startswith("/workspace/") and re.match(r"^[A-Za-z]:[\\/]", real):
+        mapping.setdefault("/workspace", real)
+    return mapping
+
+
 def _set_free_path_map(body, station_runtime) -> None:
     """Mémorise la racine factice → la racine réelle pour ce corps free."""
     identity = getattr(station_runtime, "identity", None) if station_runtime is not None else None
@@ -10439,9 +10458,7 @@ def _set_free_path_map(body, station_runtime) -> None:
         except Exception:
             real_root = ""
             fake_root = base_fake
-    _free_path_map.set(
-        {fake_root: real_root} if fake_root and real_root else {}
-    )
+    _free_path_map.set(_free_path_map_for(fake_root, real_root))
     if fake_root and real_root:
         try:
             from free.station_identity import ensure_workspace_alias

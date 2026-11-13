@@ -11,7 +11,7 @@ from free.station_identity import (
     workspace_env_cwd,
     workspace_root_from_messages,
 )
-from opencode import _ChatToolCallHealer, _heal_tool_call_paths
+from opencode import _ChatToolCallHealer, _free_path_map_for, _heal_tool_call_paths
 from streaming.tool_path_healing import ToolPathHealingMiddleware
 from streaming.tool_paths import (
     CLIENT_TOOL_NAMES,
@@ -46,6 +46,21 @@ def _edit_tool() -> dict:
             },
         },
     }
+
+
+def test_free_path_map_also_covers_bare_workspace_on_windows() -> None:
+    mapping = _free_path_map_for("/workspace/oc-WARP-1-abc", REAL)
+    assert mapping["/workspace/oc-WARP-1-abc"] == REAL
+    assert mapping["/workspace"] == REAL
+    assert (
+        translate_paths("/workspace/travelmate.apk", mapping)
+        == REAL + r"\travelmate.apk"
+    )
+
+
+def test_free_path_map_leaves_posix_workspace_alone() -> None:
+    mapping = _free_path_map_for("/workspace/oc-WARP-1-abc", "/home/user/project")
+    assert "/workspace" not in mapping
 
 
 def test_workspace_root_from_messages_reads_real_env() -> None:
