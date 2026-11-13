@@ -65,6 +65,16 @@ LOCK = ROOT / "logs" / "fresh_chain_supervisor.lock"
 ALLOCATOR_STATE = ROOT / "logs" / "allocator_state.json"
 _NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
+# A chain process loads these files at startup. When one changes, a running
+# chain executes stale code; the supervisor stops it and starts a fresh one.
+CHAIN_CODE_PATHS = (
+    ROOT / "scripts" / "fresh_chain.py",
+    ROOT / "free" / "ip_registry" / "adapters" / "hybrid_binder.py",
+    ROOT / "free" / "ip_registry" / "adapters" / "compose_binder.py",
+    ROOT / "free" / "ip_registry" / "adapters" / "gluetun_control_v2.py",
+    ROOT / "free" / "control_plane" / "client.py",
+)
+
 
 def _recent_429(window_s: float) -> int:
     path = ROOT / "logs" / "registry.db"
@@ -219,6 +229,22 @@ def _lock_state(station: int, transport: str = "wireguard") -> tuple[Path, int]:
         return path, int(data.get("pid") or 0)
     except Exception:
         return path, 0
+
+
+def _chain_code_stale(lock_path: Path) -> bool:
+    """True when the chain started before the current chain code was written."""
+
+    try:
+        started = lock_path.stat().st_mtime
+    except OSError:
+        return False
+    latest = 0.0
+    for path in CHAIN_CODE_PATHS:
+        try:
+            latest = max(latest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return latest > started + 1.0
 
 
 def _live_lock(station: int) -> tuple[str, Path, int]:
@@ -1900,6 +1926,13 @@ def _supervise() -> None:
             for sid in scope:
                 transport, path, pid = _live_lock(sid)
                 alive = bool(pid and _pid_alive(pid, "fresh_chain.py"))
+                if alive and _chain_code_stale(path):
+                    log(
+                        f"station {sid} chain predates a chain-code update "
+                        "- reloading"
+                    )
+                    _stop_chain(sid, transport, reason="code reload")
+                    alive = False
                 # [P0 2026-11-11] Une chaîne qui n'a rien trouvé depuis 20 min
                 # monopolise un slot : on la coupe pour rendre la main aux
                 # stations down qui attendent. Le compteur d'échecs et le

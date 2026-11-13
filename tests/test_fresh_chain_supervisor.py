@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 
 from scripts import fresh_chain_supervisor as supervisor
@@ -83,6 +84,20 @@ def test_any_model_proof_counts_as_usable():
         )
         is False
     )
+
+
+def test_chain_code_stale_detects_a_newer_module(tmp_path, monkeypatch):
+    lock = tmp_path / "chain.lock"
+    lock.write_text("", encoding="utf-8")
+    module = tmp_path / "fresh_chain.py"
+    module.write_text("", encoding="utf-8")
+    os.utime(lock, (1_000.0, 1_000.0))
+    os.utime(module, (2_000.0, 2_000.0))
+    monkeypatch.setattr(supervisor, "CHAIN_CODE_PATHS", (module,))
+
+    assert supervisor._chain_code_stale(lock) is True
+    os.utime(module, (999.0, 999.0))
+    assert supervisor._chain_code_stale(lock) is False
 
 
 def test_credential_refresh_respects_the_cooldown(tmp_path, monkeypatch):
