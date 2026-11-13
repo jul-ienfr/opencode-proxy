@@ -290,12 +290,23 @@ class GluetunControlV2Binder:
         if job.committed:
             ip = job.verification.ip if job.verification else ""
             return BindResult(True, hostname, egress_ip=ip or None)
-        if "resolution" in str(job.error or "").lower():
+        error_text = str(job.error or "").lower()
+        if "resolution" in error_text:
             # Compose fallback: a fresh container resolves the target from the
             # provider catalogue, without depending on the dead tunnel's DNS.
             return BindResult(
                 False, hostname,
                 error="control-unavailable:resolution-failed",
+            )
+        if job.state in ("failed_degraded", "rolled_back") and (
+            "crashed" in error_text or "awaiting tunnel" in error_text
+        ):
+            # The in-place switch cannot repair a station whose VPN loop is
+            # crashed or whose ladder needs a fresh process. Recreate it with
+            # the current image and let the runtime ladder own the transports.
+            return BindResult(
+                False, hostname,
+                error="control-unavailable:station-degraded",
             )
         return BindResult(
             False,

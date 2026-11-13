@@ -496,6 +496,34 @@ async def test_binder_maps_resolution_failure_to_a_cold_fallback_hint():
     assert result.error == "control-unavailable:resolution-failed"
 
 
+async def test_binder_maps_a_crashed_station_to_a_compose_fallback_hint():
+    from free.ip_registry.adapters.gluetun_control_v2 import (
+        GluetunControlV2Binder,
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=job_json(
+                "failed_degraded",
+                error=(
+                    "applying switch target: vpn loop is crashed after "
+                    "applying settings: already crashed"
+                ),
+            ),
+        )
+
+    client, _ = make_client(handler)
+    binder = GluetunControlV2Binder(
+        client, station=3, cycle_id="cycle-9", to_thread=_inline_to_thread
+    )
+
+    result = await binder.assign(3, "us1.nordvpn.com")
+
+    assert not result.ok
+    assert result.error == "control-unavailable:station-degraded"
+
+
 async def _inline_to_thread(function, *args, **kwargs):
     return function(*args, **kwargs)
 
