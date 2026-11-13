@@ -101,6 +101,22 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : un recreate de réparation ne fige pas un transport.
 - **Test** : `test_auto_override_leaves_vpn_type_for_the_fork_ladder`.
 
+### T119 — Un seul `/rotate` par chaîne, exécuté par le fork (P0) — à faire
+- **Fichiers** : `scripts/fresh_chain.py`,
+  `free/ip_registry/adapters/gluetun_control_v2.py`,
+  `tests/test_rotation_contract.py`, `tests/test_fresh_chain_auto_transport.py`.
+- **Action** : remplacer la boucle `binder.assign(host)` par un
+  `GluetunControlV2Binder.rotate_outcome(candidates, constraints)` unique avec
+  `transport_policy=None` (auto), la liste ordonnée du registre et les budgets
+  `max_candidates`/`max_attempts`. Le fork épuise host par host et transport
+  par transport ; le superviseur ne reprend la main que si le fork est
+  injoignable, le conteneur mort, ou les secrets/image ont changé.
+- **Acceptation** : un seul job `rotate` par chaîne ; le fork essaie WG, UDP,
+  TCP ; `committed`, `exhausted` et `rolled_back` sont traités sans disable.
+- **Test** : contrat `rotate` + test de chaîne avec un binder factice qui
+  vérifie un seul appel et l'ordre des candidats.
+
+
 ### T117 — Détecter une rotation d'identifiants et recréer (P0) — fait
 - **Fichiers** : `free/ip_registry/adapters/compose_binder.py`,
   `free/ip_registry/adapters/hybrid_binder.py`,

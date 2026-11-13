@@ -196,6 +196,10 @@ dépasse les budgets.
   OpenVPN ou clé NordLynx) doit être appliquée par un recreate ; le superviseur
   compare les secrets du conteneur aux fichiers et force le chemin Compose s'ils
   diffèrent.
+- **FR-014** : la réparation par station vit dans le fork (un job `rotate` avec
+  liste ordonnée, ladder complet, egress prouvé, rollback) ; la réparation de
+  flotte (registre, quotas, claims, warm pool, image/secrets, inter-stations)
+  reste dans le superviseur. Voir `decisions.md` (ADR-017-01).
 
 ## Exigences non fonctionnelles
 

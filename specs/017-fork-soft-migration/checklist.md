@@ -22,6 +22,7 @@
 - [x] T109 — override `VPN_TYPE=` vide en mode auto.
 - [x] T117 — rotation d'identifiants détectée et recreate forcé.
 - [x] T118 — identifiants NordVPN rafraîchis via le token existant.
+- [ ] T119 — un seul `/v1/vpn/rotate` par chaîne, exécuté par le fork.
 - [x] Tests Python binder/contrat/config verts.
 - [ ] T110 — test de non-régression « station saine jamais recréée ».
 - [ ] T111 — réparation superviseur validée de bout en bout en live.

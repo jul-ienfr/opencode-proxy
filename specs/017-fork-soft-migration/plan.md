@@ -45,6 +45,14 @@ Côté superviseur :
   `logs/compose-control-plane-N.yml` (image, ports, contrôle).
 - **Registre** : `registry.db` reste l'autorité IP/leases/quota/SLO.
 
+## Décision d'architecture
+
+Voir [decisions.md](./decisions.md) (ADR-017-01) : **le fork répare la station,
+le superviseur répare la flotte**. Le fork reçoit une liste ordonnée et exécute
+un seul `rotate` (candidats + ladder complet + egress + rollback) ; le
+superviseur garde le registre, les quotas, les claims, le warm pool, les probes
+modèle et les recreates d'image/secrets.
+
 ## Contraintes
 
 - Six stations, free uniquement ; quota par IP ; aucune attente, aucun payant,
