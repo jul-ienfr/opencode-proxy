@@ -1957,6 +1957,17 @@ async def _run_claims(
                 or 5
             ),
         )
+        rotate_rate_limit_backoff_s = max(
+            1.0,
+            float(
+                yaml_get(
+                    "ip_registry",
+                    "allocator.rotate_rate_limit_backoff_s",
+                    20,
+                )
+                or 20
+            ),
+        )
         dns_fallback = DnsFallback(
             order=tuple(
                 yaml_get(
@@ -2076,6 +2087,12 @@ async def _run_claims(
                                 error=error,
                             )
                         log(f"  rotate rejected: {error}")
+                        if "rate_limited" in error:
+                            log(
+                                "  rotate rate limited - backoff "
+                                f"{int(rotate_rate_limit_backoff_s)}s"
+                            )
+                            await asyncio.sleep(rotate_rate_limit_backoff_s)
                         continue
             else:
                 claim = claims.claim_next(args.station, forbidden_ips=exhausted)
