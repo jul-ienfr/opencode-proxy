@@ -900,9 +900,16 @@ def _station_settling(station: dict) -> bool:
         )
     if not container:
         return False
-    if _docker_health(container) != "healthy":
+    health_state = _docker_health(container)
+    if health_state == "starting":
+        # Still installing routes: a probe here is noise, not a verdict.
         return True
-    return not _socks_port_open(station)
+    if health_state == "healthy":
+        return not _socks_port_open(station)
+    # ``unhealthy`` is a hard failure: the tunnel or proxy is down and only a
+    # repair can bring it back. Treating it as settling left every station
+    # unrepaired with no chain running.
+    return False
 
 
 def _needs_chain(station: dict) -> bool:
