@@ -1169,6 +1169,32 @@ def _refresh_warm_pool(stations: dict[int, dict], now: float) -> None:
                         min(now + max(300.0, ttl), verified + max(300.0, ttl)),
                     )
                 )
+            for ip, last_seen, host in conn.execute(
+                "SELECT o.ip, MAX(o.tested_at), "
+                "(SELECT o2.hostname FROM observations o2 "
+                " WHERE o2.ip = o.ip AND o2.status = 200 "
+                " ORDER BY o2.tested_at DESC LIMIT 1) "
+                "FROM observations o "
+                "WHERE o.status = 200 AND o.tested_at > ? "
+                "AND o.ip NOT LIKE '%:%' "
+                "GROUP BY o.ip ORDER BY o.tested_at DESC LIMIT 24",
+                (now - 21600.0,),
+            ):
+                if not ip or not host:
+                    continue
+                verified = float(last_seen or 0.0)
+                if verified <= 0.0:
+                    continue
+                rows.append(
+                    (
+                        str(ip),
+                        str(host),
+                        "",
+                        "",
+                        verified,
+                        min(now + max(300.0, ttl), verified + max(300.0, ttl)),
+                    )
+                )
             if rows:
                 conn.executemany(
                     "INSERT OR REPLACE INTO warm_pool("
@@ -2250,6 +2276,12 @@ def _supervise() -> None:
             for sid in scope:
                 transport, path, pid = _live_lock(sid)
                 alive = bool(pid and _pid_alive(pid, "fresh_chain.py"))
+                if alive and now < auth_global_until:
+                    log(
+                        f"station {sid} chain stopped (global AUTH pause)"
+                    )
+                    _stop_chain(sid, transport, reason="global AUTH pause")
+                    alive = False
                 if alive and _chain_code_stale(path):
                     elapsed = time.time() - last_code_reload_at.get(sid, 0.0)
                     if elapsed < MAX_CHAIN_AGE_S:
