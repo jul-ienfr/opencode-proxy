@@ -32,17 +32,22 @@ class FakeCompose:
         result: BindResult,
         credentials_stale: bool = False,
         image_stale: bool = False,
+        dns_ladder_stale: bool = False,
     ) -> None:
         self.result = result
         self.calls: list[tuple] = []
         self.stale = credentials_stale
         self._image_stale = image_stale
+        self._dns_stale = dns_ladder_stale
 
     def credentials_stale(self, station: int) -> bool:
         return self.stale
 
     def image_stale(self, station: int) -> bool:
         return self._image_stale
+
+    def dns_ladder_stale(self, station: int) -> bool:
+        return self._dns_stale
 
     async def assign(self, station, hostname, country=None, **kwargs):
         self.calls.append((station, hostname, country, kwargs))

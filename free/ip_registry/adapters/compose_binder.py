@@ -121,6 +121,32 @@ class ComposeHostnameBinder:
         desired = self._inspect_value(tag, "{{.Id}}", image=True)
         return bool(desired and current != desired)
 
+    def dns_ladder_stale(self, station: int) -> bool:
+        """True when the container DNS ladder differs from the override."""
+
+        desired = self._desired_dns_ladder(station)
+        if not desired:
+            return False
+        current = self._container_env(station).get("DNS_LADDER", "")
+        return current.strip() != desired
+
+    def _desired_dns_ladder(self, station: int) -> str:
+        path = (
+            self._root
+            / "logs"
+            / f"compose-control-plane-{int(station)}.yml"
+        )
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line.startswith("DNS_LADDER:"):
+                continue
+            return line.split(":", 1)[1].strip().strip('"').strip("'")
+        return ""
+
     def _inspect_value(self, target: str, format_string: str, *,
         image: bool = False,
     ) -> str:

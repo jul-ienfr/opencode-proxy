@@ -269,6 +269,44 @@ def test_image_stale_detects_an_old_container(tmp_path):
     assert binder.image_stale(2) is True
 
 
+def test_dns_ladder_stale_detects_a_changed_override(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "compose-control-plane-2.yml").write_text(
+        "services:\n  vpn-gluetun-2:\n    environment:\n"
+        "      DNS_LADDER: plain,dot\n",
+        encoding="utf-8",
+    )
+
+    class Runner:
+        def __call__(self, command, cwd):
+            return subprocess.CompletedProcess(
+                command, 0, "DNS_LADDER=dot,plain\n", ""
+            )
+
+    binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=Runner())
+    assert binder.dns_ladder_stale(2) is True
+
+
+def test_dns_ladder_fresh_does_not_force_a_recreate(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "compose-control-plane-2.yml").write_text(
+        "services:\n  vpn-gluetun-2:\n    environment:\n"
+        "      DNS_LADDER: plain,dot\n",
+        encoding="utf-8",
+    )
+
+    class Runner:
+        def __call__(self, command, cwd):
+            return subprocess.CompletedProcess(
+                command, 0, "DNS_LADDER=plain,dot\n", ""
+            )
+
+    binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=Runner())
+    assert binder.dns_ladder_stale(2) is False
+
+
 def test_inspect_uses_the_project_cwd(tmp_path):
     seen = []
 

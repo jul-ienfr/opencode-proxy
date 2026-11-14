@@ -131,6 +131,7 @@ class HybridBinder:
             self._credentials_checked[station] = not (
                 self._compose.credentials_stale(station)
                 or self._compose.image_stale(station)
+                or self._compose.dns_ladder_stale(station)
             )
         return self._credentials_checked[station]
 
