@@ -152,13 +152,14 @@ class ComposeHostnameBinder:
         return False
 
     def egress_sources_stale(self, station: int) -> bool:
-        """True when the egress verification sources differ from the override."""
+        """True when the egress or health-check targets differ."""
 
-        desired = self._desired_env(station, "CONTROL_EGRESS_SOURCES")
-        if not desired:
-            return False
-        current = self._container_env(station).get("CONTROL_EGRESS_SOURCES", "")
-        return current.strip() != desired
+        current = self._container_env(station)
+        for key in ("CONTROL_EGRESS_SOURCES", "HEALTH_TARGET_ADDRESSES"):
+            desired = self._desired_env(station, key)
+            if desired and current.get(key, "").strip() != desired:
+                return True
+        return False
 
     def _desired_env(self, station: int, key: str) -> str:
         path = (
