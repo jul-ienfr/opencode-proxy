@@ -1826,6 +1826,7 @@ def _supervise() -> None:
     last_auth_attempt_at = 0.0
     auth_rejection_times: list[float] = []
     last_auth_global_log = 0.0
+    auth_baseline_done = False
     unmeasurable_logged: set[int] = set()
     last_health_probe = 0.0
     last_maintenance_at = time.time()
@@ -2055,6 +2056,12 @@ def _supervise() -> None:
                     count = int(vpn.get("auth_fail_30min") or 0)
                 except (TypeError, ValueError):
                     count = 0
+                if not auth_baseline_done:
+                    # The first poll adopts the counts already present in the
+                    # app's 30 min window. Treating them as new rejections made
+                    # every supervisor restart extend the account pause.
+                    auth_seen[sid] = count
+                    continue
                 if count <= auth_seen.get(sid, 0):
                     continue
                 auth_seen[sid] = count
@@ -2087,6 +2094,7 @@ def _supervise() -> None:
                         "AUTH global pause "
                         f"{int(GLOBAL_AUTH_PAUSE_S)}s — account rate-limited"
                     )
+            auth_baseline_done = True
             settling = {
                 sid
                 for sid, station in stations.items()
