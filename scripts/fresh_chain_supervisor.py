@@ -1202,6 +1202,41 @@ def _warm_spares_count() -> int:
         return 0
 
 
+def _best_resume_station(
+    stopped: set[int], stations: dict[int, dict]
+) -> int | None:
+    """Pick the stopped station with a live warm spare, not just the lowest id."""
+
+    if not stopped:
+        return None
+    warm_hosts: set[str] = set()
+    try:
+        with sqlite3.connect(
+            ROOT / "logs" / "registry.db", timeout=5.0
+        ) as conn:
+            for (host,) in conn.execute(
+                "SELECT hostname FROM warm_pool WHERE expires_at > ?",
+                (time.time(),),
+            ):
+                if host:
+                    warm_hosts.add(str(host))
+    except Exception:
+        pass
+    for sid in sorted(stopped):
+        station = stations.get(sid, {})
+        vpn = (
+            station.get("vpn")
+            if isinstance(station.get("vpn"), dict)
+            else {}
+        )
+        host = str(
+            vpn.get("pinned_hostname") or vpn.get("current_host") or ""
+        ).strip()
+        if host and host in warm_hosts:
+            return sid
+    return min(stopped)
+
+
 def _refresh_warm_pool(
     stations: dict[int, dict], now: float, *, host_ip: str = ""
 ) -> None:
@@ -2270,7 +2305,10 @@ def _supervise() -> None:
                         )
                         break
             elif auth_stopped:
-                sid = min(auth_stopped)
+                resume_sid = _best_resume_station(auth_stopped, stations)
+                if resume_sid is None:
+                    continue
+                sid = resume_sid
                 station = stations.get(sid, {})
                 container = _station_container(station)
                 if _docker_action("start", container):
