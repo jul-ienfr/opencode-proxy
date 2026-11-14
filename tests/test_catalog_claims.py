@@ -65,6 +65,31 @@ def test_429_is_reclaimable_after_its_reset(tmp_path):
     assert again["station"] == 2
 
 
+def test_failed_host_does_not_block_unseen_catalog(tmp_path):
+    """A dead top-priority host must not be retried before unseen hosts."""
+
+    now = {"t": 100.0}
+    claims = CatalogClaims(
+        str(tmp_path / "claims.db"), lease_s=10.0, clock=lambda: now["t"]
+    )
+    claims.seed(CANDIDATES)
+
+    first = claims.claim_next(1)
+    assert first["host"] == "a.nordvpn.com"
+    for _ in range(3):
+        claims.record("a.nordvpn.com", 1, "no_egress")
+
+    now["t"] = 10_000.0
+    second = claims.claim_next(2)
+    assert second["host"] == "b.nordvpn.com"
+    for _ in range(3):
+        claims.record("b.nordvpn.com", 2, "no_egress")
+
+    now["t"] = 20_000.0
+    third = claims.claim_next(3)
+    assert third["host"] == "c.nordvpn.com"
+
+
 def test_legacy_candidate_skips_host_with_exhausted_egress(tmp_path):
     """[P0 2026-11-10] Le catalogue legacy ne re-pioche pas une IP épuisée."""
     now = {"t": 100.0}
@@ -404,7 +429,7 @@ def test_429_sets_qualification_quota_reset(tmp_path):
         claims.close()
 
 
-def test_catalog_priority_beats_old_failure_count(tmp_path):
+def test_catalog_priority_beats_a_single_old_failure(tmp_path):
     claims = CatalogClaims(str(tmp_path / "claims.db"), clock=lambda: 100.0)
     claims.seed(
         [
@@ -412,12 +437,25 @@ def test_catalog_priority_beats_old_failure_count(tmp_path):
             {"host": "untried.nordvpn.com", "country": "Albania"},
         ]
     )
-    for offset in range(4):
+    claims.record("known.nordvpn.com", 1, "no_egress", now=100.0)
+    claimed = claims.claim_next(1, now=10_000.0)
+    assert claimed["host"] == "known.nordvpn.com"
+
+
+def test_repeated_failures_yield_to_the_unseen_catalog(tmp_path):
+    claims = CatalogClaims(str(tmp_path / "claims.db"), clock=lambda: 100.0)
+    claims.seed(
+        [
+            {"host": "known.nordvpn.com", "country": "Albania"},
+            {"host": "untried.nordvpn.com", "country": "Albania"},
+        ]
+    )
+    for offset in range(3):
         claims.record(
             "known.nordvpn.com", 1, "no_egress", now=100.0 + offset
         )
     claimed = claims.claim_next(1, now=10_000.0)
-    assert claimed["host"] == "known.nordvpn.com"
+    assert claimed["host"] == "untried.nordvpn.com"
 
 
 def test_forbidden_egress_ip_skips_the_qualification_candidate(tmp_path):

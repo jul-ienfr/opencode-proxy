@@ -297,7 +297,11 @@ class CatalogClaims:
                OR (cl.status='ok' AND cl.lease_until <= ?)
                OR (cl.status='429' AND cl.reset_at <= ?))
               {ip_clause}
-            ORDER BY c.priority, COALESCE(cl.fail_count, 0), c.hostname
+            ORDER BY
+              CASE WHEN COALESCE(cl.fail_count, 0) >= 3 THEN 1 ELSE 0 END,
+              c.priority,
+              COALESCE(cl.fail_count, 0),
+              c.hostname
             LIMIT 1
             """,
             (ts, ts, ts, ts, *ip_params),
