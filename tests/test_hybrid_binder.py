@@ -34,6 +34,7 @@ class FakeCompose:
         image_stale: bool = False,
         dns_ladder_stale: bool = False,
         transport_timeouts_stale: bool = False,
+        egress_sources_stale: bool = False,
     ) -> None:
         self.result = result
         self.calls: list[tuple] = []
@@ -41,6 +42,7 @@ class FakeCompose:
         self._image_stale = image_stale
         self._dns_stale = dns_ladder_stale
         self._timeouts_stale = transport_timeouts_stale
+        self._egress_stale = egress_sources_stale
 
     def credentials_stale(self, station: int) -> bool:
         return self.stale
@@ -53,6 +55,9 @@ class FakeCompose:
 
     def transport_timeouts_stale(self, station: int) -> bool:
         return self._timeouts_stale
+
+    def egress_sources_stale(self, station: int) -> bool:
+        return self._egress_stale
 
     async def assign(self, station, hostname, country=None, **kwargs):
         self.calls.append((station, hostname, country, kwargs))

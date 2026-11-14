@@ -143,6 +143,7 @@ class HybridBinder:
             or self._compose.image_stale(station)
             or self._compose.dns_ladder_stale(station)
             or self._compose.transport_timeouts_stale(station)
+            or self._compose.egress_sources_stale(station)
         )
         # Cache only a positive result: a stale environment must be re-read
         # after the Compose recreate, otherwise the chain recreates it again

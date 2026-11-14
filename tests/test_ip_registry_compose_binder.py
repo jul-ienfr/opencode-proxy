@@ -359,6 +359,47 @@ def test_transport_timeouts_fresh_does_not_force_a_recreate(tmp_path):
     assert binder.transport_timeouts_stale(2) is False
 
 
+def test_egress_sources_stale_detects_a_changed_source_list(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "compose-control-plane-2.yml").write_text(
+        "services:\n  vpn-gluetun-2:\n    environment:\n"
+        "      CONTROL_EGRESS_SOURCES: http:cloudflare,http:ipify\n",
+        encoding="utf-8",
+    )
+
+    class Runner:
+        def __call__(self, command, cwd):
+            return subprocess.CompletedProcess(
+                command, 0, "CONTROL_EGRESS_SOURCES=http:ipify\n", ""
+            )
+
+    binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=Runner())
+    assert binder.egress_sources_stale(2) is True
+
+
+def test_egress_sources_fresh_does_not_force_a_recreate(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "compose-control-plane-2.yml").write_text(
+        "services:\n  vpn-gluetun-2:\n    environment:\n"
+        "      CONTROL_EGRESS_SOURCES: http:cloudflare,http:ipify\n",
+        encoding="utf-8",
+    )
+
+    class Runner:
+        def __call__(self, command, cwd):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "CONTROL_EGRESS_SOURCES=http:cloudflare,http:ipify\n",
+                "",
+            )
+
+    binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=Runner())
+    assert binder.egress_sources_stale(2) is False
+
+
 def test_inspect_uses_the_project_cwd(tmp_path):
     seen = []
 
