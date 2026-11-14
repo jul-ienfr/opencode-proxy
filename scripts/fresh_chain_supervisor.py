@@ -1094,11 +1094,13 @@ def _warm_spares_count() -> int:
 
 
 def _refresh_warm_pool(stations: dict[int, dict], now: float) -> None:
-    """Feed the warm pool from stations that just proved a real 200.
+    """Feed the warm pool from every fresh real 200 we can attribute.
 
     The chain winner path fills the pool, but a station that was already
     serving never runs a chain, so its proven egress stayed out of the pool
-    and ``warm_pool`` read zero while station 5 was healthy.
+    and ``warm_pool`` read zero while station 5 was healthy. Quota buckets
+    with a same-day 200 also feed it: they are the freshest candidates the
+    account has actually served.
     """
 
     try:
@@ -1137,18 +1139,43 @@ def _refresh_warm_pool(stations: dict[int, dict], now: float) -> None:
                 now + max(300.0, ttl),
             )
         )
-    if not rows:
-        return
     try:
         with sqlite3.connect(
             ROOT / "logs" / "registry.db", timeout=5.0
         ) as conn:
-            conn.executemany(
-                "INSERT OR REPLACE INTO warm_pool("
-                "ip, hostname, transport, model, verified_at, expires_at, "
-                "score_ip) VALUES(?,?,?,?,?,?,0)",
-                rows,
-            )
+            for ip, last_seen, host in conn.execute(
+                "SELECT q.ip, MAX(q.last_seen_at), "
+                "(SELECT m.hostname FROM ip_server_map m "
+                " WHERE m.ip = q.ip ORDER BY m.last_seen_at DESC LIMIT 1) "
+                "FROM quota_buckets q "
+                "WHERE q.last_status = 200 "
+                "AND q.last_seen_at > ? "
+                "AND q.ip NOT LIKE '%:%' "
+                "GROUP BY q.ip ORDER BY q.last_seen_at DESC LIMIT 24",
+                (now - 21600.0,),
+            ):
+                if not ip or not host:
+                    continue
+                verified = float(last_seen or 0.0)
+                if verified <= 0.0:
+                    continue
+                rows.append(
+                    (
+                        str(ip),
+                        str(host),
+                        "",
+                        "",
+                        verified,
+                        min(now + max(300.0, ttl), verified + max(300.0, ttl)),
+                    )
+                )
+            if rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO warm_pool("
+                    "ip, hostname, transport, model, verified_at, expires_at, "
+                    "score_ip) VALUES(?,?,?,?,?,?,0)",
+                    rows,
+                )
     except Exception as exc:  # noqa: BLE001 - the pool is a cache, not truth
         log(f"warm pool refresh unavailable: {type(exc).__name__}: {exc}")
 
@@ -1969,10 +1996,9 @@ def _supervise() -> None:
                     auth_backoff_until.pop(sid, None)
                     auth_backoff_s.pop(sid, None)
                     auth_seen[sid] = 0
-                    if auth_global_until:
-                        log("AUTH global pause cleared by a real 200")
-                    auth_global_until = 0.0
-                    auth_rejection_times.clear()
+                    # Do not clear the account-wide AUTH pause here: the
+                    # station may be serving over WireGuard while the account
+                    # still rejects OpenVPN AUTH. Let the 30 min pause expire.
                     continue
                 vpn = (
                     station.get("vpn")
