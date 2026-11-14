@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -37,6 +38,7 @@ from free.chain_state import (  # noqa: E402
 from free.chain_state import (  # noqa: E402
     save_state as _save_chain_state,
 )
+from free.ip_registry.adapters.egress import host_public_ip  # noqa: E402
 from free.ip_registry.config import load_registry_config  # noqa: E402
 from free.qualification.supervisor_bridge import qualification_tick  # noqa: E402
 from free.repair_queue import RepairQueue  # noqa: E402
@@ -937,6 +939,51 @@ def _docker_action(action: str, container: str) -> bool:
     return proc.returncode == 0
 
 
+def _remove_extra_stations() -> None:
+    """Enforce exactly six stations, never a seventh container."""
+
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "name=opencode-vpn-",
+                "--format",
+                "{{.Names}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return
+    for raw in str(proc.stdout or "").splitlines():
+        name = raw.strip()
+        match = re.fullmatch(r"opencode-vpn-(\d+)", name)
+        if not match:
+            continue
+        if int(match.group(1)) <= MAX_STATIONS:
+            continue
+        try:
+            subprocess.run(
+                ["docker", "stop", name],
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            subprocess.run(
+                ["docker", "rm", name],
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            log(f"removed extra station container {name} (max {MAX_STATIONS})")
+        except Exception:
+            continue
+
+
 def _docker_health(container: str) -> str:
     try:
         proc = subprocess.run(
@@ -1155,7 +1202,9 @@ def _warm_spares_count() -> int:
         return 0
 
 
-def _refresh_warm_pool(stations: dict[int, dict], now: float) -> None:
+def _refresh_warm_pool(
+    stations: dict[int, dict], now: float, *, host_ip: str = ""
+) -> None:
     """Feed the warm pool from every fresh real 200 we can attribute.
 
     The chain winner path fills the pool, but a station that was already
@@ -1184,6 +1233,8 @@ def _refresh_warm_pool(stations: dict[int, dict], now: float) -> None:
             vpn.get("pinned_hostname") or vpn.get("current_host") or ""
         ).strip()
         if not ip or not host:
+            continue
+        if host_ip and ip == host_ip:
             continue
         transport = str(
             station.get("transport_effective")
@@ -1218,6 +1269,8 @@ def _refresh_warm_pool(stations: dict[int, dict], now: float) -> None:
             ):
                 if not ip or not host:
                     continue
+                if host_ip and str(ip) == host_ip:
+                    continue
                 verified = float(last_seen or 0.0)
                 if verified <= 0.0:
                     continue
@@ -1243,6 +1296,8 @@ def _refresh_warm_pool(stations: dict[int, dict], now: float) -> None:
                 (now - 21600.0,),
             ):
                 if not ip or not host:
+                    continue
+                if host_ip and str(ip) == host_ip:
                     continue
                 verified = float(last_seen or 0.0)
                 if verified <= 0.0:
@@ -1840,6 +1895,11 @@ def _scope() -> list[int]:
 def _supervise() -> None:
     log("supervisor started (all stations, one chain per down station)")
     event("supervisor_started", stations=len(_scope()))
+    _remove_extra_stations()
+    try:
+        host_public_ip_value = host_public_ip(timeout_s=5.0)
+    except Exception:
+        host_public_ip_value = ""
     last_winner: dict[int, str] = {}
     consumed_winner: dict[int, str] = {}
     pinned_winner: dict[int, str] = {}
@@ -2168,7 +2228,9 @@ def _supervise() -> None:
                         f"station {sid} every probe bucket is exhausted — "
                         "waiting for refill"
                     )
-            _refresh_warm_pool(stations, now)
+            _refresh_warm_pool(
+                stations, now, host_ip=host_public_ip_value
+            )
             if now < auth_global_until:
                 for sid in scope:
                     if sid in auth_stopped:
