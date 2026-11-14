@@ -702,6 +702,24 @@ def _repair_request_satisfied(request: dict, station: dict) -> bool:
 
 
 AUTH_PAUSE_PATH = ROOT / "logs" / "auth_global_pause.json"
+AUTH_STOPPED_PATH = ROOT / "logs" / "auth_stopped.json"
+
+
+def _load_auth_stopped() -> set[int]:
+    try:
+        raw = json.loads(AUTH_STOPPED_PATH.read_text(encoding="utf-8"))
+        return {int(value) for value in raw}
+    except Exception:
+        return set()
+
+
+def _save_auth_stopped(stopped: set[int]) -> None:
+    try:
+        AUTH_STOPPED_PATH.write_text(
+            json.dumps(sorted(stopped)), encoding="utf-8"
+        )
+    except OSError:
+        pass
 
 
 def _load_auth_pause() -> float:
@@ -887,6 +905,38 @@ def _station_has_model_proof(station: dict) -> bool:
     return bool(station.get("model_usable"))
 
 
+def _station_container(station: dict) -> str:
+    vpn = station.get("vpn") if isinstance(station.get("vpn"), dict) else {}
+    container = str(vpn.get("container") or "").strip()
+    if not container:
+        try:
+            station_id = int(station.get("station") or 0)
+        except (TypeError, ValueError):
+            station_id = 0
+        if station_id:
+            container = (
+                "opencode-vpn"
+                if station_id == 1
+                else f"opencode-vpn-{station_id}"
+            )
+    return container
+
+
+def _docker_action(action: str, container: str) -> bool:
+    if not container:
+        return False
+    try:
+        proc = subprocess.run(
+            ["docker", action, container],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0
+
+
 def _docker_health(container: str) -> str:
     try:
         proc = subprocess.run(
@@ -935,15 +985,7 @@ def _station_settling(station: dict) -> bool:
     settling. It is not an incident and must not be repaired.
     """
 
-    vpn = station.get("vpn") if isinstance(station.get("vpn"), dict) else {}
-    station_id = int(station.get("station") or 0)
-    container = str(vpn.get("container") or "").strip()
-    if not container and station_id:
-        container = (
-            "opencode-vpn"
-            if station_id == 1
-            else f"opencode-vpn-{station_id}"
-        )
+    container = _station_container(station)
     if not container:
         return False
     health_state = _docker_health(container)
@@ -1827,6 +1869,7 @@ def _supervise() -> None:
     auth_rejection_times: list[float] = []
     last_auth_global_log = 0.0
     auth_baseline_done = False
+    auth_stopped: set[int] = _load_auth_stopped()
     unmeasurable_logged: set[int] = set()
     last_health_probe = 0.0
     last_maintenance_at = time.time()
@@ -2126,6 +2169,51 @@ def _supervise() -> None:
                         "waiting for refill"
                     )
             _refresh_warm_pool(stations, now)
+            if now < auth_global_until:
+                for sid in scope:
+                    if sid in auth_stopped:
+                        continue
+                    station = stations.get(sid, {})
+                    if bool(station.get("model_usable")):
+                        continue
+                    health = (
+                        station.get("health")
+                        if isinstance(station.get("health"), dict)
+                        else {}
+                    )
+                    vpn = (
+                        station.get("vpn")
+                        if isinstance(station.get("vpn"), dict)
+                        else {}
+                    )
+                    text = (
+                        f"{health.get('cause') or ''} "
+                        f"{health.get('last_error') or ''} "
+                        f"{vpn.get('error') or ''} "
+                        f"{vpn.get('last_rotation_error') or ''}"
+                    ).lower()
+                    if "auth" not in text and "credential" not in text:
+                        continue
+                    container = _station_container(station)
+                    if _docker_action("stop", container):
+                        auth_stopped.add(sid)
+                        _save_auth_stopped(auth_stopped)
+                        log(
+                            f"station {sid} container stopped "
+                            "(global AUTH pause)"
+                        )
+                        break
+            elif auth_stopped:
+                sid = min(auth_stopped)
+                station = stations.get(sid, {})
+                container = _station_container(station)
+                if _docker_action("start", container):
+                    auth_stopped.discard(sid)
+                    _save_auth_stopped(auth_stopped)
+                    log(
+                        f"station {sid} container started "
+                        "(AUTH pause over)"
+                    )
             if not observe_only:
                 _reconcile_registry(stations)
                 _clear_stale_pins(stations, protect_s=winner_protect)
