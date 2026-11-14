@@ -918,7 +918,7 @@ def _needs_chain(station: dict) -> bool:
     health = station.get("health") if isinstance(station.get("health"), dict) else {}
     hstate = str(health.get("state") or "")
     vpn_status = str(station.get("vpn_status") or "")
-    if hstate == "settling":
+    if hstate in ("settling", "unmeasurable"):
         return False
     if hstate == "parked":
         cause_text = (
@@ -984,6 +984,7 @@ def _station_recovered(station: dict) -> bool:
         "suspect",
         "parked",
         "settling",
+        "unmeasurable",
     ):
         return False
     if not bool(station.get("station_usable")):
@@ -1655,6 +1656,7 @@ def _supervise() -> None:
     auth_backoff_until: dict[int, float] = {}
     auth_backoff_s: dict[int, float] = {}
     auth_seen: dict[int, int] = {}
+    unmeasurable_logged: set[int] = set()
     last_health_probe = 0.0
     last_maintenance_at = time.time()
     last_qualification_at = 0.0
@@ -1904,6 +1906,27 @@ def _supervise() -> None:
                 health = stations[sid].setdefault("health", {})
                 if isinstance(health, dict):
                     health["state"] = "settling"
+            probe_model_list = [
+                part.strip() for part in probe_models.split(",") if part.strip()
+            ]
+            unmeasurable = {
+                sid
+                for sid in scope
+                if sid not in settling
+                and _station_exhausted(
+                    stations.get(sid, {}), free_health, probe_model_list
+                )
+            }
+            for sid in unmeasurable:
+                health = stations[sid].setdefault("health", {})
+                if isinstance(health, dict):
+                    health["state"] = "unmeasurable"
+                if sid not in unmeasurable_logged:
+                    unmeasurable_logged.add(sid)
+                    log(
+                        f"station {sid} every probe bucket is exhausted — "
+                        "waiting for refill"
+                    )
             if not observe_only:
                 _reconcile_registry(stations)
                 _clear_stale_pins(stations, protect_s=winner_protect)
@@ -1958,6 +1981,7 @@ def _supervise() -> None:
                 sid
                 for sid in scope
                 if sid not in settling
+                and sid not in unmeasurable
                 and _needs_chain(stations.get(sid, {}))
             ]
             forced: set[int] = set()
@@ -1969,7 +1993,7 @@ def _supervise() -> None:
                         continue
                     if sid not in scope:
                         continue
-                    if sid in settling:
+                    if sid in settling or sid in unmeasurable:
                         continue
                     # [P0 2026-11-10] Demande déjà satisfaite : le modèle
                     # demandé est usable sur cette station. Sans ce garde,
@@ -2013,9 +2037,6 @@ def _supervise() -> None:
                 if sid not in broken:
                     observe_logged.pop(sid, None)
             proven_ips = _proven_live_quota_ips(free_health)
-            probe_model_list = [
-                part.strip() for part in probe_models.split(",") if part.strip()
-            ]
             for sid in scope:
                 if sid in broken:
                     continue
@@ -2038,10 +2059,6 @@ def _supervise() -> None:
                     and bool(station.get("model_usable"))
                 ):
                     continue
-                if _station_exhausted(station, free_health, probe_model_list):
-                    broken.append(sid)
-                    log(f"station {sid} every probe bucket is exhausted — new chain")
-
             for sid in list(broken):
                 if sid in forced:
                     # An explicit pool 429 must not be cancelled by a

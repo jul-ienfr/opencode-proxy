@@ -371,6 +371,18 @@ def test_egress_park_is_repairable_but_auth_park_is_not():
     assert module._needs_chain(auth_park) is False
 
 
+def test_unmeasurable_station_does_not_need_a_chain():
+    module = _module()
+    station = {
+        "station_usable": True,
+        "model_usable": False,
+        "model_usable_reason": "daily-bucket-exhausted",
+        "health": {"state": "unmeasurable"},
+    }
+    assert module._needs_chain(station) is False
+    assert module._station_recovered(station) is False
+
+
 def test_repairing_is_not_recovered_but_usable_is():
     module = _module()
     repairing = {
