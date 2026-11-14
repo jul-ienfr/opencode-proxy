@@ -2510,6 +2510,14 @@ def _supervise() -> None:
                     )
                     _stop_chain(sid, transport, reason="global AUTH pause")
                     alive = False
+                if alive and sid in unmeasurable:
+                    # The IP's bucket is empty until its reset_at. Probing or
+                    # rotating now only extends the 429; wait for the refill.
+                    log(
+                        f"station {sid} chain stopped (quota reset pending)"
+                    )
+                    _stop_chain(sid, transport, reason="quota reset pending")
+                    alive = False
                 if alive and _chain_code_stale(path):
                     elapsed = time.time() - last_code_reload_at.get(sid, 0.0)
                     if elapsed < MAX_CHAIN_AGE_S:
