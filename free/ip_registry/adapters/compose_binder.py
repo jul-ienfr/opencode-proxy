@@ -129,7 +129,7 @@ class ComposeHostnameBinder:
             command.append("image")
         command += ["inspect", target, "--format", format_string]
         try:
-            proc = self._runner(command, 10.0)
+            proc = self._runner(command, str(self._root))
         except Exception:
             return ""
         if int(getattr(proc, "returncode", 1)) != 0:
@@ -170,7 +170,7 @@ class ComposeHostnameBinder:
                     "--format",
                     "{{range .Config.Env}}{{println .}}{{end}}",
                 ],
-                10.0,
+                str(self._root),
             )
         except Exception:
             return {}

@@ -269,6 +269,21 @@ def test_image_stale_detects_an_old_container(tmp_path):
     assert binder.image_stale(2) is True
 
 
+def test_inspect_uses_the_project_cwd(tmp_path):
+    seen = []
+
+    class Runner:
+        def __call__(self, command, cwd):
+            seen.append(cwd)
+            return subprocess.CompletedProcess(command, 0, "sha256:x", "")
+
+    binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=Runner())
+    binder._inspect_value("opencode-vpn-2", "{{.Image}}")
+    binder._container_env(2)
+
+    assert seen == [str(tmp_path), str(tmp_path)]
+
+
 def test_override_path_is_per_station(tmp_path):
     binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=FakeRunner())
     p1 = binder.override_path_for(1)
