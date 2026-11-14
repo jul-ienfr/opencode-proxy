@@ -496,7 +496,11 @@ class QuotaLedger:
         with self._lock:
             state = self._get(self._key(ip, model, ts), ts, create=False)
             if state is None:
-                return True, None
+                # Principe VII : aucune preuve, aucun succès. Une IP jamais
+                # testée n'est pas « usable » — c'est ce faux positif qui
+                # faisait croire 2/6 à l'app et arrêtait les chaînes avant
+                # leur premier probe.
+                return False, "unproven"
             if state.exhausted:
                 return False, "daily-bucket-exhausted"
             limit = max(0, int(self.daily_limit or 0))

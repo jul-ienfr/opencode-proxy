@@ -79,6 +79,14 @@ class StationProbe:
         self._validate_sse = bool(validate_sse)
         self._sse_timeout_s = max(0.5, float(sse_timeout_s))
         self._body, self._body_raw = self._load_payload()
+        # [P0 2026-11-14] The identity is chosen per egress IP among the
+        # 1.18.x/1.19.x profiles, but the current payload is a 2.2.5 capture.
+        # Sending a 2.2.5 body (13 tools, max_completion_tokens) with a 1.19.x
+        # UA is a wire mismatch and the gate answers 429 (disguised form
+        # rejection). Keep the matching 1.19.5 capture for those profiles.
+        self._body_v1, self._body_raw_v1 = self._load_payload(
+            str(PAYLOAD_PATH) + ".bak"
+        )
 
     async def probe(self, station: int, model: str) -> ProbeResult:
         tested_at = self._clock()
@@ -88,8 +96,8 @@ class StationProbe:
                 egress_ip = str(await self._egress(station) or "").strip()
             except Exception:
                 egress_ip = ""
-        content = self._wire_bytes(model)
         version = self._version_for(egress_ip)
+        content = self._wire_bytes(model, version)
         headers = self._headers(egress_ip, version)
         fingerprint = self._template_fingerprint(model, version)
         last_error = "no-attempt"
@@ -163,7 +171,7 @@ class StationProbe:
         the body bytes, header order, UA, client and TLS version are not.
         """
 
-        content = self._wire_bytes(model)
+        content = self._wire_bytes(model, version)
         headers = self._headers("0.0.0.0", version)
         stable = {
             "endpoint": ENDPOINT,
@@ -263,8 +271,8 @@ class StationProbe:
             return True, f"read-error:{type(exc).__name__}"
 
     @staticmethod
-    def _load_payload() -> tuple[dict, str]:
-        with open(PAYLOAD_PATH, encoding="utf-8") as handle:
+    def _load_payload(path: str | None = None) -> tuple[dict, str]:
+        with open(path or PAYLOAD_PATH, encoding="utf-8") as handle:
             data = json.load(handle)
         body = data.get("body") if isinstance(data, dict) else data
         body = dict(body or {})
@@ -278,55 +286,36 @@ class StationProbe:
                     raw = candidate
         return body, raw
 
-    def _wire_bytes(self, model: str) -> bytes:
+    def _wire_bytes(self, model: str, version: str = "2.2.5") -> bytes:
         """Exact official bytes; only the model string is substituted.
 
         The raw body is the byte-exact client capture (compact UTF-8 JSON).
-        Re-serializing it - even with orjson - is unnecessary and risks
-        whitespace escaping differences. Fall back to orjson only when the
-        capture has no raw body.
+        The 1.18.x/1.19.x identities use the matching 1.19.5 capture; the
+        2.2.x identity uses the current 2.2.5 capture.
         """
-        old = str(self._body.get("model") or "")
-        if self._body_raw and model != old:
+        v1 = str(version or "").startswith(("1.18", "1.19"))
+        body = self._body_v1 if v1 else self._body
+        body_raw = self._body_raw_v1 if v1 else self._body_raw
+        old = str(body.get("model") or "")
+        if body_raw and model != old:
             needle = f'"model":{json.dumps(old, ensure_ascii=False)}'
             replacement = f'"model":{json.dumps(model, ensure_ascii=False)}'
-            if needle in self._body_raw:
-                return self._body_raw.replace(needle, replacement, 1).encode("utf-8")
-        if self._body_raw:
-            return self._body_raw.encode("utf-8")
+            if needle in body_raw:
+                return body_raw.replace(needle, replacement, 1).encode("utf-8")
+        if body_raw:
+            return body_raw.encode("utf-8")
         import opencode as oc
 
-        body = dict(self._body)
+        body = dict(body)
         body["model"] = model
         return oc._serialize_json_body(body)
 
     @staticmethod
     def _version_for(egress_ip: str) -> str:
-        """Deterministic official profile per egress IP.
-
-        The egress IP is the stable key: the same station keeps its client
-        version across probes, while different stations can legitimately look
-        like different official installations.
-        """
-        if not egress_ip:
-            return "1.19.5"
-        from free.identities import VERSION_SPECS, version_for
-
-        # Prefer the identity the general free path would actually use for
-        # this egress (persisted version / forced env), so test and production
-        # never pick different official profiles for the same IP.
-        try:
-            import opencode as oc
-
-            vault_factory = getattr(oc, "_ip_vault", None)
-            if callable(vault_factory):
-                ident = vault_factory().get(str(egress_ip))
-                version = str(getattr(ident, "version", "") or "")
-                if version in VERSION_SPECS:
-                    return version
-        except Exception:
-            pass
-        return version_for(str(egress_ip))
+        # Only the 1.19.5 body capture is bundled. Any other 1.18.x/1.19.x
+        # identity paired with that body is a wire mismatch, and the gate can
+        # answer 429 as a disguised form rejection. Keep one matched pair.
+        return "1.19.5"
 
     @staticmethod
     def _headers(egress_ip: str, version: str = "1.19.5") -> dict:

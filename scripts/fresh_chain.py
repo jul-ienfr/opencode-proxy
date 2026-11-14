@@ -1685,6 +1685,55 @@ def _probe_attempt_status(result) -> str:
     return "dead" if 500 <= code < 600 else "no_egress"
 
 
+def _post_quota_mark(
+    api_base: str,
+    station: int,
+    ip: str,
+    model: str,
+    result: Any,
+) -> None:
+    """Push the official probe verdict into the app ledger.
+
+    The app keeps its QuotaLedger in memory; a probe run by the supervisor
+    only wrote registry.db, so /health still considered an untested IP usable.
+    """
+
+    target = str(ip or "").strip()
+    if not target:
+        return
+    try:
+        token = (os.getenv("DASHBOARD_TOKEN") or "").strip()
+        if not token:
+            try:
+                for line in (ROOT / ".env").read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines():
+                    if line.strip().startswith("DASHBOARD_TOKEN="):
+                        token = (
+                            line.split("=", 1)[1].strip().strip('"').strip("'")
+                        )
+                        break
+            except OSError:
+                token = ""
+        requests.post(
+            f"{str(api_base or 'http://127.0.0.1:4000').rstrip('/')}"
+            "/api/free/quota/mark",
+            json={
+                "ip": target,
+                "model": str(model or ""),
+                "status": int(getattr(result, "status", 0) or 0),
+                "retry_after": float(
+                    getattr(result, "retry_after_s", 0.0) or 0.0
+                ),
+                "station": int(station),
+            },
+            headers={"X-Dashboard-Token": token} if token else {},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 async def _probe_with_fallbacks(probe, station: int, primary: str, fallbacks: list[str]):
     """Try the primary free model, then the other buckets before condemning IP.
 
@@ -2314,6 +2363,13 @@ async def _run_claims(
                     result,
                     model_used or args.model,
                     log_fn=log,
+                )
+                _post_quota_mark(
+                    args.api_base,
+                    args.station,
+                    ip,
+                    model_used or args.model,
+                    result,
                 )
                 log(
                     f"  free status={result.status} ra={result.retry_after_s} "

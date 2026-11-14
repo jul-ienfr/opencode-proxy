@@ -232,7 +232,7 @@ ip_rotation:
   model_slot_wait_s: 12
   on_429_action: rotate
   ov_auth_backoff_max_s: 600
-  ov_auth_backoff_s: 90
+  ov_auth_backoff_s: 30
   ov_auth_cascade_cooldown_min: 30
   ov_auth_cascade_enabled: false
   ov_auth_cool_s: 300
@@ -288,8 +288,8 @@ ip_rotation:
   rotation_planner:
     enabled: false
     spare_station: 0
-  rotation_stagger: 10
-  rotation_storm_cooldown_s: 30
+  rotation_stagger: 2
+  rotation_storm_cooldown_s: 5
   rotation_wait_timeout: 5
   server_countries: ''
   server_issue_grace_s: 25
@@ -308,11 +308,11 @@ ip_rotation:
     enabled: true
     label: WARP 1
     ipv6: false
-    egress_ip: 104.28.230.201
+    egress_ip: 104.28.230.202
     managed: true
     container: warp-1
     image: caomingjun/warp:latest
-    block: 104.28.230.201/32
+    block: 104.28.230.202/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -322,11 +322,11 @@ ip_rotation:
     enabled: true
     label: WARP 1 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d6:14e6::215:2a
+    egress_ip: 2a09:bac5:32d3:26b4::3db:3
     managed: true
     container: warp-1
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d6:14e6::/64
+    block: 2a09:bac5:32d3:26b4::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -378,11 +378,11 @@ ip_rotation:
     enabled: true
     label: WARP 3 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d3:28b4::40e:24
+    egress_ip: 2a09:bac5:32d4:28a0::40c:4d
     managed: true
     container: warp-3
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d3:28b4::/64
+    block: 2a09:bac5:32d4:28a0::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -406,11 +406,11 @@ ip_rotation:
     enabled: true
     label: WARP 4 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d7:1519::21a:96
+    egress_ip: 2a09:bac5:32d6:28aa::40d:2e
     managed: true
     container: warp-4
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d7:1519::/64
+    block: 2a09:bac5:32d6:28aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -434,11 +434,11 @@ ip_rotation:
     enabled: true
     label: WARP 5 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d6:28b4::40e:3
+    egress_ip: 2a09:bac5:32d0:be::13:299
     managed: true
     container: warp-5
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d6:28b4::/64
+    block: 2a09:bac5:32d0:be::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -532,11 +532,11 @@ ip_rotation:
     enabled: true
     label: WARP 8 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d3:be::13:277
+    egress_ip: 2a09:bac5:32d4:be::13:239
     managed: true
     container: warp-8
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d3:be::/64
+    block: 2a09:bac5:32d4:be::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -560,11 +560,11 @@ ip_rotation:
     enabled: true
     label: WARP 9 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d1:26b4::3db:4
+    egress_ip: 2a09:bac5:32d4:1c82::2d7:63
     managed: true
     container: warp-9
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d1:26b4::/64
+    block: 2a09:bac5:32d4:1c82::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -588,11 +588,11 @@ ip_rotation:
     enabled: true
     label: WARP 10 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d5:28a0::40c:38
+    egress_ip: 2a09:bac5:32d4:14e6::215:4d
     managed: true
     container: warp-10
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d5:28a0::/64
+    block: 2a09:bac5:32d4:14e6::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -616,7 +616,7 @@ ip_rotation:
     enabled: true
     label: WARP 11 IPv6
     ipv6: true
-    egress_ip: 2a09:bac1:2780:2060::40e:b
+    egress_ip: 2a09:bac1:2780:2060::214:ad
     managed: true
     container: warp-11
     image: caomingjun/warp:latest
@@ -644,11 +644,11 @@ ip_rotation:
     enabled: true
     label: WARP 12 IPv6
     ipv6: true
-    egress_ip: 2a09:bac1:27c0:2060::21a:73
+    egress_ip: 2a09:bac5:32d4:150f::219:97
     managed: true
     container: warp-12
     image: caomingjun/warp:latest
-    block: 2a09:bac1:27c0:2060::/64
+    block: 2a09:bac5:32d4:150f::/64
     provider: warp
     transport_url: ''
   socks5_proxy_port: 1080
@@ -674,7 +674,7 @@ ip_rotation:
     - 60
     - 120
     auth_global_min_stations: 2
-    auth_global_pause_s: 30
+    auth_global_pause_s: 5
     auth_global_window_s: 60
     bad_probes: 4
     connect_hard_deadline_s: 180
@@ -695,7 +695,7 @@ ip_rotation:
   status_cache_seconds: 5.0
   strict_free: true
   switch_delay: 1
-  transport_auth_backoff_s: 90
+  transport_auth_backoff_s: 30
   transport_cycle_timeout_s: 45
   transport_order:
   - wireguard
@@ -718,8 +718,8 @@ ip_rotation:
   wait_healthy_poll: 0.5
   wait_healthy_require_socks: false
   watchdog_auth_grace_s: 240
-  watchdog_backoff_base: 15
-  watchdog_backoff_max: 60
+  watchdog_backoff_base: 5
+  watchdog_backoff_max: 20
   watchdog_egress_grace_ticks: 6
   watchdog_interval: 20
   watchdog_max_restarts_per_hour: 3
@@ -1206,7 +1206,7 @@ egress_catalog:
     - 5
     - 6
     max_repair_attempts: 3
-    repair_backoff_s: 300
+    repair_backoff_s: 30
     watchdog_enabled: true
     watchdog_probe_interval_s: 30
     proactive_rotation_headroom_pct: 20
@@ -1278,21 +1278,21 @@ ip_registry:
     - dot
     failures_before_fallback: 2
   eligibility:
-    error_cooldown_s: 1800
+    error_cooldown_s: 300
   allocator:
     mode: enforce
     max_attempts_per_need: 20
-    max_parallel_repairs: 3
-    rebind_limit_per_min: 3
+    max_parallel_repairs: 2
+    rebind_limit_per_min: 8
     winner_cooldown_s: 0
     winner_grace_s: 10
     failure_cooldown_s: 5
     max_candidates_per_chain: 500
     host_429_cooldown_s: 600
-    no_egress_backoff_s: 120
+    no_egress_backoff_s: 30
     no_egress_backoff_max_s: 1800
-    settle_s: 10
-    egress_wait_s: 60
+    settle_s: 12
+    egress_wait_s: 45
     egress_poll_s: 2
     auth_fallback_transport: wireguard
     probe_validate_sse: true
@@ -1321,7 +1321,7 @@ ip_registry:
     - station: 6
       transport: auto
     refresh_when_exhausted: true
-    refresh_cooldown_s: 120
+    refresh_cooldown_s: 30
     refresh_min_available: 1
     global_pause_enabled: false
     global_429_window_s: 600

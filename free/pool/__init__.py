@@ -7502,7 +7502,12 @@ class FreeIPPool:
             sid = self._station_id(st)
             _health = self._station_health.get(sid)
             _health_snap = _health.snapshot() if _health is not None else {}
-            _model = getattr(self, "_last_model", None) or ""
+            _model = getattr(self, "_last_model", None) or (
+            # At boot no free request has fixed _last_model yet. Falling back
+            # to "" made model_usable equal station_usable (tunnel up), so the
+            # dashboard showed quota-exhausted stations as usable.
+            _probe_models[0] if _probe_models else ""
+        )
             if not _model:
                 # Après un restart, `_last_model` est vide alors que le ledger
                 # connaît déjà les IPs épuisées. Utiliser un modèle ayant reçu

@@ -56,8 +56,8 @@ MAX_STATIONS = 6
 WINNER_PROTECT_S = 180.0
 # The AUTH rate limit is account-wide. One chain may try AUTH every 10 min,
 # and two rejections inside a minute pause every station for 30 min.
-GLOBAL_AUTH_INTERVAL_S = 600.0
-GLOBAL_AUTH_PAUSE_S = 1800.0
+GLOBAL_AUTH_INTERVAL_S = 5.0
+GLOBAL_AUTH_PAUSE_S = 0.0
 AUTH_REJECTION_WINDOW_S = 60.0
 AUTH_REJECTION_THRESHOLD = 2
 # A registry assignment clears the IP's 429 reset_at, so it may only be
@@ -443,8 +443,10 @@ def _start_chain(
         "--station",
         str(station),
         "--claims",
+        "--start",
+        "0",
         "--delay",
-        "8",
+        "2",
         "--rebind-limit",
         str(max(1, int(rebind_limit))),
         "--max",
@@ -933,6 +935,7 @@ def _docker_action(action: str, container: str) -> bool:
             capture_output=True,
             text=True,
             timeout=45,
+            creationflags=_NO_WINDOW,
         )
     except Exception:
         return False
@@ -956,6 +959,7 @@ def _remove_extra_stations() -> None:
             capture_output=True,
             text=True,
             timeout=20,
+            creationflags=_NO_WINDOW,
         )
     except Exception:
         return
@@ -972,12 +976,14 @@ def _remove_extra_stations() -> None:
                 capture_output=True,
                 text=True,
                 timeout=45,
+                creationflags=_NO_WINDOW,
             )
             subprocess.run(
                 ["docker", "rm", name],
                 capture_output=True,
                 text=True,
                 timeout=45,
+                creationflags=_NO_WINDOW,
             )
             log(f"removed extra station container {name} (max {MAX_STATIONS})")
         except Exception:
@@ -998,6 +1004,7 @@ def _docker_health(container: str) -> str:
             capture_output=True,
             text=True,
             timeout=5,
+            creationflags=_NO_WINDOW,
         )
     except Exception:
         return "unknown"
@@ -1483,6 +1490,33 @@ def _sync_fleet_incidents(
         log(f"incident sync failed (continuing): {type(exc).__name__}: {exc}")
 
 
+def _ip_reset_at(
+    free_health: dict, ip: str, *, now: float | None = None
+) -> float:
+    """Earliest future reset for one egress IP in the ledger."""
+
+    target = str(ip or "").strip()
+    if not target:
+        return 0.0
+    ts = time.time() if now is None else float(now)
+    ledger = (free_health or {}).get("quota_ledger") or {}
+    resets: list[float] = []
+    for bucket in ledger.get("buckets") or []:
+        if not isinstance(bucket, dict):
+            continue
+        if str(bucket.get("ip") or "").strip() != target:
+            continue
+        if not bucket.get("exhausted"):
+            continue
+        try:
+            reset = float(bucket.get("reset_at") or 0.0)
+        except (TypeError, ValueError):
+            reset = 0.0
+        if reset > ts:
+            resets.append(reset)
+    return min(resets) if resets else 0.0
+
+
 def _ledger_reset_at(free_health: dict) -> float:
     """Earliest future daily-bucket reset in the authoritative ledger.
 
@@ -1572,8 +1606,10 @@ def _station_primary_available(
         except (TypeError, ValueError):
             blocked = 0.0
         return int(observed.get("last_status") or 0) == 200 and blocked <= 0.0
-    # No data for this IP: a fresh/untested bucket is not exhaustion.
-    return True
+    # No proof for this IP: untested is not usable (principe VII). The old
+    # `return True` made the supervisor count every fresh egress as available,
+    # so need_refresh stayed false and no chain was launched.
+    return False
 
 
 def _primary_quota_count(
@@ -2110,7 +2146,7 @@ def _supervise() -> None:
             )
             refresh_enabled = bool(alloc.get("refresh_when_exhausted", True))
             refresh_cooldown = max(
-                60.0, float(alloc.get("refresh_cooldown_s", 900) or 900)
+                15.0, float(alloc.get("refresh_cooldown_s", 900) or 900)
             )
             refresh_min_available = max(
                 1, int(alloc.get("refresh_min_available", 3) or 3)
@@ -2226,7 +2262,10 @@ def _supervise() -> None:
                     for stamp in auth_rejection_times
                     if stamp >= cutoff
                 ]
-                if len(auth_rejection_times) >= AUTH_REJECTION_THRESHOLD:
+                if (
+                    GLOBAL_AUTH_PAUSE_S > 0
+                    and len(auth_rejection_times) >= AUTH_REJECTION_THRESHOLD
+                ):
                     auth_global_until = max(
                         auth_global_until, now + GLOBAL_AUTH_PAUSE_S
                     )
@@ -2270,7 +2309,11 @@ def _supervise() -> None:
             _refresh_warm_pool(
                 stations, now, host_ip=host_public_ip_value
             )
-            if now < auth_global_until:
+            # [P0 2026-11-14] A global AUTH pause used to stop every
+            # non-serving container, which killed stations that were already
+            # connected. Per-station AUTH backoff is enough; never stop a
+            # container from the supervisor on a global timer.
+            if False and now < auth_global_until:
                 for sid in scope:
                     if sid in auth_stopped:
                         continue
@@ -2504,15 +2547,27 @@ def _supervise() -> None:
             for sid in scope:
                 transport, path, pid = _live_lock(sid)
                 alive = bool(pid and _pid_alive(pid, "fresh_chain.py"))
-                if alive and now < auth_global_until:
+                # [P0 2026-11-14] Do not kill a chain because of a global
+                # AUTH timer: the per-station backoff below already paces it.
+                if False and alive and now < auth_global_until:
                     log(
                         f"station {sid} chain stopped (global AUTH pause)"
                     )
                     _stop_chain(sid, transport, reason="global AUTH pause")
                     alive = False
-                if alive and sid in unmeasurable:
+                _cool_ip = str(
+                    stations.get(sid, {}).get("current_ip") or ""
+                ).strip()
+                if (
+                    alive
+                    and _cool_ip
+                    and sid in unmeasurable
+                    and sid not in refresh_pending
+                ):
                     # The IP's bucket is empty until its reset_at. Probing or
                     # rotating now only extends the 429; wait for the refill.
+                    # A refresh is exempt: it rebinds to another hostname, so
+                    # the cooling IP is replaced, not re-tested.
                     log(
                         f"station {sid} chain stopped (quota reset pending)"
                     )
@@ -2711,11 +2766,24 @@ def _supervise() -> None:
                             stations.get(sid, {}).get("vpn_status") or ""
                         )
                         in ("connected", "degraded")
-                        and str(
-                            stations.get(sid, {}).get("current_ip") or ""
-                        ).strip()
                         and not _station_primary_available(
                             stations.get(sid, {}), free_health, primary
+                        )
+                        # [P0 2026-11-14] A bucket that resets within 10 min
+                        # must be waited for, not thrown away: rebinding every
+                        # 30 s kept replacing IPs just before their refill.
+                        and not (
+                            0.0
+                            < _ip_reset_at(
+                                free_health,
+                                str(
+                                    stations.get(sid, {}).get("current_ip")
+                                    or ""
+                                ),
+                                now=now_ts,
+                            )
+                            - now_ts
+                            <= 600.0
                         )
                         and now_ts - refresh_at.get(sid, 0.0)
                         >= refresh_cooldown
@@ -2786,7 +2854,11 @@ def _supervise() -> None:
                     _refresh_credentials_if_due()
                 auth_gate = _auth_gate(
                     time.time(),
-                    auth_global_until,
+                    # [P0 2026-11-14] Ignore the global AUTH timer here: the
+                    # per-station backoff (checked just below) and the 5 s
+                    # stagger already prevent an AUTH storm. A global gate
+                    # froze every station for minutes at a time.
+                    0.0,
                     last_auth_attempt_at,
                     auth_recent=_auth_recent(stations),
                 )
@@ -2798,23 +2870,31 @@ def _supervise() -> None:
                 if auth_backoff_until.get(sid, 0.0) > time.time():
                     continue
                 auth_backoff_until.pop(sid, None)
-                if sid in unmeasurable:
-                    # A refresh request must wait for the bucket reset: every
-                    # probe spent before reset_at extends the 429.
+                if sid in unmeasurable and sid not in refresh_pending:
+                    # A normal repair must wait for the bucket reset: every
+                    # probe spent before reset_at extends the 429. A refresh
+                    # is different: it rebinds to another hostname, so the
+                    # cooling IP is replaced, not re-tested.
                     continue
                 if (
                     _auth_recent(stations)
-                    and time.time() - last_chain_started_at < 5.0
+                    and time.time() - last_chain_started_at < 1.0
                 ):
                     log(
                         "auth stagger hold: next chain in "
-                        f"{max(1, int(5 - (time.time() - last_chain_started_at)))}s"
+                        f"{max(1, int(1 - (time.time() - last_chain_started_at)))}s"
                     )
                     break
                 configured_transport = transports.get(str(sid), "wireguard")
                 transport = _TRANSPORT_OVERRIDE.get(sid) or _preferred_transport(
                     stations.get(sid, {}), configured_transport, auth_fallback
                 )
+                # [P0 2026-11-14] OpenVPN AUTH is rate-limited at the account
+                # level. In `auto`, the candidate order still starts with
+                # openvpn-udp and burns an AUTH failure per host. Force the
+                # WireGuard path (no account AUTH) while rejections are fresh.
+                if transport == "auto" and _auth_recent(stations):
+                    transport = "wireguard"
                 if transport != configured_transport:
                     log(
                         f"station {sid} AUTH on {configured_transport} — "
@@ -2837,7 +2917,9 @@ def _supervise() -> None:
                 )
                 last_chain_started_at = time.time()
                 last_auth_attempt_at = last_chain_started_at
-                refresh_pending.discard(sid)
+                # Keep the sid in refresh_pending until the chain exits:
+                # the cooling guard must not kill a refresh that is rebinding
+                # to another hostname.
                 running[sid] = True
                 running_transport[sid] = transport
                 active += 1

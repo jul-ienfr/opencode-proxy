@@ -76,7 +76,15 @@ class HybridBinder:
                     return result
                 error = str(result.error or "")
                 if not error.startswith(
-                    ("control-unavailable", "control-failed_degraded")
+                    (
+                        "control-unavailable",
+                        "control-failed_degraded",
+                        # The control plane can report no egress while the
+                        # tunnel is actually up (fresh route install, cached
+                        # state). A Compose recreate is the only way to get a
+                        # real egress proof instead of skipping the candidate.
+                        "control-no-egress",
+                    )
                 ):
                     # The host itself is unreachable; recreating the same
                     # transport would only burn another two minutes. A
