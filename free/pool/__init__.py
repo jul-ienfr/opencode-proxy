@@ -152,6 +152,18 @@ def _fresh_chain_supervisor_alive() -> bool:
         return False
 
 
+def _fresh_chain_supervisor_paused() -> bool:
+    """True while the supervisor holds the account-wide AUTH pause."""
+
+    try:
+        path = os.path.join(_ROOT, "logs", "auth_global_pause.json")
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return float(data.get("until") or 0.0) > time.time()
+    except Exception:
+        return False
+
+
 def _station_is_up(station) -> bool:
     """[graceful-aurora] Routable = connected + degraded (duck-typé : les
     stubs de test et Socks5Endpoint exposent ``status`` en string)."""
@@ -5901,27 +5913,44 @@ class FreeIPPool:
                 # (three failed attempts, ~20 s each, delayed client requests).
                 # Fresh IPs are the job of `scripts/fresh_chain.py`, which
                 # changes the hostname instead of restarting the same one.
-                if getattr(station, "_pinned_hostname", None):
-                    if _fresh_chain_supervisor_alive():
+                pinned = getattr(station, "_pinned_hostname", None)
+                if pinned:
+                    paused = _fresh_chain_supervisor_paused()
+                    live_host = str(
+                        getattr(station, "current_host", "") or ""
+                    ).strip()
+                    stale_pin = bool(live_host and pinned != live_host)
+                    if (
+                        _fresh_chain_supervisor_alive()
+                        and not paused
+                        and not stale_pin
+                    ):
                         logger.info(
                             "[free-ip] station %s pinned to %s — quota rotation skipped "
                             "(fresh-IP chain owns the rebind)",
                             getattr(station, "_station", "?"),
-                            station._pinned_hostname,
+                            pinned,
                         )
                         return
-                    # [2026-11-03] The supervisor is dead, so nobody owns the
-                    # rebind: leaving the pin in place keeps this station on an
-                    # exhausted egress forever (the 0/6 failure). Drop the pin
-                    # and let gluetun re-pick a fresh server. The manager
-                    # rate-limits this to one escape per 30 min per station.
+                    # [2026-11-03] Nobody owns the rebind: the supervisor is
+                    # dead, paused by the account-wide AUTH cooldown, or the
+                    # pin no longer matches the live host. Leaving the pin
+                    # keeps the station on an exhausted egress forever.
+                    reason = (
+                        "paused"
+                        if paused
+                        else ("stale pin" if stale_pin else "dead")
+                    )
                     logger.warning(
                         "[free-ip] station %s pinned to %s but fresh-IP supervisor is "
-                        "dead — escaping pin (pool takes over the rebind)",
+                        "%s — escaping pin (pool takes over the rebind)",
                         getattr(station, "_station", "?"),
-                        station._pinned_hostname,
+                        pinned,
+                        reason,
                     )
-                    self._launch_pin_escape(station, "quota-429, supervisor dead")
+                    self._launch_pin_escape(
+                        station, f"quota-429, supervisor {reason}"
+                    )
                     return
                 self._launch_rotation(station, forced_pool=forced_pool)
         # [PLAN-corrections-429 G4] failover cascade : en routing=failover,
