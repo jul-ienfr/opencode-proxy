@@ -52,6 +52,12 @@ MAX_STATIONS = 6
 # live incident cleared a winner 0 s after it was written because the tunnel
 # still showed the previous host; the station then re-bound to a dead server.
 WINNER_PROTECT_S = 180.0
+# The AUTH rate limit is account-wide. One chain may try AUTH every 10 min,
+# and two rejections inside a minute pause every station for 30 min.
+GLOBAL_AUTH_INTERVAL_S = 600.0
+GLOBAL_AUTH_PAUSE_S = 1800.0
+AUTH_REJECTION_WINDOW_S = 60.0
+AUTH_REJECTION_THRESHOLD = 2
 # A registry assignment clears the IP's 429 reset_at, so it may only be
 # written from a winner that a real 200 proved recently. A cached
 # ``station_usable`` flag is not a proof.
@@ -695,6 +701,26 @@ def _repair_request_satisfied(request: dict, station: dict) -> bool:
     return bool(station.get("station_usable") and station.get("model_usable"))
 
 
+def _auth_gate(
+    now: float,
+    global_until: float,
+    last_attempt: float,
+    *,
+    auth_recent: bool,
+) -> str:
+    """Reason no chain may start, or an empty string when one may."""
+
+    if now < global_until:
+        return "global-pause"
+    if (
+        auth_recent
+        and last_attempt > 0.0
+        and now - last_attempt < GLOBAL_AUTH_INTERVAL_S
+    ):
+        return "interval"
+    return ""
+
+
 def _auth_pause_remaining(stations: dict[int, dict]) -> float:
     """[P0 2026-11-10] Pause globale AUTH du manager (secondes restantes).
 
@@ -1065,6 +1091,66 @@ def _warm_spares_count() -> int:
             conn.close()
     except Exception:
         return 0
+
+
+def _refresh_warm_pool(stations: dict[int, dict], now: float) -> None:
+    """Feed the warm pool from stations that just proved a real 200.
+
+    The chain winner path fills the pool, but a station that was already
+    serving never runs a chain, so its proven egress stayed out of the pool
+    and ``warm_pool`` read zero while station 5 was healthy.
+    """
+
+    try:
+        ttl = float(
+            yaml_get(
+                "ip_registry", "allocator.verified_spare_ttl_s", 21600
+            )
+            or 21600
+        )
+    except Exception:
+        ttl = 21600.0
+    rows: list[tuple[str, str, str, str, float, float]] = []
+    for station in stations.values():
+        if not bool(station.get("model_usable")):
+            continue
+        ip = str(station.get("current_ip") or "").strip()
+        vpn = station.get("vpn") if isinstance(station.get("vpn"), dict) else {}
+        host = str(
+            vpn.get("pinned_hostname") or vpn.get("current_host") or ""
+        ).strip()
+        if not ip or not host:
+            continue
+        transport = str(
+            station.get("transport_effective")
+            or vpn.get("stack_effective")
+            or ""
+        ).strip()
+        model = str(station.get("model") or "").strip()
+        rows.append(
+            (
+                ip,
+                host,
+                transport,
+                model,
+                now,
+                now + max(300.0, ttl),
+            )
+        )
+    if not rows:
+        return
+    try:
+        with sqlite3.connect(
+            ROOT / "logs" / "registry.db", timeout=5.0
+        ) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO warm_pool("
+                "ip, hostname, transport, model, verified_at, expires_at, "
+                "score_ip) VALUES(?,?,?,?,?,?,0)",
+                rows,
+            )
+    except Exception as exc:  # noqa: BLE001 - the pool is a cache, not truth
+        log(f"warm pool refresh unavailable: {type(exc).__name__}: {exc}")
 
 
 def _sweep_state_age_s() -> float | None:
@@ -1663,6 +1749,10 @@ def _supervise() -> None:
     auth_backoff_until: dict[int, float] = {}
     auth_backoff_s: dict[int, float] = {}
     auth_seen: dict[int, int] = {}
+    auth_global_until = 0.0
+    last_auth_attempt_at = 0.0
+    auth_rejection_times: list[float] = []
+    last_auth_global_log = 0.0
     unmeasurable_logged: set[int] = set()
     last_health_probe = 0.0
     last_maintenance_at = time.time()
@@ -1879,6 +1969,10 @@ def _supervise() -> None:
                     auth_backoff_until.pop(sid, None)
                     auth_backoff_s.pop(sid, None)
                     auth_seen[sid] = 0
+                    if auth_global_until:
+                        log("AUTH global pause cleared by a real 200")
+                    auth_global_until = 0.0
+                    auth_rejection_times.clear()
                     continue
                 vpn = (
                     station.get("vpn")
@@ -1904,6 +1998,22 @@ def _supervise() -> None:
                     f"station {sid} AUTH backoff "
                     f"{int(next_backoff)}s"
                 )
+                auth_rejection_times.append(now)
+                cutoff = now - AUTH_REJECTION_WINDOW_S
+                auth_rejection_times = [
+                    stamp
+                    for stamp in auth_rejection_times
+                    if stamp >= cutoff
+                ]
+                if len(auth_rejection_times) >= AUTH_REJECTION_THRESHOLD:
+                    auth_global_until = max(
+                        auth_global_until, now + GLOBAL_AUTH_PAUSE_S
+                    )
+                    auth_rejection_times.clear()
+                    log(
+                        "AUTH global pause "
+                        f"{int(GLOBAL_AUTH_PAUSE_S)}s — account rate-limited"
+                    )
             settling = {
                 sid
                 for sid, station in stations.items()
@@ -1934,6 +2044,7 @@ def _supervise() -> None:
                         f"station {sid} every probe bucket is exhausted — "
                         "waiting for refill"
                     )
+            _refresh_warm_pool(stations, now)
             if not observe_only:
                 _reconcile_registry(stations)
                 _clear_stale_pins(stations, protect_s=winner_protect)
@@ -2379,6 +2490,17 @@ def _supervise() -> None:
                 # est le départ simultané de plusieurs chaînes.
                 if _auth_recent(stations):
                     _refresh_credentials_if_due()
+                auth_gate = _auth_gate(
+                    time.time(),
+                    auth_global_until,
+                    last_auth_attempt_at,
+                    auth_recent=_auth_recent(stations),
+                )
+                if auth_gate:
+                    if time.time() - last_auth_global_log >= 60.0:
+                        last_auth_global_log = time.time()
+                        log(f"AUTH {auth_gate} — no chain")
+                    break
                 if auth_backoff_until.get(sid, 0.0) > time.time():
                     continue
                 auth_backoff_until.pop(sid, None)
@@ -2416,6 +2538,7 @@ def _supervise() -> None:
                     transport=transport,
                 )
                 last_chain_started_at = time.time()
+                last_auth_attempt_at = last_chain_started_at
                 refresh_pending.discard(sid)
                 running[sid] = True
                 running_transport[sid] = transport

@@ -371,6 +371,21 @@ def test_egress_park_is_repairable_but_auth_park_is_not():
     assert module._needs_chain(auth_park) is False
 
 
+def test_auth_gate_is_account_wide():
+    module = _module()
+    assert module._auth_gate(100.0, 0.0, 0.0, auth_recent=False) == ""
+    assert (
+        module._auth_gate(100.0, 130.0, 0.0, auth_recent=False)
+        == "global-pause"
+    )
+    assert (
+        module._auth_gate(100.0, 0.0, 95.0, auth_recent=True) == "interval"
+    )
+    assert module._auth_gate(100.0, 0.0, 0.0, auth_recent=True) == ""
+    assert module._auth_gate(100.0, 0.0, 100.0, auth_recent=True) == "interval"
+    assert module._auth_gate(700.0, 0.0, 100.0, auth_recent=True) == ""
+
+
 def test_unmeasurable_station_does_not_need_a_chain():
     module = _module()
     station = {
