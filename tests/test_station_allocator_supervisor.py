@@ -706,30 +706,3 @@ def test_auth_throttling_switches_the_repair_to_wireguard():
     assert module._preferred_transport(egress, "auto", "") == "auto"
 
 
-def test_auth_storm_search_stays_on_wireguard():
-    module = _module()
-    assert (
-        module._transport_for_repair(
-            "auto", auth_pause=30.0, auth_recent=True
-        )
-        == "wireguard"
-    )
-    assert (
-        module._transport_for_repair(
-            "auto", auth_pause=0.0, auth_recent=True
-        )
-        == "wireguard"
-    )
-    assert (
-        module._transport_for_repair(
-            "auto", auth_pause=0.0, auth_recent=False
-        )
-        == "auto"
-    )
-    # An explicit operator transport is never overridden.
-    assert (
-        module._transport_for_repair(
-            "openvpn-tcp", auth_pause=30.0, auth_recent=True
-        )
-        == "openvpn-tcp"
-    )

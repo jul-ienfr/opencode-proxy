@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -21,6 +22,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import yaml
@@ -69,7 +71,6 @@ _NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # chain executes stale code; the supervisor stops it and starts a fresh one.
 CHAIN_CODE_PATHS = (
     ROOT / "scripts" / "fresh_chain.py",
-    ROOT / "config.yaml",
     ROOT / "free" / "catalog_claims.py",
     ROOT / "free" / "ip_registry" / "adapters" / "hybrid_binder.py",
     ROOT / "free" / "ip_registry" / "adapters" / "compose_binder.py",
@@ -627,21 +628,6 @@ def _manager_repair_enabled() -> bool:
         return True
 
 
-def _transport_for_repair(
-    transport: str, *, auth_pause: float, auth_recent: bool
-) -> str:
-    """Search over WireGuard while OpenVPN is in an AUTH storm.
-
-    AUTH failures serialise the fleet behind one probe and make the chain
-    rotate away servers that would connect after a few retries. ``auto``
-    returns as soon as no station has reported AUTH for 30 minutes.
-    """
-
-    if transport == "auto" and (auth_pause > 0 or auth_recent):
-        return "wireguard"
-    return transport
-
-
 def _preferred_transport(
     station: dict, configured: str, fallback: str = "wireguard"
 ) -> str:
@@ -855,6 +841,70 @@ def _station_has_model_proof(station: dict) -> bool:
     return bool(station.get("model_usable"))
 
 
+def _docker_health(container: str) -> str:
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{if .State.Health}}{{.State.Health.Status}}"
+                "{{else}}none{{end}}",
+                container,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return "unknown"
+    if proc.returncode != 0:
+        return "unknown"
+    return str(proc.stdout or "").strip() or "unknown"
+
+
+def _socks_port_open(station: dict) -> bool:
+    vpn = station.get("vpn") if isinstance(station.get("vpn"), dict) else {}
+    raw = str(vpn.get("socks5_url") or "").strip()
+    if not raw:
+        return True
+    try:
+        port = urlparse(raw).port
+    except ValueError:
+        return True
+    if not port:
+        return True
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _station_settling(station: dict) -> bool:
+    """True while the container or its SOCKS listener is still coming up.
+
+    A station that is ``starting`` (or whose proxy port refuses connections)
+    cannot answer a probe yet; rotating it only destroys a tunnel that is still
+    settling. It is not an incident and must not be repaired.
+    """
+
+    vpn = station.get("vpn") if isinstance(station.get("vpn"), dict) else {}
+    station_id = int(station.get("station") or 0)
+    container = str(vpn.get("container") or "").strip()
+    if not container and station_id:
+        container = (
+            "opencode-vpn"
+            if station_id == 1
+            else f"opencode-vpn-{station_id}"
+        )
+    if not container:
+        return False
+    if _docker_health(container) != "healthy":
+        return True
+    return not _socks_port_open(station)
+
+
 def _needs_chain(station: dict) -> bool:
     """A station that cannot serve a free request needs a fresh egress.
 
@@ -868,6 +918,8 @@ def _needs_chain(station: dict) -> bool:
     health = station.get("health") if isinstance(station.get("health"), dict) else {}
     hstate = str(health.get("state") or "")
     vpn_status = str(station.get("vpn_status") or "")
+    if hstate == "settling":
+        return False
     if hstate == "parked":
         cause_text = (
             f"{health.get('cause') or ''} {health.get('last_error') or ''}"
@@ -926,7 +978,13 @@ def _station_recovered(station: dict) -> bool:
     """
 
     health = station.get("health") if isinstance(station.get("health"), dict) else {}
-    if str(health.get("state") or "") in ("repairing", "probing", "suspect", "parked"):
+    if str(health.get("state") or "") in (
+        "repairing",
+        "probing",
+        "suspect",
+        "parked",
+        "settling",
+    ):
         return False
     if not bool(station.get("station_usable")):
         return False
@@ -1593,6 +1651,10 @@ def _supervise() -> None:
     last_heartbeat = 0.0
     last_auth_log = 0.0
     last_chain_started_at = 0.0
+    last_code_reload_at: dict[int, float] = {}
+    auth_backoff_until: dict[int, float] = {}
+    auth_backoff_s: dict[int, float] = {}
+    auth_seen: dict[int, int] = {}
     last_health_probe = 0.0
     last_maintenance_at = time.time()
     last_qualification_at = 0.0
@@ -1794,6 +1856,54 @@ def _supervise() -> None:
             stations = {
                 int(s.get("station") or 0): s for s in data.get("stations", [])
             }
+            auth_backoff_base = max(
+                90.0,
+                float(
+                    yaml_get(
+                        "ip_registry", "transport_auth_backoff_s", 90
+                    )
+                    or 90
+                ),
+            )
+            for sid, station in stations.items():
+                if bool(station.get("model_usable")):
+                    auth_backoff_until.pop(sid, None)
+                    auth_backoff_s.pop(sid, None)
+                    auth_seen[sid] = 0
+                    continue
+                vpn = (
+                    station.get("vpn")
+                    if isinstance(station.get("vpn"), dict)
+                    else {}
+                )
+                try:
+                    count = int(vpn.get("auth_fail_30min") or 0)
+                except (TypeError, ValueError):
+                    count = 0
+                if count <= auth_seen.get(sid, 0):
+                    continue
+                auth_seen[sid] = count
+                current = auth_backoff_s.get(sid, 0.0)
+                next_backoff = (
+                    auth_backoff_base
+                    if current <= 0
+                    else min(600.0, current * 2)
+                )
+                auth_backoff_s[sid] = next_backoff
+                auth_backoff_until[sid] = now + next_backoff
+                log(
+                    f"station {sid} AUTH backoff "
+                    f"{int(next_backoff)}s"
+                )
+            settling = {
+                sid
+                for sid, station in stations.items()
+                if _station_settling(station)
+            }
+            for sid in settling:
+                health = stations[sid].setdefault("health", {})
+                if isinstance(health, dict):
+                    health["state"] = "settling"
             if not observe_only:
                 _reconcile_registry(stations)
                 _clear_stale_pins(stations, protect_s=winner_protect)
@@ -1844,7 +1954,12 @@ def _supervise() -> None:
             elif not global_pause_enabled and exhaustion_due and now - last_exhausted_alert_at >= ex_pause:
                 last_exhausted_alert_at = now
                 log(f"{total_429} 429, aucune station usable — no global pause (per-station)")
-            broken = [sid for sid in scope if _needs_chain(stations.get(sid, {}))]
+            broken = [
+                sid
+                for sid in scope
+                if sid not in settling
+                and _needs_chain(stations.get(sid, {}))
+            ]
             forced: set[int] = set()
             try:
                 for request in repair_queue.pending():
@@ -1853,6 +1968,8 @@ def _supervise() -> None:
                     except (TypeError, ValueError):
                         continue
                     if sid not in scope:
+                        continue
+                    if sid in settling:
                         continue
                     # [P0 2026-11-10] Demande déjà satisfaite : le modèle
                     # demandé est usable sur cette station. Sans ce garde,
@@ -1973,12 +2090,21 @@ def _supervise() -> None:
                 transport, path, pid = _live_lock(sid)
                 alive = bool(pid and _pid_alive(pid, "fresh_chain.py"))
                 if alive and _chain_code_stale(path):
-                    log(
-                        f"station {sid} chain predates a chain-code update "
-                        "- reloading"
-                    )
-                    _stop_chain(sid, transport, reason="code reload")
-                    alive = False
+                    elapsed = time.time() - last_code_reload_at.get(sid, 0.0)
+                    if elapsed < MAX_CHAIN_AGE_S:
+                        if sid not in protected_logged:
+                            log(
+                                f"station {sid} code reload deferred for "
+                                f"{int(MAX_CHAIN_AGE_S - elapsed)}s"
+                            )
+                    else:
+                        log(
+                            f"station {sid} chain predates a chain-code update "
+                            "- reloading"
+                        )
+                        _stop_chain(sid, transport, reason="code reload")
+                        last_code_reload_at[sid] = time.time()
+                        alive = False
                 # [P0 2026-11-11] Une chaîne qui n'a rien trouvé depuis 20 min
                 # monopolise un slot : on la coupe pour rendre la main aux
                 # stations down qui attendent. Le compteur d'échecs et le
@@ -2229,6 +2355,9 @@ def _supervise() -> None:
                 # est le départ simultané de plusieurs chaînes.
                 if _auth_recent(stations):
                     _refresh_credentials_if_due()
+                if auth_backoff_until.get(sid, 0.0) > time.time():
+                    continue
+                auth_backoff_until.pop(sid, None)
                 if (
                     _auth_recent(stations)
                     and time.time() - last_chain_started_at < 5.0
@@ -2241,11 +2370,6 @@ def _supervise() -> None:
                 configured_transport = transports.get(str(sid), "wireguard")
                 transport = _TRANSPORT_OVERRIDE.get(sid) or _preferred_transport(
                     stations.get(sid, {}), configured_transport, auth_fallback
-                )
-                transport = _transport_for_repair(
-                    transport,
-                    auth_pause=auth_pause,
-                    auth_recent=_auth_recent(stations),
                 )
                 if transport != configured_transport:
                     log(
