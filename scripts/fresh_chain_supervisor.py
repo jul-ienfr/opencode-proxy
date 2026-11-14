@@ -701,6 +701,26 @@ def _repair_request_satisfied(request: dict, station: dict) -> bool:
     return bool(station.get("station_usable") and station.get("model_usable"))
 
 
+AUTH_PAUSE_PATH = ROOT / "logs" / "auth_global_pause.json"
+
+
+def _load_auth_pause() -> float:
+    try:
+        payload = json.loads(AUTH_PAUSE_PATH.read_text(encoding="utf-8"))
+        return float(payload.get("until") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _save_auth_pause(until: float) -> None:
+    try:
+        AUTH_PAUSE_PATH.write_text(
+            json.dumps({"until": float(until)}), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
 def _auth_gate(
     now: float,
     global_until: float,
@@ -1802,7 +1822,7 @@ def _supervise() -> None:
     auth_backoff_until: dict[int, float] = {}
     auth_backoff_s: dict[int, float] = {}
     auth_seen: dict[int, int] = {}
-    auth_global_until = 0.0
+    auth_global_until = _load_auth_pause()
     last_auth_attempt_at = 0.0
     auth_rejection_times: list[float] = []
     last_auth_global_log = 0.0
@@ -2062,6 +2082,7 @@ def _supervise() -> None:
                         auth_global_until, now + GLOBAL_AUTH_PAUSE_S
                     )
                     auth_rejection_times.clear()
+                    _save_auth_pause(auth_global_until)
                     log(
                         "AUTH global pause "
                         f"{int(GLOBAL_AUTH_PAUSE_S)}s — account rate-limited"
