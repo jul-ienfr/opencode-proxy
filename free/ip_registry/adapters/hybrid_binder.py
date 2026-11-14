@@ -91,6 +91,9 @@ class HybridBinder:
             openvpn_protocol=openvpn_protocol,
             dns_mode=dns_mode,
         )
+        # The Compose assign may have recreated the container with the current
+        # environment; re-inspect it before deciding to recreate it again.
+        self._credentials_checked.pop(int(station), None)
         if result.ok:
             self._remember(station, requested)
             self._credentials_checked[int(station)] = True
@@ -132,14 +135,21 @@ class HybridBinder:
     # ── internals ─────────────────────────────────────────────────────
     def _environment_fresh(self, station: int) -> bool:
         station = int(station)
-        if station not in self._credentials_checked:
-            self._credentials_checked[station] = not (
-                self._compose.credentials_stale(station)
-                or self._compose.image_stale(station)
-                or self._compose.dns_ladder_stale(station)
-                or self._compose.transport_timeouts_stale(station)
-            )
-        return self._credentials_checked[station]
+        cached = self._credentials_checked.get(station)
+        if cached is not None:
+            return cached
+        fresh = not (
+            self._compose.credentials_stale(station)
+            or self._compose.image_stale(station)
+            or self._compose.dns_ladder_stale(station)
+            or self._compose.transport_timeouts_stale(station)
+        )
+        # Cache only a positive result: a stale environment must be re-read
+        # after the Compose recreate, otherwise the chain recreates it again
+        # for the next candidate.
+        if fresh:
+            self._credentials_checked[station] = True
+        return fresh
 
     def _current(self, station: int) -> str:
         now = self._clock()

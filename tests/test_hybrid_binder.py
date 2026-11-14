@@ -173,6 +173,24 @@ async def test_failed_degraded_falls_back_to_compose():
     assert len(compose.calls) == 1
 
 
+async def test_stale_environment_is_rechecked_after_a_compose_recreate():
+    control = FakeControl(
+        "wireguard", BindResult(False, "a", error="control-unavailable")
+    )
+    compose = FakeCompose(
+        BindResult(False, "a", error="compose-no-egress"),
+        transport_timeouts_stale=True,
+    )
+    binder = HybridBinder(control=control, compose=compose)
+
+    assert binder.needs_recreate(2) is True
+
+    result = await binder.assign(2, "a.nordvpn.com", vpn_type="wireguard")
+    assert not result.ok
+    compose._timeouts_stale = False
+    assert binder.needs_recreate(2) is False
+
+
 async def test_control_plane_owns_the_tri_stack_before_compose():
     control = FakeControlPlane(
         "openvpn-udp", BindResult(True, "a", egress_ip="1.1.1.1")
