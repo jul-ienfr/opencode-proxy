@@ -2003,44 +2003,7 @@ async def _run_claims(
                     _close_run("catalog_exhausted")
                     await _restore_previous_host(args, binder, snapshot or {})
                     return 2
-                outcome = await binder.rotate_outcome(
-                    [
-                        ServerCandidate(hostname=str(item["host"]))
-                        for item in batch
-                    ],
-                    Constraints(
-                        max_candidates=len(batch),
-                        max_attempts=rotate_batch_attempts,
-                    ),
-                    wait=True,
-                )
-                if outcome is not None and outcome.ok:
-                    host = outcome.hostname or str(batch[0]["host"])
-                    country = next(
-                        (
-                            str(item["country"])
-                            for item in batch
-                            if str(item["host"]) == host
-                        ),
-                        str(batch[0]["country"]),
-                    )
-                    for item in batch:
-                        if str(item["host"]) != host:
-                            claims.record(
-                                str(item["host"]),
-                                args.station,
-                                "duplicate",
-                                error="rotate-not-selected",
-                            )
-                    tested += 1
-                    rotated = True
-                    log(
-                        f"  rotate committed {host} "
-                        f"egress={outcome.egress_ip or '-'}"
-                    )
-                elif outcome is None or "control-unavailable" in str(
-                    getattr(outcome, "error", "")
-                ):
+                if getattr(binder, "needs_recreate", lambda _s: False)(args.station):
                     host = str(batch[0]["host"])
                     country = str(batch[0]["country"])
                     for item in batch[1:]:
@@ -2048,23 +2011,72 @@ async def _run_claims(
                             str(item["host"]),
                             args.station,
                             "duplicate",
-                            error="rotate-fallback",
+                            error="environment-recreate",
                         )
-                    log(f"  rotate unavailable - fallback bind {host}")
+                    log(f"  environment stale - compose recreate {host}")
                 else:
-                    error = (
-                        f"rotate-{getattr(outcome, 'state', 'error')}:"
-                        f"{getattr(outcome, 'error', '')}"
+                    outcome = await binder.rotate_outcome(
+                        [
+                            ServerCandidate(hostname=str(item["host"]))
+                            for item in batch
+                        ],
+                        Constraints(
+                            max_candidates=len(batch),
+                            max_attempts=rotate_batch_attempts,
+                        ),
+                        wait=True,
                     )
-                    for item in batch:
-                        claims.record(
-                            str(item["host"]),
-                            args.station,
-                            "no_egress",
-                            error=error,
+                    if outcome is not None and outcome.ok:
+                        host = outcome.hostname or str(batch[0]["host"])
+                        country = next(
+                            (
+                                str(item["country"])
+                                for item in batch
+                                if str(item["host"]) == host
+                            ),
+                            str(batch[0]["country"]),
                         )
-                    log(f"  rotate rejected: {error}")
-                    continue
+                        for item in batch:
+                            if str(item["host"]) != host:
+                                claims.record(
+                                    str(item["host"]),
+                                    args.station,
+                                    "duplicate",
+                                    error="rotate-not-selected",
+                                )
+                        tested += 1
+                        rotated = True
+                        log(
+                            f"  rotate committed {host} "
+                            f"egress={outcome.egress_ip or '-'}"
+                        )
+                    elif outcome is None or "control-unavailable" in str(
+                        getattr(outcome, "error", "")
+                    ):
+                        host = str(batch[0]["host"])
+                        country = str(batch[0]["country"])
+                        for item in batch[1:]:
+                            claims.record(
+                                str(item["host"]),
+                                args.station,
+                                "duplicate",
+                                error="rotate-fallback",
+                            )
+                        log(f"  rotate unavailable - fallback bind {host}")
+                    else:
+                        error = (
+                            f"rotate-{getattr(outcome, 'state', 'error')}:"
+                            f"{getattr(outcome, 'error', '')}"
+                        )
+                        for item in batch:
+                            claims.record(
+                                str(item["host"]),
+                                args.station,
+                                "no_egress",
+                                error=error,
+                            )
+                        log(f"  rotate rejected: {error}")
+                        continue
             else:
                 claim = claims.claim_next(args.station, forbidden_ips=exhausted)
                 if claim is None:

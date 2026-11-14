@@ -119,6 +119,11 @@ class HybridBinder:
             return None
         return await rotate(candidates, constraints, wait=wait)
 
+    def needs_recreate(self, station: int) -> bool:
+        """True when image or credentials differ from the current files."""
+
+        return not self._environment_fresh(station)
+
     # ── internals ─────────────────────────────────────────────────────
     def _environment_fresh(self, station: int) -> bool:
         station = int(station)
