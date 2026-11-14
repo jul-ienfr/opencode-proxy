@@ -421,6 +421,7 @@ def _start_chain(
     models: str = "",
     transport: str = "wireguard",
 ) -> None:
+    _kill_station_chains(station)
     log_path = ROOT / "logs" / f"fresh_chain_{station}.log"
     handle = open(log_path, "ab")
     command = [
@@ -1393,6 +1394,30 @@ def _chain_expired(path: Path, *, now: float | None = None) -> bool:
         return current - path.stat().st_mtime >= MAX_CHAIN_AGE_S
     except OSError:
         return False
+
+
+def _kill_station_chains(station: int) -> None:
+    """Kill every fresh_chain.py process for a station before starting one.
+
+    A reload can orphan a chain whose lock was overwritten; two chains on the
+    same station race the compose recreate and the claims. The supervisor stays
+    the single owner by clearing them first.
+    """
+
+    try:
+        import psutil
+    except Exception:  # noqa: BLE001 - psutil is optional on this host
+        return
+    marker = f"--station {int(station)}"
+    for process in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = " ".join(process.info.get("cmdline") or [])
+            if "fresh_chain.py" not in cmdline or marker not in cmdline:
+                continue
+            process.kill()
+            log(f"station {station} orphan chain {process.pid} killed")
+        except Exception:  # noqa: BLE001 - a process may exit during iteration
+            continue
 
 
 def _stop_chain(
