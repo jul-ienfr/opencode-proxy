@@ -627,6 +627,21 @@ def _manager_repair_enabled() -> bool:
         return True
 
 
+def _transport_for_repair(
+    transport: str, *, auth_pause: float, auth_recent: bool
+) -> str:
+    """Search over WireGuard while OpenVPN is in an AUTH storm.
+
+    AUTH failures serialise the fleet behind one probe and make the chain
+    rotate away servers that would connect after a few retries. ``auto``
+    returns as soon as no station has reported AUTH for 30 minutes.
+    """
+
+    if transport == "auto" and (auth_pause > 0 or auth_recent):
+        return "wireguard"
+    return transport
+
+
 def _preferred_transport(
     station: dict, configured: str, fallback: str = "wireguard"
 ) -> str:
@@ -915,6 +930,10 @@ def _station_recovered(station: dict) -> bool:
         return False
     if not bool(station.get("station_usable")):
         return False
+    # A per-model quota drain is not a broken tunnel: the station still serves
+    # the other free buckets, so a running repair chain must not be stopped.
+    if str(station.get("model_usable_reason") or "") == "draining":
+        return True
     # A connected tunnel is not a usable station. Only a fresh real free-model
     # 200 counts; a healthy container without that proof stays a repair target.
     return _station_has_model_proof(station)
@@ -2222,6 +2241,11 @@ def _supervise() -> None:
                 configured_transport = transports.get(str(sid), "wireguard")
                 transport = _TRANSPORT_OVERRIDE.get(sid) or _preferred_transport(
                     stations.get(sid, {}), configured_transport, auth_fallback
+                )
+                transport = _transport_for_repair(
+                    transport,
+                    auth_pause=auth_pause,
+                    auth_recent=_auth_recent(stations),
                 )
                 if transport != configured_transport:
                     log(
