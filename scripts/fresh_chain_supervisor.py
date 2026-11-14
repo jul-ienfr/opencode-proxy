@@ -69,6 +69,7 @@ _NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # chain executes stale code; the supervisor stops it and starts a fresh one.
 CHAIN_CODE_PATHS = (
     ROOT / "scripts" / "fresh_chain.py",
+    ROOT / "config.yaml",
     ROOT / "free" / "ip_registry" / "adapters" / "hybrid_binder.py",
     ROOT / "free" / "ip_registry" / "adapters" / "compose_binder.py",
     ROOT / "free" / "ip_registry" / "adapters" / "gluetun_control_v2.py",
