@@ -2798,6 +2798,10 @@ def _supervise() -> None:
                 if auth_backoff_until.get(sid, 0.0) > time.time():
                     continue
                 auth_backoff_until.pop(sid, None)
+                if sid in unmeasurable:
+                    # A refresh request must wait for the bucket reset: every
+                    # probe spent before reset_at extends the 429.
+                    continue
                 if (
                     _auth_recent(stations)
                     and time.time() - last_chain_started_at < 5.0
