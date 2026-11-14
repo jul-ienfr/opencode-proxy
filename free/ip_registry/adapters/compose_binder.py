@@ -124,13 +124,34 @@ class ComposeHostnameBinder:
     def dns_ladder_stale(self, station: int) -> bool:
         """True when the container DNS ladder differs from the override."""
 
-        desired = self._desired_dns_ladder(station)
+        desired = self._desired_env(station, "DNS_LADDER")
         if not desired:
             return False
         current = self._container_env(station).get("DNS_LADDER", "")
         return current.strip() != desired
 
-    def _desired_dns_ladder(self, station: int) -> str:
+    def transport_timeouts_stale(self, station: int) -> bool:
+        """True when a transport budget differs from the override.
+
+        NordVPN's OpenVPN auth backend intermittently answers AUTH_FAILED
+        before accepting the same credentials; gluetun retries inside the
+        tunnel attempt, so the attempt must be long enough to outlive a few
+        retries.  A container carrying the old short budget would keep
+        rotating away from a server that is about to connect.
+        """
+
+        current = self._container_env(station)
+        for key in (
+            "TRANSPORT_ATTEMPT_TIMEOUT_S",
+            "TRANSPORT_ATTEMPT_TIMEOUT_TCP_S",
+            "TRANSPORT_MAX_CYCLES",
+        ):
+            desired = self._desired_env(station, key)
+            if desired and current.get(key, "").strip() != desired:
+                return True
+        return False
+
+    def _desired_env(self, station: int, key: str) -> str:
         path = (
             self._root
             / "logs"
@@ -140,9 +161,10 @@ class ComposeHostnameBinder:
             text = path.read_text(encoding="utf-8")
         except OSError:
             return ""
+        prefix = f"{key}:"
         for raw in text.splitlines():
             line = raw.strip()
-            if not line.startswith("DNS_LADDER:"):
+            if not line.startswith(prefix):
                 continue
             return line.split(":", 1)[1].strip().strip('"').strip("'")
         return ""
