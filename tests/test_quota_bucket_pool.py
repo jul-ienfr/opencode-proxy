@@ -37,6 +37,8 @@ def _pool() -> FreeIPPool:
 def test_exhausted_bucket_blocks_station_but_not_tunnel_gate():
     pool = _pool()
     st = _Station(1, "10.0.0.1")
+    # Principe VII : une IP n'est routable qu'après une preuve 200.
+    pool._ledger.note_result("10.0.0.1", MODEL, 200)
     assert pool._station_usable(st, exclude_approaching=False, model=MODEL) is True
 
     pool._ledger.note_result(
@@ -68,6 +70,9 @@ def test_new_ip_is_a_new_bucket():
     assert pool.model_usable(MODEL, st)[0] is False
 
     st.current_ip = "10.0.0.3"
+    # Nouvelle IP = nouveau bucket, mais aucune preuve : « unproven ».
+    assert pool.model_usable(MODEL, st) == (False, "unproven")
+    pool._ledger.note_result("10.0.0.3", MODEL, 200)
     assert pool.model_usable(MODEL, st) == (True, None)
     assert pool.quota_bucket_exhausted(MODEL) is True  # l'ancienne IP reste marquée
 

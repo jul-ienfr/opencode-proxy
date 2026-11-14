@@ -142,7 +142,7 @@ def sanitize_text(text: str, env_cwd: str, *, mask_paths: bool = True) -> str:
 def _looks_windows(text: str) -> bool:
     low = str(text or "").lower()
     return (
-        "c:\\users\\" in low
+        "c:\\users\\" in low  # platform-audit: allow détection d'un chemin client Windows
         or "git bash" in low
         or "windows powershell" in low
         or "<shell>powershell" in low

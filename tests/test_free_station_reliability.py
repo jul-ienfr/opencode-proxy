@@ -50,11 +50,19 @@ def _cfg(**over):
     return cfg
 
 
+def _prove(pool, *stations, model: str = "m") -> None:
+    """Principe VII : une IP n'est routable qu'après un 200 observé."""
+    for station in stations:
+        pool._ledger.note_result(station.current_ip, model, 200)
+
+
 def _pool():
     cfg = _cfg()
     st1 = _RelStation(1, "1.1.1.1", config=cfg)
     st2 = _RelStation(2, "2.2.2.2", config=cfg)
-    return fp.FreeIPPool(st1, st2), st1, st2
+    pool = fp.FreeIPPool(st1, st2)
+    _prove(pool, st1, st2)
+    return pool, st1, st2
 
 
 def test_shadow_selector_logs_but_keeps_legacy_routing(monkeypatch):
@@ -62,6 +70,7 @@ def test_shadow_selector_logs_but_keeps_legacy_routing(monkeypatch):
     st1 = _RelStation(1, "1.1.1.1", config=cfg)
     st2 = _RelStation(2, "2.2.2.2", config=cfg)
     pool = fp.FreeIPPool(st1, st2)
+    _prove(pool, st1, st2)
     pool._shadow_selector = True
     # The legacy failover path keeps station 1; the shadow selector prefers 2.
     pool._per_station(st2)["request_count"] = 0
@@ -232,6 +241,7 @@ def test_spare_station_is_not_selected_until_promoted_and_capacity_excludes_it()
     st3 = _RelStation(3, "3.3.3.3", config=cfg)
     pool = fp.FreeIPPool(st1, st2)
     pool.set_stations([st1, st2, st3])
+    _prove(pool, st1, st2, st3)
     assert pool._best_station(model="m") in (st1, st2)
     cap = pool.capacity_snapshot()
     assert cap["configured_stations"] == 2

@@ -385,7 +385,6 @@ async def test_systemone_free_hedge_winner_200_no_sequential(monkeypatch):
 async def test_systemone_free_hedge_429_filet_relayed(monkeypatch):
     """Parité chat : hedge 429 (toutes stations) → 429 relayé, pas de retry."""
     import opencode as oc
-
     winner = _FakeStation(1, "1.2.3.4")
     rate = _FakeResp(status=429, payload={"error": {"type": "rate_limit", "message": "quota exceeded"}})
     calls = _hedge_mocks(monkeypatch, hedge_resp=(rate, winner))
@@ -435,3 +434,34 @@ async def test_systemone_free_auto_egress_without_pool_stays_503(monkeypatch):
         )
     assert exc.value.status_code == 503
     assert "pool indisponible" in str(exc.value)
+
+
+def test_debug_log_calls_take_a_single_argument():
+    """Régression 2026-11-14 : ``_debug``/``_log`` n'acceptent qu'un argument.
+
+    Un appel printf (``_debug("… %s", value)``) lève ``TypeError`` à
+    l'exécution ; en production il devenait un 500 sur ``systemone`` (Jev),
+    invisible des tests qui mockent ``_debug`` avec ``lambda *a, **k``.
+    """
+    import ast
+    from pathlib import Path
+
+    source = Path(oc.__file__).read_text(encoding="utf-8", errors="replace")
+    tree = ast.parse(source)
+    offenders = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("_debug", "_log")
+        ):
+            if (
+                any(isinstance(arg, ast.Starred) for arg in node.args)
+                or any(kw.arg is None for kw in node.keywords)
+            ):
+                # Relais volontaire (`lambda *a, **k: _debug(*a, **k)`) : le
+                # nombre d'arguments n'est pas connu statiquement.
+                continue
+            if len(node.args) > 1 or any(kw.arg != "msg" for kw in node.keywords):
+                offenders.append((node.func.id, node.lineno))
+    assert offenders == [], f"appels multi-arguments (TypeError) : {offenders}"

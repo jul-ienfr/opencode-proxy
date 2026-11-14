@@ -2211,7 +2211,7 @@ def _supervise() -> None:
                 90.0,
                 float(
                     yaml_get(
-                        "ip_registry", "transport_auth_backoff_s", 90
+                        "ip_rotation", "transport_auth_backoff_s", 90
                     )
                     or 90
                 ),

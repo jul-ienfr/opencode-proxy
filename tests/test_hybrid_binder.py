@@ -90,7 +90,9 @@ async def test_same_transport_uses_the_control_api():
     assert compose.calls == []
 
 
-async def test_control_no_egress_is_not_hidden_by_a_recreate():
+async def test_control_no_egress_falls_back_to_a_compose_recreate():
+    """Un ``control-no-egress`` n'est pas une preuve définitive : le recreate
+    Compose obtient l'egress réel au lieu de sauter le candidat."""
     control = FakeControl(
         "wireguard", BindResult(False, "a", error="control-no-egress")
     )
@@ -99,9 +101,9 @@ async def test_control_no_egress_is_not_hidden_by_a_recreate():
 
     result = await binder.assign(2, "a.nordvpn.com", vpn_type="wireguard")
 
-    assert not result.ok
-    assert result.error == "control-no-egress"
-    assert compose.calls == []
+    assert result.ok
+    assert result.egress_ip == "2.2.2.2"
+    assert len(compose.calls) == 1
 
 
 async def test_control_unavailable_falls_back_to_compose():

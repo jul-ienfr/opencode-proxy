@@ -731,6 +731,9 @@ class TestStatusContract:
         pool = FreeIPPool(m1, m2)
         m1._status = VPNState.DEGRADED
         m1._current_ip = "1.1.1.1"
+        # Principe VII : une IP n'est routable qu'après un 200 observé.
+        pool._last_model = "m"
+        pool._ledger.note_result("1.1.1.1", "m", 200)
         data = pool.get_status()
         assert isinstance(data["degraded_routable"], int)
         assert data["degraded_routable"] == 1

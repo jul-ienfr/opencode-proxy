@@ -5128,7 +5128,10 @@ class FreeIPPool:
 
         await self.ensure_connected()
 
-        if self._vpn.proxy_mode in ("socks5", "auto_egress", "vpn"):
+        if self._vpn.proxy_mode in ("socks5", "auto_egress"):
+            # [P0 2026-11-14] In `vpn` mode the WARP endpoints are not the
+            # egress: scanning and rotating them on every request only spammed
+            # `[warp-rotate] on_request` and added network churn.
             try:
                 logger.info(
                     "[warp-rotate] on_request enabled=%s mode=%s",

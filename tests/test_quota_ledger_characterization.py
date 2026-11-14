@@ -28,12 +28,17 @@ def _ledger(tmp_path, **kwargs) -> QuotaLedger:
     return QuotaLedger(path=str(tmp_path / "ledger.json"), **kwargs)
 
 
-def test_unknown_ip_is_usable_without_headroom_limit(tmp_path):
+def test_unknown_ip_is_unproven_without_headroom_limit(tmp_path):
     ledger = _ledger(tmp_path)
-    assert ledger.usable("203.0.113.9", "m") == (True, None)
+    # Principe VII : une IP jamais testée n'est pas usable, mais son plafond
+    # de headroom reste inconnu (pas de bucket).
+    assert ledger.usable("203.0.113.9", "m") == (False, "unproven")
     assert ledger.is_exhausted("203.0.113.9", "m") is False
     assert ledger.headroom("203.0.113.9", "m") == 10**9
     assert ledger.reset_at("203.0.113.9", "m") is None
+    # Une preuve 200 rend l'IP utilisable.
+    ledger.note_result("203.0.113.9", "m", 200)
+    assert ledger.usable("203.0.113.9", "m") == (True, None)
 
 
 def test_note_request_consumes_headroom_and_reserve(tmp_path):
@@ -132,6 +137,9 @@ def test_model_prefix_mode_separates_buckets(tmp_path):
         False,
         "daily-bucket-exhausted",
     )
+    # Le bucket beta est distinct : il faut une preuve 200 pour l'ouvrir.
+    assert ledger.usable("203.0.113.9", "beta-1") == (False, "unproven")
+    ledger.note_result("203.0.113.9", "beta-1", 200)
     assert ledger.usable("203.0.113.9", "beta-1") == (True, None)
 
 
@@ -150,7 +158,8 @@ def test_clear_by_ip_and_model(tmp_path):
     ledger.mark_exhausted("203.0.113.9", "m", retry_after=600)
     ledger.mark_exhausted("198.51.100.7", "m", retry_after=600)
     assert ledger.clear(ip="203.0.113.9") == 1
-    assert ledger.usable("203.0.113.9", "m") == (True, None)
+    # Bucket supprimé : l'IP redevient « unproven », pas usable.
+    assert ledger.usable("203.0.113.9", "m") == (False, "unproven")
     assert ledger.usable("198.51.100.7", "m") == (False, "daily-bucket-exhausted")
     assert ledger.clear(model="m") == 1
     assert ledger.clear() == 0

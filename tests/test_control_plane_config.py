@@ -24,14 +24,18 @@ def test_defaults_are_legacy_and_resolve_station_urls():
     assert config.base_url_for("vpn-gluetun-6") == ("http://vpn-gluetun-vpn-gluetun-6:8000")
 
 
-def test_repo_config_activates_the_fork_control_plane():
+def test_repo_config_keeps_the_fork_control_plane_legacy_until_activation():
+    """T071/T078 : le dépôt reste en ``legacy`` ; l'activation 6→1 est une
+    action opérateur (``scripts/rollout_control_plane.py``). Le mode ``active``
+    est couvert par ``test_custom_file_overrides_every_leaf``.
+    """
     config = load_control_plane_config()
 
-    assert config.mode == "active"
-    assert config.is_active
-    assert config.transport_owner == "fork"
-    assert config.base_url_for(6) == "http://127.0.0.1:8006"
-    assert config.base_url_for(1) == "http://127.0.0.1:8001"
+    assert config.mode == "legacy"
+    assert not config.is_active
+    assert config.transport_owner == "python"
+    assert config.base_url_for(6) == "http://vpn-gluetun-6:8000"
+    assert config.base_url_for(1) == "http://vpn-gluetun-1:8000"
 
 
 def test_station_placeholder_requires_a_station():

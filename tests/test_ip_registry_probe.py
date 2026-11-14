@@ -148,27 +148,27 @@ async def test_probe_uses_the_full_official_tool_grid_in_order():
 
     body = json.loads(post.calls[0]["content"])
     names = [tool["function"]["name"] for tool in body["tools"]]
+    # [2026-11-14] Le probe utilise l'identité 1.19.5 (commit 3323b93) : corps
+    # 1.19.5 apparié, pas la capture 2.2.5 (mismatch wire → 429 déguisé).
     assert names == [
+        "bash",
         "edit",
-        "experimental_image_generate",
         "glob",
         "grep",
-        "question",
         "read",
-        "shell",
         "skill",
-        "subagent",
+        "task",
+        "todowrite",
         "webfetch",
         "websearch",
         "write",
-        "execute",
     ]
     assert body["stream"] is True
-    assert body["max_completion_tokens"] == 32000
-    assert "tool_choice" not in body
+    assert body["max_tokens"] == 32000
+    assert body["tool_choice"] == "auto"
     assert body["stream_options"] == {"include_usage": True}
     assert body["messages"][0]["role"] == "system"
-    assert "You are an AI agent running in OpenCode" in body["messages"][0]["content"]
+    assert "You are opencode, an interactive CLI tool" in body["messages"][0]["content"]
 
 
 async def test_probe_headers_match_the_1195_official_wire():

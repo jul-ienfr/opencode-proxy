@@ -29134,11 +29134,9 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
         # conversions chat/responses/effort/min_tokens, sans objet
         # pour SystemOne) — hedge free_parallel INCLUS (parité chat).
         _debug(
-            "[systemone-free] pool ok: model=%s free_max=%s station=%s socks_mode=%s",
-            free_model,
-            free_max,
-            getattr(station, "pid", station),
-            getattr(pool, "socks5_mode", None),
+            f"[systemone-free] pool ok: model={free_model} free_max={free_max} "
+            f"station={getattr(station, 'pid', station)} "
+            f"socks_mode={getattr(pool, 'socks5_mode', None)}"
         )
         _hedge_done = False
         _hedge_cands = []

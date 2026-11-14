@@ -373,13 +373,21 @@ def test_egress_park_is_repairable_but_auth_park_is_not():
 
 def test_auth_gate_is_account_wide():
     module = _module()
+    interval = module.GLOBAL_AUTH_INTERVAL_S
+    assert interval > 0.0
     assert module._auth_gate(100.0, 0.0, 0.0, auth_recent=False) == ""
     assert (
         module._auth_gate(100.0, 130.0, 0.0, auth_recent=False)
         == "global-pause"
     )
+    # Un essai STRICTEMENT dans l'intervalle est refusé...
     assert (
-        module._auth_gate(100.0, 0.0, 95.0, auth_recent=True) == "interval"
+        module._auth_gate(100.0, 0.0, 100.0 - interval / 2.0, auth_recent=True)
+        == "interval"
+    )
+    # ... et l'intervalle écoulé (borne incluse) autorise l'essai.
+    assert (
+        module._auth_gate(100.0, 0.0, 100.0 - interval, auth_recent=True) == ""
     )
     assert module._auth_gate(100.0, 0.0, 0.0, auth_recent=True) == ""
     assert module._auth_gate(100.0, 0.0, 100.0, auth_recent=True) == "interval"
@@ -706,9 +714,11 @@ def test_primary_quota_count_only_refreshes_at_true_fleet_exhaustion():
         {"station": 2, "ip": "2.2.2.2", "model": "deepseek", "last_status": 200}
     ]
     assert module._primary_quota_count(health, stations, [1, 2], "deepseek") == 1
-    # An untested IP is not declared exhausted.
+    # An untested IP is not declared exhausted, but it is not proven capacity
+    # either: the refresh must fire (count 0) instead of trusting a fresh egress
+    # that has never served a 200 (principe VII).
     health["model_ip_health"] = []
-    assert module._primary_quota_count(health, stations, [1, 2], "deepseek") == 1
+    assert module._primary_quota_count(health, stations, [1, 2], "deepseek") == 0
 
 
 def test_auth_throttling_switches_the_repair_to_wireguard():

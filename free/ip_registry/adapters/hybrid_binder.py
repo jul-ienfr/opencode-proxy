@@ -4,7 +4,9 @@ A hostname switch on the transport already configured in the container is
 applied in a few seconds by Gluetun's control server. A transport change still
 requires a Compose recreate, because a container restart re-reads its
 environment. The hybrid keeps the fast path for same-transport retries and
-never hides a real ``control-no-egress`` behind a two-minute recreate.
+falls back to one Compose recreate when the control plane reports a missing
+egress (fresh route install / cached state), so a real failure is proven
+instead of skipped.
 """
 
 from __future__ import annotations
