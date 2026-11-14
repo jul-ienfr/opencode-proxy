@@ -2061,7 +2061,9 @@ async def _run_claims(
                             f"  rotate committed {host} "
                             f"egress={outcome.egress_ip or '-'}"
                         )
-                    elif outcome is None or "control-unavailable" in str(
+                    elif outcome is None or str(
+                        getattr(outcome, "state", "")
+                    ) == "failed_degraded" or "control-unavailable" in str(
                         getattr(outcome, "error", "")
                     ):
                         host = str(batch[0]["host"])

@@ -74,9 +74,14 @@ class HybridBinder:
                 )
                 if result.ok:
                     return result
-                if not str(result.error or "").startswith("control-unavailable"):
+                error = str(result.error or "")
+                if not error.startswith(
+                    ("control-unavailable", "control-failed_degraded")
+                ):
                     # The host itself is unreachable; recreating the same
-                    # transport would only burn another two minutes.
+                    # transport would only burn another two minutes. A
+                    # failed_degraded station loop is different: a recreate is
+                    # the only way to reset it.
                     return result
         result = await self._compose.assign(
             station,

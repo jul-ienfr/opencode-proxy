@@ -154,6 +154,20 @@ async def test_stale_image_forces_a_compose_recreate():
     assert len(compose.calls) == 1
 
 
+async def test_failed_degraded_falls_back_to_compose():
+    control = FakeControl(
+        "wireguard", BindResult(False, "a", error="control-failed_degraded:")
+    )
+    compose = FakeCompose(BindResult(True, "a", egress_ip="2.2.2.2"))
+    binder = HybridBinder(control=control, compose=compose)
+
+    result = await binder.assign(2, "a.nordvpn.com", vpn_type="wireguard")
+
+    assert result.ok
+    assert result.egress_ip == "2.2.2.2"
+    assert len(compose.calls) == 1
+
+
 async def test_control_plane_owns_the_tri_stack_before_compose():
     control = FakeControlPlane(
         "openvpn-udp", BindResult(True, "a", egress_ip="1.1.1.1")
