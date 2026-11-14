@@ -269,6 +269,21 @@ def test_image_stale_detects_an_old_container(tmp_path):
     assert binder.image_stale(2) is True
 
 
+def test_image_stale_detects_a_legacy_container(tmp_path):
+    class Runner:
+        def __call__(self, command, timeout):
+            if "{{.Image}}" in command:
+                output = "sha256:legacy"
+            elif "{{.Config.Image}}" in command:
+                output = "qmcgaw/gluetun"
+            else:
+                output = ""
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+    binder = ComposeHostnameBinder(tmp_path, settle_s=0, runner=Runner())
+    assert binder.image_stale(2) is True
+
+
 def test_dns_ladder_stale_detects_a_changed_override(tmp_path):
     logs = tmp_path / "logs"
     logs.mkdir()

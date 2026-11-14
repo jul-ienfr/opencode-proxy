@@ -116,8 +116,12 @@ class ComposeHostnameBinder:
         )
         current = self._inspect_value(container, "{{.Image}}")
         tag = self._inspect_value(container, "{{.Config.Image}}")
-        if not current or not tag or not tag.startswith("gluetun-016:"):
+        if not current or not tag:
             return False
+        if not tag.startswith("gluetun-016:"):
+            # A legacy image cannot serve the control plane; migrate it on
+            # the next bind, one station at a time.
+            return True
         desired = self._inspect_value(tag, "{{.Id}}", image=True)
         return bool(desired and current != desired)
 
