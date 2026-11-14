@@ -2277,6 +2277,29 @@ def _supervise() -> None:
                     station = stations.get(sid, {})
                     if bool(station.get("model_usable")):
                         continue
+                    health = (
+                        station.get("health")
+                        if isinstance(station.get("health"), dict)
+                        else {}
+                    )
+                    vpn = (
+                        station.get("vpn")
+                        if isinstance(station.get("vpn"), dict)
+                        else {}
+                    )
+                    text = (
+                        f"{health.get('last_error') or ''} "
+                        f"{vpn.get('error') or ''}"
+                    ).lower()
+                    vpn_status = str(station.get("vpn_status") or "")
+                    if (
+                        vpn_status in ("starting", "connected")
+                        and "auth" not in text
+                    ):
+                        # A manually resumed WireGuard tunnel must be allowed
+                        # to settle and prove; only AUTH-retrying containers
+                        # are stopped during the account pause.
+                        continue
                     # Any non-serving container may keep retrying AUTH inside
                     # its OpenVPN process; stop it until the account cools.
                     container = _station_container(station)
