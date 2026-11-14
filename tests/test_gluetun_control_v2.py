@@ -25,6 +25,7 @@ from free.control_plane.errors import (
 from free.control_plane.models import (
     Constraints,
     ServerCandidate,
+    SwitchJob,
     TunnelTarget,
 )
 
@@ -522,6 +523,47 @@ async def test_binder_maps_a_crashed_station_to_a_compose_fallback_hint():
 
     assert not result.ok
     assert result.error == "control-unavailable:station-degraded"
+
+
+async def test_binder_maps_a_noop_job_to_success():
+    from free.ip_registry.adapters.gluetun_control_v2 import (
+        GluetunControlV2Binder,
+    )
+
+    class NoopClient:
+        def switch(self, *_args, **_kwargs):
+            return SwitchJob.from_json(job_json("noop"))
+
+    binder = GluetunControlV2Binder(
+        NoopClient(), station=3, cycle_id="cycle-9", to_thread=_inline_to_thread
+    )
+
+    result = await binder.assign(3, "us1.nordvpn.com")
+
+    assert result.ok
+    assert result.egress_ip is None
+
+
+async def test_binder_waits_for_an_active_rotate_job():
+    from free.ip_registry.adapters.gluetun_control_v2 import (
+        GluetunControlV2Binder,
+    )
+
+    class ActiveClient:
+        def rotate(self, *_args, **_kwargs):
+            raise ActiveJob("busy", active_job_id="job-01J9Z3K4T5")
+
+        def wait_for_active_job(self, _error):
+            return SwitchJob.from_json(job_json("committed"))
+
+    binder = GluetunControlV2Binder(
+        ActiveClient(), station=3, cycle_id="cycle-9", to_thread=_inline_to_thread
+    )
+
+    outcome = await binder.rotate_outcome([ServerCandidate("us1.nordvpn.com")])
+
+    assert outcome.ok
+    assert outcome.state == "committed"
 
 
 async def _inline_to_thread(function, *args, **kwargs):

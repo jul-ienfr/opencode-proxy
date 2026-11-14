@@ -217,6 +217,17 @@ class GluetunControlV2Binder:
             )
         try:
             job = await self.rotate(ordered, constraints, wait=wait)
+        except ActiveJob as exc:
+            try:
+                job = await self._to_thread(
+                    self._client.wait_for_active_job, exc
+                )
+            except ControlPlaneError as wait_exc:
+                return RotationOutcome(
+                    station=self._station,
+                    state="error",
+                    error=self._error_text(wait_exc),
+                )
         except Exhausted as exc:
             return RotationOutcome(
                 station=self._station,
@@ -287,6 +298,10 @@ class GluetunControlV2Binder:
             return ""
 
     def _bind_result(self, job: SwitchJob, hostname: str) -> BindResult:
+        if job.state == "noop":
+            # The target is already the active tunnel; this is success, not a
+            # rejection. The chain then probes the model normally.
+            return BindResult(True, hostname)
         if job.committed:
             ip = job.verification.ip if job.verification else ""
             return BindResult(True, hostname, egress_ip=ip or None)
