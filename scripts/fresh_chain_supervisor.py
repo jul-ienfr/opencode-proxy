@@ -1723,8 +1723,9 @@ def _station_exhausted(
     models = [str(model).strip() for model in probe_models if str(model).strip()]
     if not sid or not ip or not models:
         return False
+    if _ledger_ip_exhausted(free_health, ip, models):
+        return True
     leases: dict[str, dict] = {}
-    latest_429_at = 0.0
     for item in (free_health or {}).get("quota_leases") or []:
         if not isinstance(item, dict):
             continue
@@ -1735,20 +1736,6 @@ def _station_exhausted(
         if item_sid != sid or str(item.get("ip") or "").strip() != ip:
             continue
         leases[str(item.get("model") or "").strip()] = item
-        try:
-            age = float(item.get("last_429_age_s") or 0.0)
-        except (TypeError, ValueError):
-            age = 0.0
-        if age > 0.0:
-            latest_429_at = max(latest_429_at, time.time() - age)
-    if latest_429_at > 0.0 and time.time() - latest_429_at < 900.0:
-        # The IP just answered 429. Waiting for its next reset keeps the
-        # station pinned to a shared, dead bucket; a fresh hostname is the
-        # only free move. The chain's 429 ledger forbids the current IP, so
-        # this is a new IP, not a retest of the resetting one.
-        return False
-    if _ledger_ip_exhausted(free_health, ip, models):
-        return True
     if not leases:
         return False
     for model in models:
