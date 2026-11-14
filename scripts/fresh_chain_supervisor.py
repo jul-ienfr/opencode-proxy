@@ -2277,24 +2277,8 @@ def _supervise() -> None:
                     station = stations.get(sid, {})
                     if bool(station.get("model_usable")):
                         continue
-                    health = (
-                        station.get("health")
-                        if isinstance(station.get("health"), dict)
-                        else {}
-                    )
-                    vpn = (
-                        station.get("vpn")
-                        if isinstance(station.get("vpn"), dict)
-                        else {}
-                    )
-                    text = (
-                        f"{health.get('cause') or ''} "
-                        f"{health.get('last_error') or ''} "
-                        f"{vpn.get('error') or ''} "
-                        f"{vpn.get('last_rotation_error') or ''}"
-                    ).lower()
-                    if "auth" not in text and "credential" not in text:
-                        continue
+                    # Any non-serving container may keep retrying AUTH inside
+                    # its OpenVPN process; stop it until the account cools.
                     container = _station_container(station)
                     if _docker_action("stop", container):
                         auth_stopped.add(sid)
