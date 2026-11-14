@@ -1256,6 +1256,10 @@ def _refresh_warm_pool(
         with sqlite3.connect(
             ROOT / "logs" / "registry.db", timeout=5.0
         ) as conn:
+            if host_ip:
+                conn.execute(
+                    "DELETE FROM warm_pool WHERE ip = ?", (host_ip,)
+                )
             for ip, last_seen, host in conn.execute(
                 "SELECT q.ip, MAX(q.last_seen_at), "
                 "(SELECT m.hostname FROM ip_server_map m "
