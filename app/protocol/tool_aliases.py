@@ -18,7 +18,10 @@ intact) :
 * repli shell pour ``read`` / ``glob`` / ``grep`` / ``write`` / ``edit`` /
   ``webfetch`` / ``websearch`` quand le client n'a que ``exec_command``
   (Codex) ou ``Bash`` (Claude Code sans ``WebFetch``/``WebSearch``), avec la
-  syntaxe PowerShell ou POSIX.
+  syntaxe PowerShell ou POSIX ;
+* suppression des appels dont l'outil n'existe pas chez le client
+  (``todowrite`` sans outil todo), remplacés par un texte de repli quand le
+  tour deviendrait vide — le client ne voit jamais un nom qu'il ne connaît pas.
 """
 
 from __future__ import annotations
@@ -371,6 +374,91 @@ def tool_call_target(name: str, aliases: dict | None) -> str:
     if needs_shell_fallback(str(name or ""), aliases):
         return str((aliases or {}).get("shell") or target)
     return target
+
+
+def tool_call_supported(name: str, aliases: dict | None) -> bool:
+    """Le nom sortant est-il exécutable par le client ?
+
+    [2026-11-14] Mesure : un modèle appelait ``todowrite`` (nom officiel de la
+    grille free, absent de son prompt client) ; la famille « todo » n'existe
+    pas chez le client et n'a pas de repli shell, donc l'appel partait tel
+    quel et le client répondait ``No such tool available: todowrite``.
+
+    Seuls les noms du **vocabulaire connu** (familles ci-dessus) sont
+    vérifiables : un nom hors vocabulaire peut être un outil client renommé
+    (limite 64 de l'amont Chat) ou un outil MCP, et on ne peut pas prouver son
+    absence — on le laisse passer comme avant. Un nom de famille connu est
+    supporté quand l'adaptation tombe sur un outil déclaré (casse, alias de
+    famille ou repli shell compris). Sans carte d'outils, on ne peut rien
+    trancher et on laisse passer : ce filtre ne doit jamais casser un client
+    inconnu.
+    """
+    raw = str(name or "").strip()
+    if not raw or not aliases:
+        return True
+    if raw.lower() not in _FAMILY_OF:
+        return True
+    target = tool_call_target(raw, aliases)
+    if not target:
+        return False
+    return target in (aliases.get("exact") or set())
+
+
+_TODO_STATUS_MARKS = {
+    "completed": "x",
+    "complete": "x",
+    "done": "x",
+    "in_progress": "~",
+    "in-progress": "~",
+    "active": "~",
+    "cancelled": "-",
+    "canceled": "-",
+    "pending": " ",
+}
+
+
+def _todo_lines(arguments) -> list[str]:
+    """Rend ``todos`` en liste Markdown (content + status)."""
+    obj, ok = _parse_object(arguments)
+    if not ok or not isinstance(obj, dict):
+        return []
+    todos = obj.get("todos")
+    if not isinstance(todos, list):
+        return []
+    lines = []
+    for item in todos:
+        if isinstance(item, dict):
+            text = item.get("content") or item.get("text") or item.get("task") or ""
+            status = str(item.get("status") or "pending").strip().lower()
+        elif isinstance(item, str):
+            text, status = item, "pending"
+        else:
+            continue
+        text = str(text).strip()
+        if not text:
+            continue
+        mark = _TODO_STATUS_MARKS.get(status, " ")
+        lines.append(f"- [{mark}] {text}")
+    return lines
+
+
+def dropped_tool_call_text(name: str, arguments=None) -> str:
+    """Texte de repli quand un appel vise un outil absent du client.
+
+    Un appel supprimé sans texte laisserait un tour assistant vide (certains
+    clients le traitent comme une erreur ou relancent la requête). Pour
+    ``todowrite`` on restitue la liste de tâches — c'est exactement ce que
+    l'outil aurait affiché — sinon une note courte et explicite.
+    """
+    raw = str(name or "").strip() or "unknown"
+    if _FAMILY_OF.get(raw.lower()) == "todo":
+        lines = _todo_lines(arguments)
+        if lines:
+            return "**Plan**\n" + "\n".join(lines)
+    return (
+        f"(the assistant tried to call `{raw}`, which this client does not "
+        "provide; the call was skipped.)"
+    )
 
 
 def _parse_object(arguments) -> tuple[dict | None, bool]:
@@ -853,6 +941,30 @@ def adapt_tool_call(
     return target, json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
+def _content_has_text(content) -> bool:
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            isinstance(part, dict) and str(part.get("text") or "").strip()
+            for part in content
+        )
+    return False
+
+
+def _responses_output_has_text(items) -> bool:
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message":
+            for block in item.get("content") or []:
+                if isinstance(block, dict) and str(block.get("text") or "").strip():
+                    return True
+        elif item.get("type") == "function_call":
+            return True
+    return False
+
+
 def adapt_chat_completion(
     resp,
     aliases: dict | None,
@@ -863,12 +975,19 @@ def adapt_chat_completion(
 
     Retourne ``True`` si au moins un nom/argument a changé, pour que l'appelant
     sache qu'il doit re-sérialiser le corps au lieu de relayer les octets amont.
+
+    [2026-11-14] Les appels dont l'outil n'existe pas chez le client sont
+    **retirés** (``No such tool available: todowrite``). Si le tour ne portait
+    rien d'autre, un texte de repli le remplace et ``finish_reason`` passe de
+    ``tool_calls`` à ``stop`` : le client ne voit ni appel inconnu ni tour vide.
     """
     if not isinstance(resp, dict) or not aliases:
         return False
     changed = False
+    dropped: list[tuple[str, object]] = []
 
-    def _adapt(tc: dict) -> None:
+    def _adapt(tc: dict) -> bool:
+        """True = conserver l'appel ; False = le retirer."""
         nonlocal changed
         fn = tc.get("function") if isinstance(tc.get("function"), dict) else None
         if fn is not None:
@@ -877,7 +996,11 @@ def adapt_chat_completion(
             holder, name_key, args_key = tc, "name", "arguments"
         name = holder.get(name_key)
         if not isinstance(name, str) or not name:
-            return
+            return True
+        if not tool_call_supported(name, aliases):
+            dropped.append((name, holder.get(args_key) or ""))
+            changed = True
+            return False
         new_name, new_args = adapt_tool_call(
             name, holder.get(args_key) or "", aliases, shell_kind=shell_kind
         )
@@ -887,18 +1010,55 @@ def adapt_chat_completion(
         if new_args != (holder.get(args_key) or ""):
             holder[args_key] = new_args
             changed = True
+        return True
 
     for choice in resp.get("choices") or []:
         if not isinstance(choice, dict):
             continue
         msg = choice.get("message")
-        if isinstance(msg, dict):
-            for tc in msg.get("tool_calls") or []:
-                if isinstance(tc, dict):
-                    _adapt(tc)
-    for item in resp.get("output") or []:
-        if isinstance(item, dict) and item.get("type") == "function_call":
-            _adapt(item)
+        if not isinstance(msg, dict):
+            continue
+        calls = msg.get("tool_calls")
+        if not isinstance(calls, list) or not calls:
+            continue
+        kept = [tc for tc in calls if not isinstance(tc, dict) or _adapt(tc)]
+        if len(kept) == len(calls):
+            continue
+        if kept:
+            msg["tool_calls"] = kept
+        else:
+            msg.pop("tool_calls", None)
+            if choice.get("finish_reason") in ("tool_calls", "function_call"):
+                choice["finish_reason"] = "stop"
+            if not _content_has_text(msg.get("content")):
+                msg["content"] = dropped_tool_call_text(*dropped[0])
+    out = resp.get("output")
+    if isinstance(out, list):
+        kept_items = []
+        for item in out:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "function_call"
+                and not _adapt(item)
+            ):
+                continue
+            kept_items.append(item)
+        if len(kept_items) != len(out):
+            resp["output"] = kept_items
+            if not _responses_output_has_text(kept_items):
+                resp["output"].append(
+                    {
+                        "id": "msg_dropped_tool",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": dropped_tool_call_text(*dropped[0]),
+                            }
+                        ],
+                    }
+                )
     return changed
 
 

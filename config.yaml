@@ -462,11 +462,11 @@ ip_rotation:
     enabled: true
     label: WARP 6 IPv6
     ipv6: true
-    egress_ip: 2a09:bac1:27a0:2060::2d7:f9
+    egress_ip: 2a09:bac1:2780:2060::214:8a
     managed: true
     container: warp-6
     image: caomingjun/warp:latest
-    block: 2a09:bac1:27a0:2060::/64
+    block: 2a09:bac1:2780:2060::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -504,11 +504,11 @@ ip_rotation:
     enabled: true
     label: WARP 7 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d2:26aa::3da:2a
+    egress_ip: 2a09:bac5:32d3:28aa::40d:1d
     managed: true
     container: warp-7
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d2:26aa::/64
+    block: 2a09:bac5:32d3:28aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -1041,6 +1041,7 @@ retry_until_success:
   buffer_max_bytes: 10485760
 free:
   station_identity: true
+  workspace_path_masking: false
   cooldown_cap_s: 1200
   preflight_inline_wait_s: 30
   max_wire_bytes: 900000

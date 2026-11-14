@@ -17,6 +17,7 @@ from app.protocol.chat_sse_to_anthropic import (
     anthropic_stop_reason,
     chat_sse_to_anthropic_events,
 )
+from app.protocol.tool_aliases import build_tool_alias_map
 
 # Nom d'outil > 64 caractères : cible du rename A8 côté amont Chat.
 LONG_TOOL_NAME = "mcp__plugin_example__some_very_long_tool_name_" + "x" * 20
@@ -954,3 +955,94 @@ class TestF1FormeDuWire:
         assert "message_stop" in _names(first)
         assert _events([_data_line({"error": {"message": "boom2", "type": "api_error"}})], st) == []
         assert st.finished is True
+
+
+def _opencode_tools():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
+
+
+def _todowrite_chunk():
+    return {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_todo",
+                            "function": {
+                                "name": "todowrite",
+                                "arguments": json.dumps(
+                                    {
+                                        "todos": [
+                                            {
+                                                "content": "Fix the build",
+                                                "status": "pending",
+                                            }
+                                        ]
+                                    }
+                                ),
+                            },
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+
+def test_outil_absent_du_client_est_retire_et_le_tour_reste_texte():
+    """``todowrite`` sans outil todo : pas de tool_use, stop end_turn, note."""
+    st = ChatSseToAnthropicState(
+        model="m",
+        message_id="msg_drop_todo",
+        tool_aliases=build_tool_alias_map(_opencode_tools()),
+    )
+    events: list[str] = []
+    events.extend(st.feed_chunk(_todowrite_chunk()))
+    events.extend(st.feed_chunk({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}))
+    events.extend(chat_sse_to_anthropic_events("data: [DONE]", state=st))
+    joined = "".join(events)
+    assert '"type":"tool_use"' not in joined
+    assert '"name":"todowrite"' not in joined
+    stops = _data(events, "message_delta")
+    assert len(stops) == 1
+    assert stops[0]["delta"]["stop_reason"] == "end_turn"
+    assert "- [ ] Fix the build" in joined
+
+
+def test_outil_todo_declare_reste_un_tool_use():
+    tools = _opencode_tools() + [
+        {
+            "type": "function",
+            "function": {
+                "name": "TodoWrite",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"todos": {"type": "array"}},
+                    "required": ["todos"],
+                },
+            },
+        }
+    ]
+    st = ChatSseToAnthropicState(
+        model="m",
+        message_id="msg_keep_todo",
+        tool_aliases=build_tool_alias_map(tools),
+    )
+    events = st.feed_chunk(_todowrite_chunk())
+    joined = "".join(events)
+    assert '"type":"tool_use"' in joined
+    assert '"name":"TodoWrite"' in joined

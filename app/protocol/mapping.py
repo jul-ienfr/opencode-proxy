@@ -35,7 +35,7 @@ from config.limits import clamp_output_token_limit as _clamp_output_token_limit
 from dashboard.display import debug as _debug
 from dashboard.display import log as _log
 
-from .tool_aliases import adapt_tool_call
+from .tool_aliases import adapt_tool_call, dropped_tool_call_text, tool_call_supported
 
 _cfg_settings: Any
 try:
@@ -2273,6 +2273,7 @@ def openai_to_anthropic(
     usage = resp.get("usage", {})
 
     blocks = []
+    dropped: list[tuple[str, object]] = []
     if reasoning := msg.get("reasoning_content") or msg.get("reasoning"):
         if _looks_encrypted_reasoning(reasoning):
             # [PLAN-raisonnement Phase B.2] raisonnement chiffré/binaire de
@@ -2294,6 +2295,12 @@ def openai_to_anthropic(
         _name = restore_tool_name(fn.get("name", ""), name_map)
         _args = fn.get("arguments", "{}")
         if tool_aliases:
+            # [2026-11-14] Un nom que le client ne déclare pas (``todowrite``
+            # sans outil todo) produisait « No such tool available ». On retire
+            # l'appel ; le tour reçoit un texte de repli s'il devient vide.
+            if not tool_call_supported(_name, tool_aliases):
+                dropped.append((_name, _args))
+                continue
             # [2026-11-12] Nom officiel amont (``bash``) → nom déclaré par le
             # client (``Bash``/…), clés d'arguments adaptées au schéma cible.
             # Le repli shell couvre les familles absentes du runtime client
@@ -2319,9 +2326,12 @@ def openai_to_anthropic(
         )
 
     if not blocks:
-        blocks.append({"type": "text", "text": ""})
+        if dropped:
+            blocks.append({"type": "text", "text": dropped_tool_call_text(*dropped[0])})
+        else:
+            blocks.append({"type": "text", "text": ""})
 
-    stop = "tool_use" if msg.get("tool_calls") else "end_turn"
+    stop = "tool_use" if any(b.get("type") == "tool_use" for b in blocks) else "end_turn"
     if choice.get("finish_reason") == "length":
         stop = "max_tokens"
 

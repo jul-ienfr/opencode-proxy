@@ -38,8 +38,10 @@ from app.protocol.mapping import (
 )
 from app.protocol.tool_aliases import (
     adapt_tool_call,
+    dropped_tool_call_text,
     needs_argument_rewrite,
     needs_shell_fallback,
+    tool_call_supported,
     tool_call_target,
 )
 
@@ -345,6 +347,8 @@ class ChatSseToAnthropicState:
         "tool_aliases",
         "shell_kind",
         "deferred_tool_args",
+        "skipped_tool_idx",
+        "dropped_tool_names",
         "started",
         "finished",
         "next_block_idx",
@@ -387,6 +391,11 @@ class ChatSseToAnthropicState:
         # ``WebFetch``) : arguments retenus puis convertis en commande shell à
         # la clôture, car la réécriture exige le JSON complet.
         self.deferred_tool_args: dict[int, str] = {}
+        # [2026-11-14] Appels retirés parce que le client ne déclare pas
+        # l'outil (``todowrite`` sans outil todo) : leurs fragments d'arguments
+        # sont ignorés et un texte de repli évite un tour vide.
+        self.skipped_tool_idx: set[int] = set()
+        self.dropped_tool_names: list[tuple[str, str]] = []
         self.started: bool = False
         self.finished: bool = False
         # Indices de blocs alloués séquentiellement à partir de 0.
@@ -435,6 +444,8 @@ class ChatSseToAnthropicState:
         self.pending_tool_args.clear()
         self.pending_tool_ids.clear()
         self.deferred_tool_args.clear()
+        self.skipped_tool_idx.clear()
+        self.dropped_tool_names.clear()
         self.open_blocks.clear()
         self.input_tokens = 0
         self.usage_seen = False
@@ -535,6 +546,24 @@ class ChatSseToAnthropicState:
         # avant le ``content_block_stop`` du bloc concerné.
         events.extend(self._flush_deferred_events())
 
+        # [2026-11-14] Tous les appels ont été retirés (outil absent du client)
+        # et rien d'autre n'a été produit : un message vide serait traité comme
+        # une panne. On restitue les todos en texte, ou une note explicite.
+        if not self.open_blocks and self.dropped_tool_names:
+            _note = dropped_tool_call_text(*self.dropped_tool_names[0])
+            _block_idx, _opened = self._open_block({"type": "text", "text": ""})
+            events.extend(_opened)
+            events.append(
+                _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": _block_idx,
+                        "delta": {"type": "text_delta", "text": _note},
+                    },
+                )
+            )
+
         # opencode.py:8618-8632 — clôture des blocs ouverts, dans l'ordre.
         # Parité chemin natif : le bloc thinking reçoit sa `signature_delta`
         # (forgée locale — reconnue et strippée avant upstream strict par
@@ -557,6 +586,15 @@ class ChatSseToAnthropicState:
         # Troncation sans terminal amont → `error`, jamais `end_turn` déguisé.
         if self.finish_reason is None:
             stop_reason = "error"
+        elif (
+            self.finish_reason in ("tool_calls", "function_call")
+            and not self.tool_block_idx
+            and self.dropped_tool_names
+        ):
+            # [2026-11-14] L'amont annonce un tour d'outil mais tous les
+            # appels ont été retirés (outil absent du client) : `tool_use`
+            # ferait attendre un tool_result qui n'arrivera jamais.
+            stop_reason = "end_turn"
         else:
             stop_reason = anthropic_stop_reason(self.finish_reason, has_tool_use=bool(self.tool_block_idx))
         events.append(
@@ -763,6 +801,10 @@ class ChatSseToAnthropicState:
             api_idx = tc.get("index", 0)
             if not isinstance(api_idx, int):
                 api_idx = 0
+            # [2026-11-14] Appel déjà retiré (outil absent du client) : ses
+            # fragments d'arguments ne doivent ouvrir aucun bloc.
+            if api_idx in self.skipped_tool_idx:
+                continue
             function = tc.get("function")
             if not isinstance(function, dict):
                 function = {}
@@ -771,6 +813,22 @@ class ChatSseToAnthropicState:
                 # opencode.py:10660-10666 — [Lot L4 — A8] le nom raccourci pour
                 # l'amont Chat (≤64) redevient celui que le client a envoyé.
                 _restored = restore_tool_name(function.get("name", ""), self.tool_name_map)
+                if _restored and not tool_call_supported(_restored, self.tool_aliases):
+                    # Le client ne déclare pas cet outil (``todowrite`` sans
+                    # todo) : le bloc provoquerait « No such tool available ».
+                    self.skipped_tool_idx.add(api_idx)
+                    self.pending_tool_args.pop(api_idx, None)
+                    self.pending_tool_ids.pop(api_idx, None)
+                    _dropped_args = function.get("arguments", "")
+                    if isinstance(_dropped_args, dict):
+                        try:
+                            _dropped_args = json.dumps(_dropped_args, ensure_ascii=False)
+                        except Exception:
+                            _dropped_args = ""
+                    self.dropped_tool_names.append(
+                        (_restored, _dropped_args if isinstance(_dropped_args, str) else "")
+                    )
+                    continue
                 # [2026-11-12] Famille absente du runtime client (``webfetch``
                 # sans ``WebFetch``) : le bloc part sous l'outil shell et les
                 # arguments seront convertis en commande à la clôture.

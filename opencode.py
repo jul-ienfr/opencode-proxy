@@ -8782,6 +8782,10 @@ class _ChatToolCallHealer:
         self.used_names: list[str] = []
         self.emitted_indices: set[int] = set()
         self.dropped_calls = 0
+        # [2026-11-14] Appels retirés parce que le client ne déclare pas
+        # l'outil (``todowrite`` sans outil todo) : distincts des appels
+        # inidentifiables, ils ne doivent pas déclencher le retry « flux vide ».
+        self.dropped_tool_names: list[tuple[str, str]] = []
         self.saw_content = False
 
     @staticmethod
@@ -8840,6 +8844,22 @@ class _ChatToolCallHealer:
         ]
         return base
 
+    def _dropped_note_chunks(self) -> list[dict]:
+        """Texte de repli quand le tour ne contenait qu'un appel retiré."""
+        if self.emitted_indices or self.saw_content or not self.dropped_tool_names:
+            return []
+        self.saw_content = True
+        note = dropped_tool_call_text(*self.dropped_tool_names[0])
+        base = {
+            k: v
+            for k, v in (self._template or {}).items()
+            if k not in ("choices", "usage") and not str(k).startswith("_")
+        }
+        base["choices"] = [
+            {"index": 0, "delta": {"content": note}, "finish_reason": None}
+        ]
+        return [base]
+
     def _flush_pending(self, template, final: bool = False) -> list[dict]:
         out: list[dict] = []
         for st in self._states.values():
@@ -8877,6 +8897,13 @@ class _ChatToolCallHealer:
                 allow_shell_fallback=bool(st.get("defer")),
             )
             st["args"] = str(st["args"] or "")
+            if not tool_call_supported(st.get("raw_name") or st["name"], self._aliases):
+                # Le nom adapté ne correspond à aucun outil déclaré : le
+                # client répondrait « No such tool available ».
+                st["pending"] = False
+                st["dropped"] = True
+                self.dropped_tool_names.append((st["name"], st["args"]))
+                continue
             out.append(self._call_chunk(template, st))
             st["pending"] = False
             self._mark_emitted(st)
@@ -8912,6 +8939,10 @@ class _ChatToolCallHealer:
                 if not isinstance(tc, dict):
                     continue
                 st = self._state(tc)
+                # [2026-11-14] Appel déjà retiré (outil absent du client) :
+                # ignorer ses fragments, n'ouvrir aucun bloc.
+                if st.get("dropped"):
+                    continue
                 fn = tc.get("function")
                 if not isinstance(fn, dict):
                     fn = tc if (tc.get("name") or tc.get("arguments")) else {}
@@ -8949,6 +8980,15 @@ class _ChatToolCallHealer:
                     )
                     _raw_name = st["raw_name"] or st["name"]
                     st["name"] = adapt_tool_name(_raw_name, self._aliases)
+                    if not tool_call_supported(_raw_name, self._aliases):
+                        # Aucun outil déclaré ne correspond (``todowrite`` chez
+                        # un client sans todo) : le client répondrait « No such
+                        # tool available ». On retire l'appel et on retiendra un
+                        # texte de repli si le tour devient vide.
+                        st["dropped"] = True
+                        st["pending"] = False
+                        self.dropped_tool_names.append((st["name"], st["args"]))
+                        continue
                     if (
                         needs_shell_fallback(_raw_name, self._aliases)
                         or needs_argument_rewrite(_raw_name, self._aliases)
@@ -9005,6 +9045,7 @@ class _ChatToolCallHealer:
 
         if finish_present:
             out.extend(self._flush_pending(chunk, final=True))
+            out.extend(self._dropped_note_chunks())
             for ch in choices:
                 if not isinstance(ch, dict):
                     continue
@@ -9029,7 +9070,9 @@ class _ChatToolCallHealer:
             self._template = template
         if not self._states:
             return []
-        return self._flush_pending(self._template or {}, final=True)
+        out = self._flush_pending(self._template or {}, final=True)
+        out.extend(self._dropped_note_chunks())
+        return out
 
 
 def _collect_chat_completion(lines, model, tools=None) -> dict | None:
@@ -9125,6 +9168,7 @@ def _collect_chat_completion(lines, model, tools=None) -> dict | None:
             message["reasoning_details"] = [{"type": "reasoning.text", "text": message["reasoning_content"]}]
     if tool_calls:
         ordered = []
+        dropped_tools: list[tuple[str, str]] = []
         for tc in (tool_calls[i] for i in sorted(tool_calls)):
             tc.pop("index", None)
             _raw_tc_fn = tc.get("function")
@@ -9150,6 +9194,11 @@ def _collect_chat_completion(lines, model, tools=None) -> dict | None:
             fn["arguments"] = _heal_tool_call_paths(
                 fn["name"], fn["arguments"], _free_path_map.get() or {}
             )
+            if not tool_call_supported(fn["name"], _aliases):
+                # [2026-11-14] Outil absent du client (``todowrite`` sans todo) :
+                # le client répondrait « No such tool available ».
+                dropped_tools.append((fn["name"], fn["arguments"]))
+                continue
             # [2026-11-12] Nom officiel amont (``bash``) → nom déclaré par le
             # client (``Bash``/``shell``/…), clés d'arguments adaptées.
             _adapted_name, _adapted_args = adapt_tool_call(
@@ -9171,10 +9220,13 @@ def _collect_chat_completion(lines, model, tools=None) -> dict | None:
                 message["content"] = None
             if not finish:
                 finish = "tool_calls"
-        elif finish == "tool_calls":
-            # Tous les appels ont été écartés : un « tool_calls » sans appel
-            # laisserait le client attendre un résultat qui n'arrivera jamais.
-            finish = "stop"
+        else:
+            if finish == "tool_calls":
+                # Tous les appels ont été écartés : un « tool_calls » sans appel
+                # laisserait le client attendre un résultat qui n'arrivera jamais.
+                finish = "stop"
+            if dropped_tools and not message["content"]:
+                message["content"] = dropped_tool_call_text(*dropped_tools[0])
     return {
         "id": f"chatcmpl-free-{int(time.time() * 1000):x}",
         "object": "chat.completion",
@@ -19466,8 +19518,10 @@ from app.protocol.tool_aliases import (  # noqa: E402,I001  # re-export after fu
     adapt_tool_name,
     build_tool_alias_map,
     detect_shell_kind,
+    dropped_tool_call_text,
     needs_argument_rewrite,
     needs_shell_fallback,
+    tool_call_supported,
     tool_call_target,
 )
 
@@ -19746,6 +19800,7 @@ async def _finalize_and_close_stream(
     tool_aliases=None,
     shell_kind="powershell",
     path_map=None,
+    dropped_tools=None,
 ):
     """Yield closing SSE events for a stream and persist the request.
 
@@ -19790,6 +19845,28 @@ async def _finalize_and_close_stream(
         _debug(
             f"  [stream-oai] WARNING: thinking requested (type={thinking_type}, effort={effort}) but upstream returned no reasoning_content"
         )
+    # [2026-11-14] Le tour ne contenait que des appels retirés (outil absent du
+    # client) : un message sans bloc serait traité comme une panne. On rend la
+    # liste de tâches en texte, ou une note explicite.
+    if not open_blocks and dropped_tools:
+        _note = dropped_tool_call_text(*dropped_tools[0])
+        yield _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+        yield _sse(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": _note},
+            },
+        )
+        open_blocks = [0]
     for idx in open_blocks:
         # [2026-11-12] Appel dont la famille n'existe pas chez le client
         # (``webfetch`` chez Claude Code) : les arguments ont été retenus, on
@@ -22563,6 +22640,9 @@ async def messages(request: Request):
             # clôture pour être convertis en commande shell.
             _deferred_names: dict[int, str] = {}
             _deferred_args: dict[int, str] = {}
+            # [2026-11-14] Appels retirés (outil absent du client) : si le tour
+            # ne porte rien d'autre, un texte de repli évite un message vide.
+            _dropped_tools: list[tuple[str, str]] = []
             got_response_completed = False  # Responses API: set on response.completed
             _responses_stream_done = False  # True after response.completed/incomplete → break inner loop
             try:
@@ -22917,6 +22997,7 @@ async def messages(request: Request):
                                 request_body,
                                 reasoning_signature=_ts,
                                 deferred_args=_deferred_out,
+                                dropped_tools=_dropped_tools,
                                 tool_aliases=_stream_aliases,
                                 shell_kind=_client_shell_kind,
                                 path_map=_stream_path_map,
@@ -23125,6 +23206,27 @@ async def messages(request: Request):
                                     _debug(
                                         f"  [stream-oai] SKIP tool_call sans nom idx={api_idx} "
                                         f"id={tc_id!r} args={str(tc.get('function', {}).get('arguments', ''))[:120]!r}"
+                                    )
+                                    continue
+                                if not tool_call_supported(_raw_name, _stream_aliases):
+                                    # [2026-11-14] Aucun outil client ne
+                                    # correspond (``todowrite`` sans todo) : le
+                                    # client répondrait « No such tool
+                                    # available ». On retire l'appel et on
+                                    # retient son nom pour le texte de repli.
+                                    skipped_tool_idx.add(api_idx)
+                                    _dropped_tools.append(
+                                        (
+                                            tc_name or _raw_name,
+                                            str(
+                                                tc.get("function", {}).get("arguments", "")
+                                                or ""
+                                            ),
+                                        )
+                                    )
+                                    _debug(
+                                        f"  [stream-oai] SKIP tool_call absent du client idx={api_idx} "
+                                        f"name={_raw_name!r} id={tc_id}"
                                     )
                                     continue
                                 used_tools.append(tc_name)
@@ -23518,6 +23620,7 @@ async def messages(request: Request):
                 request_body,
                 reasoning_signature=_ts,
                 deferred_args=_deferred_post,
+                dropped_tools=_dropped_tools,
                 tool_aliases=_stream_aliases,
                 shell_kind=_client_shell_kind,
                 path_map=_stream_path_map,
@@ -27227,7 +27330,7 @@ async def chat_completions(request: Request):
                                     _oai_has_yielded = True
                                     yield f"data: {_json_dumps_str(_enrich_chunk(_c), ensure_ascii=False)}\n\n".encode()
                                 _sync_healer()
-                                if _flushed and not emitted_finish:
+                                if _flushed and _tool_healer.emitted_indices and not emitted_finish:
                                     _synth = {
                                         "id": _fast_id("chatcmpl"),
                                         "object": "chat.completion.chunk",
@@ -31589,6 +31692,9 @@ async def responses(request: Request):
         _reason_idx = None
         _reason_open = False
         _tools: dict[int, dict] = {}
+        # [2026-11-14] Appels retirés (outil absent du client) : si le tour
+        # devient vide, un message texte de repli est émis.
+        _dropped_tool_names: list[tuple[str, str]] = []
         _finish = ""
         _usage: dict = {}
         _state = ResponsesSseState()
@@ -31742,6 +31848,11 @@ async def responses(request: Request):
                         continue
                     _call_id = _acc.get("id") or _fast_id("call")
                     _args = str(_fn.get("arguments") or "{}")
+                    if not tool_call_supported(_name, _client_aliases):
+                        # [2026-11-14] Le client ne déclare pas cet outil :
+                        # « No such tool available » côté client.
+                        _dropped_tool_names.append((_name, _args))
+                        continue
                     _name, _args = adapt_tool_call(
                         _name, _args, _client_aliases, shell_kind=_shell_kind
                     )
@@ -31761,6 +31872,37 @@ async def responses(request: Request):
                     _full_item = {**_item, "arguments": _args}
                     yield _ev(_em.output_item_done(_full_item, _oix))
                     _out.append(_full_item)
+                if _dropped_tool_names and not _out and not _failed_msg:
+                    _note = dropped_tool_call_text(*_dropped_tool_names[0])
+                    _drop_id = _fast_id("msg")
+                    _drop_idx = len(_out)
+                    yield _ev(
+                        _em.output_item_added(
+                            {
+                                "id": _drop_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "output_text", "text": "", "annotations": []}
+                                ],
+                            },
+                            _drop_idx,
+                        )
+                    )
+                    yield _ev(_em.content_part_added(_drop_id, _drop_idx, 0))
+                    yield _ev(_em.text_delta(_note, _drop_id, _drop_idx, 0))
+                    yield _ev(_em.text_done(_note, _drop_id, _drop_idx, 0))
+                    yield _ev(_em.content_part_done(_drop_id, _note, _drop_idx, 0))
+                    _drop_item = {
+                        "id": _drop_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": _note, "annotations": []}
+                        ],
+                    }
+                    yield _ev(_em.output_item_done(_drop_item, _drop_idx))
+                    _out.append(_drop_item)
                 if not _out and not _failed_msg:
                     _payload: dict | None = None
                     if isinstance(_completed_response, dict) and _responses_output_has_visible_content(

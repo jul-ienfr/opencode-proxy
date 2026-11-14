@@ -18,9 +18,12 @@ from app.protocol.tool_aliases import (
     adapt_tool_call,
     adapt_tool_name,
     build_tool_alias_map,
+    dropped_tool_call_text,
     needs_argument_rewrite,
+    tool_call_supported,
     tool_call_target,
 )
+
 
 def _claude_tools():
     return [
@@ -1107,3 +1110,125 @@ def test_openai_to_anthropic_webfetch_falls_back_to_bash():
     assert block["type"] == "tool_use"
     assert block["name"] == "Bash"
     assert "curl" in block["input"]["command"]
+
+
+# ───────── [2026-11-14] outil absent du client : jamais émis ─────────
+
+
+def _todo_tools():
+    return _opencode_tools() + [
+        {
+            "type": "function",
+            "function": {
+                "name": "TodoWrite",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"todos": {"type": "array"}},
+                    "required": ["todos"],
+                },
+            },
+        }
+    ]
+
+
+_TODOS_ARGS = '{"todos":[{"content":"Fix the build","status":"pending"}]}'
+
+
+def test_todowrite_without_todo_tool_is_not_supported():
+    aliases = build_tool_alias_map(_opencode_tools())
+    assert tool_call_supported("bash", aliases) is True
+    assert tool_call_supported("webfetch", aliases) is True  # repli shell
+    assert tool_call_supported("todowrite", aliases) is False
+
+
+def test_name_outside_vocabulary_is_never_dropped():
+    """Outil MCP / nom raccourci >64 : absence non prouvable, on relaie."""
+    aliases = build_tool_alias_map(_opencode_tools())
+    assert tool_call_supported("mcp__plugin__custom_tool", aliases) is True
+    assert tool_call_supported("get_weather_abcdef", aliases) is True
+
+
+def test_todowrite_maps_to_client_todo_tool():
+    aliases = build_tool_alias_map(_todo_tools())
+    assert tool_call_supported("todowrite", aliases) is True
+    name, _args = adapt_tool_call("todowrite", _TODOS_ARGS, aliases)
+    assert name == "TodoWrite"
+
+
+def test_dropped_tool_call_text_renders_todos():
+    text = dropped_tool_call_text("todowrite", _TODOS_ARGS)
+    assert "- [ ] Fix the build" in text
+
+
+def test_adapt_chat_completion_drops_unsupported_tool_and_keeps_turn_alive():
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {"name": "todowrite", "arguments": _TODOS_ARGS},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    changed = adapt_chat_completion(
+        payload, build_tool_alias_map(_opencode_tools())
+    )
+    assert changed is True
+    msg = payload["choices"][0]["message"]
+    assert "tool_calls" not in msg
+    assert "- [ ] Fix the build" in msg["content"]
+    assert payload["choices"][0]["finish_reason"] == "stop"
+
+
+def test_adapt_chat_completion_keeps_supported_calls_untouched():
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {"name": "todowrite", "arguments": _TODOS_ARGS},
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    assert adapt_chat_completion(payload, build_tool_alias_map(_todo_tools())) is True
+    fn = payload["choices"][0]["message"]["tool_calls"][0]["function"]
+    assert fn["name"] == "TodoWrite"
+    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_openai_to_anthropic_drops_unsupported_tool_call():
+    resp = {
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {"name": "todowrite", "arguments": _TODOS_ARGS},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    out = openai_to_anthropic(
+        resp, "m", tool_aliases=build_tool_alias_map(_opencode_tools())
+    )
+    assert out["stop_reason"] == "end_turn"
+    assert all(block["type"] != "tool_use" for block in out["content"])
+    assert "- [ ] Fix the build" in out["content"][0]["text"]

@@ -283,3 +283,83 @@ def test_collecteur_non_stream_ecarte_un_nom_vide_non_identifiable():
     msg = out["choices"][0]["message"]
     assert "tool_calls" not in msg
     assert out["choices"][0]["finish_reason"] == "stop"
+
+
+# ───────── [2026-11-14] outil absent du client : retiré, jamais émis ─────────
+
+_TODOS_ARGS = '{"todos":[{"content":"Fix the build","status":"pending"}]}'
+
+
+def test_healer_ecarte_un_outil_absent_du_client():
+    healer = oc._ChatToolCallHealer(TOOLS)
+    first = healer.feed(
+        _chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_todo",
+                        "function": {"name": "todowrite", "arguments": _TODOS_ARGS},
+                    }
+                ]
+            }
+        )
+    )
+    assert first == []
+    assert healer.dropped_tool_names
+    # Le finish amont reste sans tool_calls : le tour se termine par du texte.
+    fin = healer.feed(_chunk({}, finish="tool_calls"))
+    assert all(not _tool_calls(c) for c in fin)
+    assert fin[-1]["choices"][0]["finish_reason"] == "stop"
+    assert any(
+        "- [ ] Fix the build" in (c["choices"][0]["delta"].get("content") or "")
+        for c in fin
+    )
+
+
+def test_healer_garde_un_outil_todo_declare():
+    tools = TOOLS + [
+        {
+            "type": "function",
+            "function": {
+                "name": "TodoWrite",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"todos": {"type": "array"}},
+                    "required": ["todos"],
+                },
+            },
+        }
+    ]
+    healer = oc._ChatToolCallHealer(tools)
+    out = healer.feed(
+        _chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_todo",
+                        "function": {"name": "todowrite", "arguments": _TODOS_ARGS},
+                    }
+                ]
+            }
+        )
+    )
+    call = _tool_calls(out[0])[0]
+    assert call["function"]["name"] == "TodoWrite"
+    assert healer.dropped_tool_names == []
+
+
+def test_collecteur_non_stream_ecarte_un_outil_absent_du_client():
+    lines = [
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_todo",'
+        '"function":{"name":"todowrite","arguments":"{\\"todos\\":[{\\"content\\":'
+        '\\"Fix the build\\",\\"status\\":\\"pending\\"}]}"}}]}}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+        "data: [DONE]",
+    ]
+    out = oc._collect_chat_completion(lines, "m", tools=TOOLS)
+    msg = out["choices"][0]["message"]
+    assert "tool_calls" not in msg
+    assert "- [ ] Fix the build" in (msg.get("content") or "")
+    assert out["choices"][0]["finish_reason"] == "stop"
