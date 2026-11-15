@@ -82,6 +82,18 @@ Le 429 client vient d'un partage de bucket entre les probes et le trafic client.
 3. Réserve vide + WARP disponible → 200 via WARP.
 4. Réserve vide + tous fallbacks morts → 429 avec `Retry-After`.
 
+
+## Résolutions des angles morts
+
+- **Shadow qualification** : les probes de remplissage ne prennent jamais une station de réserve ; elles utilisent le mode shadow (connexion éphémère) déjà supporté par le qualification daemon.
+- **`client_budget_pct`** : une IP sort de la réserve avant épuisement (défaut 80 % du bucket).
+- **TTL de réserve** : `reserve_ttl_s` (défaut 300 s) ; une IP plus vieille est re-probée ou sortie.
+- **Fallback prouvé** : WARP/proxys ne sont utilisés qu'avec un 200 récent.
+- **SLO** : p95 < 2 s, bascule < 500 ms, 0 requête bloquée > 5 s.
+- **Claim atomique** : `BEGIN IMMEDIATE` + `UPDATE ... RETURNING` sur `client_reserve` ; une IP = un client à la fois.
+- **Chaos/CI** : tests de panne, nightly `slow`, non-régression 6/6.
+- **Rétention/migration** : purge des expirées, backup avant migration.
+
 ## Fichiers touchés
 
 | Fichier | Rôle |

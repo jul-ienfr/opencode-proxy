@@ -134,3 +134,34 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Action** : `client_reserve.enabled`, `reserve_target`, `probe_budget_pct`, `reserve_min`, `direct_allowed` avec consommateur + test ; table incluse dans le backup ; code sans API Windows hors adapter ; direct utilisé uniquement si `direct_allowed`/`proxy_mode` l'autorise.
 - **Acceptation** : `config_audit` sans option morte, backup contient `client_reserve`.
 - **Test** : `config_audit --strict`.
+
+## Phase 6 — Angles morts production (P1)
+
+### T019 — Qualification shadow sans station de réserve (P1) — à faire
+- **Fichiers** : `scripts/fresh_chain.py`, `scripts/fresh_chain_supervisor.py`.
+- **Action** : les probes de remplissage utilisent le mode shadow ; aucune station de réserve n'est immobilisée.
+- **Acceptation** : `reserve_target = 6` et les probes tournent quand même.
+- **Test** : live.
+
+### T020 — Budget client par IP (P1) — à faire
+- **Fichiers** : `free/quota_ledger.py`, `config.yaml`.
+- **Action** : `client_budget_pct` (80 %) ; une IP sort de la réserve sous le seuil.
+- **Acceptation** : aucune IP servie jusqu'à l'épuisement.
+- **Test** : unitaire.
+
+### T021 — TTL et re-vérification (P1) — à faire
+- **Fichiers** : `free/quota_ledger.py`, `free/pool/__init__.py`.
+- **Action** : `reserve_ttl_s` (300 s) ; une IP plus vieille est re-probée ou sortie.
+- **Acceptation** : 0 IP périmée servie.
+- **Test** : unitaire.
+
+### T022 — Claim atomique (P1) — à faire
+- **Fichiers** : `free/quota_ledger.py`.
+- **Action** : `BEGIN IMMEDIATE` + `UPDATE ... RETURNING` ; une IP = un client à la fois.
+- **Acceptation** : aucun doublon de claim sous concurrence.
+- **Test** : test concurrent.
+
+### T023 — Chaos et CI (P2) — à faire
+- **Fichiers** : `tests/test_zero_429.py`, CI.
+- **Action** : tests IP qui tombe, WARP mort, DB lock ; nightly `slow`.
+- **Acceptation** : les tests passent et la non-régression 6/6 est vérifiée.

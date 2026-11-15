@@ -53,3 +53,13 @@
 - [ ] Direct utilisé uniquement si la configuration l'autorise (`direct_allowed`/`proxy_mode`).
 - [ ] Pas de septième station.
 - [ ] Aucune fenêtre console pendant le remplissage.
+
+## Angles morts production
+
+- [ ] T019 — `reserve_target = 6` et probes shadow sans station immobilisée.
+- [ ] T020 — `client_budget_pct` respecté, aucune IP servie jusqu'à épuisement.
+- [ ] T021 — TTL de réserve, 0 IP périmée servie.
+- [ ] T022 — claim atomique, aucun doublon sous concurrence.
+- [ ] T023 — chaos tests et nightly `slow` verts.
+- [ ] SLO : p95 < 2 s, bascule < 500 ms, 0 requête bloquée > 5 s.
+- [ ] Migration `client_reserve` avec backup préalable.

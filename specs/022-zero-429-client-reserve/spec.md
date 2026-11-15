@@ -139,6 +139,22 @@ En tant qu'opérateur, je veux mesurer le taux de 429 réellement renvoyé aux c
 7. **Options GUI** : chaque option (`enabled`, `reserve_target`, `probe_budget_pct`, `reserve_min`) a un consommateur runtime, un effet observable et un test.
 8. **Données** : `client_reserve` est dans `registry.db`, donc couverte par le backup `VACUUM INTO` et l'`integrity_check` existants.
 
+
+## Qualité, fiabilité, performance — angles morts et résolutions
+
+Le plan initial garantit la séparation probe/client, mais il ne règle pas encore ces points :
+
+1. **Conflit 6 réserves / 6 stations.** Avec `reserve_target = 6`, les six stations portent une IP de réserve et il n'en reste aucune pour qualifier de nouvelles IPs. Résolution : les probes de remplissage utilisent le **mode shadow** (connexions éphémères, sans immobiliser une station de réserve), déjà présent dans le qualification daemon. Aucune station de réserve n'est consommée par une probe.
+2. **Budget client par IP absent.** La réserve peut être vidée par le trafic client avant le refill. Résolution : `client_budget_pct` (défaut 80 %) ; une IP dont le bucket descend sous le seuil sort de la réserve et est remplacée **avant** d'être épuisée.
+3. **Pas de re-vérification avant usage.** Une IP de réserve peut avoir été consommée par un autre utilisateur (bucket partagé). Résolution : TTL de réserve (défaut 5 min) ; une IP plus vieille est re-probée ou sortie avant d'être servie.
+4. **Fallback non vérifié.** WARP/proxys peuvent être épuisés. Résolution : le fallback n'est utilisé que s'il a une preuve 200 récente ; sinon il est ignoré et le prochain fallback est tenté.
+5. **Pas de SLO de performance.** Résolution : p95 client < 2 s, bascule de fallback < 500 ms, aucune requête bloquée > 5 s, 0 429 sur 1 000 requêtes avec réserve ≥ 1.
+6. **Pas de claim atomique.** Deux clients pourraient recevoir la même IP de réserve, ou le superviseur pourrait la remplacer pendant qu'elle sert. Résolution : claim transactionnel `BEGIN IMMEDIATE` sur `client_reserve`, un seul client par IP, libération à la fin de la requête.
+7. **Pas de chaos test ni de CI.** Résolution : tests de panne (IP qui tombe, WARP mort, DB lock), tests `slow` exécutés en nightly, et test de non-régression 6/6.
+8. **Pas de rétention/migration explicite.** Résolution : purge des entrées expirées, migration versionnée avec backup `VACUUM INTO` avant application.
+
+Ces points sont convertis en tâches T019–T023 et en critères de checklist.
+
 ## Hors périmètre
 
 - Compte payant, workspace, second compte.
