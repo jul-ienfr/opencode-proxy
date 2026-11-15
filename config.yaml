@@ -309,11 +309,11 @@ ip_rotation:
     enabled: true
     label: WARP 1
     ipv6: false
-    egress_ip: 104.28.198.201
+    egress_ip: 104.28.230.202
     managed: true
     container: warp-1
     image: caomingjun/warp:latest
-    block: 104.28.198.201/32
+    block: 104.28.230.202/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -323,11 +323,11 @@ ip_rotation:
     enabled: true
     label: WARP 1 IPv6
     ipv6: true
-    egress_ip: 2a09:bac1:27c0:2060::216:a0
+    egress_ip: 2a09:bac5:32d3:26b4::3db:16
     managed: true
     container: warp-1
     image: caomingjun/warp:latest
-    block: 2a09:bac1:27c0:2060::/64
+    block: 2a09:bac5:32d3:26b4::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -351,11 +351,11 @@ ip_rotation:
     enabled: true
     label: WARP 2 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d4:14e6::215:5c
+    egress_ip: 2a09:bac5:32d0:14f0::216:99
     managed: true
     container: warp-2
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d4:14e6::/64
+    block: 2a09:bac5:32d0:14f0::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -379,11 +379,11 @@ ip_rotation:
     enabled: true
     label: WARP 3 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d2:28aa::40d:65
+    egress_ip: 2a09:bac5:32d3:26aa::3da:4e
     managed: true
     container: warp-3
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d2:28aa::/64
+    block: 2a09:bac5:32d3:26aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -407,11 +407,11 @@ ip_rotation:
     enabled: true
     label: WARP 4 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d5:28b4::40e:43
+    egress_ip: 2a09:bac5:32d4:28aa::40d:48
     managed: true
     container: warp-4
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d5:28b4::/64
+    block: 2a09:bac5:32d4:28aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -435,11 +435,11 @@ ip_rotation:
     enabled: true
     label: WARP 5 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d7:be::13:266
+    egress_ip: 2a09:bac1:27e0:2060::2d7:e5
     managed: true
     container: warp-5
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d7:be::/64
+    block: 2a09:bac1:27e0:2060::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -463,11 +463,11 @@ ip_rotation:
     enabled: true
     label: WARP 6 IPv6
     ipv6: true
-    egress_ip: 2a09:bac1:2780:2060::2d7:68
+    egress_ip: 2a09:bac5:32d7:28b4::40e:23
     managed: true
     container: warp-6
     image: caomingjun/warp:latest
-    block: 2a09:bac1:2780:2060::/64
+    block: 2a09:bac5:32d7:28b4::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -505,11 +505,11 @@ ip_rotation:
     enabled: true
     label: WARP 7 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d3:1519::21a:5c
+    egress_ip: 2a09:bac5:32d6:be::13:2c3
     managed: true
     container: warp-7
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d3:1519::/64
+    block: 2a09:bac5:32d6:be::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1

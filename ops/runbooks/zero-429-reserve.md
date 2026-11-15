@@ -51,6 +51,12 @@ leurs IPs à la réserve avec un TTL d'une heure.
 | 12:25 → 12:31 | **12/12 requêtes client en 200**, `client_429_total = 0`, réserve 4 → 7 |
 | 12:31 → 12:35 | réserve 7 → 8, `client_usable` 4/6 → **6/6 à 12:35:04** |
 | 12:35:34 | retour à 4/6 : la flotte fluctue encore avec le quota upstream |
+| **14:06 → 14:11** | **6/6 `model_usable` et 6/6 `health=usable` tenus 4 min**, réserve 9-11, **3/3 requêtes client en 200** (1,6–2,2 s) |
+
+Le 6/6 de 14:06 est le premier tenu après les correctifs anti-churn :
+`refresh_min_available=3`, rotation réservée aux stations `health=usable`,
+grâce de 75 s après un lancement de chaîne, `winner_cooldown_s=120`,
+transports forcés en WireGuard, et réconciliation ledger ↔ observations.
 
 Latence client : 1,1 à 2,6 s sur 11 requêtes, un outlier à 40,6 s (bascule
 interne). Le zéro 429 est tenu quand une IP réservée est liée à une station.
