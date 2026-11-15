@@ -1127,7 +1127,9 @@ def _needs_chain(station: dict) -> bool:
             return False
     if not str(station.get("current_ip") or "").strip():
         return True
-    if station.get("station_usable") and _station_has_model_proof(station):
+    if (
+        station.get("station_usable") or station.get("model_usable")
+    ) and _station_has_model_proof(station):
         return False
     # [2026-11-03] Operator policy: an unusable station is an unusable IP.
     # Change it, whatever the reason or the tunnel state. The only exception
