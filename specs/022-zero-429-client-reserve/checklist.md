@@ -7,7 +7,7 @@
 
 - [x] T001 — table `client_reserve` créée (migration idempotente).
 - [x] T002 — une IP 200 confirmée entre dans la réserve et sort du pool probe.
-- [ ] T005 — réserve maintenue `>= 2` IPs prouvées.
+- [x] T005 — réserve maintenue `>= 2` IPs prouvées (4 à 8 le 2026-11-15).
 - [x] T007 — une IP consommée sort de la réserve et est remplacée.
 - [x] La réserve survit à un redémarrage de l'app.
 
@@ -39,16 +39,16 @@
 
 ## Preuves live
 
-- [ ] `client_429_total = 0` sur une fenêtre de charge avec réserve.
-- [ ] Réserve `>= 2` pendant 10 min.
-- [ ] Un 429 client porte toujours un `Retry-After`.
+- [x] `client_429_total = 0` sur une fenêtre de charge avec réserve (12/12 200, 12:24–12:31).
+- [x] Réserve `>= 2` pendant 10 min (4 à 8 IPs, 12:25–12:35).
+- [x] Un 429 client porte toujours un `Retry-After` (`Retry after 85s.` observé).
 - [ ] Aucune probe sur une IP réservée dans les logs.
 
 ## Alignement projet
 
 - [ ] T015 — partiel : garde ≥3 usables ; 6/6 + refill exige le shadow (T019).
 - [x] T016 — aucune IP `probe-format-poisoned` dans la réserve.
-- [ ] T017 — 6/6 sur un même cycle et `warm_pool >= 6`.
+- [x] T017 — 6/6 sur un même cycle (12:35:04) et `warm_pool >= 6` (8 IPs) ; encore fluctuant.
 - [ ] T018 — options GUI effectives, backup `client_reserve`, cross-platform.
 - [ ] Direct utilisé uniquement si la configuration l'autorise (`direct_allowed`/`proxy_mode`).
 - [ ] Pas de septième station.

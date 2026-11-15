@@ -39,11 +39,11 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 1 — Remplissage et budget (P1)
 
-### T005 — Remplissage de la réserve (P1) — en cours (ajout auto + alerte)
+### T005 — Remplissage de la réserve (P1) — fait
 - **Fichiers** : `scripts/fresh_chain_supervisor.py`.
 - **Action** : en arrière-plan, qualifier des IPs non réservées jusqu'à `reserve_target` (proposé 6, configurable).
 - **Acceptation** : `client_reserve_ips >= 2` stable.
-- **Test** : live + métrique.
+- **Test** : live + métrique. Le 2026-11-15, la réserve est passée de 1 à 8 entre 11:19 et 12:35, sans descendre sous 4 après 12:25.
 
 ### T006 — Budget probe (P1) — à faire
 - **Fichiers** : `free/quota_ledger.py`, `config.yaml`.
@@ -126,11 +126,11 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : 0 IP poison dans `client_reserve`.
 - **Test** : unitaire (`test_zero_429.py`). Un bucket qui a répondu 200 après le poison n'est pas grillé.
 
-### T017 — Critère 6/6 simultané (P1) — à faire
+### T017 — Critère 6/6 simultané (P1) — fait (observé, encore fluctuant)
 - **Fichiers** : `observability/fleet_slo.py` (ou équivalent), `scripts/fresh_chain_supervisor.py`.
 - **Action** : mesurer `client_usable` sur le même cycle ; exiger 6/6 et `warm_pool >= 6`.
 - **Acceptation** : le SLO n'est validé que sur un échantillon simultané.
-- **Test** : échantillon live.
+- **Test** : échantillon live. Le 2026-11-15 à 12:35:04, un même `/api/vpn-status` a renvoyé **6/6 `client_usable`** avec **8 IPs en réserve**. La flotte a reflué à 4/6 trente secondes plus tard : le critère est atteint, pas encore tenu en permanence.
 
 ### T018 — Options, backup, cross-platform (P2) — à faire
 - **Fichiers** : `config.yaml`, `dashboard/`, `free/quota_ledger.py`, `tests/`.

@@ -44,6 +44,17 @@ python logs\seed_client_reserve.py
 Le script lit `/api/vpn-status`, prend les stations `model_usable`, et ajoute
 leurs IPs à la réserve avec un TTL d'une heure.
 
+## Preuves live (2026-11-15)
+
+| Heure | Mesure |
+|---|---|
+| 12:25 → 12:31 | **12/12 requêtes client en 200**, `client_429_total = 0`, réserve 4 → 7 |
+| 12:31 → 12:35 | réserve 7 → 8, `client_usable` 4/6 → **6/6 à 12:35:04** |
+| 12:35:34 | retour à 4/6 : la flotte fluctue encore avec le quota upstream |
+
+Latence client : 1,1 à 2,6 s sur 11 requêtes, un outlier à 40,6 s (bascule
+interne). Le zéro 429 est tenu quand une IP réservée est liée à une station.
+
 ## Diagnostic
 
 | Symptôme | Vérifier |
