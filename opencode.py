@@ -45,18 +45,33 @@ _CLIENT_429_BY_REASON: dict[str, int] = {}
 def _client_429_reason() -> str:
     """Pourquoi le client reçoit un 429 (022 T009).
 
-    ``reserve_empty`` : aucune IP de réserve servable.
+    ``reserve_empty`` : aucune IP de réserve **liée à une station** ; des
+    entrées peuvent exister en base sans être servables.
     ``all_fallbacks_dead`` : réserve vide et aucun endpoint WARP/proxy utilisable.
-    ``upstream_429`` : la réserve existe mais l'amont a refusé.
+    ``upstream_429`` : une IP réservée est servie, mais l'amont a refusé.
     """
 
+    reserved: set[str] = set()
     try:
-        from free.client_reserve import count as _reserve_count
+        from free.client_reserve import reserved_ips
 
-        if int(_reserve_count()) > 0:
-            return "upstream_429"
+        reserved = reserved_ips()
     except Exception:
-        return "reserve_empty"
+        reserved = set()
+    bound = False
+    if reserved:
+        try:
+            import shared_state
+
+            for station in getattr(shared_state, "vpn_managers", None) or []:
+                ip = str(getattr(station, "current_ip", "") or "")
+                if ip and ip in reserved:
+                    bound = True
+                    break
+        except Exception:
+            bound = False
+    if bound:
+        return "upstream_429"
     try:
         import shared_state
 

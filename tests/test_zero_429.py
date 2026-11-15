@@ -283,7 +283,9 @@ def test_reason_reports_dead_fallbacks(monkeypatch) -> None:
     class _Pool:
         _socks5_eps: list = []
 
-    monkeypatch.setattr("free.client_reserve.count", lambda **_: 0)
+    monkeypatch.setattr(
+        "free.client_reserve.reserved_ips", lambda **_: set()
+    )
     monkeypatch.setattr(
         shared_state, "free_ip_pool", _Pool(), raising=False
     )
@@ -302,12 +304,40 @@ def test_reason_reports_dead_fallbacks(monkeypatch) -> None:
 
 
 def test_reason_reports_upstream_429(monkeypatch) -> None:
-    """T009 : réserve non vide + refus amont = upstream_429."""
+    """T009 : réserve liée à une station + refus amont = upstream_429."""
 
     import opencode
+    import shared_state
 
-    monkeypatch.setattr("free.client_reserve.count", lambda **_: 3)
+    class _Station:
+        current_ip = "10.0.0.1"
+
+    monkeypatch.setattr(
+        "free.client_reserve.reserved_ips", lambda **_: {"10.0.0.1"}
+    )
+    monkeypatch.setattr(
+        shared_state, "vpn_managers", [_Station()], raising=False
+    )
     assert opencode._client_429_reason() == "upstream_429"
+
+
+def test_reserve_entries_without_a_station_are_not_servable(monkeypatch) -> None:
+    """Une entrée en base sans station liée ne justifie pas 'upstream_429'."""
+
+    import opencode
+    import shared_state
+
+    class _Station:
+        current_ip = "10.0.0.99"
+
+    monkeypatch.setattr(
+        "free.client_reserve.reserved_ips", lambda **_: {"10.0.0.1"}
+    )
+    monkeypatch.setattr(
+        shared_state, "vpn_managers", [_Station()], raising=False
+    )
+    monkeypatch.setattr(shared_state, "free_ip_pool", None, raising=False)
+    assert opencode._client_429_reason() == "all_fallbacks_dead"
 
 
 def test_direct_provider_is_gated(monkeypatch) -> None:
