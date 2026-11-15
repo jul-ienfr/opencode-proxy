@@ -53,7 +53,7 @@ leurs IPs à la réserve avec un TTL d'une heure.
 | 12:35:34 | retour à 4/6 : la flotte fluctue encore avec le quota upstream |
 | **14:06 → 14:11** | **6/6 `model_usable` et 6/6 `health=usable` tenus 4 min**, réserve 9-11, **3/3 requêtes client en 200** (1,6–2,2 s) |
 | **14:52 → 14:55** | **6/6 tenu**, six conteneurs Docker `healthy` (uptime 5-29 min), **3/3 requêtes client en 200** (2,2–2,4 s), réserve 12 |
-| **21:30 → 21:33** | correctif de périmètre réserve : **WARP usable=10/13**, `socks5_current = WARP 3 IPv6`, réserve 0, **1/1 requête client en 200** (3,3 s) |
+| **21:30 → 21:40** | correctif de périmètre réserve : **WARP usable=9–12/13**, `socks5_current` = WARP 3/5/12 IPv6, **réserve 0** et **6/6 stations NordVPN en 429**, pourtant **4/4 requêtes client en 200** (3,1–3,3 s), `client_429_total = 0` |
 
 Le 6/6 de 14:06 est le premier tenu après les correctifs anti-churn :
 `refresh_min_available=3`, rotation réservée aux stations `health=usable`,
@@ -72,6 +72,12 @@ dès qu'une IP NordVPN entrait dans `client_reserve`, tous les endpoints WARP
 devenaient « unusable » et disparaissaient de la GUI ; WARP ne revenait qu'à
 réserve vide, c'est-à-dire quand NordVPN était mort. Le test
 `test_reserve_scope_is_docker_stations_only` verrouille ce périmètre.
+
+La preuve la plus parlante est la fenêtre 21:30 → 21:40 : les six stations
+NordVPN étaient toutes en 429 jusqu'à leur reset (21:46), la réserve était
+vide, et pourtant 4/4 requêtes client sont revenues en 200 via WARP. Avant le
+correctif, cet état exact produisait des 429 `all_fallbacks_dead` pendant tout
+l'intervalle.
 
 Latence client : 1,1 à 2,6 s sur 11 requêtes, un outlier à 40,6 s (bascule
 interne). Le zéro 429 est tenu quand une IP réservée est liée à une station.
