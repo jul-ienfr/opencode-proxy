@@ -253,3 +253,39 @@ def test_reserve_can_be_disabled(monkeypatch) -> None:
     assert pool_mod._reserve_allows("10.0.0.99")
     monkeypatch.setenv("CLIENT_RESERVE_ENABLED", "1")
     assert not pool_mod._reserve_allows("10.0.0.99")
+
+
+def test_reason_reports_dead_fallbacks(monkeypatch) -> None:
+    """T008/T023 : réserve vide + aucun WARP/proxy = all_fallbacks_dead."""
+
+    import shared_state
+    import opencode
+
+    class _Pool:
+        _socks5_eps: list = []
+
+    monkeypatch.setattr("free.client_reserve.count", lambda **_: 0)
+    monkeypatch.setattr(
+        shared_state, "free_ip_pool", _Pool(), raising=False
+    )
+    assert opencode._client_429_reason() == "all_fallbacks_dead"
+
+    class _Warp:
+        client_usable = True
+
+    monkeypatch.setattr(
+        shared_state,
+        "free_ip_pool",
+        type("P", (), {"_socks5_eps": [_Warp()]})(),
+        raising=False,
+    )
+    assert opencode._client_429_reason() == "reserve_empty"
+
+
+def test_reason_reports_upstream_429(monkeypatch) -> None:
+    """T009 : réserve non vide + refus amont = upstream_429."""
+
+    import opencode
+
+    monkeypatch.setattr("free.client_reserve.count", lambda **_: 3)
+    assert opencode._client_429_reason() == "upstream_429"

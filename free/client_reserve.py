@@ -28,21 +28,25 @@ def _default_ttl() -> float:
     """
 
     try:
-        return max(60.0, float(os.getenv("RESERVE_TTL_S", "") or DEFAULT_TTL_S))
+        from free.reserve_settings import get_float
+
+        return max(60.0, get_float("ttl_s", DEFAULT_TTL_S))
     except (TypeError, ValueError):
         return DEFAULT_TTL_S
 
 
 def _client_budget() -> int:
-    """Budget client par IP (022 T006).
+    """Budget client par IP (022 T006/T020).
 
-    ``CLIENT_BUDGET_PCT`` (défaut 80) × ``CLIENT_QUOTA_ESTIMATE`` (défaut 200).
+    ``client_budget_pct`` (défaut 80) × ``CLIENT_QUOTA_ESTIMATE`` (défaut 200).
     Une IP dont le bucket a consommé ce budget sort de la réserve avant
     épuisement.
     """
 
     try:
-        pct = float(os.getenv("CLIENT_BUDGET_PCT", "80") or 80)
+        from free.reserve_settings import get_float
+
+        pct = get_float("client_budget_pct", 80.0)
         estimate = float(os.getenv("CLIENT_QUOTA_ESTIMATE", "200") or 200)
         return max(1, int(estimate * pct / 100.0))
     except (TypeError, ValueError):
@@ -52,13 +56,15 @@ def _client_budget() -> int:
 def _probe_budget() -> int:
     """Budget probe par IP (022 T006).
 
-    ``PROBE_BUDGET_PCT`` (défaut 50). Une IP qui a déjà consommé la moitié de
+    ``probe_budget_pct`` (défaut 50). Une IP qui a déjà consommé la moitié de
     son quota estimé n'est plus une candidate utile : la sonder gaspille le
     peu de quota qui reste au client.
     """
 
     try:
-        pct = float(os.getenv("PROBE_BUDGET_PCT", "50") or 50)
+        from free.reserve_settings import get_float
+
+        pct = get_float("probe_budget_pct", 50.0)
         estimate = float(os.getenv("CLIENT_QUOTA_ESTIMATE", "200") or 200)
         return max(1, int(estimate * pct / 100.0))
     except (TypeError, ValueError):
@@ -231,12 +237,16 @@ def is_reserved(ip: str, *, now: float | None = None) -> bool:
 def enabled() -> bool:
     """Interrupteur de la réserve (022 T018).
 
-    ``CLIENT_RESERVE_ENABLED=0`` rend le comportement pré-022 : le pool peut
-    servir une IP non réservée. Défaut : activé.
+    ``enabled=0`` (GUI ou ``CLIENT_RESERVE_ENABLED=0``) rend le comportement
+    pré-022 : le pool peut servir une IP non réservée. Défaut : activé.
     """
 
-    value = str(os.getenv("CLIENT_RESERVE_ENABLED", "1")).strip().lower()
-    return value not in ("0", "false", "no", "off")
+    try:
+        from free.reserve_settings import get_bool
+
+        return get_bool("enabled", True)
+    except Exception:
+        return True
 
 
 def probe_blocked_ips(

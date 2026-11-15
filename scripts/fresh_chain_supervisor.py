@@ -1419,15 +1419,12 @@ def _refresh_warm_pool(
         if _rc != _LAST_RESERVE_COUNT:
             _LAST_RESERVE_COUNT = _rc
             try:
-                _reserve_min = int(
-                    os.getenv("RESERVE_MIN") or 2
-                )
-            except (TypeError, ValueError):
-                _reserve_min = 2
-            try:
-                _reserve_target = int(os.getenv("RESERVE_TARGET") or 6)
-            except (TypeError, ValueError):
-                _reserve_target = 6
+                from free.reserve_settings import get_int as _reserve_get
+
+                _reserve_min = _reserve_get("min", 2)
+                _reserve_target = _reserve_get("target", 6)
+            except Exception:
+                _reserve_min, _reserve_target = 2, 6
             if _rc < _reserve_min:
                 log(
                     f"ALERT client_reserve={_rc} (<{_reserve_min}) — priorité "
