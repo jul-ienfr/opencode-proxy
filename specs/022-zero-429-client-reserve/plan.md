@@ -110,6 +110,7 @@ Le 429 client vient d'un partage de bucket entre les probes et le trafic client.
 - `direct_allowed` lu depuis la config, false par défaut.
 - Capacité mesurée : 960 req/jour (6 × 200 × 80 %).
 - `client_reserve` est l'autorité ; `warm_pool` est le pool probe.
+- Périmètre du filtre réserve : stations Docker (`_sid > 0`) uniquement. WARP/proxys n'entrent jamais dans `client_reserve` (preuves = 200 de chaîne NordVPN) ; ils gardent `egress_ip`, `bad_until` et le ledger comme preuves. Les filtrer supprimait toute la jambe WARP dès qu'une IP NordVPN était valide (elle ne revenait qu'à 0/6).
 - Auth 401/403 : backoff séparé, jamais un épuisement de réserve.
 - Erreurs transport : retry/rotation, jamais une consommation de réserve.
 - Backpressure : limite de concurrence 2000, file courte si réserve saturée.

@@ -53,6 +53,7 @@ leurs IPs à la réserve avec un TTL d'une heure.
 | 12:35:34 | retour à 4/6 : la flotte fluctue encore avec le quota upstream |
 | **14:06 → 14:11** | **6/6 `model_usable` et 6/6 `health=usable` tenus 4 min**, réserve 9-11, **3/3 requêtes client en 200** (1,6–2,2 s) |
 | **14:52 → 14:55** | **6/6 tenu**, six conteneurs Docker `healthy` (uptime 5-29 min), **3/3 requêtes client en 200** (2,2–2,4 s), réserve 12 |
+| **21:30 → 21:33** | correctif de périmètre réserve : **WARP usable=10/13**, `socks5_current = WARP 3 IPv6`, réserve 0, **1/1 requête client en 200** (3,3 s) |
 
 Le 6/6 de 14:06 est le premier tenu après les correctifs anti-churn :
 `refresh_min_available=3`, rotation réservée aux stations `health=usable`,
@@ -65,6 +66,12 @@ Cloudflare/Google/Quad9, bloqué sur certains serveurs NordVPN
 Passage en **plain UDP vers le DNS NordVPN** (`103.86.96.100`,
 `103.86.99.100`) : plus de healthcheck DNS en échec, donc plus de station
 marquée `tunnel_down` alors que le tunnel fonctionne.
+
+Le correctif de 21:30 restreint le filtre réserve aux stations Docker. Avant,
+dès qu'une IP NordVPN entrait dans `client_reserve`, tous les endpoints WARP
+devenaient « unusable » et disparaissaient de la GUI ; WARP ne revenait qu'à
+réserve vide, c'est-à-dire quand NordVPN était mort. Le test
+`test_reserve_scope_is_docker_stations_only` verrouille ce périmètre.
 
 Latence client : 1,1 à 2,6 s sur 11 requêtes, un outlier à 40,6 s (bascule
 interne). Le zéro 429 est tenu quand une IP réservée est liée à une station.
@@ -100,6 +107,7 @@ POST `/quota/mark` perdu pendant un redémarrage laissait l'IP bloquée ~19 min.
 | Symptôme | Vérifier |
 |---|---|
 | clients en 429 alors que des stations sont up | `reserved_ips()` contient-il ces IPs ? |
+| WARP « unusable » alors que les conteneurs sont sains | la réserve ne filtre que les stations Docker ; vérifier `bad_until` / ledger WARP, pas `client_reserve` |
 | réserve qui ne remonte pas | `logs/fresh_chain_supervisor.log` : `client_reserve=` et `ALERT` |
 | IP réservée mais 429 | `quota_buckets` : `last_status=429`, `reset_at` futur → elle doit sortir |
 | probes qui consomment la réserve | `fresh_chain.py` doit exclure `_reserved_client_ips()` |
