@@ -48,3 +48,11 @@ def test_install_is_idempotent() -> None:
         assert len(loop.handlers) == 1
     finally:
         socket_guard._INSTALLED = previous
+
+
+def test_restart_calls_in_process_callback() -> None:
+    calls: list[int] = []
+    socket_guard.set_restart_callback(lambda: calls.append(1))
+    socket_guard._RESTART_TIMES.clear()
+    socket_guard._restart()
+    assert calls == [1]
