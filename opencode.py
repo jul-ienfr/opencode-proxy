@@ -63,11 +63,20 @@ def _client_429_reason() -> str:
         try:
             import shared_state
 
+            pool = getattr(shared_state, "free_ip_pool", None)
+            usable_fn = getattr(pool, "_station_usable", None)
             for station in getattr(shared_state, "vpn_managers", None) or []:
                 ip = str(getattr(station, "current_ip", "") or "")
-                if ip and ip in reserved:
-                    bound = True
-                    break
+                if not ip or ip not in reserved:
+                    continue
+                if callable(usable_fn):
+                    try:
+                        if not usable_fn(station, exclude_approaching=False):
+                            continue
+                    except Exception:
+                        pass
+                bound = True
+                break
         except Exception:
             bound = False
     if bound:
