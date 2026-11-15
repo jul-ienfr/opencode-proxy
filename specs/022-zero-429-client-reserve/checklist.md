@@ -20,7 +20,7 @@
 
 ## Fallback
 
-- [ ] T008 — partiel : réserve vide laisse passer les fallbacks ; ordre non instrumenté.
+- [ ] T008 — partiel : `reason` distingue `reserve_empty`/`all_fallbacks_dead` ; ordre WARP → proxys non instrumenté.
 - [x] T009 — 429 JSON avec `Retry-After`, `reason` et `X-Free-Reason`, jamais vide.
 - [ ] Chaque bascule est loggée avec sa cause.
 
@@ -49,7 +49,7 @@
 - [x] T015 — aucune station `client_usable` recréée pendant le remplissage (`_refresh_allowed`).
 - [x] T016 — aucune IP `probe-format-poisoned` dans la réserve.
 - [x] T017 — 6/6 sur un même cycle (12:35:04) et `warm_pool >= 6` (8 IPs) ; encore fluctuant.
-- [ ] T018 — options GUI effectives (env consommés ; GUI restante), backup `client_reserve`.
+- [x] T018 — options effectives (API dashboard, DB partagée), backup `client_reserve`.
 - [ ] Direct utilisé uniquement si la configuration l'autorise (`direct_allowed`/`proxy_mode`).
 - [ ] Pas de septième station.
 - [ ] Aucune fenêtre console pendant le remplissage.
@@ -60,7 +60,7 @@
 - [x] T020 — `client_budget_pct` respecté, aucune IP servie jusqu'à épuisement.
 - [x] T021 — TTL 3600 s (`RESERVE_TTL_S`), 0 IP périmée servie.
 - [x] T022 — sans objet : `_refresh_allowed` empêche le rebind d'une IP servie (test dédié).
-- [ ] T023 — chaos tests et nightly `slow` verts (DB corrompue/verrouillée faites).
+- [ ] T023 — chaos tests et nightly `slow` verts (DB corrompue/verrouillée, WARP mort faits).
 - [ ] SLO : p95 < 2 s, bascule < 500 ms, 0 requête bloquée > 5 s.
 - [ ] Migration `client_reserve` avec backup préalable.
 

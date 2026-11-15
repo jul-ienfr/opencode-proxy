@@ -130,12 +130,11 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : le SLO n'est validé que sur un échantillon simultané.
 - **Test** : échantillon live. Le 2026-11-15 à 12:35:04, un même `/api/vpn-status` a renvoyé **6/6 `client_usable`** avec **8 IPs en réserve**. La flotte a reflué à 4/6 trente secondes plus tard : le critère est atteint, pas encore tenu en permanence.
 
-### T018 — Options, backup, cross-platform (P2) — partiel
-- **Fichiers** : `dashboard/`, `free/client_reserve.py`, `scripts/fresh_chain_supervisor.py`, `tests/`.
-- **Action** : `client_reserve.enabled`, `reserve_target`, `probe_budget_pct`, `reserve_min`, `direct_allowed` avec consommateur + test ; table incluse dans le backup ; code sans API Windows hors adapter ; direct utilisé uniquement si `direct_allowed`/`proxy_mode` l'autorise.
-- **État** : consommateurs en place via l'environnement — `CLIENT_RESERVE_ENABLED`, `RESERVE_TARGET`, `RESERVE_MIN`, `CLIENT_BUDGET_PCT`, `PROBE_BUDGET_PCT`, `RESERVE_TTL_S` (test `test_reserve_can_be_disabled`). L'environnement est utilisé plutôt que `config.yaml` parce que le runtime réécrit ce fichier et peut perdre une clé ajoutée hors schéma. `client_reserve` est dans `registry.db`, donc couverte par le backup `VACUUM INTO`. Restent : exposition GUI et `config_audit --strict` (0 clé morte/missing après retrait des lectures YAML).
-- **Acceptation** : `config_audit` sans option morte, backup contient `client_reserve`.
-- **Test** : `config_audit --strict`.
+### T018 — Options, backup, cross-platform (P2) — fait (API dashboard)
+- **Fichiers** : `free/reserve_settings.py`, `dashboard/routers/free_routes.py`, `free/client_reserve.py`, `scripts/fresh_chain_supervisor.py`.
+- **Action** : `enabled`, `target`, `min`, `ttl_s`, `client_budget_pct`, `probe_budget_pct` persistés dans `registry.db` (partagés app/superviseur), avec précédence env > GUI > défaut. Route `GET/POST /api/free/client-reserve` (token dashboard) + tests.
+- **Pourquoi pas `config.yaml`** : le runtime réécrit ce fichier et perd les clés hors schéma (constaté deux fois). Une base partagée est la seule source fiable pour deux processus.
+- **Acceptation** : `config_audit --strict` sans option morte (0 dead, 0 missing), backup `VACUUM INTO` contient `client_reserve` et `client_reserve_settings`.
 
 ## Phase 6 — Angles morts production (P1)
 
@@ -165,4 +164,4 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Fichiers** : `tests/test_zero_429.py`, CI.
 - **Action** : tests IP qui tombe, WARP mort, DB lock ; nightly `slow`.
 - **Acceptation** : les tests passent et la non-régression 6/6 est vérifiée.
-- **État** : DB corrompue et DB verrouillée couvertes (`test_reserve_survives_a_corrupt_db`, `test_reserve_survives_a_locked_db`). WARP mort et nightly `slow` restent à câbler.
+- **État** : DB corrompue, DB verrouillée et WARP mort couvertes (`test_reserve_survives_a_corrupt_db`, `test_reserve_survives_a_locked_db`, `test_reason_reports_dead_fallbacks`). Reste le nightly `slow` et la non-régression 6/6 automatisée.
