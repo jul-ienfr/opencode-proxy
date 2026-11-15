@@ -2881,9 +2881,9 @@ def _supervise() -> None:
                             stations.get(sid, {}).get("vpn_status") or ""
                         )
                         in ("connected", "degraded")
-                        # Ne jamais rotationner une station dont la santé
-                        # n'est pas confirmée : un `suspect`/`settling` est en
-                        # train de se stabiliser, le rebinder le tue.
+                        # Ne jamais rotationner une station en réparation,
+                        # mais une station `suspect` dont le tunnel répond et
+                        # dont le bucket est mort doit pouvoir être rafraîchie.
                         and (
                             not isinstance(
                                 stations.get(sid, {}).get("health"), dict
@@ -2891,7 +2891,7 @@ def _supervise() -> None:
                             or str(
                                 stations[sid]["health"].get("state") or ""
                             )
-                            == "usable"
+                            in ("usable", "suspect")
                         )
                         and not _station_primary_available(
                             stations.get(sid, {}), free_health, primary
