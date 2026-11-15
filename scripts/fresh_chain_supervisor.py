@@ -425,6 +425,10 @@ def _reconcile_registry(stations: dict[int, dict]) -> None:
                 log(f"registry: station {sid} keeps live {ip} ({host})")
 
 
+_CHAIN_REPAIR_GRACE_S = 75.0
+_LAST_CHAIN_AT: dict[int, float] = {}
+
+
 def _start_chain(
     station: int,
     rebind_limit: int = 4,
@@ -468,6 +472,7 @@ def _start_chain(
         f"station {station} chain started pid={proc.pid} "
         f"(slice {max_candidates}, transport {transport})"
     )
+    _LAST_CHAIN_AT[station] = time.time()
     event(
         "chain_started",
         station=station,
@@ -2508,6 +2513,8 @@ def _supervise() -> None:
                 if sid not in settling
                 and sid not in unmeasurable
                 and _needs_chain(stations.get(sid, {}))
+                and now - _LAST_CHAIN_AT.get(sid, 0.0)
+                >= _CHAIN_REPAIR_GRACE_S
             ]
             forced: set[int] = set()
             try:
@@ -2541,6 +2548,15 @@ def _supervise() -> None:
                             f"{(stations.get(sid) or {}).get('current_ip')}) — dropped"
                         )
                         repair_queue.complete(sid)
+                        continue
+                    if (
+                        now - _LAST_CHAIN_AT.get(sid, 0.0)
+                        < _CHAIN_REPAIR_GRACE_S
+                    ):
+                        log(
+                            f"station {sid} repair held "
+                            f"({int(_CHAIN_REPAIR_GRACE_S)}s chain grace)"
+                        )
                         continue
                     forced.add(sid)
                     if sid not in broken:
