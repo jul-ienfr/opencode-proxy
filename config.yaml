@@ -505,11 +505,11 @@ ip_rotation:
     enabled: true
     label: WARP 7 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d3:be::13:243
+    egress_ip: 2a09:bac5:32d3:1519::21a:5c
     managed: true
     container: warp-7
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d3:be::/64
+    block: 2a09:bac5:32d3:1519::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -533,11 +533,11 @@ ip_rotation:
     enabled: true
     label: WARP 8 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d5:1c82::2d7:95
+    egress_ip: 2a09:bac1:27e0:2060::21a:36
     managed: true
     container: warp-8
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d5:1c82::/64
+    block: 2a09:bac1:27e0:2060::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -561,11 +561,11 @@ ip_rotation:
     enabled: true
     label: WARP 9 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d4:1c82::2d7:64
+    egress_ip: 2a09:bac5:32d2:26aa::3da:32
     managed: true
     container: warp-9
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d4:1c82::/64
+    block: 2a09:bac5:32d2:26aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -589,11 +589,11 @@ ip_rotation:
     enabled: true
     label: WARP 10 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d6:be::13:2c1
+    egress_ip: 2a09:bac5:32d6:14f0::216:c3
     managed: true
     container: warp-10
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d6:be::/64
+    block: 2a09:bac5:32d6:14f0::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -617,11 +617,11 @@ ip_rotation:
     enabled: true
     label: WARP 11 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d6:26b4::3db:38
+    egress_ip: 2a09:bac5:32d2:150f::219:a9
     managed: true
     container: warp-11
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d6:26b4::/64
+    block: 2a09:bac5:32d2:150f::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -645,11 +645,11 @@ ip_rotation:
     enabled: true
     label: WARP 12 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d5:14e6::215:34
+    egress_ip: 2a09:bac5:32d7:14dc::214:b1
     managed: true
     container: warp-12
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d5:14e6::/64
+    block: 2a09:bac5:32d7:14dc::/64
     provider: warp
     transport_url: ''
   socks5_proxy_port: 1080
@@ -1327,7 +1327,7 @@ ip_registry:
       transport: auto
     refresh_when_exhausted: true
     refresh_cooldown_s: 30
-    refresh_min_available: 1
+    refresh_min_available: 3
     global_pause_enabled: false
     global_429_window_s: 600
     global_429_threshold: 100000
@@ -1590,12 +1590,4 @@ models:
   gemini-4-carbon:
     protocol: gemini
   gemini-4-hydrogen:
-    protocol: gemini
-  gemini-3-flash:
-    protocol: gemini
-  gemini-3-pro:
-    protocol: gemini
-  gemini-3.1-pro:
-    protocol: gemini
-  gemini-4-argon-contributor:
     protocol: gemini

@@ -2850,7 +2850,7 @@ def _supervise() -> None:
                     free_health, stations, scope, primary
                 )
                 need_refresh = available < len(scope) and (
-                    available >= refresh_min_available or available <= 0
+                    available >= refresh_min_available
                 )
                 if need_refresh:
                     now_ts = time.time()
@@ -2863,6 +2863,18 @@ def _supervise() -> None:
                             stations.get(sid, {}).get("vpn_status") or ""
                         )
                         in ("connected", "degraded")
+                        # Ne jamais rotationner une station dont la santé
+                        # n'est pas confirmée : un `suspect`/`settling` est en
+                        # train de se stabiliser, le rebinder le tue.
+                        and (
+                            not isinstance(
+                                stations.get(sid, {}).get("health"), dict
+                            )
+                            or str(
+                                stations[sid]["health"].get("state") or ""
+                            )
+                            == "usable"
+                        )
                         and not _station_primary_available(
                             stations.get(sid, {}), free_health, primary
                         )
