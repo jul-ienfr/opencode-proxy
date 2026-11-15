@@ -392,6 +392,45 @@ def test_model_usable_ignores_reserve_membership(monkeypatch) -> None:
     assert seen.get("enforce_reserve") is False
 
 
+def test_reserve_scope_is_docker_stations_only(monkeypatch) -> None:
+    """La réserve filtre NordVPN, jamais la jambe WARP/SOCKS5.
+
+    Une IP WARP n'entre jamais dans ``client_reserve`` : ses preuves sont des
+    200 de chaîne NordVPN. La filtrer faisait disparaître tout WARP dès qu'une
+    IP NordVPN était valide ; elle ne revenait qu'à 0/6.
+    """
+
+    from free import pool as pool_mod
+
+    monkeypatch.setattr(
+        "free.client_reserve.reserved_ips", lambda **_: {"10.0.0.1"}
+    )
+
+    class _Station:
+        _station = 1
+        current_ip = "10.0.0.2"
+        status = "connected"
+        _disabled = False
+
+    pool = object.__new__(pool_mod.FreeIPPool)
+    pool._per = {}
+    pool._stations = []
+    pool._station_health = pool_mod.StationHealthRegistry()
+    pool._strict_health = False
+    pool._quota_enabled = False
+
+    assert not pool._station_usable(_Station(), exclude_approaching=False)
+
+    warp = pool_mod.Socks5Endpoint(
+        host="127.0.0.1",
+        port=11080,
+        egress_ip="104.28.1.1",
+        managed=True,
+        index=5,
+    )
+    assert pool._station_usable(warp, exclude_approaching=False)
+
+
 def test_direct_provider_is_gated(monkeypatch) -> None:
     """T008 : ordre des fallbacks, `direct` seulement si autorisé."""
 

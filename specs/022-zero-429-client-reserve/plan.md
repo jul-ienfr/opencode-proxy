@@ -53,7 +53,7 @@ Le 429 client vient d'un partage de bucket entre les probes et le trafic client.
 
 ### Phase 1 — Routage client vers la réserve (P0)
 
-1. `free/pool` : `_station_usable` exige une entrée `client_reserve` valide.
+1. `free/pool` : `_station_usable` exige une entrée `client_reserve` valide (stations Docker).
 2. Si la réserve est vide, ne pas router vers une IP non prouvée : passer au fallback.
 3. Le client ne doit jamais recevoir un 429 si `client_reserve` contient une IP valide.
 

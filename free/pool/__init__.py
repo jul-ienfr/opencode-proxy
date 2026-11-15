@@ -3191,11 +3191,18 @@ class FreeIPPool:
                     return False
         # [022 T004] Réserve client : si elle n'est pas vide, seules ses IPs
         # sont servies. Une IP non réservée n'est jamais exposée au client.
+        # Le périmètre est celui des stations Docker (`_sid > 0`) : une IP
+        # WARP/proxy n'entre jamais dans `client_reserve` (les preuves de la
+        # table sont des 200 de chaîne NordVPN, pas des egress SOCKS5). La
+        # filtrer rendait toute la jambe WARP « unusable » dès qu'une IP
+        # NordVPN était valide, et WARP ne revenait qu'à 0/6 — précisément
+        # quand on en a besoin. WARP garde ses propres preuves (egress_ip,
+        # bad_until, ledger) plus bas dans cette fonction.
         # `enforce_reserve=False` sert à évaluer la santé/le quota d'une
         # station qui vient de sortir de la réserve : sans cela, elle ne peut
         # plus redevenir `model_usable`, donc le superviseur ne peut plus la
         # réinscrire — verrou mortel observé sur la station 3.
-        if enforce_reserve and not _reserve_allows(_ip):
+        if enforce_reserve and _sid > 0 and not _reserve_allows(_ip):
             return False
         if forced_pool is not None:
             cc = getattr(station, "_current_country", None) or getattr(station, "current_country", None)
