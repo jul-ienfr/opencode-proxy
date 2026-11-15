@@ -102,7 +102,7 @@ En tant qu'opérateur, je veux mesurer le taux de 429 réellement renvoyé aux c
 
 | Critère | Cible |
 |---|---|
-| 429 client avec réserve ≥ 1 | **0** sur 1000 requêtes |
+| 429 client avec réserve ≥ 1 | **0** sur 1 000 sélections simulées ; **0** sur un soak live ≤ budget mesuré |
 | Réserve maintenue | **≥ 2** IPs prouvées en permanence |
 | Probes sur réserve | **0** |
 | Fallback avant 429 | 100 % des cas où un fallback est disponible |
@@ -172,6 +172,8 @@ Règles de capacité :
 2. **Suspension réelle** : suspendre toutes les probes quand la réserve est basse arrêterait le seul mécanisme de refill. Ce n'est donc pas la règle : la règle est « ne pas casser ce qui sert le client », pas « arrêter de qualifier ».
 3. **Alerte capacité** : si la demande client dépasse le budget journalier, une alerte `capacity_shortfall` est émise avant l'épuisement.
 4. **Honnêteté** : le plan ne promet pas l'infini. Il promet zéro 429 **dans la capacité mesurée**, et une alerte quand la demande approche la limite.
+
+Conséquence sur les tests : un burst réel de 1 000 requêtes dépasse la capacité d'une journée (~960). Le test T012 valide donc **1 000 sélections simulées** (routage, réserve, exclusion) ; le soak live reste borné au budget mesuré, sinon il ne teste plus la réserve mais l'épuisement upstream.
 
 
 ## Décisions tranchées

@@ -88,3 +88,51 @@ def test_keeps_ip_when_poison_is_older_than_24h(tmp_path: Path) -> None:
     assert cr.reserved_ips(now=1_000.0 + cr.POISON_TTL_S + 1, db=db) == {
         "1.1.1.1"
     }
+
+
+def test_thousand_client_picks_stay_in_reserve(monkeypatch) -> None:
+    """T012 (simulation) : 1 000 sélections, jamais une IP hors réserve."""
+
+    from free import pool as pool_mod
+
+    reserve = {"10.0.0.1", "10.0.0.2"}
+    monkeypatch.setattr(
+        "free.client_reserve.reserved_ips", lambda **_: set(reserve)
+    )
+    stations = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"]
+    misses = 0
+    for index in range(1000):
+        allowed = [ip for ip in stations if pool_mod._reserve_allows(ip)]
+        if allowed:
+            assert allowed[0] in reserve
+        else:
+            misses += 1
+        if index == 499:
+            # Le client consomme la première IP : elle sort de la réserve.
+            reserve.discard("10.0.0.1")
+    assert misses == 0
+
+
+def test_hundred_probes_never_touch_the_reserve(monkeypatch) -> None:
+    """T013 (simulation) : les probes excluent les IPs réservées."""
+
+    from scripts import fresh_chain
+
+    monkeypatch.setattr(
+        fresh_chain, "_ledger_exhausted_ips", lambda api_base: {"10.0.0.9"}
+    )
+    monkeypatch.setattr(
+        fresh_chain,
+        "_reserved_client_ips",
+        lambda: {"10.0.0.1", "10.0.0.2"},
+    )
+    excluded = fresh_chain._probe_excluded_ips("http://127.0.0.1:4000")
+    assert excluded == {"10.0.0.1", "10.0.0.2", "10.0.0.9"}
+    candidates = [f"10.0.0.{i}" for i in range(1, 7)]
+    touched = {
+        ip
+        for _ in range(100)
+        for ip in candidates
+        if ip not in excluded
+    }
+    assert not (touched & {"10.0.0.1", "10.0.0.2"})

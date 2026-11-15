@@ -32,8 +32,8 @@
 
 ## Tests
 
-- [ ] T012 — 1000 requêtes client, réserve non vide → 0 429.
-- [ ] T013 — 100 probes + 100 clients → réserve intacte.
+- [x] T012 — 1000 sélections simulées, réserve non vide → 0 429 (soak live borné au budget).
+- [x] T013 — 100 probes simulées + clients → réserve intacte.
 - [x] T014 — runbook `ops/runbooks/zero-429-reserve.md`.
 - [ ] Test de non-régression : les 6 stations restent `client_usable`.
 

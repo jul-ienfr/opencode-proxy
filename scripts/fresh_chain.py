@@ -1438,6 +1438,16 @@ def _reserved_client_ips() -> set[str]:
         return set()
 
 
+def _probe_excluded_ips(api_base: str) -> set[str]:
+    """IPs qu'une probe ne doit jamais toucher (022 T003).
+
+    Deux sources : le ledger (429 actifs) et la réserve client. Les probes de
+    remplissage ne doivent consommer ni l'un ni l'autre.
+    """
+
+    return _ledger_exhausted_ips(api_base) | _reserved_client_ips()
+
+
 def _reserve_winner(ip: str, host: str, station: int) -> None:
     """[022 T002] Un 200 réel entre immédiatement dans la réserve.
 
@@ -1872,7 +1882,7 @@ async def _restore_previous_host(
     """
 
     current = _station_snapshot(args.api_base, args.station)
-    exhausted = _ledger_exhausted_ips(args.api_base) | _reserved_client_ips()
+    exhausted = _probe_excluded_ips(args.api_base)
     if not _should_restore_previous(
         snapshot, exhausted=exhausted, current_host=current.get("host", "")
     ):
@@ -2208,7 +2218,7 @@ async def _run_claims(
                 else ""
             )
             if tested % 20 == 0:
-                exhausted = _ledger_exhausted_ips(args.api_base) | _reserved_client_ips()
+                exhausted = _probe_excluded_ips(args.api_base)
                 active_hosts = _active_hosts(args.station)
             if host in active_hosts:
                 log("  hostname already served by another station — skip")
@@ -2889,7 +2899,7 @@ async def run(args) -> int:
         for part in str(getattr(args, "models", "") or "").split(",")
         if part.strip() and part.strip() != args.model
     ][:_max_fallbacks]
-    exhausted = _ledger_exhausted_ips(args.api_base) | _reserved_client_ips()
+    exhausted = _probe_excluded_ips(args.api_base)
     tested = 0
     snapshot = _station_snapshot(args.api_base, args.station)
     if args.claims or auto:
@@ -2911,7 +2921,7 @@ async def run(args) -> int:
         if not host:
             continue
         if tested and tested % 20 == 0:
-            exhausted = _ledger_exhausted_ips(args.api_base) | _reserved_client_ips()
+            exhausted = _probe_excluded_ips(args.api_base)
             state["index"] = index
             save_state(state_path, state)
         log(f"[{index + 1}/{len(candidates)}] bind {host} ({country})")

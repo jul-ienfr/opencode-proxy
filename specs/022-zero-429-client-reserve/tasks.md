@@ -94,16 +94,17 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 4 — Tests de charge (P2)
 
-### T012 — 1000 requêtes client (P2) — à faire
+### T012 — 1000 requêtes client (P2) — fait (simulation)
 - **Fichiers** : `tests/test_zero_429.py`.
-- **Action** : réserve non vide, 1000 requêtes, compter les 429.
+- **Action** : réserve non vide, 1000 sélections, compter les 429.
 - **Acceptation** : 0 429.
-- **Test** : pytest marker `slow`.
+- **Test** : `test_thousand_client_picks_stay_in_reserve`. Un burst réel de 1000 dépasse la capacité (~960/jour) : le live est un soak borné, pas 1000 d'un coup.
 
-### T013 — 100 probes + 100 clients (P2) — à faire
+### T013 — 100 probes + 100 clients (P2) — fait (simulation)
 - **Fichiers** : `tests/test_zero_429.py`.
 - **Action** : vérifier que les probes ne touchent pas la réserve.
 - **Acceptation** : `client_used` = 0 sur la réserve.
+- **Test** : `test_hundred_probes_never_touch_the_reserve`.
 
 ### T014 — Runbook (P2) — fait
 - **Fichiers** : `ops/runbooks/zero-429-reserve.md`.

@@ -173,6 +173,22 @@ def _station_is_up(station) -> bool:
         return False
 
 
+def _reserve_allows(ip: str) -> bool:
+    """[022 T004] Le pool client ne sert que la réserve quand elle existe.
+
+    Fonction pure pour être testable sans VPNManager : elle ne décide que de
+    l'appartenance à la réserve, pas de l'état du tunnel.
+    """
+
+    try:
+        from free.client_reserve import reserved_ips
+
+        reserved = reserved_ips()
+    except Exception:
+        return True
+    return not reserved or str(ip or "") in reserved
+
+
 def _best_station_excluding_impl(pool, station, forced_pool, selector=None, model=None):
     """Sélection « autre station » : score si activé, sinon ordre legacy."""
     _ordered = sorted(
@@ -3166,14 +3182,8 @@ class FreeIPPool:
                     return False
         # [022 T004] Réserve client : si elle n'est pas vide, seules ses IPs
         # sont servies. Une IP non réservée n'est jamais exposée au client.
-        try:
-            from free.client_reserve import reserved_ips as _reserved_ips
-
-            _reserved = _reserved_ips()
-            if _reserved and _ip not in _reserved:
-                return False
-        except Exception:
-            pass
+        if not _reserve_allows(_ip):
+            return False
         if forced_pool is not None:
             cc = getattr(station, "_current_country", None) or getattr(station, "current_country", None)
             if cc is None:
