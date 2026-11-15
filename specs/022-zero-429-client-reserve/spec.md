@@ -155,6 +155,24 @@ Le plan initial garantit la séparation probe/client, mais il ne règle pas enco
 
 Ces points sont convertis en tâches T019–T023 et en critères de checklist.
 
+
+## Capacité et limite physique
+
+Le free tier est borné par le quota de chaque IP. Le plan ne peut pas créer de quota ; il peut seulement garantir que le client ne consomme pas le quota des probes et qu'une réserve est prête.
+
+Hypothèse de dimensionnement (à mesurer sur le ledger réel) :
+
+- 6 IPs × quota estimé par IP (paramètre `quota_estimate`, défaut 200) = **1 200 requêtes/jour**.
+- Réserve client 80 % (`client_budget_pct`) = **960 requêtes/jour** garanties.
+- Au-delà, les IPs s'épuisent et le 429 redevient possible : il faut alors plus d'IPs (WARP/proxys) ou un autre provider free.
+
+Règles de capacité :
+
+1. **Priorité client** : quand `client_reserve < reserve_min`, les probes sont **suspendues** jusqu'au prochain refill.
+2. **Suspension** : une probe ne démarre jamais si `client_reserve < reserve_min` ; elle attend.
+3. **Alerte capacité** : si la demande client dépasse le budget journalier, une alerte `capacity_shortfall` est émise avant l'épuisement.
+4. **Honnêteté** : le plan ne promet pas l'infini. Il promet zéro 429 **dans la capacité mesurée**, et une alerte quand la demande approche la limite.
+
 ## Hors périmètre
 
 - Compte payant, workspace, second compte.

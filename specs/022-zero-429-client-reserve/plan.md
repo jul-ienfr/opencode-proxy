@@ -94,6 +94,14 @@ Le 429 client vient d'un partage de bucket entre les probes et le trafic client.
 - **Chaos/CI** : tests de panne, nightly `slow`, non-régression 6/6.
 - **Rétention/migration** : purge des expirées, backup avant migration.
 
+
+## Capacité
+
+- Capacité estimée : `6 × quota_estimate × client_budget_pct`.
+- Avec 200 requêtes/IP et 80 %, **960 requêtes/jour** garanties par la réserve.
+- Si `client_reserve < reserve_min`, les probes sont suspendues (priorité client).
+- Si la demande dépasse la capacité, alerte `capacity_shortfall` ; le 429 redevient possible et le plan ne le cache pas.
+
 ## Fichiers touchés
 
 | Fichier | Rôle |

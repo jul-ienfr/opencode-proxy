@@ -63,3 +63,10 @@
 - [ ] T023 — chaos tests et nightly `slow` verts.
 - [ ] SLO : p95 < 2 s, bascule < 500 ms, 0 requête bloquée > 5 s.
 - [ ] Migration `client_reserve` avec backup préalable.
+
+## Capacité
+
+- [ ] Capacité mesurée : `6 × quota_estimate × client_budget_pct`.
+- [ ] Probes suspendues quand `client_reserve < reserve_min`.
+- [ ] Alerte `capacity_shortfall` avant épuisement.
+- [ ] Le plan ne promet pas l'infini : 429 explicite hors capacité.
