@@ -2868,7 +2868,7 @@ def _supervise() -> None:
                     free_health, stations, scope, primary
                 )
                 need_refresh = available < len(scope) and (
-                    available >= refresh_min_available
+                    available >= refresh_min_available or available <= 0
                 )
                 if need_refresh:
                     now_ts = time.time()
