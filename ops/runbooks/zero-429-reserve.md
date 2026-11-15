@@ -68,6 +68,19 @@ l'en-tête `X-Free-Reason` :
 
 Compteur : `client_429_total{reason="..."}`. Un 429 vide n'est plus possible.
 
+## Anti-churn (correctif 2026-11-15)
+
+Deux gardes empêchent la flotte de se détruire elle-même :
+
+- `allocator.refresh_min_available = 3` : aucune rotation proactive tant que
+  moins de 3 stations ont du quota. La réparation des IPs 429 reste active.
+- Une station `health=suspect` / `settling` n'est jamais rotationnée : on
+  attend qu'elle soit confirmée `usable`.
+
+Réconciliation ledger ↔ observations : toutes les 60 s, un 200 réel plus récent
+qu'un 429 débloque le bucket (`_reconcile_free_ledger_once`). Sans elle, un
+POST `/quota/mark` perdu pendant un redémarrage laissait l'IP bloquée ~19 min.
+
 ## Diagnostic
 
 | Symptôme | Vérifier |
