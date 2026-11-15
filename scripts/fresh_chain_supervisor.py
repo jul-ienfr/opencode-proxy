@@ -2793,6 +2793,28 @@ def _supervise() -> None:
             # for the primary free model.  This is the safe moment to rotate a
             # good IP, because it can no longer serve that model anyway.
             if refresh_enabled and probe_model_list:
+                # [022 T007/T015] Ne jamais rafraîchir une IP que le client
+                # peut servir : la rotation proactive tuait le seul vainqueur
+                # avant que la réserve ne l'enregistre, donc le client avait
+                # 0 IP servable alors que la flotte venait de réussir.
+                try:
+                    from free.client_reserve import (
+                        reserved_ips as _reserved_now,
+                    )
+
+                    live_reserved = _reserved_now()
+                except Exception:
+                    live_reserved = set()
+                try:
+                    reserve_target = int(
+                        os.getenv("RESERVE_TARGET")
+                        or yaml_get(
+                            "ip_registry", "client_reserve.target", 6
+                        )
+                        or 6
+                    )
+                except Exception:
+                    reserve_target = 6
                 primary = probe_model_list[0]
                 available = _primary_quota_count(
                     free_health, stations, scope, primary
@@ -2832,6 +2854,14 @@ def _supervise() -> None:
                         )
                         and now_ts - refresh_at.get(sid, 0.0)
                         >= refresh_cooldown
+                        and (
+                            str(
+                                stations.get(sid, {}).get("current_ip")
+                                or ""
+                            )
+                            not in live_reserved
+                            or len(live_reserved) > reserve_target
+                        )
                     ]
                     if eligible:
                         sid = min(eligible)

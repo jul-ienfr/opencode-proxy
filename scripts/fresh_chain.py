@@ -1438,6 +1438,25 @@ def _reserved_client_ips() -> set[str]:
         return set()
 
 
+def _reserve_winner(ip: str, host: str, station: int) -> None:
+    """[022 T002] Un 200 réel entre immédiatement dans la réserve.
+
+    Le refresh périodique du superviseur ajoutait le vainqueur avec jusqu'à
+    une minute de retard ; une rotation proactive pouvait le tuer avant.
+    """
+
+    target = str(ip or "").strip()
+    name = str(host or "").strip()
+    if not target or not name:
+        return
+    try:
+        from free.client_reserve import add
+
+        add(target, name, int(station) or None)
+    except Exception:
+        pass
+
+
 def _ledger_exhausted_ips(api_base: str) -> set[str]:
     buckets: list = []
     try:
@@ -2573,6 +2592,7 @@ async def _run_claims(
                 ]
                 save_state(state_path, state)
                 _persist_env_pin(args.station, host, country)
+                _reserve_winner(ip, host, args.station)
                 log(
                     f"WINNER station={args.station} host={host} egress={ip} "
                     f"transport={transport} model={model_used}"
@@ -2996,6 +3016,7 @@ async def run(args) -> int:
             }
             save_state(state_path, state)
             _persist_env_pin(args.station, host, country)
+            _reserve_winner(ip, host, args.station)
             log(f"WINNER station={args.station} host={host} egress={ip} model={model_used}")
             return 0
         if result.status == 429:
