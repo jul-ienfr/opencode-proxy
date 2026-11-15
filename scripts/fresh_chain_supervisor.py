@@ -1989,6 +1989,8 @@ def _supervise() -> None:
     repair_queue = RepairQueue()
     paused_until = 0.0
     stale_logged_at = 0.0
+    stale_since = 0.0
+    stale_alert_at = 0.0
     last_alert_at = 0.0
     last_global_alert_at = 0.0
     last_exhausted_alert_at = 0.0
@@ -2199,11 +2201,21 @@ def _supervise() -> None:
                 data, free_health, max_age_s=max_state_age_s
             )
             if stale:
+                # [021 T003] Alerte si l'app reste injoignable > 60 s.
+                if stale_since == 0.0:
+                    stale_since = now
+                elif now - stale_since >= 60.0 and now - stale_alert_at >= 300.0:
+                    stale_alert_at = now
+                    log(
+                        f"ALERT app control state unavailable for "
+                        f"{int(now - stale_since)}s ({stale_reason})"
+                    )
                 if now - stale_logged_at >= 60.0:
                     stale_logged_at = now
                     log(f"control state stale — scans paused ({stale_reason})")
                 time.sleep(min(poll, 10.0))
                 continue
+            stale_since = 0.0
             stations = {
                 int(s.get("station") or 0): s for s in data.get("stations", [])
             }

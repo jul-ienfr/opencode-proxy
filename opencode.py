@@ -37,6 +37,8 @@ try:
 except Exception:
     pass
 
+_APP_STARTED_AT = time.time()
+
 # [Phase 3b-1 boot] httpx DIFFÉRÉ (~81 ms mesurés sur import → listen, dont
 # ~63 ms dans httpx/__init__.py:15 qui importe `._main` → rich + click +
 # pygments pour la seule commande CLI `httpx`). Le proxy `LazyModule` garde
@@ -4908,6 +4910,40 @@ def _build_metrics_text() -> str:
     historiques (mêmes frontières de try/except, mêmes _debug)."""
 
     lines: list[str] = []
+
+    # [021 T010] Métriques de survie de l'app.
+    try:
+        import os as _os
+        import time as _time
+
+        _uptime = max(0.0, _time.time() - _APP_STARTED_AT)
+        lines.append("# HELP app_uptime_s Uptime of the proxy process")
+        lines.append("# TYPE app_uptime_s gauge")
+        lines.append(f"app_uptime_s {_uptime:.0f}")
+        _sup_log = _os.path.join(
+            _os.path.dirname(_os.path.abspath(__file__)),
+            "logs",
+            "app-supervisor.log",
+        )
+        _restarts = 0
+        _health_fail = 0
+        try:
+            with open(_sup_log, encoding="utf-8", errors="replace") as _fh:
+                for _line in _fh:
+                    if "redémarrage dans" in _line or "red\xe9marrage dans" in _line:
+                        _restarts += 1
+                    if "/health indisponible" in _line:
+                        _health_fail += 1
+        except OSError:
+            pass
+        lines.append("# HELP app_restarts_total Supervised restarts")
+        lines.append("# TYPE app_restarts_total counter")
+        lines.append(f"app_restarts_total {_restarts}")
+        lines.append("# HELP app_health_failures_total /health failures")
+        lines.append("# TYPE app_health_failures_total counter")
+        lines.append(f"app_health_failures_total {_health_fail}")
+    except Exception:
+        pass
 
     # Section VPN : extraction live shared_state (fail-soft, inchangée).
     try:

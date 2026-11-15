@@ -6,8 +6,8 @@
 ## Surveillance
 
 - [x] T001 — `app_supervisor.py` restauré (health check 45 s, kill zombie).
-- [ ] T002 — superviseur lancé au boot (service/tâche planifiée) — droits admin requis.
-- [ ] T003 — alerte si `/health` absent > 60 s.
+- [x] T002 — superviseur lancé au boot (service/tâche planifiée) — droits admin requis.
+- [x] T003 — alerte si `/health` absent > 60 s.
 - [ ] Redémarrage après 45 s d'échec vérifié sur un processus réel.
 - [ ] `/health` 200 en < 30 s après restart.
 
@@ -34,12 +34,12 @@
 
 ## Qualité
 
-- [ ] T010 — métriques `app_uptime_s`, `app_restarts_total`, `app_health_failures_total`.
+- [x] T010 — métriques `app_uptime_s`, `app_restarts_total`, `app_health_failures_total`.
 - [x] T011 — runbook `ops/runbooks/app-supervision.md`.
 - [x] T012 — `tests/test_no_visible_spawn.py` vert.
 - [x] T013 — CHANGELOG daté.
 - [x] T014 — test d'intégration zombie.
-- [ ] T015 — `client_usable` revient après un restart app.
+- [x] T015 — `client_usable` revient après un restart app.
 
 ## Preuves live
 

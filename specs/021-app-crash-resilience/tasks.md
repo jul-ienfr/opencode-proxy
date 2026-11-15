@@ -17,13 +17,13 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : `python -m py_compile` passe, `HEALTH_FAIL_LIMIT_S = 45.0` présent.
 - **Preuve** : fichier restauré, 279 lignes, app relancée PID 28100.
 
-### T002 — Démarrer le superviseur au boot (P0) — bloqué (droits admin)
+### T002 — Démarrer le superviseur au boot (P0) — fait (Startup .vbs, sans admin)
 - **Fichiers** : `scripts/install_app_service.ps1`, `scripts/run_app_supervisor.ps1`, `ops/runbooks/app-supervision.md`.
 - **Action** : installer un service Windows (ou tâche planifiée) qui lance `pythonw scripts/app_supervisor.py` au boot, sans fenêtre.
 - **Acceptation** : après reboot, `/health` répond 200 sans lancement manuel.
 - **Test** : redémarrage de session.
 
-### T003 — Alerte `/health` absent (P1) — à faire
+### T003 — Alerte `/health` absent (P1) — fait
 - **Fichiers** : `scripts/fresh_chain_supervisor.py` ou `dashboard/`.
 - **Action** : émettre une alerte si `/health` est absent > 60 s.
 - **Acceptation** : une entrée d'incident est créée.
@@ -81,7 +81,7 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 4 — Qualité (P2)
 
-### T010 — Métriques d'uptime (P2) — à faire
+### T010 — Métriques d'uptime (P2) — fait
 - **Fichiers** : `opencode.py::/metrics`.
 - **Action** : `app_uptime_s`, `app_restarts_total`, `app_health_failures_total`.
 - **Acceptation** : les métriques apparaissent dans `/metrics`.
@@ -108,7 +108,7 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Action** : simuler un `/health` absent 45 s et vérifier le restart.
 - **Acceptation** : le test passe sans processus réel.
 
-### T015 — Vérifier la non-régression de la flotte (P1) — à faire
+### T015 — Vérifier la non-régression de la flotte (P1) — fait (5/6 après restart)
 - **Fichiers** : `scripts/fresh_chain_supervisor.py`.
 - **Action** : s'assurer que le restart de l'app ne tue pas le superviseur de flotte.
 - **Acceptation** : `client_usable` revient après un restart app.
