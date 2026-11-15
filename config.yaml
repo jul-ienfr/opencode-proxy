@@ -379,11 +379,11 @@ ip_rotation:
     enabled: true
     label: WARP 3 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d7:be::13:274
+    egress_ip: 2a09:bac1:2780:2060::40d:56
     managed: true
     container: warp-3
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d7:be::/64
+    block: 2a09:bac1:2780:2060::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -407,11 +407,11 @@ ip_rotation:
     enabled: true
     label: WARP 4 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d1:14f0::216:c4
+    egress_ip: 2a09:bac5:32d5:1519::21a:62
     managed: true
     container: warp-4
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d1:14f0::/64
+    block: 2a09:bac5:32d5:1519::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -463,11 +463,11 @@ ip_rotation:
     enabled: true
     label: WARP 6 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d1:26b4::3db:33
+    egress_ip: 2a09:bac1:2780:2060::2d7:68
     managed: true
     container: warp-6
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d1:26b4::/64
+    block: 2a09:bac1:2780:2060::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -505,11 +505,11 @@ ip_rotation:
     enabled: true
     label: WARP 7 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d2:28b4::40e:c
+    egress_ip: 2a09:bac5:32d3:be::13:243
     managed: true
     container: warp-7
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d2:28b4::/64
+    block: 2a09:bac5:32d3:be::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -533,11 +533,11 @@ ip_rotation:
     enabled: true
     label: WARP 8 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d2:14dc::214:c4
+    egress_ip: 2a09:bac5:32d5:1c82::2d7:95
     managed: true
     container: warp-8
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d2:14dc::/64
+    block: 2a09:bac5:32d5:1c82::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -1590,4 +1590,12 @@ models:
   gemini-4-carbon:
     protocol: gemini
   gemini-4-hydrogen:
+    protocol: gemini
+  gemini-3-flash:
+    protocol: gemini
+  gemini-3-pro:
+    protocol: gemini
+  gemini-3.1-pro:
+    protocol: gemini
+  gemini-4-argon-contributor:
     protocol: gemini

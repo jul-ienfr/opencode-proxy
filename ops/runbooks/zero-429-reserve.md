@@ -55,6 +55,19 @@ leurs IPs à la réserve avec un TTL d'une heure.
 Latence client : 1,1 à 2,6 s sur 11 requêtes, un outlier à 40,6 s (bascule
 interne). Le zéro 429 est tenu quand une IP réservée est liée à une station.
 
+## 429 raisonnés (T009)
+
+Le client reçoit toujours un 429 JSON avec `Retry-After`, un champ `reason` et
+l'en-tête `X-Free-Reason` :
+
+| `reason` | Sens |
+|---|---|
+| `reserve_empty` | Aucune IP de réserve liée à une station ; un fallback WARP/proxy existe |
+| `all_fallbacks_dead` | Réserve vide **et** aucun WARP/proxy utilisable |
+| `upstream_429` | Une IP réservée est servie (ou en cooldown) mais l'amont a refusé |
+
+Compteur : `client_429_total{reason="..."}`. Un 429 vide n'est plus possible.
+
 ## Diagnostic
 
 | Symptôme | Vérifier |
