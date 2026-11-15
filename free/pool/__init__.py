@@ -3164,6 +3164,16 @@ class FreeIPPool:
                 _osid = int(getattr(_other, "_station", 0) or 0)
                 if 0 < _osid < _sid and str(getattr(_other, "current_ip", "") or "") == _ip:
                     return False
+        # [022 T004] Réserve client : si elle n'est pas vide, seules ses IPs
+        # sont servies. Une IP non réservée n'est jamais exposée au client.
+        try:
+            from free.client_reserve import reserved_ips as _reserved_ips
+
+            _reserved = _reserved_ips()
+            if _reserved and _ip not in _reserved:
+                return False
+        except Exception:
+            pass
         if forced_pool is not None:
             cc = getattr(station, "_current_country", None) or getattr(station, "current_country", None)
             if cc is None:

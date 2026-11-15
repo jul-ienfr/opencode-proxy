@@ -1427,6 +1427,17 @@ def _exhausted_ips_from_buckets(buckets, now: float | None = None) -> set[str]:
     return out
 
 
+def _reserved_client_ips() -> set[str]:
+    """[022 T003] IPs de la réserve client : interdites aux probes."""
+
+    try:
+        from free.client_reserve import reserved_ips
+
+        return reserved_ips()
+    except Exception:
+        return set()
+
+
 def _ledger_exhausted_ips(api_base: str) -> set[str]:
     buckets: list = []
     try:
@@ -1842,7 +1853,7 @@ async def _restore_previous_host(
     """
 
     current = _station_snapshot(args.api_base, args.station)
-    exhausted = _ledger_exhausted_ips(args.api_base)
+    exhausted = _ledger_exhausted_ips(args.api_base) | _reserved_client_ips()
     if not _should_restore_previous(
         snapshot, exhausted=exhausted, current_host=current.get("host", "")
     ):
@@ -2178,7 +2189,7 @@ async def _run_claims(
                 else ""
             )
             if tested % 20 == 0:
-                exhausted = _ledger_exhausted_ips(args.api_base)
+                exhausted = _ledger_exhausted_ips(args.api_base) | _reserved_client_ips()
                 active_hosts = _active_hosts(args.station)
             if host in active_hosts:
                 log("  hostname already served by another station — skip")
@@ -2858,7 +2869,7 @@ async def run(args) -> int:
         for part in str(getattr(args, "models", "") or "").split(",")
         if part.strip() and part.strip() != args.model
     ][:_max_fallbacks]
-    exhausted = _ledger_exhausted_ips(args.api_base)
+    exhausted = _ledger_exhausted_ips(args.api_base) | _reserved_client_ips()
     tested = 0
     snapshot = _station_snapshot(args.api_base, args.station)
     if args.claims or auto:
@@ -2880,7 +2891,7 @@ async def run(args) -> int:
         if not host:
             continue
         if tested and tested % 20 == 0:
-            exhausted = _ledger_exhausted_ips(args.api_base)
+            exhausted = _ledger_exhausted_ips(args.api_base) | _reserved_client_ips()
             state["index"] = index
             save_state(state_path, state)
         log(f"[{index + 1}/{len(candidates)}] bind {host} ({country})")

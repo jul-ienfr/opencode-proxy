@@ -5,16 +5,16 @@
 
 ## Réserve
 
-- [ ] T001 — table `client_reserve` créée (migration idempotente).
-- [ ] T002 — une IP 200 confirmée entre dans la réserve et sort du pool probe.
+- [x] T001 — table `client_reserve` créée (migration idempotente).
+- [x] T002 — une IP 200 confirmée entre dans la réserve et sort du pool probe.
 - [ ] T005 — réserve maintenue `>= 2` IPs prouvées.
 - [ ] T007 — une IP consommée sort de la réserve et est remplacée.
 - [ ] La réserve survit à un redémarrage de l'app.
 
 ## Séparation probe/client
 
-- [ ] T003 — `StationProbe` refuse toute IP réservée.
-- [ ] T004 — le pool client ne sélectionne que la réserve.
+- [x] T003 — `StationProbe` refuse toute IP réservée.
+- [x] T004 — le pool client ne sélectionne que la réserve.
 - [ ] T006 — budget probe respecté (`probe_budget_pct`).
 - [ ] 100 probes → `client_used = 0` sur la réserve.
 

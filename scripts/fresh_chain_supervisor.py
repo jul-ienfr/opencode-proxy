@@ -1294,6 +1294,18 @@ def _refresh_warm_pool(
                 now + max(300.0, ttl),
             )
         )
+        # [022 T002] Une station qui a un 200 réel entre dans la réserve
+        # client. Les probes ne la consommeront plus.
+        try:
+            from free.client_reserve import add as _reserve_add
+
+            _reserve_add(
+                ip,
+                host,
+                int(station.get("station") or 0) or None,
+            )
+        except Exception:
+            pass
     try:
         with sqlite3.connect(
             ROOT / "logs" / "registry.db", timeout=5.0

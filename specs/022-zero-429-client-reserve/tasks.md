@@ -11,25 +11,25 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 0 — Mesure et séparation (P0)
 
-### T001 — Table `client_reserve` (P0) — à faire
+### T001 — Table `client_reserve` (P0) — fait
 - **Fichiers** : `free/quota_ledger.py`, migration `registry.db`.
 - **Action** : créer `client_reserve(ip, hostname, station, verified_at, expires_at, source)` avec index unique sur `ip`.
 - **Acceptation** : migration idempotente, table lisible par le pool.
 - **Test** : `tests/test_client_reserve.py::test_migration`.
 
-### T002 — Marqueur `reserved_for_client` (P0) — à faire
+### T002 — Marqueur `reserved_for_client` (P0) — fait
 - **Fichiers** : `free/quota_ledger.py`, `warm_pool`.
 - **Action** : une IP entre dans `client_reserve` après un 200 confirmé ; elle est retirée du pool probe.
 - **Acceptation** : une IP réservée n'est jamais proposée aux probes.
 - **Test** : unitaire.
 
-### T003 — Probes interdites sur la réserve (P0) — à faire
+### T003 — Probes interdites sur la réserve (P0) — fait
 - **Fichiers** : `free/ip_registry/adapters/probe.py`, `scripts/fresh_chain.py`.
 - **Action** : refuser `client_reserve` dans `StationProbe` et dans la sélection de candidats.
 - **Acceptation** : 100 probes → 0 sélection d'IP réservée.
 - **Test** : unitaire + compteur.
 
-### T004 — Pool client réserve-only (P0) — à faire
+### T004 — Pool client réserve-only (P0) — fait
 - **Fichiers** : `free/pool/__init__.py`.
 - **Action** : `_station_usable` exige une entrée `client_reserve` valide.
 - **Acceptation** : aucune requête client sur une IP non réservée.
