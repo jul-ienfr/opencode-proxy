@@ -45,12 +45,11 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : `client_reserve_ips >= 2` stable.
 - **Test** : live + métrique. Le 2026-11-15, la réserve est passée de 1 à 8 entre 11:19 et 12:35, sans descendre sous 4 après 12:25.
 
-### T006 — Budget probe (P1) — à faire
-- **Fichiers** : `free/quota_ledger.py`, `config.yaml`.
+### T006 — Budget probe (P1) — fait
+- **Fichiers** : `free/client_reserve.py`, `scripts/fresh_chain.py`.
 - **Action** : `probe_budget_pct` (défaut 50 %) ; les probes ne consomment pas plus.
 - **Acceptation** : `client_used` reste 0 sur les IPs réservées.
-- **Test** : unitaire + live.
-- **Note** : non implémenté. Le budget client (T020) est fait ; le budget probe reste à câbler.
+- **Test** : `test_probe_budget_blocks_half_spent_ip`, `test_probe_budget_remaining_counts_reserve_only`. Les probes excluent la réserve **et** les IPs à 50 % de leur quota ; métrique `probe_budget_remaining`.
 
 ### T007 — Remplacement d'une IP consommée (P1) — fait
 - **Fichiers** : `free/client_reserve.py`, `free/pool/__init__.py`, superviseur.
@@ -62,17 +61,17 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 2 — Fallback avant 429 (P1)
 
-### T008 — Ordre de fallback (P1) — à faire
+### T008 — Ordre de fallback (P1) — partiel
 - **Fichiers** : `free/pool/__init__.py`, `opencode.py`.
 - **Action** : réserve → WARP → proxys → direct (si autorisé) → 429.
 - **Acceptation** : un WARP disponible est utilisé avant le 429.
-- **Test** : `test_zero_429.py::test_fallback_before_429`.
+- **État** : la réserve ne bloque plus les fallbacks quand elle est vide (`test_empty_reserve_leaves_fallback_available`). L'ordre WARP → proxys → direct n'est pas encore instrumenté ni testé de bout en bout.
 
-### T009 — 429 explicite (P1) — à faire
-- **Fichiers** : `opencode.py`.
+### T009 — 429 explicite (P1) — fait
+- **Fichiers** : `core/errors.py`, `opencode.py`.
 - **Action** : 429 JSON avec `Retry-After` exact et `reason` (`reserve_empty`, `all_fallbacks_dead`, `upstream_429`).
 - **Acceptation** : aucun 429 vide.
-- **Test** : unitaire.
+- **Test** : `test_quota_error_carries_a_reason` + en-tête `X-Free-Reason` + compteur `client_429_total{reason}`.
 
 ---
 
@@ -164,7 +163,8 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : aucun doublon de claim sous concurrence.
 - **Test** : test concurrent.
 
-### T023 — Chaos et CI (P2) — à faire
+### T023 — Chaos et CI (P2) — partiel
 - **Fichiers** : `tests/test_zero_429.py`, CI.
 - **Action** : tests IP qui tombe, WARP mort, DB lock ; nightly `slow`.
 - **Acceptation** : les tests passent et la non-régression 6/6 est vérifiée.
+- **État** : DB corrompue et DB verrouillée couvertes (`test_reserve_survives_a_corrupt_db`, `test_reserve_survives_a_locked_db`). WARP mort et nightly `slow` restent à câbler.

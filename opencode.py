@@ -39,12 +39,42 @@ except Exception:
 
 _APP_STARTED_AT = time.time()
 _CLIENT_429_TOTAL = 0
+_CLIENT_429_BY_REASON: dict[str, int] = {}
 
 
-def _count_client_429() -> None:
+def _client_429_reason() -> str:
+    """Pourquoi le client reçoit un 429 (022 T009).
+
+    ``reserve_empty`` : aucune IP de réserve servable.
+    ``all_fallbacks_dead`` : réserve vide et aucun endpoint WARP/proxy utilisable.
+    ``upstream_429`` : la réserve existe mais l'amont a refusé.
+    """
+
+    try:
+        from free.client_reserve import count as _reserve_count
+
+        if int(_reserve_count()) > 0:
+            return "upstream_429"
+    except Exception:
+        return "reserve_empty"
+    try:
+        import shared_state
+
+        pool = getattr(shared_state, "free_ip_pool", None)
+        endpoints = list(getattr(pool, "_socks5_eps", None) or [])
+        if any(bool(getattr(ep, "client_usable", False)) for ep in endpoints):
+            return "reserve_empty"
+    except Exception:
+        pass
+    return "all_fallbacks_dead"
+
+
+def _count_client_429(reason: str = "") -> None:
     """Compteur des 429 quota réellement renvoyés au client (022 T010)."""
     global _CLIENT_429_TOTAL
     _CLIENT_429_TOTAL += 1
+    label = str(reason or "unknown")
+    _CLIENT_429_BY_REASON[label] = _CLIENT_429_BY_REASON.get(label, 0) + 1
 
 # [Phase 3b-1 boot] httpx DIFFÉRÉ (~81 ms mesurés sur import → listen, dont
 # ~63 ms dans httpx/__init__.py:15 qui importe `._main` → rich + click +
@@ -4955,11 +4985,30 @@ def _build_metrics_text() -> str:
             lines.append("# HELP client_reserve_ips Reserved client egress IPs")
             lines.append("# TYPE client_reserve_ips gauge")
             lines.append(f"client_reserve_ips {_reserve_count()}")
+            try:
+                from free.client_reserve import (
+                    probe_budget_remaining as _probe_budget_left,
+                )
+
+                lines.append(
+                    "# HELP probe_budget_remaining Probe requests left on "
+                    "reserved IPs"
+                )
+                lines.append("# TYPE probe_budget_remaining gauge")
+                lines.append(
+                    f"probe_budget_remaining {_probe_budget_left()}"
+                )
+            except Exception:
+                pass
         except Exception:
             pass
         lines.append("# HELP client_429_total 429 quota returned to clients")
         lines.append("# TYPE client_429_total counter")
         lines.append(f"client_429_total {_CLIENT_429_TOTAL}")
+        for _reason, _count in sorted(_CLIENT_429_BY_REASON.items()):
+            lines.append(
+                f'client_429_total{{reason="{_reason}"}} {_count}'
+            )
     except Exception:
         pass
 
@@ -15462,15 +15511,20 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
 
 def _free_preflight_response(wait_s: float, *, anthropic: bool):
     """429 JSON propre (le seul format qu'un client affiche lisiblement)."""
-    _count_client_429()
+    reason = _client_429_reason()
+    _count_client_429(reason)
     msg = "Free quota exhausted on all VPN stations."
     try:
         if wait_s >= 1:
             msg += f" Retry in {int(wait_s)}s."
     except Exception:
         pass
-    resp = _anthropic_error(429, msg, "rate_limit_error") if anthropic else _openai_error(429, msg, "rate_limit_error")
+    if anthropic:
+        resp = _anthropic_error(429, msg, "rate_limit_error", reason=reason)
+    else:
+        resp = _openai_error(429, msg, "rate_limit_error", reason=reason)
     try:
+        resp.headers["X-Free-Reason"] = reason
         if wait_s >= 1:
             resp.headers["Retry-After"] = str(int(wait_s))
     except Exception:
@@ -18437,7 +18491,8 @@ async def _free_stream_refuse_bytes(
     # Un 429 « Endpoint is unavailable » = surcharge serveur transitoire :
     # message véridique + type overloaded_error (jamais rate_limit_error).
     if _status == 429 and _is_free_quota_failure(_status, _cap):
-        _count_client_429()
+        _reason429 = _client_429_reason()
+        _count_client_429(_reason429)
         if _retry_after:
             _msg429 = f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."
         else:
@@ -18447,6 +18502,7 @@ async def _free_stream_refuse_bytes(
             "error": {
                 "type": "rate_limit_error",
                 "message": _msg429,
+                "reason": _reason429,
             },
         }
     else:

@@ -108,14 +108,20 @@ class ModelOutOfScope(Exception):
         self.reason = reason or str(self)
 
 
-def anthropic_error(status_code: int, message: str, error_type: str = "api_error") -> JSONResponse:
+def anthropic_error(
+    status_code: int,
+    message: str,
+    error_type: str = "api_error",
+    *,
+    reason: str = "",
+) -> JSONResponse:
     """Return an error in Anthropic Messages API format."""
+    error: dict[str, object] = {"type": error_type, "message": message}
+    if reason:
+        error["reason"] = reason
     return JSONResponse(
         status_code=status_code,
-        content={
-            "type": "error",
-            "error": {"type": error_type, "message": message},
-        },
+        content={"type": "error", "error": error},
     )
 
 
@@ -123,13 +129,24 @@ def anthropic_error(status_code: int, message: str, error_type: str = "api_error
 _anthropic_error = anthropic_error
 
 
-def openai_error(status_code: int, message: str, error_type: str = "invalid_request_error") -> JSONResponse:
+def openai_error(
+    status_code: int,
+    message: str,
+    error_type: str = "invalid_request_error",
+    *,
+    reason: str = "",
+) -> JSONResponse:
     """Return an error in OpenAI API format."""
+    error: dict[str, object] = {
+        "message": message,
+        "type": error_type,
+        "code": str(status_code),
+    }
+    if reason:
+        error["reason"] = reason
     return JSONResponse(
         status_code=status_code,
-        content={
-            "error": {"message": message, "type": error_type, "code": str(status_code)},
-        },
+        content={"error": error},
     )
 
 

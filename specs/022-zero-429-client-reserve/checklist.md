@@ -15,18 +15,18 @@
 
 - [x] T003 — `StationProbe` refuse toute IP réservée.
 - [x] T004 — le pool client ne sélectionne que la réserve.
-- [ ] T006 — budget probe respecté (`probe_budget_pct`).
-- [ ] 100 probes → `client_used = 0` sur la réserve.
+- [x] T006 — budget probe respecté (`probe_budget_pct`), `probe_budget_remaining` exposé.
+- [ ] 100 probes → `client_used = 0` sur la réserve (simulation seule).
 
 ## Fallback
 
-- [ ] T008 — WARP utilisé avant le 429 quand la réserve est vide.
-- [ ] T009 — 429 JSON avec `Retry-After` et `reason`, jamais vide.
+- [ ] T008 — partiel : réserve vide laisse passer les fallbacks ; ordre non instrumenté.
+- [x] T009 — 429 JSON avec `Retry-After`, `reason` et `X-Free-Reason`, jamais vide.
 - [ ] Chaque bascule est loggée avec sa cause.
 
 ## Observabilité
 
-- [x] T010 — `client_reserve_ips`, `client_429_total` dans `/metrics`.
+- [x] T010 — `client_reserve_ips`, `client_429_total{reason}`, `probe_budget_remaining`.
 - [x] T011 — alerte `reserve < 2`, loggée au changement.
 - [ ] Tableau de bord réserve/consommation.
 
@@ -60,7 +60,7 @@
 - [x] T020 — `client_budget_pct` respecté, aucune IP servie jusqu'à épuisement.
 - [x] T021 — TTL 3600 s (`RESERVE_TTL_S`), 0 IP périmée servie.
 - [ ] T022 — claim atomique, aucun doublon sous concurrence.
-- [ ] T023 — chaos tests et nightly `slow` verts.
+- [ ] T023 — chaos tests et nightly `slow` verts (DB corrompue/verrouillée faites).
 - [ ] SLO : p95 < 2 s, bascule < 500 ms, 0 requête bloquée > 5 s.
 - [ ] Migration `client_reserve` avec backup préalable.
 

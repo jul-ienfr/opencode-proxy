@@ -1439,13 +1439,20 @@ def _reserved_client_ips() -> set[str]:
 
 
 def _probe_excluded_ips(api_base: str) -> set[str]:
-    """IPs qu'une probe ne doit jamais toucher (022 T003).
+    """IPs qu'une probe ne doit jamais toucher (022 T003/T006).
 
-    Deux sources : le ledger (429 actifs) et la réserve client. Les probes de
-    remplissage ne doivent consommer ni l'un ni l'autre.
+    Trois sources : le ledger (429 actifs), la réserve client et les IPs qui
+    ont déjà consommé leur budget probe.
     """
 
-    return _ledger_exhausted_ips(api_base) | _reserved_client_ips()
+    excluded = _ledger_exhausted_ips(api_base) | _reserved_client_ips()
+    try:
+        from free.client_reserve import probe_blocked_ips
+
+        excluded |= probe_blocked_ips()
+    except Exception:
+        pass
+    return excluded
 
 
 def _reserve_winner(ip: str, host: str, station: int) -> None:

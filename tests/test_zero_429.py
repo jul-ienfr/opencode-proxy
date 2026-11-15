@@ -126,6 +126,9 @@ def test_hundred_probes_never_touch_the_reserve(monkeypatch) -> None:
         "_reserved_client_ips",
         lambda: {"10.0.0.1", "10.0.0.2"},
     )
+    monkeypatch.setattr(
+        "free.client_reserve.probe_blocked_ips", lambda **_: set()
+    )
     excluded = fresh_chain._probe_excluded_ips("http://127.0.0.1:4000")
     assert excluded == {"10.0.0.1", "10.0.0.2", "10.0.0.9"}
     candidates = [f"10.0.0.{i}" for i in range(1, 7)]
@@ -136,3 +139,91 @@ def test_hundred_probes_never_touch_the_reserve(monkeypatch) -> None:
         if ip not in excluded
     }
     assert not (touched & {"10.0.0.1", "10.0.0.2"})
+
+
+def test_probe_budget_blocks_half_spent_ip(tmp_path: Path) -> None:
+    """T006 : une IP à 50 % de son quota n'est plus sondée."""
+
+    db = tmp_path / "registry.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE quota_buckets(ip TEXT, used INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO quota_buckets(ip, used) VALUES(?, ?)",
+        [("10.0.0.1", cr._probe_budget()), ("10.0.0.2", 40)],
+    )
+    conn.commit()
+    conn.close()
+    assert cr.probe_blocked_ips(db=db) == {"10.0.0.1"}
+
+
+def test_probe_budget_remaining_counts_reserve_only(tmp_path: Path) -> None:
+    db = tmp_path / "registry.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE quota_buckets(ip TEXT, used INTEGER)"
+    )
+    conn.execute("INSERT INTO quota_buckets(ip, used) VALUES('10.0.0.1', 40)")
+    conn.commit()
+    conn.close()
+    assert cr.add("10.0.0.1", "host.nordvpn.com", 1, db=db)
+    assert cr.probe_budget_remaining(db=db) == cr._probe_budget() - 40
+
+
+def test_empty_reserve_leaves_fallback_available(monkeypatch) -> None:
+    """T008 : réserve vide = les fallbacks reprennent la main."""
+
+    from free import pool as pool_mod
+
+    monkeypatch.setattr(
+        "free.client_reserve.reserved_ips", lambda **_: set()
+    )
+    assert pool_mod._reserve_allows("10.0.0.99")
+
+
+def test_quota_error_carries_a_reason(monkeypatch) -> None:
+    """T009 : le 429 expose une raison structurée."""
+
+    import opencode
+
+    monkeypatch.setattr(opencode, "_client_429_reason", lambda: "reserve_empty")
+    monkeypatch.setattr(opencode, "_CLIENT_429_BY_REASON", {})
+    response = opencode._free_preflight_response(42, anthropic=False)
+    payload = response.body
+    assert b'"reason":"reserve_empty"' in payload
+    assert response.headers.get("X-Free-Reason") == "reserve_empty"
+    assert response.headers.get("Retry-After") == "42"
+    assert opencode._CLIENT_429_BY_REASON == {"reserve_empty": 1}
+
+
+def test_reserve_survives_a_corrupt_db(tmp_path: Path) -> None:
+    """T023 : une base illisible ne fait pas planter le routage."""
+
+    db = tmp_path / "registry.db"
+    db.write_bytes(b"not a sqlite database")
+    assert cr.reserved_ips(db=db) == set()
+    assert cr.count(db=db) == 0
+
+
+def test_reserve_survives_a_locked_db(tmp_path: Path, monkeypatch) -> None:
+    """T023 : une base verrouillée dégrade, elle ne bloque pas 5 s."""
+
+    import sqlite3 as _sqlite
+
+    db = tmp_path / "registry.db"
+    assert cr.add("10.0.0.1", "host.nordvpn.com", 1, db=db)
+    monkeypatch.setattr(
+        cr,
+        "_connect",
+        lambda target=None: _sqlite.connect(
+            str(target or cr.DEFAULT_DB), timeout=0.05
+        ),
+    )
+    locker = _sqlite.connect(str(db), timeout=0.05)
+    locker.execute("BEGIN EXCLUSIVE")
+    try:
+        assert cr.reserved_ips(db=db) == set()
+    finally:
+        locker.rollback()
+        locker.close()

@@ -48,6 +48,22 @@ def _client_budget() -> int:
     except (TypeError, ValueError):
         return 160
 
+
+def _probe_budget() -> int:
+    """Budget probe par IP (022 T006).
+
+    ``PROBE_BUDGET_PCT`` (défaut 50). Une IP qui a déjà consommé la moitié de
+    son quota estimé n'est plus une candidate utile : la sonder gaspille le
+    peu de quota qui reste au client.
+    """
+
+    try:
+        pct = float(os.getenv("PROBE_BUDGET_PCT", "50") or 50)
+        estimate = float(os.getenv("CLIENT_QUOTA_ESTIMATE", "200") or 200)
+        return max(1, int(estimate * pct / 100.0))
+    except (TypeError, ValueError):
+        return 100
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS client_reserve (
     ip TEXT PRIMARY KEY,
@@ -210,6 +226,63 @@ def reserved_ips(
 
 def is_reserved(ip: str, *, now: float | None = None) -> bool:
     return str(ip or "").strip() in reserved_ips(now=now)
+
+
+def probe_blocked_ips(
+    *, now: float | None = None, db: Path | None = None
+) -> set[str]:
+    """IPs qu'une probe ne doit plus consommer (022 T006).
+
+    Une IP qui a déjà dépensé ``probe_budget_pct`` de son quota estimé n'a plus
+    assez pour le client : la sonder ne ferait que confirmer son épuisement.
+    """
+
+    del now  # le budget ne dépend pas de l'heure, seulement du compteur
+    try:
+        ensure_schema(db)
+        with _connect(db) as conn:
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(quota_buckets)")
+            }
+            if not {"ip", "used"} <= columns:
+                return set()
+            rows = conn.execute(
+                "SELECT ip FROM quota_buckets WHERE used >= ?",
+                (_probe_budget(),),
+            ).fetchall()
+        return {str(row[0]) for row in rows if row and row[0]}
+    except Exception:
+        return set()
+
+
+def probe_budget_remaining(
+    *, now: float | None = None, db: Path | None = None
+) -> int:
+    """Requêtes encore disponibles dans le budget probe des IPs réservées."""
+
+    reserved = reserved_ips(now=now, db=db)
+    if not reserved:
+        return 0
+    budget = _probe_budget()
+    try:
+        with _connect(db) as conn:
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(quota_buckets)")
+            }
+            if not {"ip", "used"} <= columns:
+                return budget * len(reserved)
+            placeholders = ",".join("?" for _ in reserved)
+            rows = conn.execute(
+                f"SELECT ip, MAX(used) FROM quota_buckets "
+                f"WHERE ip IN ({placeholders}) GROUP BY ip",
+                tuple(reserved),
+            ).fetchall()
+        used = {str(row[0]): int(row[1] or 0) for row in rows}
+        return sum(max(0, budget - used.get(ip, 0)) for ip in reserved)
+    except Exception:
+        return 0
 
 
 def remove(ip: str, *, db: Path | None = None) -> int:
