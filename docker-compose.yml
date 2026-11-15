@@ -69,9 +69,8 @@ x-gluetun-multi-env: &gluetun-multi-env
   # redémarre le tunnel en boucle. DoT et plain ont été validés live sur le
   # même serveur NordVPN ; DoT garde le chiffrement, plain est le repli si
   # TCP/853 est bloqué.
-  DNS_UPSTREAM_RESOLVER_TYPE: dot
-  DNS_UPSTREAM_PLAIN_ADDRESSES: 1.1.1.1:53,8.8.8.8:53,9.9.9.9:53
-  DNS_UPSTREAM_RESOLVERS: cloudflare,google,quad9
+  DNS_UPSTREAM_RESOLVER_TYPE: plain
+  DNS_UPSTREAM_PLAIN_ADDRESSES: 103.86.96.100:53,103.86.99.100:53,1.1.1.1:53
   # [2026-11-05] Do NOT force 1.1.1.1/8.8.8.8 as health targets: several
   # NordVPN servers drop TCP/443 to those addresses while cloudflare.com /
   # github.com work. Gluetun then restarts the tunnel every 6 s and every
@@ -247,9 +246,8 @@ services:
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1080
       # [2026-11-05] DoH mesuré mort ; DoT validé live (repli plain).
-      - DNS_UPSTREAM_RESOLVER_TYPE=dot
-      - DNS_UPSTREAM_PLAIN_ADDRESSES=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53
-      - DNS_UPSTREAM_RESOLVERS=cloudflare,google,quad9
+      - DNS_UPSTREAM_RESOLVER_TYPE=plain
+      - DNS_UPSTREAM_PLAIN_ADDRESSES=103.86.96.100:53,103.86.99.100:53,1.1.1.1:53
       # [incident v10] blocs littéraux st1/st2 : le MTU de l'ancre partagée
       # n'atteint pas ces services — TLS black-holait au-delà de ~1300 octets.
       - OPENVPN_MSSFIX=1280
@@ -351,9 +349,8 @@ services:
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1081
       # [2026-11-05] DoH mesuré mort ; DoT validé live (repli plain).
-      - DNS_UPSTREAM_RESOLVER_TYPE=dot
-      - DNS_UPSTREAM_PLAIN_ADDRESSES=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53
-      - DNS_UPSTREAM_RESOLVERS=cloudflare,google,quad9
+      - DNS_UPSTREAM_RESOLVER_TYPE=plain
+      - DNS_UPSTREAM_PLAIN_ADDRESSES=103.86.96.100:53,103.86.99.100:53,1.1.1.1:53
       - OPENVPN_MSSFIX=1280
       - FIREWALL=on
       - PUID=1000
@@ -612,9 +609,8 @@ services:
       - SOCKS5_ENABLED=on
       - SOCKS5_LISTENING_ADDRESS=:1090
       # [2026-11-05] DoH mesuré mort ; DoT validé live (repli plain).
-      - DNS_UPSTREAM_RESOLVER_TYPE=dot
-      - DNS_UPSTREAM_PLAIN_ADDRESSES=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53
-      - DNS_UPSTREAM_RESOLVERS=cloudflare,google,quad9
+      - DNS_UPSTREAM_RESOLVER_TYPE=plain
+      - DNS_UPSTREAM_PLAIN_ADDRESSES=103.86.96.100:53,103.86.99.100:53,1.1.1.1:53
       - FIREWALL=on
       - PUID=1000
       - PGID=1000
