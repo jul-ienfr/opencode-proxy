@@ -41,7 +41,7 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ### T005 — Remplissage de la réserve (P1) — à faire
 - **Fichiers** : `scripts/fresh_chain_supervisor.py`.
-- **Action** : en arrière-plan, qualifier des IPs non réservées jusqu'à `reserve_target` (défaut 3).
+- **Action** : en arrière-plan, qualifier des IPs non réservées jusqu'à `reserve_target` (défaut 6).
 - **Acceptation** : `client_reserve_ips >= 2` stable.
 - **Test** : live + métrique.
 
@@ -108,3 +108,29 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Fichiers** : `ops/runbooks/zero-429-reserve.md`.
 - **Action** : décrire la réserve, les alertes, le remplacement, le fallback.
 - **Acceptation** : un opérateur sait quoi faire quand `reserve < 2`.
+
+## Phase 5 — Alignement explicite (P1)
+
+### T015 — Migration douce (P1) — à faire
+- **Fichiers** : `scripts/fresh_chain_supervisor.py`.
+- **Action** : le remplissage de réserve ne recrée jamais une station `client_usable` ; il attend une station libre.
+- **Acceptation** : aucune station saine recréée pendant un remplissage.
+- **Test** : scénario 6/6 + remplissage.
+
+### T016 — Exclusion des IPs grillées (P1) — à faire
+- **Fichiers** : `free/quota_ledger.py`, `free/pool/__init__.py`.
+- **Action** : une IP `probe-format-poisoned` (24 h) ne peut pas entrer dans la réserve.
+- **Acceptation** : 0 IP poison dans `client_reserve`.
+- **Test** : unitaire.
+
+### T017 — Critère 6/6 simultané (P1) — à faire
+- **Fichiers** : `observability/fleet_slo.py` (ou équivalent), `scripts/fresh_chain_supervisor.py`.
+- **Action** : mesurer `client_usable` sur le même cycle ; exiger 6/6 et `warm_pool >= 6`.
+- **Acceptation** : le SLO n'est validé que sur un échantillon simultané.
+- **Test** : échantillon live.
+
+### T018 — Options, backup, cross-platform (P2) — à faire
+- **Fichiers** : `config.yaml`, `dashboard/`, `free/quota_ledger.py`, `tests/`.
+- **Action** : `client_reserve.enabled`, `reserve_target`, `probe_budget_pct`, `reserve_min` avec consommateur + test ; table incluse dans le backup ; code sans API Windows hors adapter.
+- **Acceptation** : `config_audit` sans option morte, backup contient `client_reserve`.
+- **Test** : `config_audit --strict`.

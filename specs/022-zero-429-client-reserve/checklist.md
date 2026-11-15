@@ -43,3 +43,13 @@
 - [ ] Réserve `>= 2` pendant 10 min.
 - [ ] Un 429 client porte toujours un `Retry-After`.
 - [ ] Aucune probe sur une IP réservée dans les logs.
+
+## Alignement projet
+
+- [ ] T015 — aucune station `client_usable` recréée pendant le remplissage.
+- [ ] T016 — aucune IP `probe-format-poisoned` dans la réserve.
+- [ ] T017 — 6/6 sur un même cycle et `warm_pool >= 6`.
+- [ ] T018 — options GUI effectives, backup `client_reserve`, cross-platform.
+- [ ] Pas de mode direct dans le fallback free.
+- [ ] Pas de septième station.
+- [ ] Aucune fenêtre console pendant le remplissage.

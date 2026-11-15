@@ -109,6 +109,36 @@ En tant qu'opérateur, je veux mesurer le taux de 429 réellement renvoyé aux c
 | Alerte réserve basse | émise à `reserve_ips < 2` |
 | 429 client avec `Retry-After` | 100 % |
 
+## Conformité aux exigences du projet
+
+| Exigence | Réponse du plan | Statut |
+|---|---|---|
+| Quota free **par IP**, jamais par compte | `client_reserve` est indexée par IP ; aucune clé de compte | conforme |
+| Jamais de payant, second compte ou attente comme réponse | Fallback free uniquement (WARP/proxys) ; 429 explicite si tout est épuisé | conforme |
+| Six stations maximum, jamais de 7ᵉ | La réserve est répartie sur les 6 stations ; aucune création de station | à expliciter (fait ci-dessous) |
+| Une IP d'egress par station | `client_reserve.station` unique + index d'unicité IP | conforme |
+| Migration douce : ne pas recréer une station saine | Le remplissage ne touche pas aux stations `client_usable` | à expliciter (fait ci-dessous) |
+| Superviseur jamais gelé, seul réparateur | Le superviseur remplit la réserve et répare ; l'app ne crée rien | conforme |
+| Wire officiel complet (principe XVIII) | Les entrées de réserve viennent de `StationProbe` 1.19.5 apparié | à expliciter (fait ci-dessous) |
+| IP grillée 24 h exclue | Aucune IP `probe-format-poisoned` n'entre dans la réserve | à expliciter (fait ci-dessous) |
+| `warm_pool >= 6` avant remontée | `reserve_target = 6` (et non 3) | corrigé |
+| 6/6 sur le **même cycle** de probe | Critère de sortie : 6/6 simultané, pas six 200 à des heures différentes | à expliciter (fait ci-dessous) |
+| Aucune fenêtre console | Tous les sous-processus runtime portent `CREATE_NO_WINDOW` | conforme (test 021) |
+| Cross-platform | Le code reste Python pur ; pas d'API Windows hors adapters | conforme |
+| Options GUI effectives | `client_reserve.enabled`, `reserve_target`, `probe_budget_pct` avec consommateur et test | à expliciter (fait ci-dessous) |
+| Données traçables, backup, rétention | `client_reserve` migrée, incluse dans le backup `registry.db` | à expliciter (fait ci-dessous) |
+
+### Corrections d'alignement appliquées
+
+1. **`reserve_target = 6`**, pas 3 : l'objectif AGENTS est `warm_pool >= 6` avant toute déclaration de remontée. Une réserve de 6 IPs prouvées, une par station, est la cible.
+2. **Le mode direct est retiré de l'ordre de fallback.** La jambe free n'est pas autorisée à sortir en direct. Ordre : réserve → WARP → proxys → 429.
+3. **La réserve est répartie sur les six stations**, une IP par station, sans création d'une septième.
+4. **Aucune IP `probe-format-poisoned`** n'entre dans la réserve ; les probes de remplissage utilisent `StationProbe` 1.19.5 apparié.
+5. **Migration douce** : le remplissage ne recrée jamais une station `client_usable` ; il attend qu'une station soit libre.
+6. **Critère 6/6 simultané** : la sortie exige six stations `client_usable` sur le même cycle de probe, pas six 200 observés à des heures différentes.
+7. **Options GUI** : chaque option (`enabled`, `reserve_target`, `probe_budget_pct`, `reserve_min`) a un consommateur runtime, un effet observable et un test.
+8. **Données** : `client_reserve` est dans `registry.db`, donc couverte par le backup `VACUUM INTO` et l'`integrity_check` existants.
+
 ## Hors périmètre
 
 - Compte payant, workspace, second compte.
