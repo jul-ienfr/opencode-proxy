@@ -462,7 +462,10 @@ class QuotaLedger:
                 state.failures += 1
                 state.last_error = str(error_type or code or "error")
             self._dirty = True
-            _force = bool(state.exhausted)
+            # Un 200 est une preuve plus forte qu'un 429 : il doit être
+            # persisté immédiatement, sinon un redémarrage avant le flush
+            # recharge l'ancien 429 et re-bloque une IP qui servait.
+            _force = bool(state.exhausted) or 200 <= code < 300
         self._maybe_save(force=_force)
 
     def mark_exhausted(

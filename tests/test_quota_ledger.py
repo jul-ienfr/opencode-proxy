@@ -249,3 +249,22 @@ def test_snapshot_shape():
     assert row["exhausted"] is True
     assert row["reset_at_iso"] == "2023-11-15T00:00:00Z"
     assert row["retry_in_s"] == MIDNIGHT - NOW
+
+
+def test_200_persists_immediately():
+    """Un 200 doit être sauvé tout de suite : un restart ne doit pas le perdre."""
+
+    ledger = QuotaLedger(persist=False, clock=lambda: NOW)
+    calls: list[bool] = []
+    ledger._maybe_save = lambda force=False: calls.append(bool(force))
+    ledger.note_request("10.0.0.30", MODEL)
+    ledger.note_result(
+        "10.0.0.30",
+        MODEL,
+        429,
+        error_type="FreeUsageLimitError",
+        retry_after=600.0,
+    )
+    ledger.note_result("10.0.0.30", MODEL, 200)
+    assert calls[-1] is True
+    assert ledger.is_exhausted("10.0.0.30", MODEL) is False
