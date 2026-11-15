@@ -16,6 +16,7 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Action** : récupérer la version corrigée depuis `stash@{0}` (health check 45 s, kill zombie).
 - **Acceptation** : `python -m py_compile` passe, `HEALTH_FAIL_LIMIT_S = 45.0` présent.
 - **Preuve** : fichier restauré, 279 lignes, app relancée PID 28100.
+- **Preuve live 2026-11-15 10:30Z** : `WinError 64` détecté par `socket_guard`, sortie volontaire `code=1`, superviseur relance, `/health` 200 en 9,6 s (indisponibilité totale ~13 s).
 
 ### T002 — Démarrer le superviseur au boot (P0) — fait (Startup .vbs, sans admin)
 - **Fichiers** : `scripts/install_app_service.ps1`, `scripts/run_app_supervisor.ps1`, `ops/runbooks/app-supervision.md`.

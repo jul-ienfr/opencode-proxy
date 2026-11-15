@@ -9,7 +9,7 @@
 - [x] T002 — superviseur lancé au boot (service/tâche planifiée) — droits admin requis.
 - [x] T003 — alerte si `/health` absent > 60 s.
 - [ ] Redémarrage après 45 s d'échec vérifié sur un processus réel.
-- [ ] `/health` 200 en < 30 s après restart.
+- [x] `/health` 200 en < 30 s après restart.
 
 ## Socket
 
@@ -44,7 +44,8 @@
 ## Preuves live
 
 - [ ] `/health` répond 200 après un reboot.
-- [ ] 10 min de trafic sans `Accept failed`.
+- [x] 10 min de trafic sans `Accept failed`.
+- [x] Récupération live : `WinError 64` → sortie volontaire → `/health` 200 en 13 s (2026-11-15 10:30Z).
 - [ ] 6/6 `client_usable` après un restart app.
 - [ ] `logs/app-supervisor.log` contient un cycle complet (démarrage, sortie, restart).
 - [ ] Aucun événement Windows `pythonw.exe` en erreur.
