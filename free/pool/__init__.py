@@ -181,8 +181,10 @@ def _reserve_allows(ip: str) -> bool:
     """
 
     try:
-        from free.client_reserve import reserved_ips
+        from free.client_reserve import enabled, reserved_ips
 
+        if not enabled():
+            return True
         reserved = reserved_ips()
     except Exception:
         return True

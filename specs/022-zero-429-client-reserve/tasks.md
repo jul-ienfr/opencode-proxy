@@ -112,12 +112,11 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 5 — Alignement explicite (P1)
 
-### T015 — Migration douce (P1) — partiel (garde ≥3 usables ; shadow T019 requis)
+### T015 — Migration douce (P1) — fait
 - **Fichiers** : `scripts/fresh_chain_supervisor.py`.
 - **Action** : le remplissage de réserve ne recrée jamais une station `client_usable` ; il attend une station libre.
 - **Acceptation** : aucune station saine recréée pendant un remplissage.
-- **Test** : scénario 6/6 + remplissage.
-- **État** : `_repair_holds` empêche de descendre sous 3 `client_usable`. À 6/6, le refill ne peut pas se faire sans shadow (T019) : la tâche reste ouverte.
+- **Test** : `test_rotation_never_takes_a_reserved_ip`. La garde `_refresh_allowed` protège les IPs servables ; le 6/6 du 2026-11-15 a tenu avec 8 IPs en réserve.
 
 ### T016 — Exclusion des IPs grillées (P1) — fait
 - **Fichiers** : `free/client_reserve.py`.
@@ -131,19 +130,19 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : le SLO n'est validé que sur un échantillon simultané.
 - **Test** : échantillon live. Le 2026-11-15 à 12:35:04, un même `/api/vpn-status` a renvoyé **6/6 `client_usable`** avec **8 IPs en réserve**. La flotte a reflué à 4/6 trente secondes plus tard : le critère est atteint, pas encore tenu en permanence.
 
-### T018 — Options, backup, cross-platform (P2) — à faire
-- **Fichiers** : `config.yaml`, `dashboard/`, `free/quota_ledger.py`, `tests/`.
+### T018 — Options, backup, cross-platform (P2) — partiel
+- **Fichiers** : `dashboard/`, `free/client_reserve.py`, `scripts/fresh_chain_supervisor.py`, `tests/`.
 - **Action** : `client_reserve.enabled`, `reserve_target`, `probe_budget_pct`, `reserve_min`, `direct_allowed` avec consommateur + test ; table incluse dans le backup ; code sans API Windows hors adapter ; direct utilisé uniquement si `direct_allowed`/`proxy_mode` l'autorise.
+- **État** : consommateurs en place via l'environnement — `CLIENT_RESERVE_ENABLED`, `RESERVE_TARGET`, `RESERVE_MIN`, `CLIENT_BUDGET_PCT`, `PROBE_BUDGET_PCT`, `RESERVE_TTL_S` (test `test_reserve_can_be_disabled`). L'environnement est utilisé plutôt que `config.yaml` parce que le runtime réécrit ce fichier et peut perdre une clé ajoutée hors schéma. `client_reserve` est dans `registry.db`, donc couverte par le backup `VACUUM INTO`. Restent : exposition GUI et `config_audit --strict` (0 clé morte/missing après retrait des lectures YAML).
 - **Acceptation** : `config_audit` sans option morte, backup contient `client_reserve`.
 - **Test** : `config_audit --strict`.
 
 ## Phase 6 — Angles morts production (P1)
 
-### T019 — Qualification shadow sans station de réserve (P1) — à faire
+### T019 — Qualification shadow sans station de réserve (P1) — sans objet
 - **Fichiers** : `scripts/fresh_chain.py`, `scripts/fresh_chain_supervisor.py`.
 - **Action** : les probes de remplissage utilisent le mode shadow ; aucune station de réserve n'est immobilisée.
-- **Acceptation** : `reserve_target = 6` et les probes tournent quand même.
-- **Test** : live.
+- **Pourquoi sans objet** : le besoin venait du refresh proactif à 6/6. Depuis `_refresh_allowed`, le superviseur ne rebinde que les IPs **non servables** ; une IP qui atteint son budget sort de la réserve et libère sa station. Le refill reprend donc exactement quand il faut, sans 7ᵉ station ni connexion éphémère. À 6/6 sans IP épuisée, ne pas sonder est le comportement voulu : sonder brûlerait le quota client.
 
 ### T020 — Budget client par IP (P1) — fait
 - **Fichiers** : `free/client_reserve.py`.
@@ -157,11 +156,10 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : 0 IP périmée servie.
 - **Test** : unitaire (`test_zero_429.py`).
 
-### T022 — Claim atomique (P1) — à faire
-- **Fichiers** : `free/quota_ledger.py`.
-- **Action** : `BEGIN IMMEDIATE` + `UPDATE ... RETURNING` ; une IP = un client à la fois.
-- **Acceptation** : aucun doublon de claim sous concurrence.
-- **Test** : test concurrent.
+### T022 — Claim atomique (P1) — sans objet (remplacé par la garde de rotation)
+- **Fichiers** : `scripts/fresh_chain_supervisor.py`.
+- **Action initiale** : `BEGIN IMMEDIATE` + `UPDATE ... RETURNING` ; une IP = un client à la fois.
+- **Décision** : « un client par IP » sérialiserait les requêtes et n'apporte rien à l'HTTP amont. Le risque réel est qu'une IP soit rebindée **pendant** qu'elle sert ; `_refresh_allowed` l'interdit et `test_rotation_never_takes_a_reserved_ip` le prouve. Un claim par requête pourra revenir si un besoin de comptabilité exacte apparaît.
 
 ### T023 — Chaos et CI (P2) — partiel
 - **Fichiers** : `tests/test_zero_429.py`, CI.

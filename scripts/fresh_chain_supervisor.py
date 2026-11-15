@@ -882,6 +882,25 @@ def _active_serving_count(
     )
 
 
+def _refresh_allowed(
+    ip: str, live_reserved: set[str], reserve_target: int
+) -> bool:
+    """[022 T007/T015/T022] Une IP servable n'est jamais rebindée.
+
+    Le surplus (réserve au-delà de la cible) peut tourner ; une IP de la
+    réserve active ne le peut pas. C'est le verrou réel contre la rotation
+    pendant qu'un client est servi — plus utile qu'un claim par requête, qui
+    sérialiserait les clients sur une seule IP.
+    """
+
+    target = str(ip or "").strip()
+    if not target:
+        return True
+    return target not in live_reserved or len(live_reserved) > int(
+        reserve_target
+    )
+
+
 def _repair_holds(usable_now: int, active_serving: int, *, refresh: bool) -> bool:
     """[P0 2026-11-11] Faut-il retenir une réparation ?
 
@@ -1391,10 +1410,16 @@ def _refresh_warm_pool(
         _rc = _reserve_count()
         if _rc != _LAST_RESERVE_COUNT:
             _LAST_RESERVE_COUNT = _rc
-            if _rc < 2:
+            try:
+                _reserve_min = int(
+                    os.getenv("RESERVE_MIN") or 2
+                )
+            except (TypeError, ValueError):
+                _reserve_min = 2
+            if _rc < _reserve_min:
                 log(
-                    f"ALERT client_reserve={_rc} (<2) — priorité client, "
-                    "refill sur stations libres"
+                    f"ALERT client_reserve={_rc} (<{_reserve_min}) — priorité "
+                    "client, refill sur stations libres"
                 )
             else:
                 log(f"client_reserve={_rc}")
@@ -2806,14 +2831,8 @@ def _supervise() -> None:
                 except Exception:
                     live_reserved = set()
                 try:
-                    reserve_target = int(
-                        os.getenv("RESERVE_TARGET")
-                        or yaml_get(
-                            "ip_registry", "client_reserve.target", 6
-                        )
-                        or 6
-                    )
-                except Exception:
+                    reserve_target = int(os.getenv("RESERVE_TARGET") or 6)
+                except (TypeError, ValueError):
                     reserve_target = 6
                 primary = probe_model_list[0]
                 available = _primary_quota_count(
@@ -2854,13 +2873,13 @@ def _supervise() -> None:
                         )
                         and now_ts - refresh_at.get(sid, 0.0)
                         >= refresh_cooldown
-                        and (
+                        and _refresh_allowed(
                             str(
                                 stations.get(sid, {}).get("current_ip")
                                 or ""
-                            )
-                            not in live_reserved
-                            or len(live_reserved) > reserve_target
+                            ),
+                            live_reserved,
+                            reserve_target,
                         )
                     ]
                     if eligible:

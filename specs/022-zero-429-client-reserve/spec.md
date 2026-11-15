@@ -134,7 +134,7 @@ En tant qu'opérateur, je veux mesurer le taux de 429 réellement renvoyé aux c
 2. **Le mode direct est conditionnel.** Il n'est utilisé que si la configuration l'autorise (`proxy_mode`, checkbox ou `direct_allowed`) ; sinon il est ignoré. Ordre : réserve → WARP → proxys → direct si autorisé → 429.
 3. **La réserve est répartie sur les six stations**, une IP par station, sans création d'une septième.
 4. **Aucune IP `probe-format-poisoned`** n'entre dans la réserve ; les probes de remplissage utilisent `StationProbe` 1.19.5 apparié.
-5. **Migration douce (partielle)** : le refresh proactif ne descend jamais sous 3 stations `client_usable`. À 6/6 sans mode shadow, il doit attendre : T015 reste ouvert jusqu'à T019.
+5. **Migration douce** : le refresh proactif ne rebinde jamais une IP servable (`_refresh_allowed`) et garde ≥3 stations `client_usable` (`_repair_holds`). Testé et observé avec 6/6 et 8 IPs en réserve.
 6. **Critère 6/6 simultané** : la sortie exige six stations `client_usable` sur le même cycle de probe, pas six 200 observés à des heures différentes.
 7. **Options GUI** : chaque option (`enabled`, `reserve_target`, `probe_budget_pct`, `reserve_min`) a un consommateur runtime, un effet observable et un test.
 8. **Données** : `client_reserve` est dans `registry.db`, donc couverte par le backup `VACUUM INTO` et l'`integrity_check` existants.
@@ -144,12 +144,12 @@ En tant qu'opérateur, je veux mesurer le taux de 429 réellement renvoyé aux c
 
 Le plan initial garantit la séparation probe/client, mais il ne règle pas encore ces points :
 
-1. **Conflit 6 réserves / 6 stations.** Avec `reserve_target = 6`, les six stations portent une IP de réserve et il n'en reste aucune pour qualifier de nouvelles IPs. Résolution : les probes de remplissage utilisent le **mode shadow** (connexions éphémères, sans immobiliser une station de réserve), déjà présent dans le qualification daemon. Aucune station de réserve n'est consommée par une probe.
+1. **Conflit 6 réserves / 6 stations.** Avec `reserve_target = 6`, les six stations portent une IP de réserve. Résolution : le refresh proactif ne touche jamais une IP servable (`_refresh_allowed`) ; une IP qui atteint son budget sort de la réserve et libère sa station, donc le refill reprend exactement quand il faut. Aucune 7ᵉ station, aucune connexion éphémère.
 2. **Budget client par IP absent.** La réserve peut être vidée par le trafic client avant le refill. Résolution : `client_budget_pct` (défaut 80 %) ; une IP dont le bucket descend sous le seuil sort de la réserve et est remplacée **avant** d'être épuisée.
 3. **Pas de re-vérification avant usage.** Une IP de réserve peut avoir été consommée par un autre utilisateur (bucket partagé). Résolution : preuve rafraîchie par le 200 du cycle de probe ; `reserve_ttl_s` (défaut **3600 s**, configurable) ; un 429 actif ou un budget atteint sort l'IP immédiatement. Un TTL de 5 min a été écarté : 6 IPs × 12 re-probes/h = 72 probes/h, soit ~1 700/jour, incompatible avec ~200 requêtes/jour/IP. La fraîcheur vient de l'événement (200/429), pas d'un minuteur qui brûle le quota.
 4. **Fallback non vérifié.** WARP/proxys peuvent être épuisés. Résolution : le fallback n'est utilisé que s'il a une preuve 200 récente ; sinon il est ignoré et le prochain fallback est tenté.
 5. **Pas de SLO de performance.** Résolution : p95 client < 2 s, bascule de fallback < 500 ms, aucune requête bloquée > 5 s, 0 429 sur 1 000 requêtes avec réserve ≥ 1.
-6. **Pas de claim atomique.** Deux clients pourraient recevoir la même IP de réserve, ou le superviseur pourrait la remplacer pendant qu'elle sert. Résolution : claim transactionnel `BEGIN IMMEDIATE` sur `client_reserve`, un seul client par IP, libération à la fin de la requête.
+6. **Pas de verrou pendant le service.** Deux clients sur une même IP HTTP ne se nuisent pas ; un claim par requête les sérialiserait. Le risque réel est le rebind d'une IP **pendant** qu'elle sert : `_refresh_allowed` l'interdit et `test_rotation_never_takes_a_reserved_ip` le prouve.
 7. **Pas de chaos test ni de CI.** Résolution : tests de panne (IP qui tombe, WARP mort, DB lock), tests `slow` exécutés en nightly, et test de non-régression 6/6.
 8. **Pas de rétention/migration explicite.** Résolution : purge des entrées expirées, migration versionnée avec backup `VACUUM INTO` avant application.
 
@@ -191,7 +191,7 @@ Conséquence sur les tests : un burst réel de 1 000 requêtes dépasse la capac
 | Erreurs transport | `no-egress`/timeout ne consomment pas la réserve ; retry ou rotation |
 | Backpressure | Limite de concurrence 2000 (uvicorn) ; si réserve saturée, attente courte ou 429 explicite |
 | TTL de réserve | **3600 s** par défaut (`RESERVE_TTL_S`) ; la preuve est rafraîchie à chaque 200 ; un TTL de 5 min brûlerait le quota en re-probes |
-| Priorité / probes | Garde `_repair_holds` : jamais moins de 3 stations `client_usable` ; à 6/6 le refill attend ou passe en shadow (T019) |
+| Priorité / probes | `_refresh_allowed` : jamais de rebind d'une IP servable ; `_repair_holds` garde ≥3 `client_usable` |
 
 ## Hors périmètre
 

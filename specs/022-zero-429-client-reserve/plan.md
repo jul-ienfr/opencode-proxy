@@ -99,7 +99,7 @@ Le 429 client vient d'un partage de bucket entre les probes et le trafic client.
 
 - Capacité estimée : `6 × quota_estimate × client_budget_pct`.
 - Avec 200 requêtes/IP et 80 %, **960 requêtes/jour** garanties par la réserve.
-- Si `client_reserve < reserve_min`, la priorité client s'applique : le refresh proactif garde ≥3 stations utilisables ; à 6/6, le refill attend ou passe en shadow (T019).
+- Si `client_reserve < reserve_min`, la priorité client s'applique : `_refresh_allowed` interdit de rebinder une IP servable ; le refill reprend quand une IP épuisée sort.
 - TTL de réserve : `RESERVE_TTL_S` (défaut 3600 s) ; une IP sans 200 depuis 1 h sort. Un TTL de 5 min coûterait ~1 700 probes/jour et viderait le quota.
 - Si la demande dépasse la capacité, alerte `capacity_shortfall` ; le 429 redevient possible et le plan ne le cache pas.
 

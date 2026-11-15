@@ -228,6 +228,17 @@ def is_reserved(ip: str, *, now: float | None = None) -> bool:
     return str(ip or "").strip() in reserved_ips(now=now)
 
 
+def enabled() -> bool:
+    """Interrupteur de la réserve (022 T018).
+
+    ``CLIENT_RESERVE_ENABLED=0`` rend le comportement pré-022 : le pool peut
+    servir une IP non réservée. Défaut : activé.
+    """
+
+    value = str(os.getenv("CLIENT_RESERVE_ENABLED", "1")).strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
 def probe_blocked_ips(
     *, now: float | None = None, db: Path | None = None
 ) -> set[str]:

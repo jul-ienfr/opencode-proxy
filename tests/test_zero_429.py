@@ -227,3 +227,29 @@ def test_reserve_survives_a_locked_db(tmp_path: Path, monkeypatch) -> None:
     finally:
         locker.rollback()
         locker.close()
+
+
+def test_rotation_never_takes_a_reserved_ip() -> None:
+    """T015/T022 : le superviseur ne rebinde pas une IP servable."""
+
+    from scripts.fresh_chain_supervisor import _refresh_allowed
+
+    reserved = {"10.0.0.1", "10.0.0.2"}
+    assert not _refresh_allowed("10.0.0.1", reserved, 2)
+    assert _refresh_allowed("10.0.0.9", reserved, 2)
+    # Réserve au-delà de la cible : le surplus peut tourner.
+    assert _refresh_allowed("10.0.0.1", reserved, 1)
+
+
+def test_reserve_can_be_disabled(monkeypatch) -> None:
+    """T018 : l'interrupteur rend le comportement pré-022."""
+
+    from free import pool as pool_mod
+
+    monkeypatch.setenv("CLIENT_RESERVE_ENABLED", "0")
+    monkeypatch.setattr(
+        "free.client_reserve.reserved_ips", lambda **_: {"10.0.0.1"}
+    )
+    assert pool_mod._reserve_allows("10.0.0.99")
+    monkeypatch.setenv("CLIENT_RESERVE_ENABLED", "1")
+    assert not pool_mod._reserve_allows("10.0.0.99")
