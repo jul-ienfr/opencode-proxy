@@ -120,6 +120,30 @@ POST `/quota/mark` perdu pendant un redémarrage laissait l'IP bloquée ~19 min.
 | réserve qui ne remonte pas | `logs/fresh_chain_supervisor.log` : `client_reserve=` et `ALERT` |
 | IP réservée mais 429 | `quota_buckets` : `last_status=429`, `reset_at` futur → elle doit sortir |
 | probes qui consomment la réserve | `fresh_chain.py` doit exclure `_reserved_client_ips()` |
+| `proxies` à `usable=0` / `observed=0` alors qu'un endpoint public est actif | `station_health[-sid]` en `repairing` (jamais réparé) **et** ledger du jour `unproven` : voir « Jambe proxys (2026-11-16) » |
+
+## Jambe proxys (2026-11-16)
+
+Deux verrous distincts expliquaient `proxies usable=0 / observed=0` sur des
+centaines de requêtes alors qu'un endpoint public avait une preuve 200 :
+
+1. **Santé sans réparation** : un 429 posait `station_health[-sid]=repairing`,
+   état terminal pour un endpoint statique (aucun watchdog ne le répare). Il
+   n'entre plus dans `_socks5_client_usable` pour les endpoints
+   **non `managed`** : la preuve d'egress (`egress_ip`) suffit, le verrou réel
+   d'un 429 reste le bucket modèle (`_ledger_usable`).
+2. **Preuve absente du ledger** : `_provider_has_free_bucket('proxies')`
+   interroge le ledger du jour ; l'IP publique y était `unproven`, donc le
+   provider était exclu et aucune requête n'y passait — le bucket ne pouvait
+   jamais naître. `set_public_proxies` enregistre désormais la preuve 200 du
+   catalogue (`note_model_ip`, même jour UTC uniquement).
+
+Preuve live après correctif : `proxies usable=1 observed=11`,
+`quota_buckets(87.58.86.206, 20261115)` → `used=11 successes=1 last_status=200`.
+
+Les listes publiques restent très majoritairement mortes (≈ 1 endpoint vivant
+sur 429 candidats testés) : la jambe proxys est un appoint, pas une garantie de
+capacité. La capacité garantie reste 6 IPs × 200 × 80 % ≈ 960 requêtes/jour.
 
 ## Ne pas faire
 

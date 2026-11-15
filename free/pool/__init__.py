@@ -3858,6 +3858,13 @@ class FreeIPPool:
         Le health strict 2-probes est pensé pour les tunnels Docker. Pour un
         endpoint SOCKS5, la preuve d'egress réelle est la mesure `egress_ip` ;
         on refuse seulement un endpoint en réparation/park ou sans IP.
+
+        [013] Un endpoint **non managed** (proxy public) n'a aucun chemin de
+        réparation : un 429 le laisse en ``repairing`` pour toujours, donc le
+        compter ``unusable`` figeait ``proxies`` à 0 dans la carte Capacité et
+        dans le routage alors qu'une preuve 200 existe. Le verrou réel d'un 429
+        est le bucket modèle (``_ledger_usable``/``model_usable``), évalué dans
+        ``_station_usable(model=...)`` — pas la santé du tunnel.
         """
         try:
             if not self._socks5_usable(endpoint, exclude_approaching=False):
@@ -3865,6 +3872,12 @@ class FreeIPPool:
         except Exception:
             return False
         egress = str(getattr(endpoint, "egress_ip", "") or "").strip()
+        if not egress:
+            # ADR-017-01 : une IP sans preuve n'est jamais servie.
+            return False
+        if not bool(getattr(endpoint, "managed", False)):
+            # Pas de réparation possible : la preuve d'egress suffit.
+            return True
         try:
             health = self._station_health.get(int(getattr(endpoint, "_station", 0)))
         except Exception:
@@ -3872,8 +3885,6 @@ class FreeIPPool:
         if health is None:
             # Pas encore de preuve : la sélection reste l'autorité (compat).
             return True
-        if not egress:
-            return False
         return str(getattr(health, "state", "")) in ("usable", "probing")
 
     def pin_socks5_conversation(self, key: str | None, endpoint) -> None:
@@ -4375,6 +4386,7 @@ class FreeIPPool:
         self._public_signature = signature
         self._public_https_proxies = new_rows
         self._rebuild_https_list()
+        self._seed_public_ledger_proofs()
         self._stop_public_worker(old, delay_s=300.0)
         logger.info(
             "[public-proxies] active=%s isolation=%s worker_port=%s max_per_24=%s",
@@ -4384,6 +4396,50 @@ class FreeIPPool:
             max_per_24,
         )
         return len(new_rows)
+
+    def _seed_public_ledger_proofs(self) -> None:
+        """[013] Une preuve 200 du catalogue public vaut preuve ledger.
+
+        ``_provider_has_free_bucket('proxies')`` interroge le ledger du jour :
+        une IP publique jamais servie y est ``unproven``, donc le provider est
+        exclu de la sélection et aucune requête n'y passe — le bucket ne peut
+        jamais naître. Verrou circulaire observé en live (``observed=0`` sur
+        des centaines de requêtes alors que le catalogue avait une preuve
+        200). On enregistre cette preuve réelle via le chemin canonique
+        ``note_model_ip`` ; une preuve d'un autre jour UTC n'est pas reportée
+        (le ledger est journalier).
+        """
+        rows = [
+            row
+            for row in (getattr(self, "_public_https_proxies", None) or [])
+            if int(row.get("last_status") or 0) == 200
+        ]
+        if not rows:
+            return
+        cfg = dict(getattr(self, "_public_cfg", None) or {})
+        model = str(cfg.get("free_probe_model") or "deepseek-v4.1-flash-free")
+        from free.quota_ledger import utc_day
+
+        today = utc_day(time.time())
+        by_pid = {
+            str(getattr(ep, "pid", "") or ""): ep
+            for ep in (getattr(self, "_socks5_eps", None) or [])
+            if str(getattr(ep, "provider", "") or "").strip().lower() == "public"
+        }
+        for row in rows:
+            endpoint = by_pid.get(str(row.get("label") or ""))
+            if endpoint is None or not getattr(endpoint, "egress_ip", None):
+                continue
+            try:
+                proof_day = utc_day(float(row.get("last_checked_at") or 0))
+            except (TypeError, ValueError):
+                continue
+            if proof_day != today:
+                continue
+            try:
+                self.note_model_ip(model, endpoint, 200)
+            except Exception:
+                continue
 
     @staticmethod
     def _load_public_feed(path: str) -> list:

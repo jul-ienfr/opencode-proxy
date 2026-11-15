@@ -330,3 +330,54 @@ async def test_pool_close_stops_public_worker(monkeypatch):
     pool.set_public_proxies(_rows(), max_active=1, max_per_24=2)
     await pool.close()
     assert handle.stopped is True
+
+
+def _public_pool_with_proof(monkeypatch, *, last_status: int = 200, checked_at: float | None = None):
+    handle = _FakeHandle()
+    monkeypatch.setattr("free.public_egress_worker.start_worker_process", lambda upstreams: handle)
+    pool = _pool()
+    row = {
+        "url": "https://1.2.3.4:443",
+        "egress_ip": "1.2.3.4",
+        "last_status": last_status,
+        "last_checked_at": time.time() if checked_at is None else checked_at,
+    }
+    assert pool.set_public_proxies([row], max_active=1, max_per_24=1) == 1
+    endpoint = next(ep for ep in pool._socks5_eps if ep.provider == "public")
+    return pool, endpoint
+
+
+def test_public_endpoint_survives_a_429_health_repair(monkeypatch):
+    """Un proxy public n'a aucun chemin de réparation : un 429 ne doit pas
+    figer le compteur ``proxies`` à zéro (état ``repairing`` permanent)."""
+    pool, endpoint = _public_pool_with_proof(monkeypatch)
+    assert pool._socks5_client_usable(endpoint) is True
+    health = pool._station_health.get(int(endpoint._station))
+    health.observe_probe(False, bad_needed=1)
+    health.observe_probe(False, bad_needed=1)
+    assert health.state == "repairing"
+    assert pool._socks5_client_usable(endpoint) is True
+    assert pool.egress_endpoint_counts()["proxies"]["usable"] == 1
+
+
+def test_public_endpoint_without_egress_is_not_client_usable(monkeypatch):
+    pool, endpoint = _public_pool_with_proof(monkeypatch)
+    endpoint.egress_ip = None
+    endpoint.current_ip = "socks5:1.2.3.4:443"
+    assert pool._socks5_client_usable(endpoint) is False
+
+
+def test_catalog_200_proof_seeds_the_daily_ledger(monkeypatch):
+    """Sans preuve ledger, ``proxies`` restait ``unproven`` et exclu : le
+    bucket ne pouvait jamais naître (verrou circulaire, observed=0)."""
+    pool, endpoint = _public_pool_with_proof(monkeypatch)
+    model = "deepseek-v4.1-flash-free"
+    assert pool._get_ledger().usable("1.2.3.4", model) == (True, None)
+    assert pool.model_bucket_usable(model, endpoint) is True
+
+
+def test_stale_catalog_proof_does_not_seed_the_ledger(monkeypatch):
+    pool, endpoint = _public_pool_with_proof(monkeypatch, checked_at=time.time() - 90000)
+    model = "deepseek-v4.1-flash-free"
+    assert pool._get_ledger().usable("1.2.3.4", model) == (False, "unproven")
+    assert pool.model_bucket_usable(model, endpoint) is False
