@@ -41,7 +41,7 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ### T005 — Remplissage de la réserve (P1) — à faire
 - **Fichiers** : `scripts/fresh_chain_supervisor.py`.
-- **Action** : en arrière-plan, qualifier des IPs non réservées jusqu'à `reserve_target` (défaut 6).
+- **Action** : en arrière-plan, qualifier des IPs non réservées jusqu'à `reserve_target` (proposé 6, configurable).
 - **Acceptation** : `client_reserve_ips >= 2` stable.
 - **Test** : live + métrique.
 
@@ -131,6 +131,6 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ### T018 — Options, backup, cross-platform (P2) — à faire
 - **Fichiers** : `config.yaml`, `dashboard/`, `free/quota_ledger.py`, `tests/`.
-- **Action** : `client_reserve.enabled`, `reserve_target`, `probe_budget_pct`, `reserve_min` avec consommateur + test ; table incluse dans le backup ; code sans API Windows hors adapter.
+- **Action** : `client_reserve.enabled`, `reserve_target`, `probe_budget_pct`, `reserve_min`, `direct_allowed` avec consommateur + test ; table incluse dans le backup ; code sans API Windows hors adapter ; direct utilisé uniquement si `direct_allowed`/`proxy_mode` l'autorise.
 - **Acceptation** : `config_audit` sans option morte, backup contient `client_reserve`.
 - **Test** : `config_audit --strict`.

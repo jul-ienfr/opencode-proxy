@@ -50,6 +50,6 @@
 - [ ] T016 — aucune IP `probe-format-poisoned` dans la réserve.
 - [ ] T017 — 6/6 sur un même cycle et `warm_pool >= 6`.
 - [ ] T018 — options GUI effectives, backup `client_reserve`, cross-platform.
-- [ ] Pas de mode direct dans le fallback free.
+- [ ] Direct utilisé uniquement si la configuration l'autorise (`direct_allowed`/`proxy_mode`).
 - [ ] Pas de septième station.
 - [ ] Aucune fenêtre console pendant le remplissage.

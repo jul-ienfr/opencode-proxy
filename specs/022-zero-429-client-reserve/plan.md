@@ -19,12 +19,12 @@ Le 429 client vient d'un partage de bucket entre les probes et le trafic client.
 - Le pool client (`free/pool`) ne sélectionne que `client_reserve`.
 - `StationProbe` / `fresh_chain` refusent toute IP de `client_reserve` (sauf remplacement explicite d'une IP expirée).
 - Le budget probe (`probe_budget_pct`, défaut 50 %) limite la consommation des probes par IP.
-- Si `client_reserve` est vide, le routeur essaie WARP, puis les proxys, puis renvoie un 429 avec `Retry-After` et une cause. **Le mode direct n'est pas utilisé** : la jambe free n'y est pas autorisée.
+- Si `client_reserve` est vide, le routeur essaie WARP, puis les proxys, puis le **direct si la configuration l'autorise**, puis renvoie un 429 avec `Retry-After` et une cause.
 
 ## Contraintes d'alignement (AGENTS.md + constitution)
 
 - **Six stations, une IP par station** : la réserve est répartie sur les six, sans création d'une septième.
-- **`reserve_target = 6`** : l'objectif `warm_pool >= 6` d'AGENTS.md est la cible, pas 3.
+- **`reserve_target`** : nombre d'IPs de réserve maintenues. Proposition 6 (une par station), configurable ; à valider par l'opérateur.
 - **Migration douce** : le remplissage ne recrée jamais une station `client_usable` ; il attend une station libre.
 - **Wire officiel (principe XVIII)** : les entrées de réserve viennent de `StationProbe` 1.19.5 apparié, jamais d'un corps réduit.
 - **IP grillée 24 h** : aucune IP `probe-format-poisoned` n'entre dans la réserve.
@@ -65,7 +65,7 @@ Le 429 client vient d'un partage de bucket entre les probes et le trafic client.
 
 ### Phase 3 — Fallback avant 429 (P1)
 
-1. Ordre : `client_reserve` → WARP → proxys → 429. Le mode direct est interdit pour la jambe free.
+1. Ordre : `client_reserve` → WARP → proxys → direct si autorisé → 429.
 2. Chaque bascule est loggée avec sa cause.
 3. Le 429 final porte `Retry-After` (reset le plus proche) et `reason`.
 

@@ -130,8 +130,8 @@ En tant qu'opérateur, je veux mesurer le taux de 429 réellement renvoyé aux c
 
 ### Corrections d'alignement appliquées
 
-1. **`reserve_target = 6`**, pas 3 : l'objectif AGENTS est `warm_pool >= 6` avant toute déclaration de remontée. Une réserve de 6 IPs prouvées, une par station, est la cible.
-2. **Le mode direct est retiré de l'ordre de fallback.** La jambe free n'est pas autorisée à sortir en direct. Ordre : réserve → WARP → proxys → 429.
+1. **`reserve_target` est un paramètre à valider.** Il désigne le nombre d'IPs de réserve maintenues en permanence. Proposition : 6 (une par station), configurable. L'objectif AGENTS `warm_pool >= 6` plaide pour 6, mais la valeur reste un réglage opérateur, pas une constante.
+2. **Le mode direct est conditionnel.** Il n'est utilisé que si la configuration l'autorise (`proxy_mode`, checkbox ou `direct_allowed`) ; sinon il est ignoré. Ordre : réserve → WARP → proxys → direct si autorisé → 429.
 3. **La réserve est répartie sur les six stations**, une IP par station, sans création d'une septième.
 4. **Aucune IP `probe-format-poisoned`** n'entre dans la réserve ; les probes de remplissage utilisent `StationProbe` 1.19.5 apparié.
 5. **Migration douce** : le remplissage ne recrée jamais une station `client_usable` ; il attend qu'une station soit libre.
