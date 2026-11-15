@@ -1176,7 +1176,13 @@ class FreeIPPool:
         allow_draining: bool = False,
     ) -> tuple[bool, str | None]:
         """Contrat public ``model_usable(model, station)``."""
-        if not self.station_usable(station, model=None, now=now):
+        if not self._station_usable(
+            station,
+            exclude_approaching=False,
+            model=None,
+            now=now,
+            enforce_reserve=False,
+        ):
             return False, "station-unusable"
         _lok, _lwhy = self._ledger_usable(model, station)
         if not _lok:
@@ -3156,6 +3162,7 @@ class FreeIPPool:
         ignore_supervisor_breaker: bool = False,
         model: str | None = None,
         now: float | None = None,
+        enforce_reserve: bool = True,
     ) -> bool:
         """A station is usable when its tunnel is up and it is not marked
         bad by a recent 429. ``exclude_approaching`` also rules out stations
@@ -3184,7 +3191,11 @@ class FreeIPPool:
                     return False
         # [022 T004] Réserve client : si elle n'est pas vide, seules ses IPs
         # sont servies. Une IP non réservée n'est jamais exposée au client.
-        if not _reserve_allows(_ip):
+        # `enforce_reserve=False` sert à évaluer la santé/le quota d'une
+        # station qui vient de sortir de la réserve : sans cela, elle ne peut
+        # plus redevenir `model_usable`, donc le superviseur ne peut plus la
+        # réinscrire — verrou mortel observé sur la station 3.
+        if enforce_reserve and not _reserve_allows(_ip):
             return False
         if forced_pool is not None:
             cc = getattr(station, "_current_country", None) or getattr(station, "current_country", None)

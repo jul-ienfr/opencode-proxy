@@ -367,6 +367,31 @@ def test_unusable_station_does_not_justify_upstream_429(monkeypatch) -> None:
     assert opencode._client_429_reason() == "all_fallbacks_dead"
 
 
+def test_model_usable_ignores_reserve_membership(monkeypatch) -> None:
+    """Une station hors réserve peut redevenir `model_usable` (refill)."""
+
+    from free import pool as pool_mod
+
+    seen: dict = {}
+
+    def _fake(self, station, **kwargs):
+        seen.update(kwargs)
+        return True
+
+    monkeypatch.setattr(pool_mod.FreeIPPool, "_station_usable", _fake)
+    monkeypatch.setattr(
+        pool_mod.FreeIPPool,
+        "_ledger_usable",
+        lambda self, model, station: (True, None),
+    )
+    pool = object.__new__(pool_mod.FreeIPPool)
+    pool._quota_enabled = False
+    ok, reason = pool.model_usable("deepseek-v4.1-flash-free", object())
+    assert ok is True
+    assert reason is None
+    assert seen.get("enforce_reserve") is False
+
+
 def test_direct_provider_is_gated(monkeypatch) -> None:
     """T008 : ordre des fallbacks, `direct` seulement si autorisé."""
 
