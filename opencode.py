@@ -28,6 +28,15 @@ from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Annotated, Any
 
+# [021 T008/T009] Capture de crash : faulthandler + excepthook vers
+# logs/app-crash.log. L'app tourne souvent sous pythonw, sans console.
+try:
+    from observability.crashguard import install as _install_crash_guard
+
+    _install_crash_guard()
+except Exception:
+    pass
+
 # [Phase 3b-1 boot] httpx DIFFÉRÉ (~81 ms mesurés sur import → listen, dont
 # ~63 ms dans httpx/__init__.py:15 qui importe `._main` → rich + click +
 # pygments pour la seule commande CLI `httpx`). Le proxy `LazyModule` garde
@@ -32266,6 +32275,17 @@ class ServerManager:
                 )
                 self._generation += 1
                 generation = self._generation
+                # [021 T004/T005] Le socket d'écoute peut être invalidé par un
+                # changement réseau (WinError 64). Le guard sort volontairement
+                # pour que le superviseur relance en ~2 s.
+                try:
+                    from observability.socket_guard import (
+                        install_server_patch as _install_socket_guard,
+                    )
+
+                    _install_socket_guard()
+                except Exception:
+                    pass
                 server = Server(config)
                 thread = threading.Thread(
                     target=server.run,
