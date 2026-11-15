@@ -2229,9 +2229,6 @@ def _supervise() -> None:
             refresh_cooldown = max(
                 15.0, float(alloc.get("refresh_cooldown_s", 900) or 900)
             )
-            refresh_min_available = max(
-                1, int(alloc.get("refresh_min_available", 3) or 3)
-            )
             winner_grace = max(
                 0.0, float(alloc.get("winner_grace_s", 20) or 20)
             )
@@ -2867,9 +2864,12 @@ def _supervise() -> None:
                 available = _primary_quota_count(
                     free_health, stations, scope, primary
                 )
-                need_refresh = available < len(scope) and (
-                    available >= refresh_min_available or available <= 0
-                )
+                # Un remplacement par cycle, dès qu'une station n'a plus de
+                # quota primaire. Le filtre `eligible` ci-dessous ne retient
+                # que les stations dont le bucket est mort, jamais une IP
+                # servie (`_refresh_allowed`) : pas besoin d'un seuil global
+                # qui, à 1/6, empêchait justement le refill.
+                need_refresh = available < len(scope)
                 if need_refresh:
                     now_ts = time.time()
                     eligible = [
