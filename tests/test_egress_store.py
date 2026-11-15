@@ -299,3 +299,62 @@ def test_summary_counts_each_state_and_unique_blocks(tmp_path):
         assert summary["unique_blocks"] == 2
     finally:
         store.close()
+
+def test_summary_does_not_count_an_expired_proof_as_usable(tmp_path):
+    """830 lignes ``usable`` expirées ne doivent pas être annoncées usable.
+
+    C'était le symptôme : le catalogue affichait des centaines de proxys
+    utilisables alors que ``selectable`` (qui exige ``expires_at > now``)
+    n'en retournait aucun.
+    """
+
+    store, clock = _store(tmp_path)
+    try:
+        store.apply(
+            _option(egress_ip="1.2.3.4"),
+            Observation(
+                phase=ObservationPhase.FREE_GATE,
+                status=200,
+                result=OptionStatus.USABLE,
+                observed_at=1_000.0,
+            ),
+            _policy(),
+        )
+        clock[0] = 1_050.0
+        assert store.summary()[Provider.PUBLIC]["usable"] == 1
+        clock[0] = 1_200.0  # TTL 100 s dépassé
+        summary = store.summary()[Provider.PUBLIC]
+        assert summary["usable"] == 0
+        assert summary["expired"] == 1
+        assert summary["known"] == 1
+    finally:
+        store.close()
+
+
+def test_list_options_oldest_first_walks_the_stalest_proofs(tmp_path):
+    store, _ = _store(tmp_path)
+    try:
+        for index, observed in enumerate((1_000.0, 1_020.0, 1_040.0)):
+            store.apply(
+                _option(host=f"10.0.0.{index + 1}", egress_ip=f"10.0.1.{index + 1}"),
+                Observation(
+                    phase=ObservationPhase.FREE_GATE,
+                    status=200,
+                    result=OptionStatus.USABLE,
+                    observed_at=observed,
+                ),
+                _policy(),
+            )
+        newest = store.list_options(
+            provider=Provider.PUBLIC, status=OptionStatus.USABLE, limit=1
+        )
+        oldest = store.list_options(
+            provider=Provider.PUBLIC,
+            status=OptionStatus.USABLE,
+            limit=1,
+            oldest_first=True,
+        )
+        assert newest[0].last_checked_at == 1_040.0
+        assert oldest[0].last_checked_at == 1_000.0
+    finally:
+        store.close()

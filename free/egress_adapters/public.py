@@ -8,6 +8,7 @@ provider reset; a timeout/403/5xx is ``dead``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import time
 from dataclasses import dataclass
@@ -181,7 +182,14 @@ async def probe_public_candidates(
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
     finally:
-        await asyncio.to_thread(handle.stop)
+        # [013] Un cycle annulé (timeout ou arrêt de l'app) doit quand même
+        # tuer le worker : ``await`` dans le ``finally`` d'une tâche annulée
+        # relance CancelledError et laissait un processus par cycle (~30
+        # orphelins en 15 h). L'arrêt part dans une tâche indépendante,
+        # protégée par ``shield``.
+        stopper = asyncio.ensure_future(asyncio.to_thread(handle.stop))
+        with contextlib.suppress(BaseException):
+            await asyncio.shield(stopper)
     mapped: dict[str, CandidateProbe] = {}
     for task in done:
         try:
@@ -419,11 +427,13 @@ class PublicEgressAdapter:
                 provider=Provider.PUBLIC,
                 status=OptionStatus.USABLE,
                 limit=policy.max_active,
+                oldest_first=True,
             ),
             *store.list_options(
                 provider=Provider.PUBLIC,
                 status=OptionStatus.REACHABLE,
                 limit=max(8, policy.max_active),
+                oldest_first=True,
             ),
         ]
         seen_revalidation: set[str] = set()
@@ -481,12 +491,21 @@ class PublicEgressAdapter:
             candidates = kept
         blocked = store.blocked_endpoints(self.provider)
         if blocked:
+            # [013] Ne jamais bloquer la *revalidation* : ``blocked_endpoints``
+            # renvoie des host:port, or un proxy rotatif porte plusieurs
+            # lignes (une par egress). Un 429 sur l'egress Y mettait le
+            # host:port en quarantaine et excluait la preuve 200 de l'egress
+            # X ; la ligne ``usable`` n'était donc plus jamais re-testée,
+            # expirait au bout de 12 h et le pool public tombait à zéro
+            # endpoint. La revalidation existe précisément pour re-prouver.
             kept = [
                 candidate
                 for candidate in candidates
-                if (str(candidate.get("host") or ""), int(candidate.get("port") or 0)) not in blocked
+                if candidate.get("revalidate")
+                or (str(candidate.get("host") or ""), int(candidate.get("port") or 0))
+                not in blocked
             ]
-            result.skipped = len(candidates) - len(kept)
+            result.skipped += len(candidates) - len(kept)
             candidates = kept
         result.candidates = len(candidates)
         if not candidates:

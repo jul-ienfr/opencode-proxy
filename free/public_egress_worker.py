@@ -423,6 +423,38 @@ class WorkerHandle:
             self.config_path.parent.rmdir()
 
 
+def cleanup_orphan_worker_processes(*, keep: set[int] | None = None) -> int:
+    """Kill leftover probe workers from a previous app generation.
+
+    ``start_worker_process`` launches one worker per probe cycle. A full app
+    restart loses the handles; the workers keep listening on loopback forever
+    (one per cycle, ~30 after 15 h). The command line always carries the
+    ``oc-public-egress-`` temp dir, even after the config file is unlinked, so
+    it is a safe marker.
+    """
+
+    try:
+        import psutil
+    except Exception:  # noqa: BLE001 - psutil is optional on this host
+        return 0
+    keep = set(keep or ())
+    removed = 0
+    for process in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = " ".join(process.info.get("cmdline") or [])
+            if "public_egress_worker.py" not in cmdline:
+                continue
+            if "oc-public-egress-" not in cmdline:
+                continue
+            if process.pid in keep:
+                continue
+            process.kill()
+            removed += 1
+        except Exception:  # noqa: BLE001 - a process may exit during iteration
+            continue
+    return removed
+
+
 def start_worker_process(
     upstreams: dict[str, str],
     *,

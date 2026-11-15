@@ -685,3 +685,130 @@ async def test_max_candidates_bounds_the_cycle(tmp_path):
         assert len(seen) == 5
     finally:
         store.close()
+
+@pytest.mark.asyncio
+async def test_revalidation_is_not_blocked_by_a_sibling_quota_row(tmp_path):
+    """Un 429 sur un egress ne doit pas geler la preuve 200 du même endpoint.
+
+    Un proxy rotatif porte plusieurs lignes (une par egress). ``blocked_endpoints``
+    renvoie des host:port : le 429 de l'egress Y excluait la ligne ``usable`` de
+    l'egress X de la revalidation. Elle expirait donc sans jamais être
+    re-testée, et le pool public tombait à zéro endpoint.
+    """
+
+    import time
+
+    from free.egress_catalog import new_option
+
+    policy = ProviderPolicy(provider=Provider.PUBLIC, max_active=8)
+    store = EgressStore(tmp_path / "registry.db")
+    try:
+        now = time.time()
+        store.apply(
+            new_option(
+                provider=Provider.PUBLIC,
+                kind="https",
+                host="10.0.0.1",
+                port=443,
+                egress_ip="1.1.1.1",
+                now=now - 50_000.0,
+            ),
+            Observation(
+                phase=ObservationPhase.FREE_GATE,
+                status=200,
+                result=OptionStatus.USABLE,
+                observed_at=now - 50_000.0,
+            ),
+            policy,
+        )
+        store.apply(
+            new_option(
+                provider=Provider.PUBLIC,
+                kind="https",
+                host="10.0.0.1",
+                port=443,
+                egress_ip="2.2.2.2",
+                now=now - 10.0,
+            ),
+            Observation(
+                phase=ObservationPhase.FREE_GATE,
+                status=429,
+                result=OptionStatus.QUOTA,
+                observed_at=now - 10.0,
+            ),
+            policy,
+            reset_at=now + 3_600.0,
+        )
+        assert store.selectable(policy, now=now) == []
+        assert ("10.0.0.1", 443) in store.blocked_endpoints(Provider.PUBLIC, now=now)
+
+        seen: list[str] = []
+
+        async def probe(candidates, **kwargs):
+            seen.extend(str(candidate["url"]) for candidate in candidates)
+            return {
+                candidate["url"]: CandidateProbe(
+                    url=candidate["url"],
+                    egress_ip="1.1.1.1",
+                    liveness_status=200,
+                    free_status=200,
+                )
+                for candidate in candidates
+            }
+
+        adapter = PublicEgressAdapter(sources=[], probe=probe, concurrency=2, timeout=2)
+        result = await adapter.refresh(store, policy, run_id="reval-test")
+
+        assert "https://10.0.0.1:443" in seen
+        assert result.promoted == 1
+        assert [option.egress_ip for option in store.selectable(policy)] == ["1.1.1.1"]
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_revalidation_walks_the_stalest_proofs_first(tmp_path):
+    """La fenêtre doit prendre les preuves les plus vieilles, pas les plus récentes.
+
+    Avec ``last_checked_at DESC``, les lignes re-testées restaient en tête et la
+    queue du catalogue n'était jamais rafraîchie : elle expirait pour toujours.
+    """
+
+    import time
+
+    from free.egress_catalog import new_option
+
+    policy = ProviderPolicy(provider=Provider.PUBLIC, max_active=1, ttl_usable_s=10_000.0)
+    store = EgressStore(tmp_path / "registry.db")
+    try:
+        now = time.time()
+        for index, age in enumerate((9_000.0, 100.0)):
+            store.apply(
+                new_option(
+                    provider=Provider.PUBLIC,
+                    kind="https",
+                    host=f"10.0.1.{index + 1}",
+                    port=443,
+                    egress_ip=f"10.0.2.{index + 1}",
+                    now=now - age,
+                ),
+                Observation(
+                    phase=ObservationPhase.FREE_GATE,
+                    status=200,
+                    result=OptionStatus.USABLE,
+                    observed_at=now - age,
+                ),
+                policy,
+            )
+
+        seen: list[str] = []
+
+        async def probe(candidates, **kwargs):
+            seen.extend(str(candidate["url"]) for candidate in candidates)
+            return {}
+
+        adapter = PublicEgressAdapter(sources=[], probe=probe, concurrency=1, timeout=2)
+        await adapter.refresh(store, policy, run_id="oldest-test")
+        assert seen == ["https://10.0.1.1:443"]
+    finally:
+        store.close()

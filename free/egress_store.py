@@ -609,6 +609,7 @@ class EgressStore:
         kind: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        oldest_first: bool = False,
     ) -> list[EgressOption]:
         clauses: list[str] = []
         values: list[Any] = []
@@ -622,9 +623,16 @@ class EgressStore:
             clauses.append("kind=?")
             values.append(str(kind))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        if oldest_first:
+            # [013] Revalidation must walk the *stalest* proofs first: with a
+            # ``DESC`` window the freshly re-tested rows stay on top and the
+            # tail of the catalog is never refreshed, so it expires forever.
+            order = "ORDER BY status, last_checked_at ASC, id ASC"
+        else:
+            order = "ORDER BY status, last_checked_at DESC, id DESC"
         sql = (
             "SELECT * FROM egress_options "
-            f"{where} ORDER BY status, last_checked_at DESC, id DESC LIMIT ? OFFSET ?"
+            f"{where} {order} LIMIT ? OFFSET ?"
         )
         with self._lock:
             rows = self._conn.execute(
@@ -695,10 +703,23 @@ class EgressStore:
             ).fetchone()
         return int(row[0] if row else 0)
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self, *, now: float | None = None) -> dict[str, Any]:
+        """Per-provider counters, with expired proofs counted separately.
+
+        A ``usable`` row whose TTL elapsed is *not* usable: nothing can select
+        it (``is_selectable`` gates on ``expires_at``).  Counting it as usable
+        made the catalog advertise hundreds of proxies while the pool had
+        zero.  It lands in ``expired`` instead and is re-probed by the
+        revalidation window.
+        """
+
+        ts = self._now() if now is None else float(now)
         with self._lock:
             rows = self._conn.execute(
-                "SELECT provider, status, COUNT(*) AS n FROM egress_options GROUP BY provider, status"
+                "SELECT provider, status, COUNT(*) AS n, "
+                "SUM(CASE WHEN expires_at <= ? THEN 1 ELSE 0 END) AS stale "
+                "FROM egress_options GROUP BY provider, status",
+                (ts,),
             ).fetchall()
             blocks = self._conn.execute(
                 "SELECT provider, COUNT(DISTINCT block) FROM egress_options "
@@ -720,12 +741,20 @@ class EgressStore:
                     "auth": 0,
                     "dead": 0,
                     "candidate": 0,
+                    "expired": 0,
                     "unique_blocks": 0,
                     "last_run_at": 0.0,
                 },
             )
-            bucket[str(row["status"])] = int(row["n"])
-            bucket["known"] += int(row["n"])
+            status = str(row["status"])
+            count = int(row["n"])
+            stale = int(row["stale"] or 0)
+            if status == OptionStatus.USABLE:
+                bucket["usable"] = max(0, count - stale)
+                bucket["expired"] += stale
+            else:
+                bucket[status] = count
+            bucket["known"] += count
         for row in blocks:
             providers.setdefault(str(row[0]), {})["unique_blocks"] = int(row[1])
         for row in runs:
@@ -739,6 +768,7 @@ class EgressStore:
                 "auth",
                 "dead",
                 "candidate",
+                "expired",
                 "unique_blocks",
             ):
                 bucket.setdefault(key, 0)

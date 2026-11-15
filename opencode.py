@@ -3523,6 +3523,19 @@ async def lifespan(app):
                 _debug(f"  [public-proxies] {_removed_workers} worker(s) orphelin(s) supprimé(s)")
     except Exception as _e_cleanup:
         _debug(f"  [public-proxies] nettoyage workers orphelins (fail-soft): {_e_cleanup}")
+    # [013] Les probes publiques tournent en processus (indépendamment de
+    # l'isolation du pool). Un arrêt brutal en laissait un par cycle ; on les
+    # tue au démarrage, quel que soit le mode d'isolation.
+    try:
+        from free.public_egress_worker import cleanup_orphan_worker_processes
+
+        _killed_probes = await asyncio.to_thread(cleanup_orphan_worker_processes)
+        if _killed_probes:
+            _debug(
+                f"  [public-proxies] {_killed_probes} worker(s) de probe orphelin(s) arrêté(s)"
+            )
+    except Exception as _e_probe_cleanup:
+        _debug(f"  [public-proxies] nettoyage probes orphelines (fail-soft): {_e_probe_cleanup}")
     shared_state.free_ip_pool.update_config(IP_ROTATION)
     try:
         shared_state.free_ip_pool.load_pool_state()
