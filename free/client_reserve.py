@@ -7,6 +7,7 @@ que des IPs de cette réserve ; les probes l'ignorent. La table vit dans
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -14,6 +15,38 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "logs" / "registry.db"
 DEFAULT_TTL_S = 3600.0
+POISONED_ERROR = "probe-format-poisoned"
+POISON_TTL_S = 86400.0
+
+
+def _default_ttl() -> float:
+    """TTL de la preuve de réserve (022 T021).
+
+    Défaut 3600 s. Un TTL de 5 min imposerait ~1 700 re-probes/jour pour six
+    IPs, incompatible avec le quota free (~200 requêtes/jour/IP). La fraîcheur
+    vient des 200 du cycle et de l'exclusion immédiate sur 429.
+    """
+
+    try:
+        return max(60.0, float(os.getenv("RESERVE_TTL_S", "") or DEFAULT_TTL_S))
+    except (TypeError, ValueError):
+        return DEFAULT_TTL_S
+
+
+def _client_budget() -> int:
+    """Budget client par IP (022 T006).
+
+    ``CLIENT_BUDGET_PCT`` (défaut 80) × ``CLIENT_QUOTA_ESTIMATE`` (défaut 200).
+    Une IP dont le bucket a consommé ce budget sort de la réserve avant
+    épuisement.
+    """
+
+    try:
+        pct = float(os.getenv("CLIENT_BUDGET_PCT", "80") or 80)
+        estimate = float(os.getenv("CLIENT_QUOTA_ESTIMATE", "200") or 200)
+        return max(1, int(estimate * pct / 100.0))
+    except (TypeError, ValueError):
+        return 160
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS client_reserve (
@@ -46,7 +79,7 @@ def add(
     hostname: str,
     station: int | None = None,
     *,
-    ttl_s: float = DEFAULT_TTL_S,
+    ttl_s: float | None = None,
     source: str = "chain-200",
     now: float | None = None,
     db: Path | None = None,
@@ -56,7 +89,7 @@ def add(
     if not target or not host:
         return False
     ts = time.time() if now is None else float(now)
-    ttl = max(60.0, float(ttl_s or DEFAULT_TTL_S))
+    ttl = max(60.0, float(ttl_s if ttl_s is not None else _default_ttl()))
     try:
         ensure_schema(db)
         with _connect(db) as conn:
@@ -89,6 +122,68 @@ def _invalidate() -> None:
     _CACHE = None
 
 
+def _excluded_ips(
+    conn: sqlite3.Connection, ips: set[str], ts: float, budget: int
+) -> set[str]:
+    """IPs de la réserve que le ledger interdit de servir (022 T006/T016).
+
+    Trois motifs : 429 actif, budget client consommé, ou probe non conforme
+    (`probe-format-poisoned`) de moins de 24 h. Un compteur (bucket) qui a
+    répondu 200 depuis le poison n'est pas grillé : le 200 est postérieur.
+    """
+
+    if not ips:
+        return set()
+    try:
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(quota_buckets)")
+        }
+    except sqlite3.DatabaseError:
+        return set()
+    if not columns:
+        return set()
+    wanted = [
+        name
+        for name in (
+            "ip",
+            "used",
+            "last_status",
+            "reset_at",
+            "last_error",
+            "last_seen_at",
+        )
+        if name in columns
+    ]
+    if "ip" not in wanted:
+        return set()
+    placeholders = ",".join("?" for _ in ips)
+    rows = conn.execute(
+        f"SELECT {', '.join(wanted)} FROM quota_buckets "
+        f"WHERE ip IN ({placeholders})",
+        tuple(ips),
+    ).fetchall()
+    excluded: set[str] = set()
+    for values in rows:
+        row = dict(zip(wanted, values))
+        ip = str(row.get("ip") or "")
+        if not ip:
+            continue
+        status = row.get("last_status")
+        reset_at = float(row.get("reset_at") or 0.0)
+        used = row.get("used")
+        if status == 429 and reset_at > ts:
+            excluded.add(ip)
+            continue
+        if used is not None and int(used) >= budget:
+            excluded.add(ip)
+            continue
+        if str(row.get("last_error") or "") == POISONED_ERROR:
+            seen = float(row.get("last_seen_at") or 0.0)
+            if status != 200 and seen > ts - POISON_TTL_S:
+                excluded.add(ip)
+    return excluded
+
+
 def reserved_ips(
     *, now: float | None = None, db: Path | None = None
 ) -> set[str]:
@@ -101,20 +196,11 @@ def reserved_ips(
     try:
         ensure_schema(db)
         with _connect(db) as conn:
-            try:
-                rows = conn.execute(
-                    "SELECT c.ip FROM client_reserve c "
-                    "WHERE c.expires_at > ? AND NOT EXISTS ("
-                    "SELECT 1 FROM quota_buckets q WHERE q.ip = c.ip "
-                    "AND q.last_status = 429 AND q.reset_at > ?)",
-                    (ts, ts),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                # registry.db sans quota_buckets (tests isolés) : pas de filtre.
-                rows = conn.execute(
-                    "SELECT ip FROM client_reserve WHERE expires_at > ?", (ts,)
-                ).fetchall()
-        out = {str(row[0]) for row in rows if row and row[0]}
+            rows = conn.execute(
+                "SELECT ip FROM client_reserve WHERE expires_at > ?", (ts,)
+            ).fetchall()
+            out = {str(row[0]) for row in rows if row and row[0]}
+            out -= _excluded_ips(conn, out, ts, _client_budget())
     except Exception:
         return set()
     if db is None:

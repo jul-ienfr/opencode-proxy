@@ -1393,8 +1393,8 @@ def _refresh_warm_pool(
             _LAST_RESERVE_COUNT = _rc
             if _rc < 2:
                 log(
-                    f"ALERT client_reserve={_rc} (<2) — probes suspendues, "
-                    "priorité client"
+                    f"ALERT client_reserve={_rc} (<2) — priorité client, "
+                    "refill sur stations libres"
                 )
             else:
                 log(f"client_reserve={_rc}")

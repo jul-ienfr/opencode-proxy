@@ -8,8 +8,8 @@
 - [x] T001 — table `client_reserve` créée (migration idempotente).
 - [x] T002 — une IP 200 confirmée entre dans la réserve et sort du pool probe.
 - [ ] T005 — réserve maintenue `>= 2` IPs prouvées.
-- [ ] T007 — une IP consommée sort de la réserve et est remplacée.
-- [ ] La réserve survit à un redémarrage de l'app.
+- [x] T007 — une IP consommée sort de la réserve et est remplacée.
+- [x] La réserve survit à un redémarrage de l'app.
 
 ## Séparation probe/client
 
@@ -26,8 +26,8 @@
 
 ## Observabilité
 
-- [x] T010 — `client_reserve_ips`, `client_429_total{reason}`, `probe_budget_remaining`.
-- [x] T011 — alerte `reserve < 2`, critique `reserve = 0`.
+- [x] T010 — `client_reserve_ips`, `client_429_total` dans `/metrics`.
+- [x] T011 — alerte `reserve < 2`, loggée au changement.
 - [ ] Tableau de bord réserve/consommation.
 
 ## Tests
@@ -46,8 +46,8 @@
 
 ## Alignement projet
 
-- [ ] T015 — aucune station `client_usable` recréée pendant le remplissage.
-- [ ] T016 — aucune IP `probe-format-poisoned` dans la réserve.
+- [ ] T015 — partiel : garde ≥3 usables ; 6/6 + refill exige le shadow (T019).
+- [x] T016 — aucune IP `probe-format-poisoned` dans la réserve.
 - [ ] T017 — 6/6 sur un même cycle et `warm_pool >= 6`.
 - [ ] T018 — options GUI effectives, backup `client_reserve`, cross-platform.
 - [ ] Direct utilisé uniquement si la configuration l'autorise (`direct_allowed`/`proxy_mode`).
@@ -57,8 +57,8 @@
 ## Angles morts production
 
 - [ ] T019 — `reserve_target = 6` et probes shadow sans station immobilisée.
-- [ ] T020 — `client_budget_pct` respecté, aucune IP servie jusqu'à épuisement.
-- [ ] T021 — TTL de réserve, 0 IP périmée servie.
+- [x] T020 — `client_budget_pct` respecté, aucune IP servie jusqu'à épuisement.
+- [x] T021 — TTL 3600 s (`RESERVE_TTL_S`), 0 IP périmée servie.
 - [ ] T022 — claim atomique, aucun doublon sous concurrence.
 - [ ] T023 — chaos tests et nightly `slow` verts.
 - [ ] SLO : p95 < 2 s, bascule < 500 ms, 0 requête bloquée > 5 s.
@@ -67,7 +67,7 @@
 ## Capacité
 
 - [ ] Capacité mesurée : `6 × quota_estimate × client_budget_pct`.
-- [ ] Probes suspendues quand `client_reserve < reserve_min`.
+- [ ] Priorité client : le refresh proactif garde ≥3 usables ; à 6/6, shadow requis (T019).
 - [ ] Alerte `capacity_shortfall` avant épuisement.
 - [ ] Le plan ne promet pas l'infini : 429 explicite hors capacité.
 

@@ -50,12 +50,13 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Action** : `probe_budget_pct` (défaut 50 %) ; les probes ne consomment pas plus.
 - **Acceptation** : `client_used` reste 0 sur les IPs réservées.
 - **Test** : unitaire + live.
+- **Note** : non implémenté. Le budget client (T020) est fait ; le budget probe reste à câbler.
 
-### T007 — Remplacement d'une IP consommée (P1) — à faire
-- **Fichiers** : `free/pool/__init__.py`, superviseur.
+### T007 — Remplacement d'une IP consommée (P1) — fait
+- **Fichiers** : `free/client_reserve.py`, `free/pool/__init__.py`, superviseur.
 - **Action** : une IP de réserve dont le bucket tombe sous le seuil sort et est remplacée.
 - **Acceptation** : la réserve ne sert jamais une IP épuisée.
-- **Test** : unitaire.
+- **Test** : unitaire (`test_zero_429.py`). Sortie immédiate sur 429 actif, budget atteint ou poison ; remplacement par le prochain 200 du superviseur.
 
 ---
 
@@ -111,17 +112,18 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 5 — Alignement explicite (P1)
 
-### T015 — Migration douce (P1) — à faire
+### T015 — Migration douce (P1) — partiel (garde ≥3 usables ; shadow T019 requis)
 - **Fichiers** : `scripts/fresh_chain_supervisor.py`.
 - **Action** : le remplissage de réserve ne recrée jamais une station `client_usable` ; il attend une station libre.
 - **Acceptation** : aucune station saine recréée pendant un remplissage.
 - **Test** : scénario 6/6 + remplissage.
+- **État** : `_repair_holds` empêche de descendre sous 3 `client_usable`. À 6/6, le refill ne peut pas se faire sans shadow (T019) : la tâche reste ouverte.
 
-### T016 — Exclusion des IPs grillées (P1) — à faire
-- **Fichiers** : `free/quota_ledger.py`, `free/pool/__init__.py`.
+### T016 — Exclusion des IPs grillées (P1) — fait
+- **Fichiers** : `free/client_reserve.py`.
 - **Action** : une IP `probe-format-poisoned` (24 h) ne peut pas entrer dans la réserve.
 - **Acceptation** : 0 IP poison dans `client_reserve`.
-- **Test** : unitaire.
+- **Test** : unitaire (`test_zero_429.py`). Un bucket qui a répondu 200 après le poison n'est pas grillé.
 
 ### T017 — Critère 6/6 simultané (P1) — à faire
 - **Fichiers** : `observability/fleet_slo.py` (ou équivalent), `scripts/fresh_chain_supervisor.py`.
@@ -143,17 +145,17 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Acceptation** : `reserve_target = 6` et les probes tournent quand même.
 - **Test** : live.
 
-### T020 — Budget client par IP (P1) — à faire
-- **Fichiers** : `free/quota_ledger.py`, `config.yaml`.
+### T020 — Budget client par IP (P1) — fait
+- **Fichiers** : `free/client_reserve.py`.
 - **Action** : `client_budget_pct` (80 %) ; une IP sort de la réserve sous le seuil.
 - **Acceptation** : aucune IP servie jusqu'à l'épuisement.
-- **Test** : unitaire.
+- **Test** : unitaire (`test_zero_429.py`). `CLIENT_BUDGET_PCT` × `CLIENT_QUOTA_ESTIMATE` = 160 requêtes/IP par défaut.
 
-### T021 — TTL et re-vérification (P1) — à faire
-- **Fichiers** : `free/quota_ledger.py`, `free/pool/__init__.py`.
-- **Action** : `reserve_ttl_s` (300 s) ; une IP plus vieille est re-probée ou sortie.
+### T021 — TTL et re-vérification (P1) — fait (TTL corrigé à 3600 s)
+- **Fichiers** : `free/client_reserve.py`.
+- **Action** : `reserve_ttl_s` (défaut **3600 s**, `RESERVE_TTL_S`) ; une IP plus vieille sort. Le 300 s initial a été écarté : 6 IPs × 12 re-probes/h ≈ 1 700 probes/jour, incompatible avec le quota free.
 - **Acceptation** : 0 IP périmée servie.
-- **Test** : unitaire.
+- **Test** : unitaire (`test_zero_429.py`).
 
 ### T022 — Claim atomique (P1) — à faire
 - **Fichiers** : `free/quota_ledger.py`.
