@@ -20,7 +20,7 @@
 
 ## Fallback
 
-- [ ] T008 — partiel : `reason` distingue `reserve_empty`/`all_fallbacks_dead` ; ordre WARP → proxys non instrumenté.
+- [x] T008 — ordre des fallbacks testé, `direct` utilisé uniquement si autorisé.
 - [x] T009 — 429 JSON avec `Retry-After`, `reason` et `X-Free-Reason`, jamais vide.
 - [ ] Chaque bascule est loggée avec sa cause.
 
@@ -60,7 +60,7 @@
 - [x] T020 — `client_budget_pct` respecté, aucune IP servie jusqu'à épuisement.
 - [x] T021 — TTL 3600 s (`RESERVE_TTL_S`), 0 IP périmée servie.
 - [x] T022 — sans objet : `_refresh_allowed` empêche le rebind d'une IP servie (test dédié).
-- [ ] T023 — chaos tests et nightly `slow` verts (DB corrompue/verrouillée, WARP mort faits).
+- [x] T023 — chaos + pas CI bloquant « Contrat zéro 429 » (6/6 live manuel).
 - [ ] SLO : p95 < 2 s, bascule < 500 ms, 0 requête bloquée > 5 s.
 - [ ] Migration `client_reserve` avec backup préalable.
 

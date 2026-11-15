@@ -62,6 +62,13 @@ jobs:
         # `--strict` compare à la référence versionnée et refuse toute clé morte
         # nouvelle.
         run: python scripts/config_audit.py --strict
+      - name: Contrat zéro 429 (BLOQUANT, ~2 s)
+        # 022 : réserve client, budget probe/client, TTL, poison, 429
+        # raisonné, réglages runtime. Ces tests sont rapides ; un pas dédié
+        # les rend visibles au lieu de les noyer dans la couverture.
+        run: >-
+          pytest -q tests/test_zero_429.py tests/test_client_reserve.py
+          tests/test_reserve_settings.py
       - name: Tests with coverage
         # [V8.4] `-m "not docker"` : le seul test Docker-marké (chaos kill -9)
         # exige un daemon live et n'a rien à faire dans le gate par défaut —

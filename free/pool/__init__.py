@@ -4979,6 +4979,29 @@ class FreeIPPool:
             return False
         return True
 
+    def _direct_allowed(self) -> bool:
+        """[022 T008] Le direct n'est utilisé que s'il est explicitement permis.
+
+        ``proxy_mode=direct`` (choix opérateur) ou ``direct_allowed=1`` (GUI /
+        ``DIRECT_ALLOWED``). Sinon le provider `direct` est ignoré, même s'il
+        figure dans la liste configurée.
+        """
+
+        try:
+            from free.reserve_settings import get_bool
+
+            if get_bool("direct_allowed", False):
+                return True
+        except Exception:
+            pass
+        try:
+            return (
+                str(getattr(self._vpn, "proxy_mode", "") or "").lower()
+                == "direct"
+            )
+        except Exception:
+            return False
+
     def _available_egress_providers(
         self, excluded=None, model: str | None = None
     ) -> list[str]:
@@ -4987,7 +5010,7 @@ class FreeIPPool:
             if name in ("nordvpn", "warp", "proxies"):
                 if self._provider_has_free_bucket(name, excluded, model=model):
                     out.append(name)
-            elif name == "direct":
+            elif name == "direct" and self._direct_allowed():
                 out.append(name)
         return out
 

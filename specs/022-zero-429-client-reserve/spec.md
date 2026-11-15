@@ -181,7 +181,7 @@ Conséquence sur les tests : un burst réel de 1 000 requêtes dépasse la capac
 | Question | Décision |
 |---|---|
 | `reserve_target` | **6** par défaut (une IP par station), configurable ; validé par l'opérateur |
-| `direct_allowed` | Lu depuis la config/GUI ; **false** par défaut ; direct utilisé seulement si explicitement autorisé |
+| `direct_allowed` | Réglage `direct_allowed` (GUI/`DIRECT_ALLOWED`), **false** par défaut ; `proxy_mode=direct` l'autorise aussi ; sinon le provider direct est ignoré |
 | Capacité | **960 requêtes/jour** avec 6 IPs × 200 × 80 % ; mesurée sur le ledger, pas supposée |
 | Priorité | **Client > probe** ; probes suspendues sous `reserve_min` |
 | Réserve initiale | Les 6 IPs `client_usable` actuelles entrent dans la réserve au déploiement |

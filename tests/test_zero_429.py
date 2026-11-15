@@ -258,8 +258,8 @@ def test_reserve_can_be_disabled(monkeypatch) -> None:
 def test_reason_reports_dead_fallbacks(monkeypatch) -> None:
     """T008/T023 : réserve vide + aucun WARP/proxy = all_fallbacks_dead."""
 
-    import shared_state
     import opencode
+    import shared_state
 
     class _Pool:
         _socks5_eps: list = []
@@ -289,3 +289,32 @@ def test_reason_reports_upstream_429(monkeypatch) -> None:
 
     monkeypatch.setattr("free.client_reserve.count", lambda **_: 3)
     assert opencode._client_429_reason() == "upstream_429"
+
+
+def test_direct_provider_is_gated(monkeypatch) -> None:
+    """T008 : ordre des fallbacks, `direct` seulement si autorisé."""
+
+    from free import pool as pool_mod
+
+    pool = object.__new__(pool_mod.FreeIPPool)
+    pool._egress_providers = ["nordvpn", "warp", "proxies", "direct"]
+    pool._provider_has_free_bucket = (
+        lambda name, excluded=None, model=None: True
+    )
+    monkeypatch.setattr(
+        pool_mod.FreeIPPool, "_direct_allowed", lambda self: False
+    )
+    assert pool._available_egress_providers() == [
+        "nordvpn",
+        "warp",
+        "proxies",
+    ]
+    monkeypatch.setattr(
+        pool_mod.FreeIPPool, "_direct_allowed", lambda self: True
+    )
+    assert pool._available_egress_providers() == [
+        "nordvpn",
+        "warp",
+        "proxies",
+        "direct",
+    ]

@@ -25,6 +25,7 @@ DEFAULTS: dict[str, str] = {
     "ttl_s": "3600",
     "client_budget_pct": "80",
     "probe_budget_pct": "50",
+    "direct_allowed": "0",
 }
 
 ENV_NAMES: dict[str, str] = {
@@ -34,6 +35,7 @@ ENV_NAMES: dict[str, str] = {
     "ttl_s": "RESERVE_TTL_S",
     "client_budget_pct": "CLIENT_BUDGET_PCT",
     "probe_budget_pct": "PROBE_BUDGET_PCT",
+    "direct_allowed": "DIRECT_ALLOWED",
 }
 
 _SCHEMA = """
@@ -113,13 +115,13 @@ def get_bool(name: str, default: bool = True) -> bool:
 
 
 def _validate(name: str, value: object) -> str:
-    if name == "enabled":
+    if name in ("enabled", "direct_allowed"):
         text = str(value).strip().lower()
         if text in ("1", "true", "yes", "on"):
             return "1"
         if text in ("0", "false", "no", "off"):
             return "0"
-        raise ValueError("enabled doit être un booléen")
+        raise ValueError(f"{name} doit être un booléen")
     if name == "target":
         number = int(float(str(value)))
         if not 1 <= number <= 6:

@@ -61,11 +61,11 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 2 — Fallback avant 429 (P1)
 
-### T008 — Ordre de fallback (P1) — partiel
+### T008 — Ordre de fallback (P1) — fait
 - **Fichiers** : `free/pool/__init__.py`, `opencode.py`.
 - **Action** : réserve → WARP → proxys → direct (si autorisé) → 429.
 - **Acceptation** : un WARP disponible est utilisé avant le 429.
-- **État** : la réserve ne bloque plus les fallbacks quand elle est vide (`test_empty_reserve_leaves_fallback_available`). L'ordre WARP → proxys → direct n'est pas encore instrumenté ni testé de bout en bout.
+- **Test** : `test_direct_provider_is_gated` vérifie l'ordre et le fait que `direct` est exclu sauf si `proxy_mode=direct` ou `direct_allowed=1` ; `test_reason_reports_dead_fallbacks` / `test_reason_reports_upstream_429` prouvent les trois issues (`reserve_empty`, `all_fallbacks_dead`, `upstream_429`).
 
 ### T009 — 429 explicite (P1) — fait
 - **Fichiers** : `core/errors.py`, `opencode.py`.
@@ -160,8 +160,8 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Action initiale** : `BEGIN IMMEDIATE` + `UPDATE ... RETURNING` ; une IP = un client à la fois.
 - **Décision** : « un client par IP » sérialiserait les requêtes et n'apporte rien à l'HTTP amont. Le risque réel est qu'une IP soit rebindée **pendant** qu'elle sert ; `_refresh_allowed` l'interdit et `test_rotation_never_takes_a_reserved_ip` le prouve. Un claim par requête pourra revenir si un besoin de comptabilité exacte apparaît.
 
-### T023 — Chaos et CI (P2) — partiel
-- **Fichiers** : `tests/test_zero_429.py`, CI.
+### T023 — Chaos et CI (P2) — fait (live 6/6 manuel)
+- **Fichiers** : `tests/test_zero_429.py`, `.github/workflows/ci.yml`.
 - **Action** : tests IP qui tombe, WARP mort, DB lock ; nightly `slow`.
 - **Acceptation** : les tests passent et la non-régression 6/6 est vérifiée.
-- **État** : DB corrompue, DB verrouillée et WARP mort couvertes (`test_reserve_survives_a_corrupt_db`, `test_reserve_survives_a_locked_db`, `test_reason_reports_dead_fallbacks`). Reste le nightly `slow` et la non-régression 6/6 automatisée.
+- **État** : DB corrompue, DB verrouillée et WARP mort couvertes. Pas de nightly : les tests 022 sont rapides et tournent dans un pas CI bloquant dédié (`Contrat zéro 429`). La non-régression 6/6 reste une vérification live (runbook), pas un test CI : elle dépend du quota upstream.

@@ -8,9 +8,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from dashboard.routers.free_routes import register_free_status_routes
 from free import client_reserve as cr
 from free import reserve_settings as rs
-from dashboard.routers.free_routes import register_free_status_routes
 
 
 def _fresh_db(tmp_path: Path, monkeypatch) -> Path:
@@ -65,8 +65,13 @@ def test_route_get_and_post(tmp_path: Path, monkeypatch) -> None:
     first = client.get("/api/free/client-reserve")
     assert first.status_code == 200
     assert first.json()["settings"]["target"] == "6"
-    posted = client.post("/api/free/client-reserve", json={"target": 4})
+    assert first.json()["settings"]["direct_allowed"] == "0"
+    posted = client.post(
+        "/api/free/client-reserve",
+        json={"target": 4, "direct_allowed": "1"},
+    )
     assert posted.status_code == 200
     assert posted.json()["settings"]["target"] == "4"
+    assert posted.json()["settings"]["direct_allowed"] == "1"
     bad = client.post("/api/free/client-reserve", json={"target": 99})
     assert bad.status_code == 400
