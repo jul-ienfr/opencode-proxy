@@ -70,3 +70,12 @@
 - [ ] Probes suspendues quand `client_reserve < reserve_min`.
 - [ ] Alerte `capacity_shortfall` avant épuisement.
 - [ ] Le plan ne promet pas l'infini : 429 explicite hors capacité.
+
+## Décisions
+
+- [ ] `reserve_target = 6` configurable.
+- [ ] `direct_allowed` false par défaut, direct seulement si autorisé.
+- [ ] Capacité mesurée (960 req/jour) et documentée.
+- [ ] Client prioritaire sur les probes.
+- [ ] Les 6 IPs actuelles entrent dans la réserve.
+- [ ] 401/403 et erreurs transport ne consomment pas la réserve.

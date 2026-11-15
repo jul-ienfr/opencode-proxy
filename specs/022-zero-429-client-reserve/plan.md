@@ -102,6 +102,17 @@ Le 429 client vient d'un partage de bucket entre les probes et le trafic client.
 - Si `client_reserve < reserve_min`, les probes sont suspendues (priorité client).
 - Si la demande dépasse la capacité, alerte `capacity_shortfall` ; le 429 redevient possible et le plan ne le cache pas.
 
+
+## Décisions d'implémentation
+
+- `reserve_target = 6` par défaut, configurable.
+- `direct_allowed` lu depuis la config, false par défaut.
+- Capacité mesurée : 960 req/jour (6 × 200 × 80 %).
+- `client_reserve` est l'autorité ; `warm_pool` est le pool probe.
+- Auth 401/403 : backoff séparé, jamais un épuisement de réserve.
+- Erreurs transport : retry/rotation, jamais une consommation de réserve.
+- Backpressure : limite de concurrence 2000, file courte si réserve saturée.
+
 ## Fichiers touchés
 
 | Fichier | Rôle |

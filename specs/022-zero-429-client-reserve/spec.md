@@ -173,6 +173,22 @@ Règles de capacité :
 3. **Alerte capacité** : si la demande client dépasse le budget journalier, une alerte `capacity_shortfall` est émise avant l'épuisement.
 4. **Honnêteté** : le plan ne promet pas l'infini. Il promet zéro 429 **dans la capacité mesurée**, et une alerte quand la demande approche la limite.
 
+
+## Décisions tranchées
+
+| Question | Décision |
+|---|---|
+| `reserve_target` | **6** par défaut (une IP par station), configurable ; validé par l'opérateur |
+| `direct_allowed` | Lu depuis la config/GUI ; **false** par défaut ; direct utilisé seulement si explicitement autorisé |
+| Capacité | **960 requêtes/jour** avec 6 IPs × 200 × 80 % ; mesurée sur le ledger, pas supposée |
+| Priorité | **Client > probe** ; probes suspendues sous `reserve_min` |
+| Réserve initiale | Les 6 IPs `client_usable` actuelles entrent dans la réserve au déploiement |
+| Autorité | `client_reserve` est l'autorité ; `warm_pool` ne contient que les probes |
+| Modèles | Réserve par bucket `default` (partagé), pas par modèle |
+| 401/403 | Auth backoff séparé ; ne marque jamais la réserve comme épuisée |
+| Erreurs transport | `no-egress`/timeout ne consomment pas la réserve ; retry ou rotation |
+| Backpressure | Limite de concurrence 2000 (uvicorn) ; si réserve saturée, attente courte ou 429 explicite |
+
 ## Hors périmètre
 
 - Compte payant, workspace, second compte.
