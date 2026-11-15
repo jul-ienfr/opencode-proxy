@@ -4194,6 +4194,13 @@ async def lifespan(app):
         _debug("  [lifespan] station egress probe loop started")
     except Exception:
         pass
+    try:
+        app.state._free_ledger_reconcile_task = asyncio.create_task(
+            _free_ledger_reconcile_loop()
+        )
+        _debug("  [lifespan] free ledger reconcile loop started")
+    except Exception:
+        pass
 
     # Ultra-fast DB writer (single writer, batch 32)
     # [fix hot-restart] ``asyncio.Queue`` se lie à la boucle courante au
@@ -24288,6 +24295,90 @@ async def _station_quality_probe_loop() -> None:
         raise
     except Exception as exc:
         _debug(f"  [free-quality] probe loop disabled: {exc}")
+
+
+def _reconcile_free_ledger_once(db_path: str) -> int:
+    """[022] Un 200 réel de probe efface un 429 plus ancien.
+
+    Les probes écrivent ``registry.db`` ; l'app peut rater le POST
+    ``/api/free/quota/mark`` quand elle redémarre. Sans cette réconciliation,
+    un 429 de 19 min garde une IP saine exclue alors que la chaîne vient
+    d'obtenir 200. Retourne le nombre de buckets débloqués.
+    """
+
+    import sqlite3 as _sqlite3
+
+    try:
+        import shared_state as _ss
+    except Exception:
+        return 0
+    pool = getattr(_ss, "free_ip_pool", None)
+    ledger = pool._get_ledger() if hasattr(pool, "_get_ledger") else None
+    managers = list(getattr(_ss, "vpn_managers", None) or [])
+    if ledger is None or not managers:
+        return 0
+    now = time.time()
+    cleared = 0
+    try:
+        conn = _sqlite3.connect(db_path, timeout=5.0)
+    except Exception:
+        return 0
+    try:
+        for manager in managers:
+            ip = str(getattr(manager, "current_ip", "") or "").strip()
+            if not ip:
+                continue
+            try:
+                row = conn.execute(
+                    "SELECT status, tested_at FROM observations "
+                    "WHERE ip=? ORDER BY tested_at DESC LIMIT 1",
+                    (ip,),
+                ).fetchone()
+            except Exception:
+                continue
+            if not row or int(row[0] or 0) != 200:
+                continue
+            tested_at = float(row[1] or 0.0)
+            if now - tested_at > 1800.0:
+                continue
+            try:
+                reset_at = float(ledger.reset_at(ip, None) or 0.0)
+            except Exception:
+                reset_at = 0.0
+            if reset_at <= now:
+                continue  # rien à débloquer
+            try:
+                ledger.note_result(ip, None, 200)
+                cleared += 1
+            except Exception:
+                continue
+    finally:
+        conn.close()
+    return cleared
+
+
+async def _free_ledger_reconcile_loop() -> None:
+    """Boucle de réconciliation ledger ↔ observations (toutes les 60 s)."""
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return
+    db_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "logs", "registry.db"
+    )
+    await asyncio.sleep(20.0)
+    while True:
+        try:
+            cleared = await asyncio.to_thread(
+                _reconcile_free_ledger_once, db_path
+            )
+            if cleared:
+                _debug(
+                    f"  [free-ledger] {cleared} IP(s) débloquée(s) par un "
+                    "200 de probe plus récent"
+                )
+        except Exception as exc:
+            _debug(f"  [free-ledger] réconciliation ignorée: {exc}")
+        await asyncio.sleep(60.0)
 
 
 async def _station_egress_probe_loop() -> None:
