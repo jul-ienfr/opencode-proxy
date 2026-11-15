@@ -351,11 +351,11 @@ ip_rotation:
     enabled: true
     label: WARP 2 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d7:28aa::40d:61
+    egress_ip: 2a09:bac5:32d4:14e6::215:5c
     managed: true
     container: warp-2
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d7:28aa::/64
+    block: 2a09:bac5:32d4:14e6::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -1314,17 +1314,17 @@ ip_registry:
     max_fallback_models: 2
     transports:
     - station: 1
-      transport: auto
+      transport: wireguard
     - station: 2
-      transport: auto
+      transport: wireguard
     - station: 3
-      transport: auto
+      transport: wireguard
     - station: 4
-      transport: auto
+      transport: wireguard
     - station: 5
-      transport: auto
+      transport: wireguard
     - station: 6
-      transport: auto
+      transport: wireguard
     refresh_when_exhausted: true
     refresh_cooldown_s: 30
     refresh_min_available: 3

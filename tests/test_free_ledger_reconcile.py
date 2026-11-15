@@ -10,12 +10,12 @@ import opencode
 
 
 class _Ledger:
-    def __init__(self, reset_at_value: float) -> None:
-        self._reset = reset_at_value
+    def __init__(self, exhausted: bool) -> None:
+        self._exhausted = exhausted
         self.calls: list[tuple] = []
 
-    def reset_at(self, ip, model) -> float:
-        return self._reset
+    def is_exhausted(self, ip, model) -> bool:
+        return self._exhausted
 
     def note_result(self, ip, model, status, **kwargs) -> None:
         self.calls.append((ip, model, status))
@@ -34,8 +34,8 @@ class _Station:
         self.current_ip = ip
 
 
-def _ledger(reset_in_s: float) -> _Ledger:
-    return _Ledger(time.time() + reset_in_s)
+def _ledger(exhausted: bool) -> _Ledger:
+    return _Ledger(exhausted)
 
 
 def _db(tmp_path: Path, rows: list[tuple[str, int, float]]) -> Path:
@@ -63,7 +63,7 @@ def _wire(monkeypatch, ledger: _Ledger, ip: str = "10.0.0.1") -> None:
 def test_recent_200_clears_a_future_reset(tmp_path, monkeypatch) -> None:
     now = time.time()
     db = _db(tmp_path, [("10.0.0.1", 200, now - 30)])
-    ledger = _ledger(600)
+    ledger = _ledger(True)
     _wire(monkeypatch, ledger)
     assert opencode._reconcile_free_ledger_once(str(db)) == 1
     assert ledger.calls == [("10.0.0.1", None, 200)]
@@ -75,7 +75,7 @@ def test_latest_429_does_not_clear(tmp_path, monkeypatch) -> None:
         tmp_path,
         [("10.0.0.1", 200, now - 60), ("10.0.0.1", 429, now - 5)],
     )
-    ledger = _ledger(600)
+    ledger = _ledger(True)
     _wire(monkeypatch, ledger)
     assert opencode._reconcile_free_ledger_once(str(db)) == 0
     assert ledger.calls == []
@@ -84,7 +84,7 @@ def test_latest_429_does_not_clear(tmp_path, monkeypatch) -> None:
 def test_stale_200_does_not_clear(tmp_path, monkeypatch) -> None:
     now = time.time()
     db = _db(tmp_path, [("10.0.0.1", 200, now - 3600)])
-    ledger = _ledger(600)
+    ledger = _ledger(True)
     _wire(monkeypatch, ledger)
     assert opencode._reconcile_free_ledger_once(str(db)) == 0
     assert ledger.calls == []
@@ -93,7 +93,7 @@ def test_stale_200_does_not_clear(tmp_path, monkeypatch) -> None:
 def test_no_future_reset_is_left_alone(tmp_path, monkeypatch) -> None:
     now = time.time()
     db = _db(tmp_path, [("10.0.0.1", 200, now - 30)])
-    ledger = _ledger(-10)
+    ledger = _ledger(False)
     _wire(monkeypatch, ledger)
     assert opencode._reconcile_free_ledger_once(str(db)) == 0
     assert ledger.calls == []

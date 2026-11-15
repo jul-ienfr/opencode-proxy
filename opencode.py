@@ -24342,10 +24342,10 @@ def _reconcile_free_ledger_once(db_path: str) -> int:
             if now - tested_at > 1800.0:
                 continue
             try:
-                reset_at = float(ledger.reset_at(ip, None) or 0.0)
+                exhausted = bool(ledger.is_exhausted(ip, None))
             except Exception:
-                reset_at = 0.0
-            if reset_at <= now:
+                exhausted = False
+            if not exhausted:
                 continue  # rien à débloquer
             try:
                 ledger.note_result(ip, None, 200)
