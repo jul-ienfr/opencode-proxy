@@ -2962,7 +2962,14 @@ def _supervise() -> None:
                 # une réparation d'une station déjà down ne consomme aucune
                 # réserve et ne doit donc pas être retenue.
                 _station = stations.get(sid, {})
-                _refresh = bool(_station.get("model_usable"))
+                # Une réparation forcée par l'app (quota-429) ne consomme
+                # aucune station servable : la station est déjà morte pour le
+                # client. Le garde `_repair_holds` ne doit protéger que les
+                # refreshs proactifs, sinon à 1/6 il gèle la seule réparation
+                # qui pourrait remonter la flotte.
+                _refresh = (
+                    bool(_station.get("model_usable")) and sid not in forced
+                )
                 _usable_now = sum(
                     1
                     for _s in stations.values()
