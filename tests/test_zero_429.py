@@ -235,10 +235,10 @@ def test_rotation_never_takes_a_reserved_ip() -> None:
     from scripts.fresh_chain_supervisor import _refresh_allowed
 
     reserved = {"10.0.0.1", "10.0.0.2"}
-    assert not _refresh_allowed("10.0.0.1", reserved, 2)
-    assert _refresh_allowed("10.0.0.9", reserved, 2)
-    # Réserve au-delà de la cible : le surplus peut tourner.
-    assert _refresh_allowed("10.0.0.1", reserved, 1)
+    assert not _refresh_allowed("10.0.0.1", reserved)
+    assert not _refresh_allowed("10.0.0.2", reserved)
+    assert _refresh_allowed("10.0.0.9", reserved)
+    assert _refresh_allowed("10.0.0.9", set())
 
 
 def test_reserve_can_be_disabled(monkeypatch) -> None:

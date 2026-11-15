@@ -882,23 +882,19 @@ def _active_serving_count(
     )
 
 
-def _refresh_allowed(
-    ip: str, live_reserved: set[str], reserve_target: int
-) -> bool:
+def _refresh_allowed(ip: str, live_reserved: set[str]) -> bool:
     """[022 T007/T015/T022] Une IP servable n'est jamais rebindée.
 
-    Le surplus (réserve au-delà de la cible) peut tourner ; une IP de la
-    réserve active ne le peut pas. C'est le verrou réel contre la rotation
-    pendant qu'un client est servi — plus utile qu'un claim par requête, qui
-    sérialiserait les clients sur une seule IP.
+    Le verrou réel contre la rotation pendant qu'un client est servi — plus
+    utile qu'un claim par requête, qui sérialiserait les clients sur une seule
+    IP. Inconditionnel : même avec une réserve au-delà de la cible, une IP
+    servable reste servable jusqu'à son épuisement.
     """
 
     target = str(ip or "").strip()
     if not target:
         return True
-    return target not in live_reserved or len(live_reserved) > int(
-        reserve_target
-    )
+    return target not in live_reserved
 
 
 def _repair_holds(usable_now: int, active_serving: int, *, refresh: bool) -> bool:
@@ -1328,6 +1324,18 @@ def _refresh_warm_pool(
             )
         except Exception:
             pass
+    # [022 T021] La table ne doit pas accumuler une entrée par IP vue dans
+    # l'heure : on garde les IPs des stations utilisables et les preuves
+    # récentes, le reste est du bruit de métrique.
+    try:
+        from free.client_reserve import prune_stale as _reserve_prune
+
+        _reserve_prune(
+            {row[0] for row in rows},
+            max_age_s=float(os.getenv("RESERVE_STALE_S", "") or 900),
+        )
+    except Exception:
+        pass
     try:
         with sqlite3.connect(
             ROOT / "logs" / "registry.db", timeout=5.0
@@ -1416,10 +1424,19 @@ def _refresh_warm_pool(
                 )
             except (TypeError, ValueError):
                 _reserve_min = 2
+            try:
+                _reserve_target = int(os.getenv("RESERVE_TARGET") or 6)
+            except (TypeError, ValueError):
+                _reserve_target = 6
             if _rc < _reserve_min:
                 log(
                     f"ALERT client_reserve={_rc} (<{_reserve_min}) — priorité "
                     "client, refill sur stations libres"
+                )
+            elif _rc < _reserve_target:
+                log(
+                    f"client_reserve={_rc} (<target {_reserve_target}) — "
+                    "refill en cours"
                 )
             else:
                 log(f"client_reserve={_rc}")
@@ -2822,18 +2839,15 @@ def _supervise() -> None:
                 # peut servir : la rotation proactive tuait le seul vainqueur
                 # avant que la réserve ne l'enregistre, donc le client avait
                 # 0 IP servable alors que la flotte venait de réussir.
-                try:
-                    from free.client_reserve import (
-                        reserved_ips as _reserved_now,
-                    )
-
-                    live_reserved = _reserved_now()
-                except Exception:
-                    live_reserved = set()
-                try:
-                    reserve_target = int(os.getenv("RESERVE_TARGET") or 6)
-                except (TypeError, ValueError):
-                    reserve_target = 6
+                # On protège les IPs réellement servies (stations
+                # `model_usable`), pas les entrées historiques de la table :
+                # une station tombée doit pouvoir être réparée.
+                live_reserved = {
+                    str(station.get("current_ip") or "").strip()
+                    for station in stations.values()
+                    if station.get("model_usable")
+                    and str(station.get("current_ip") or "").strip()
+                }
                 primary = probe_model_list[0]
                 available = _primary_quota_count(
                     free_health, stations, scope, primary
@@ -2879,7 +2893,6 @@ def _supervise() -> None:
                                 or ""
                             ),
                             live_reserved,
-                            reserve_target,
                         )
                     ]
                     if eligible:

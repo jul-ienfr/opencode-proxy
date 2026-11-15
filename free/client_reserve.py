@@ -310,6 +310,51 @@ def remove(ip: str, *, db: Path | None = None) -> int:
         return 0
 
 
+def prune_stale(
+    keep: set[str],
+    *,
+    max_age_s: float = 900.0,
+    now: float | None = None,
+    db: Path | None = None,
+) -> int:
+    """Retire les preuves anciennes qui ne servent aucune station (022 T021).
+
+    La table accumulait une entrée par IP vue dans l'heure (13 pour six
+    stations) et la métrique ne reflétait plus la réserve servable. On garde
+    les IPs liées à une station utilisable et les preuves récentes.
+    """
+
+    ts = time.time() if now is None else float(now)
+    cutoff = ts - max(60.0, float(max_age_s))
+    keep_set = {str(ip).strip() for ip in keep if str(ip).strip()}
+    try:
+        with _connect(db) as conn:
+            rows = conn.execute(
+                "SELECT ip FROM client_reserve "
+                "WHERE expires_at <= ? OR verified_at < ?",
+                (ts, cutoff),
+            ).fetchall()
+            stale = [
+                str(row[0])
+                for row in rows
+                if row
+                and row[0]
+                and str(row[0]) not in keep_set
+            ]
+            removed = 0
+            for ip in stale:
+                cur = conn.execute(
+                    "DELETE FROM client_reserve WHERE ip=?", (ip,)
+                )
+                removed += int(cur.rowcount or 0)
+            conn.commit()
+        if removed:
+            _invalidate()
+        return removed
+    except Exception:
+        return 0
+
+
 def prune(*, now: float | None = None, db: Path | None = None) -> int:
     ts = time.time() if now is None else float(now)
     try:
