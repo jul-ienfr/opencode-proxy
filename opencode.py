@@ -38,6 +38,13 @@ except Exception:
     pass
 
 _APP_STARTED_AT = time.time()
+_CLIENT_429_TOTAL = 0
+
+
+def _count_client_429() -> None:
+    """Compteur des 429 quota réellement renvoyés au client (022 T010)."""
+    global _CLIENT_429_TOTAL
+    _CLIENT_429_TOTAL += 1
 
 # [Phase 3b-1 boot] httpx DIFFÉRÉ (~81 ms mesurés sur import → listen, dont
 # ~63 ms dans httpx/__init__.py:15 qui importe `._main` → rich + click +
@@ -4942,6 +4949,17 @@ def _build_metrics_text() -> str:
         lines.append("# HELP app_health_failures_total /health failures")
         lines.append("# TYPE app_health_failures_total counter")
         lines.append(f"app_health_failures_total {_health_fail}")
+        try:
+            from free.client_reserve import count as _reserve_count
+
+            lines.append("# HELP client_reserve_ips Reserved client egress IPs")
+            lines.append("# TYPE client_reserve_ips gauge")
+            lines.append(f"client_reserve_ips {_reserve_count()}")
+        except Exception:
+            pass
+        lines.append("# HELP client_429_total 429 quota returned to clients")
+        lines.append("# TYPE client_429_total counter")
+        lines.append(f"client_429_total {_CLIENT_429_TOTAL}")
     except Exception:
         pass
 
@@ -15444,6 +15462,7 @@ def _free_preflight_retry_after(model_id: str, *, min_wait: float = 5.0) -> floa
 
 def _free_preflight_response(wait_s: float, *, anthropic: bool):
     """429 JSON propre (le seul format qu'un client affiche lisiblement)."""
+    _count_client_429()
     msg = "Free quota exhausted on all VPN stations."
     try:
         if wait_s >= 1:
@@ -18418,6 +18437,7 @@ async def _free_stream_refuse_bytes(
     # Un 429 « Endpoint is unavailable » = surcharge serveur transitoire :
     # message véridique + type overloaded_error (jamais rate_limit_error).
     if _status == 429 and _is_free_quota_failure(_status, _cap):
+        _count_client_429()
         if _retry_after:
             _msg429 = f"Free quota exhausted on all VPN stations. Retry after {_retry_after}s."
         else:
@@ -32251,6 +32271,15 @@ class ServerManager:
 
     def start(self):
         from uvicorn import Config, Server
+
+        # [021 T004] Le guard socket recrée le serveur dans le processus au
+        # lieu de tuer l'app. Fallback vers le superviseur après 3 échecs.
+        try:
+            from observability.socket_guard import set_restart_callback
+
+            set_restart_callback(self.restart)
+        except Exception:
+            pass
 
         with self._lock:
             if self.is_running:

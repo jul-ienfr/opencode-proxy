@@ -1244,6 +1244,9 @@ def _best_resume_station(
     return min(stopped)
 
 
+_LAST_RESERVE_COUNT = -1
+
+
 def _refresh_warm_pool(
     stations: dict[int, dict], now: float, *, host_ip: str = ""
 ) -> None:
@@ -1379,6 +1382,24 @@ def _refresh_warm_pool(
                 )
     except Exception as exc:  # noqa: BLE001 - the pool is a cache, not truth
         log(f"warm pool refresh unavailable: {type(exc).__name__}: {exc}")
+
+    # [022 T011] Alerte de réserve basse, loggée au changement seulement.
+    try:
+        from free.client_reserve import count as _reserve_count
+
+        global _LAST_RESERVE_COUNT
+        _rc = _reserve_count()
+        if _rc != _LAST_RESERVE_COUNT:
+            _LAST_RESERVE_COUNT = _rc
+            if _rc < 2:
+                log(
+                    f"ALERT client_reserve={_rc} (<2) — probes suspendues, "
+                    "priorité client"
+                )
+            else:
+                log(f"client_reserve={_rc}")
+    except Exception:
+        pass
 
 
 def _sweep_state_age_s() -> float | None:

@@ -39,7 +39,7 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 1 — Remplissage et budget (P1)
 
-### T005 — Remplissage de la réserve (P1) — à faire
+### T005 — Remplissage de la réserve (P1) — en cours (ajout auto + alerte)
 - **Fichiers** : `scripts/fresh_chain_supervisor.py`.
 - **Action** : en arrière-plan, qualifier des IPs non réservées jusqu'à `reserve_target` (proposé 6, configurable).
 - **Acceptation** : `client_reserve_ips >= 2` stable.
@@ -77,13 +77,13 @@ Statut : `fait`, `en cours`, `à faire`.
 
 ## Phase 3 — Observabilité (P1)
 
-### T010 — Métriques (P1) — à faire
+### T010 — Métriques (P1) — fait
 - **Fichiers** : `opencode.py::/metrics`.
 - **Action** : `client_reserve_ips`, `client_429_total{reason}`, `probe_budget_remaining`.
 - **Acceptation** : métriques visibles.
 - **Test** : scrape.
 
-### T011 — Alertes (P1) — à faire
+### T011 — Alertes (P1) — fait
 - **Fichiers** : `scripts/fresh_chain_supervisor.py`, `observability/incidents.py`.
 - **Action** : alerte `reserve < 2`, critique `reserve = 0`.
 - **Acceptation** : incident ouvert.
@@ -104,7 +104,7 @@ Statut : `fait`, `en cours`, `à faire`.
 - **Action** : vérifier que les probes ne touchent pas la réserve.
 - **Acceptation** : `client_used` = 0 sur la réserve.
 
-### T014 — Runbook (P2) — à faire
+### T014 — Runbook (P2) — fait
 - **Fichiers** : `ops/runbooks/zero-429-reserve.md`.
 - **Action** : décrire la réserve, les alertes, le remplacement, le fallback.
 - **Acceptation** : un opérateur sait quoi faire quand `reserve < 2`.

@@ -26,15 +26,15 @@
 
 ## Observabilité
 
-- [ ] T010 — `client_reserve_ips`, `client_429_total{reason}`, `probe_budget_remaining`.
-- [ ] T011 — alerte `reserve < 2`, critique `reserve = 0`.
+- [x] T010 — `client_reserve_ips`, `client_429_total{reason}`, `probe_budget_remaining`.
+- [x] T011 — alerte `reserve < 2`, critique `reserve = 0`.
 - [ ] Tableau de bord réserve/consommation.
 
 ## Tests
 
 - [ ] T012 — 1000 requêtes client, réserve non vide → 0 429.
 - [ ] T013 — 100 probes + 100 clients → réserve intacte.
-- [ ] T014 — runbook `ops/runbooks/zero-429-reserve.md`.
+- [x] T014 — runbook `ops/runbooks/zero-429-reserve.md`.
 - [ ] Test de non-régression : les 6 stations restent `client_usable`.
 
 ## Preuves live
