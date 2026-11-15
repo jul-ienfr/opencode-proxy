@@ -52,11 +52,19 @@ leurs IPs à la réserve avec un TTL d'une heure.
 | 12:31 → 12:35 | réserve 7 → 8, `client_usable` 4/6 → **6/6 à 12:35:04** |
 | 12:35:34 | retour à 4/6 : la flotte fluctue encore avec le quota upstream |
 | **14:06 → 14:11** | **6/6 `model_usable` et 6/6 `health=usable` tenus 4 min**, réserve 9-11, **3/3 requêtes client en 200** (1,6–2,2 s) |
+| **14:52 → 14:55** | **6/6 tenu**, six conteneurs Docker `healthy` (uptime 5-29 min), **3/3 requêtes client en 200** (2,2–2,4 s), réserve 12 |
 
 Le 6/6 de 14:06 est le premier tenu après les correctifs anti-churn :
 `refresh_min_available=3`, rotation réservée aux stations `health=usable`,
 grâce de 75 s après un lancement de chaîne, `winner_cooldown_s=120`,
 transports forcés en WireGuard, et réconciliation ledger ↔ observations.
+
+Le 6/6 de 14:52 ajoute le correctif DNS : les tunnels utilisaient DoT vers
+Cloudflare/Google/Quad9, bloqué sur certains serveurs NordVPN
+(`DNS ladder exhausted`, `lookup checkip.amazonaws.com: server misbehaving`).
+Passage en **plain UDP vers le DNS NordVPN** (`103.86.96.100`,
+`103.86.99.100`) : plus de healthcheck DNS en échec, donc plus de station
+marquée `tunnel_down` alors que le tunnel fonctionne.
 
 Latence client : 1,1 à 2,6 s sur 11 requêtes, un outlier à 40,6 s (bascule
 interne). Le zéro 429 est tenu quand une IP réservée est liée à une station.
