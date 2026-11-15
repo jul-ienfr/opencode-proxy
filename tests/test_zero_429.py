@@ -197,6 +197,25 @@ def test_quota_error_carries_a_reason(monkeypatch) -> None:
     assert opencode._CLIENT_429_BY_REASON == {"reserve_empty": 1}
 
 
+def test_refusal_response_carries_reason() -> None:
+    """T009 : le chemin non-stream compte le 429 et expose la raison."""
+
+    from core.errors import FreeRefusal, free_refusal_response
+
+    seen: list[str] = []
+    response = free_refusal_response(
+        FreeRefusal(429, "FreeUsageLimitError", "53"),
+        "openai",
+        redact_fn=lambda body, limit: body,
+        reason="upstream_429",
+        on_429=seen.append,
+    )
+    assert b'"reason":"upstream_429"' in response.body
+    assert response.headers.get("X-Free-Reason") == "upstream_429"
+    assert response.headers.get("Retry-After") == "53"
+    assert seen == ["upstream_429"]
+
+
 def test_reserve_survives_a_corrupt_db(tmp_path: Path) -> None:
     """T023 : une base illisible ne fait pas planter le routage."""
 

@@ -182,7 +182,14 @@ def model_deprecated_error(
 
 
 def free_refusal_response(
-    exc: FreeRefusal, protocol: str, *, anthropic_error_fn=anthropic_error, openai_error_fn=openai_error, redact_fn
+    exc: FreeRefusal,
+    protocol: str,
+    *,
+    anthropic_error_fn=anthropic_error,
+    openai_error_fn=openai_error,
+    redact_fn,
+    reason: str = "",
+    on_429=None,
 ) -> JSONResponse:
     """[PLAN_CORRECTION_FAUX_429 Lot A1] Réponse HTTP véridique (non-stream).
 
@@ -220,14 +227,26 @@ def free_refusal_response(
     # serveur. Le message « quota épuisé » n'est émis que pour un VRAI quota.
     _fb_body = getattr(exc, "body", "") or ""
     if status == 429 and is_free_quota_failure(status, _fb_body):
+        if on_429 is not None:
+            try:
+                on_429(reason)
+            except Exception:
+                pass
         if _ra_out:
             _msg = f"Free quota exhausted on all VPN stations. Retry after {_ra_out}s."
         else:
             _msg = "Free quota exhausted on all VPN stations."
+        reason_kw = {"reason": reason} if reason else {}
         if protocol == "anthropic":
-            resp = anthropic_error_fn(429, _msg, error_type="rate_limit_error")
+            resp = anthropic_error_fn(
+                429, _msg, error_type="rate_limit_error", **reason_kw
+            )
         else:
-            resp = openai_error_fn(429, _msg, error_type="rate_limit_error")
+            resp = openai_error_fn(
+                429, _msg, error_type="rate_limit_error", **reason_kw
+            )
+        if reason:
+            resp.headers["X-Free-Reason"] = reason
         if _ra_out:
             resp.headers["Retry-After"] = _ra_out
         return resp

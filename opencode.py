@@ -15933,12 +15933,15 @@ from core.errors import free_refusal_response as _free_refusal_response_impl  # 
 
 def _free_refusal_response(exc: FreeRefusal, protocol: str):
     """[PLAN_CORRECTION_FAUX_429 Lot A1] Réponse HTTP véridique (non-stream)."""
+    reason = _client_429_reason()
     return _free_refusal_response_impl(
         exc,
         protocol,
         anthropic_error_fn=_anthropic_error,
         openai_error_fn=_openai_error,
         redact_fn=_redact,
+        reason=reason,
+        on_429=_count_client_429,
     )
 
 
