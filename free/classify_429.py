@@ -39,14 +39,6 @@ _SESSION_HINTS = (
     "too many connections",
     "maximum number of",
 )
-_TRANSIENT_HINTS = (
-    "unavailable",
-    "overloaded",
-    "try again",
-    "temporarily",
-    "timeout",
-    "capacity",
-)
 _QUOTA_TYPES = ("FreeUsageLimitError",)
 _RATE_TYPES = ("RateLimitError", "RateLimitExceeded")
 _FORMAT_HINTS = (
@@ -70,10 +62,6 @@ class Classification:
     @property
     def is_quota(self) -> bool:
         return self.cls == QUOTA
-
-    @property
-    def is_format(self) -> bool:
-        return self.cls == FORMAT
 
     def as_dict(self) -> dict[str, Any]:
         return {

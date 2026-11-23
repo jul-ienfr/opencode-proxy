@@ -34,6 +34,7 @@ reste la couche qualité/headroom estimé ; le ledger est la couche
 autoritaire « cette IP a-t-elle déjà été 429 aujourd'hui ? ».
 """
 
+from core.testing import under_test
 import asyncio
 import itertools
 import json
@@ -553,6 +554,25 @@ _POST_ROTATION_PROBE_DEFAULTS = {
     "max_tokens": 4,
 }
 
+
+
+def _state_sid_kept(sid, known: set[int]) -> bool:
+    """[024 T102] Garde uniquement les stations réellement configurées.
+
+    Les sid négatifs sont des proxys SOCKS5 éphémères / reliquats d'anciens
+    boots : ils ne doivent jamais être persistés. Quand la flotte live est
+    connue, on ne garde que ses sid positifs ; sinon (boot précoce, flotte
+    vide) on garde tout sid positif pour compatibilité de reprise.
+    """
+    try:
+        sid_i = int(sid)
+    except Exception:
+        return False
+    if sid_i <= 0:
+        return False
+    if not known:
+        return True
+    return sid_i in known
 
 class FreeIPPool:
     """Manages IP rotation for free model requests.
@@ -1150,13 +1170,6 @@ class FreeIPPool:
 
     def _station_id(self, station) -> int:
         return _station_id_impl(station)
-
-    def _station_health_snapshot(self, station) -> dict:
-        try:
-            item = self._station_health.get(self._station_id(station))
-            return item.snapshot() if item is not None else {}
-        except Exception:
-            return {}
 
     def station_usable(self, station, *, model: str | None = None, now: float | None = None) -> bool:
         """Contrat public ``station_usable`` (avec quota si ``model`` fourni)."""
@@ -3817,11 +3830,6 @@ class FreeIPPool:
         # plan: staggers évite burst simultané; on retourne toutes, l'appelant borne
         return usable
 
-    # Back-compat alias for plan's pick_two (2 stations max)
-    def pick_two(self, forced_pool=None, model: str | None = None) -> list:
-        cands = self.pick_candidates(forced_pool, model=model)
-        return cands[:2]
-
     # [Axe 3.1] Static SOCKS5 proxies (socks5 mode — NO docker is ever
     # touched). The proxy list is an alternative backend to the docker
     # stations: negative sids (-1 - index) keep them outside ``_stations``
@@ -4841,18 +4849,6 @@ class FreeIPPool:
         if provider == "proxies":
             return name != "warp"
         return True
-
-    def _socks5_provider_available(self, provider: str, excluded=None) -> bool:
-        excluded = excluded or set()
-        for ep in self._socks5_enabled_eps():
-            if ep in excluded or not self._provider_matches(ep, provider):
-                continue
-            try:
-                if self._socks5_usable(ep, exclude_approaching=False):
-                    return True
-            except Exception:
-                return True
-        return False
 
     def duplicate_egress_groups(self, endpoints: list | None = None) -> dict[str, list[str]]:
         """Buckets partagés par plusieurs endpoints actifs (WARP/proxys)."""
@@ -7485,6 +7481,17 @@ class FreeIPPool:
         except Exception:
             return "logs/free_pool.json"
 
+    def _known_station_sids(self) -> set[int]:
+        sids: set[int] = set()
+        for st in list(getattr(self, "_stations", []) or []):
+            try:
+                sid = int(getattr(st, "_station", 0) or 0)
+            except Exception:
+                continue
+            if sid > 0:
+                sids.add(sid)
+        return sids
+
     def save_pool_state(self, force: bool = False) -> None:
         """Persiste compteurs quota + ip_stats (débouncée 60s, fail-soft)."""
         try:
@@ -7497,9 +7504,12 @@ class FreeIPPool:
             if not force and (_tm.monotonic() - float(getattr(self, "_last_pool_persist_at", 0.0))) < 25.0:
                 return
             self._last_pool_persist_at = _tm.monotonic()
+            known = self._known_station_sids()
             data: dict[str, dict] = {}
             for sid, per in list(self._per.items()):
                 try:
+                    if not _state_sid_kept(sid, known):
+                        continue
                     ip_stats = dict(list((per.get("ip_stats") or {}).items())[-200:])
                     bu = per.get("bad_until")
                     rem = float(bu - _tm.monotonic()) if bu else 0.0
@@ -7512,11 +7522,21 @@ class FreeIPPool:
                     }
                 except Exception:
                     continue
+            health_raw = self._station_health.export_state() if hasattr(self, "_station_health") else {}
+            health = {k: v for k, v in (health_raw or {}).items() if _state_sid_kept(k, known)} if isinstance(health_raw, dict) else {}
+            quota_raw = self._quota.export_state() if hasattr(self, "_quota") else []
+            quota = []
+            for item in (quota_raw or []):
+                try:
+                    if isinstance(item, dict) and _state_sid_kept(item.get("station"), known):
+                        quota.append(item)
+                except Exception:
+                    continue
             fp = self._pool_state_file()
             payload = {
                 "per": data,
-                "health": self._station_health.export_state() if hasattr(self, "_station_health") else {},
-                "quota": self._quota.export_state() if hasattr(self, "_quota") else [],
+                "health": health,
+                "quota": quota,
             }
             from free.chain_state import save_json_state
 
@@ -7528,15 +7548,16 @@ class FreeIPPool:
     def load_pool_state(self) -> None:
         """Restaure compteurs au boot (fail-open, borné, jamais de 500)."""
         try:
-            import os as _os
-
-            if _os.getenv("PYTEST_CURRENT_TEST"):
+            if under_test():
                 return
             from free.chain_state import load_json_state
 
             raw = load_json_state(self._pool_state_file(), default={}) or {}
+            known = self._known_station_sids()
             for sid_s, st in (raw.get("per") or {}).items():
                 try:
+                    if not _state_sid_kept(sid_s, known):
+                        continue
                     sid = int(sid_s)
                     per = self._per_station_by_sid(sid)
                     per["request_count"] = max(0, int(st.get("request_count", 0)))
@@ -7560,9 +7581,18 @@ class FreeIPPool:
                 except Exception:
                     continue
             if hasattr(self, "_station_health"):
-                self._station_health.restore_state(raw.get("health"))
+                health_raw = raw.get("health")
+                if isinstance(health_raw, dict):
+                    health_raw = {k: v for k, v in health_raw.items() if _state_sid_kept(k, known)}
+                self._station_health.restore_state(health_raw)
             if hasattr(self, "_quota"):
-                self._quota.restore_state(raw.get("quota"))
+                quota_raw = raw.get("quota")
+                if isinstance(quota_raw, list):
+                    quota_raw = [
+                        item for item in quota_raw
+                        if isinstance(item, dict) and _state_sid_kept(item.get("station"), known)
+                    ]
+                self._quota.restore_state(quota_raw)
             self._dirty_state = False
             logger.info("[free-ip] pool state restauré (%d stations)", len(raw.get("per") or {}))
         except Exception as e:
