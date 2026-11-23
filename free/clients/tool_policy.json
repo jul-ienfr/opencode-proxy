@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "official_grid": [
+    "edit",
+    "experimental_image_generate",
+    "glob",
+    "grep",
+    "question",
+    "read",
+    "shell",
+    "skill",
+    "subagent",
+    "webfetch",
+    "websearch",
+    "write",
+    "execute"
+  ],
+  "forbidden": ["subagent_fork", "subagent-fork"],
+  "aliases": {
+    "Read": "read",
+    "Write": "write",
+    "Edit": "edit",
+    "MultiEdit": "edit",
+    "Bash": "shell",
+    "Shell": "shell",
+    "Glob": "glob",
+    "Grep": "grep",
+    "WebFetch": "webfetch",
+    "WebSearch": "websearch",
+    "Task": "subagent",
+    "Subagent": "subagent",
+    "TodoWrite": "todowrite",
+    "Question": "question",
+    "Skill": "skill"
+  },
+  "shims": {
+    "todowrite": {"strategy": "text_plan"},
+    "subagent_fork": {"strategy": "reject"}
+  },
+  "client_extras_max": 8,
+  "unknown_tool": "text_heal",
+  "tool_choice": {"none": "auto"}
+}

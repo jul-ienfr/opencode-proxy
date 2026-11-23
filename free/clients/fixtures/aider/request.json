@@ -1,0 +1,11 @@
+{
+  "model": "deepseek-v4.1-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with the single word: ok"
+    }
+  ],
+  "stream": false,
+  "max_tokens": 64
+}

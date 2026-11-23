@@ -1,0 +1,22 @@
+services:
+  vpn-gluetun-3:
+    image: gluetun-016:local
+    pull_policy: never
+    ports:
+      - "127.0.0.1:8003:8000"
+    environment:
+      CONTROL_PLANE_ENABLED: "true"
+      CONTROL_STATE_DIR: /gluetun/control-state
+      CONTROL_STATE_MODE: env
+      HEALTH_TARGET_ADDRESSES: 1.1.1.1:443,1.0.0.1:443
+      CONTROL_EGRESS_SOURCES: http:cloudflare,http:ipify,http:ifconfig,http:icanhazip,publicip:internal
+      CONTROL_EGRESS_SOURCE_TIMEOUT_MS: "5000"
+      CONTROL_EGRESS_SOURCE_BACKOFF_MS: "1000"
+      CONTROL_EGRESS_SOURCE_BACKOFF_MAX_MS: "5000"
+      TRANSPORT_ATTEMPT_TIMEOUT_S: "100"
+      TRANSPORT_ATTEMPT_TIMEOUT_TCP_S: "100"
+      TRANSPORT_MAX_ATTEMPTS: "1"
+      TRANSPORT_MAX_CYCLES: "1"
+      DNS_LADDER: doh,plain,dot
+      DNS_HEALTH_COOLDOWN_MS: "2000"
+      DNS_HEALTH_COOLDOWN_MAX_MS: "15000"

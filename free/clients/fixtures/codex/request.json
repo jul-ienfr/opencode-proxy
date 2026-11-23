@@ -1,0 +1,31 @@
+{
+  "model": "deepseek-v4.1-flash",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Reply with the single word: ok"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "read",
+      "description": "Read a file",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  ],
+  "reasoning": {
+    "effort": "low"
+  },
+  "max_output_tokens": 64,
+  "stream": true
+}

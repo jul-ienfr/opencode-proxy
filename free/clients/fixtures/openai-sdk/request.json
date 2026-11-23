@@ -1,0 +1,14 @@
+{
+  "model": "deepseek-v4.1-flash",
+  "system": "You are an assistant.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with the single word: ok"
+    }
+  ],
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  }
+}

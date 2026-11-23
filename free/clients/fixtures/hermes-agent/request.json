@@ -1,0 +1,23 @@
+{
+  "model": "deepseek-v4.1-flash",
+  "system": "You are Hermes Agent.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with the single word: ok"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "Read",
+        "description": "Read",
+        "parameters": {
+          "type": "object"
+        }
+      }
+    }
+  ],
+  "stream": true
+}

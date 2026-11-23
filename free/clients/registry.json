@@ -1,0 +1,124 @@
+{
+  "version": 1,
+  "default_family": "openai_chat",
+  "unknown_client": "custom",
+  "families": {
+    "anthropic_messages": {"enabled": true},
+    "openai_chat": {"enabled": true},
+    "openai_responses": {"enabled": true},
+    "passthrough": {"enabled": false}
+  },
+  "clients": {
+    "claude-code": {
+      "family": "anthropic_messages",
+      "endpoints": ["/v1/messages", "/v1/messages/count_tokens"],
+      "auth": {"x-api-key": true, "anthropic-version": true, "bearer": true},
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "tool_choice": true,
+        "reasoning": true,
+        "vision": true,
+        "cache_control": true,
+        "count_tokens": true,
+        "max_context": 200000
+      },
+      "tool_policy": "anthropic"
+    },
+    "codex": {
+      "family": "openai_responses",
+      "endpoints": ["/v1/responses"],
+      "auth": {"bearer": true},
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "tool_choice": true,
+        "reasoning": true,
+        "vision": true,
+        "count_tokens": false,
+        "max_context": 200000
+      },
+      "tool_policy": "openai"
+    },
+    "kilo-code": {
+      "family": "openai_chat",
+      "endpoints": ["/v1/chat/completions"],
+      "auth": {"bearer": true},
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "tool_choice": true,
+        "vision": true,
+        "count_tokens": false,
+        "max_context": 200000
+      },
+      "tool_policy": "openai"
+    },
+    "hermes-agent": {
+      "family": "openai_chat",
+      "endpoints": ["/v1/chat/completions"],
+      "auth": {"bearer": true},
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "tool_choice": true,
+        "count_tokens": false,
+        "max_context": 128000
+      },
+      "tool_policy": "openai"
+    },
+    "deepseek": {
+      "family": "openai_chat",
+      "endpoints": ["/v1/chat/completions"],
+      "auth": {"bearer": true},
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "reasoning": true,
+        "count_tokens": false,
+        "max_context": 64000
+      },
+      "reasoning": "reasoning_content",
+      "tool_policy": "openai"
+    },
+    "aider": {
+      "family": "openai_chat",
+      "endpoints": ["/v1/chat/completions"],
+      "auth": {"bearer": true},
+      "capabilities": {
+        "stream": false,
+        "tools": false,
+        "count_tokens": false,
+        "max_context": 128000
+      },
+      "tool_policy": "openai"
+    },
+    "openai-sdk": {
+      "family": "openai_chat",
+      "endpoints": ["/v1/chat/completions", "/v1/responses"],
+      "auth": {"bearer": true},
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "tool_choice": true,
+        "vision": true,
+        "count_tokens": false,
+        "max_context": 200000
+      },
+      "tool_policy": "openai"
+    },
+    "custom": {
+      "family": "openai_chat",
+      "endpoints": ["/v1/chat/completions"],
+      "auth": {"bearer": true, "x-api-key": true},
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "count_tokens": false,
+        "max_context": 64000
+      },
+      "strict": true,
+      "tool_policy": "openai"
+    }
+  }
+}
