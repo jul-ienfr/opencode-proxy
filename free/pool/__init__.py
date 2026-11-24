@@ -174,6 +174,75 @@ def _station_is_up(station) -> bool:
         return False
 
 
+#: [T318 / 023 US1] Cache court des IPs prouvées 200 servables (réserve client
+#: ∪ état ``proven``/``serving`` de ``free.ip_state``). 2 s : éviter un scan à
+#: chaque appel de sélection sans servir une preuve périmée.
+_PROVEN_RESERVE_CACHE: tuple[float, frozenset[str]] | None = None
+_PROVEN_RESERVE_TTL_S = 2.0
+
+
+def _proven_reserve_ips(*, now: float | None = None) -> set[str]:
+    """[T318 / 023 US1] IPs prouvées 200 servables.
+
+    Union de la réserve client (``client_reserve.reserved_ips()``) et des IP
+    ``proven``/``serving`` de la machine à états (``free.ip_state``). Le repli
+    ``ip_state`` couvre le cas « table ``client_reserve`` vide mais preuve 200
+    persistée » (redémarrage, purge). Cache 2 s ; fail-soft (ensemble partiel).
+    """
+    global _PROVEN_RESERVE_CACHE
+    ts = time.time() if now is None else now
+    cached = _PROVEN_RESERVE_CACHE
+    if cached is not None:
+        try:
+            expires, ips = cached
+            if ts < float(expires):
+                return set(ips)
+        except Exception:
+            pass
+    ips: set[str] = set()
+    try:
+        from free.client_reserve import reserved_ips
+
+        ips.update(str(ip) for ip in reserved_ips() if ip)
+    except Exception:
+        pass
+    try:
+        from free import ip_state as _ip_state_mod
+
+        for state in _ip_state_mod.store().list():
+            if str(getattr(state, "state", "")) in ("proven", "serving"):
+                ip = str(getattr(state, "ip", "") or "")
+                if ip:
+                    ips.add(ip)
+    except Exception:
+        pass
+    _PROVEN_RESERVE_CACHE = (ts + _PROVEN_RESERVE_TTL_S, frozenset(ips))
+    return set(ips)
+
+
+def reserve_health(*, now: float | None = None) -> dict:
+    """[024 T318] Santé de la réserve prouvée : ``count`` vs ``min``/``target``.
+
+    Alimente l'observabilité (`client_reserve_proven`, `client_reserve_below_min`).
+    ``min``/``target`` viennent de ``free.reserve_settings``. Fail-soft : rend un
+    compte (éventuellement partiel), jamais une exception.
+    """
+    try:
+        from free.reserve_settings import get_int
+
+        _min = int(get_int("min", 2))
+        _target = int(get_int("target", 6))
+    except Exception:
+        _min, _target = 2, 6
+    count = len(_proven_reserve_ips(now=now))
+    return {
+        "count": count,
+        "min": _min,
+        "target": _target,
+        "below_min": count < _min,
+    }
+
+
 def _reserve_allows(ip: str) -> bool:
     """[022 T004] Le pool client ne sert que la réserve quand elle existe.
 
@@ -189,6 +258,9 @@ def _reserve_allows(ip: str) -> bool:
         reserved = reserved_ips()
     except Exception:
         return True
+    # [T008] Réserve vide ⇒ les fallbacks reprennent la main (tout est
+    # autorisé). ``_proven_reserve_ips`` reste le lecteur de preuve utilisé par
+    # la surveillance de réserve (T318), jamais une porte de sélection ici.
     return not reserved or str(ip or "") in reserved
 
 
@@ -557,12 +629,10 @@ _POST_ROTATION_PROBE_DEFAULTS = {
 
 
 def _state_sid_kept(sid, known: set[int]) -> bool:
-    """[024 T102] Garde uniquement les stations réellement configurées.
+    """[024 T102] Garde les sid positifs réellement configurés.
 
-    Les sid négatifs sont des proxys SOCKS5 éphémères / reliquats d'anciens
-    boots : ils ne doivent jamais être persistés. Quand la flotte live est
-    connue, on ne garde que ses sid positifs ; sinon (boot précoce, flotte
-    vide) on garde tout sid positif pour compatibilité de reprise.
+    Les sid négatifs (proxys SOCKS5 éphémères / anciens boots) ne sont jamais
+    persistés ; flotte inconnue → tout sid positif est gardé pour la reprise.
     """
     try:
         sid_i = int(sid)
@@ -793,7 +863,6 @@ class FreeIPPool:
         self._spare_station = int(_rotation_cfg.get("spare_station", 0) or 0)
         self._spare_promoted = False
         self._draining_stations: set[int] = set()
-        self._spare_ready = bool(self._spare_station)
         self._station_health = StationHealthRegistry()
         self._quota_profile = QuotaProfile.from_config(_rel_cfg)
         self._quota = IpQuotaRegistry(self._quota_profile)
@@ -846,7 +915,6 @@ class FreeIPPool:
         )
         self._repair_policy = RepairPolicy.from_config(_rel_cfg)
         self._canary = CanaryRouter(CanaryConfig.from_config(_rel_cfg))
-        self._last_selection: Any = None
         self._last_model: str | None = None
         self._last_repair: dict[str, Any] = {}
         # [review 18/08 F1a] Late-signal absorption window — SHORT on
@@ -2165,6 +2233,9 @@ class FreeIPPool:
             error_type=error_type,
             retry_after=retry_after,
         )
+        # [024 Phase 1.5 / T316] Un vrai quota 429 marque l'IP `spent` dans
+        # `egress_ip_state` (refus d'admission jusqu'au reset). Fail-soft.
+        self._note_ip_state_quota(mid, station, ip, body, error_type, retry_after)
         try:
             now = time.monotonic()
             st = self._model_ip_state(mid, station, ip, now=now)
@@ -2196,6 +2267,10 @@ class FreeIPPool:
                     except Exception:
                         pass
                     self._note_health_probe(station, True)
+                    # [024 option 2] La preuve 200 la plus récente prime sur un
+                    # `spent` antérieur : lever la barrière dure T317 pour que
+                    # l'IP prouvée redevienne sélectionnable tout de suite.
+                    self._clear_ip_state_quota_on_success(station, ip)
                     try:
                         self._quota.note_success(mid, station, ip=str(ip or ""), now=now)
                     except Exception:
@@ -3202,6 +3277,11 @@ class FreeIPPool:
                 _osid = int(getattr(_other, "_station", 0) or 0)
                 if 0 < _osid < _sid and str(getattr(_other, "current_ip", "") or "") == _ip:
                     return False
+        # [024 T317 / T316] Une IP d'egress `spent` (429 quota, T316) n'est pas
+        # servie avant son `reset_at` : passe dure, jamais ré-admise par les
+        # passes de secours, de sorte que la chaîne bascule sur WARP/proxys/direct.
+        if _ip and _ip in self._spent_egress_ips():
+            return False
         # [022 T004] Réserve client : si elle n'est pas vide, seules ses IPs
         # sont servies. Une IP non réservée n'est jamais exposée au client.
         # Le périmètre est celui des stations Docker (`_sid > 0`) : une IP
@@ -3552,7 +3632,6 @@ class FreeIPPool:
             except Exception:
                 ranked = []
             if ranked:
-                self._last_selection = ranked[0]
                 if getattr(self, "_shadow_selector", False):
                     try:
                         logger.info(
@@ -3790,7 +3869,6 @@ class FreeIPPool:
             except Exception:
                 ranked = []
             if ranked:
-                self._last_selection = ranked[0]
                 if not getattr(self, "_shadow_selector", False):
                     stations_ranked = [row.station for row in ranked]
                     if not self._free_parallel_enabled:
@@ -4097,11 +4175,6 @@ class FreeIPPool:
                     self._socks5_rr = idx
                     return ep
         return None
-
-    def _socks5_best_excluding(self, ep) -> Socks5Endpoint | None:
-        """Next usable proxy that is NOT ``ep`` (for a dual-clutch switch
-        when the current one approaches quota)."""
-        return self._socks5_next(excluded={ep})
 
     def _socks5_fallback_next(self, excluded=None) -> Socks5Endpoint | None:
         """Next usable SOCKS5-only endpoint for the vpn-mode fallback tier.
@@ -5128,6 +5201,147 @@ class FreeIPPool:
         except Exception:
             return
 
+    def _ipstate_store(self):
+        """Store ``egress_ip_state`` du pool — injectable pour les tests.
+
+        Défaut hors test : le singleton de production. Sous pytest sans store
+        injecté, on n'écrit rien : les bases de test ne doivent pas polluer
+        ``registry.db`` (même garde que ``QuotaLedger.__post_init__``). Un test
+        qui veut exercer ce chemin injecte ``pool._ipstate_store_override``.
+        """
+        override = getattr(self, "_ipstate_store_override", None)
+        if override is not None:
+            return override
+        try:
+            from core.testing import under_test
+
+            if under_test():
+                return None
+        except Exception:
+            pass
+        try:
+            from free import ip_state as _ipstate
+
+            return _ipstate.store()
+        except Exception:
+            return None
+
+    def _note_ip_state_quota(
+        self, model, station, ip, body, error_type: str, retry_after
+    ) -> None:
+        """[024 Phase 1.5 / T316] Un 429 quota marque l'IP ``spent`` (principe IV).
+
+        Écrit dans ``egress_ip_state`` (lu par ``wire_admission.admit_ip``) :
+        l'IP est refusée jusqu'à son ``reset_at``. Idempotent, fail-soft ; ne
+        s'applique qu'à un vrai quota (``FreeUsageLimitError``), jamais à un 429
+        transitoire.
+        """
+        try:
+            quota = str(error_type or "") == "FreeUsageLimitError" or (
+                body is not None and "free usage limit" in str(body).lower()
+            )
+            if not quota:
+                return
+            ip_s = str(ip or "").strip() or str(
+                getattr(station, "current_ip", "") or ""
+            ).strip()
+            if not ip_s:
+                return
+            provider = self._provider_for_station(station)
+            if not provider:
+                return
+            store = self._ipstate_store()
+            if store is None:
+                return
+            reset_at = None
+            try:
+                if retry_after:
+                    reset_at = time.time() + float(retry_after)
+            except (TypeError, ValueError):
+                reset_at = None
+            if not reset_at:
+                from free.classify_429 import next_utc_midnight
+
+                reset_at = next_utc_midnight()
+            store.note_quota(
+                provider,
+                ip_s,
+                reset_at=reset_at,
+                reason=f"client 429 quota ({model})",
+            )
+        except Exception:
+            return
+
+    def _clear_ip_state_quota_on_success(self, station, ip) -> None:
+        """[024 option 2] Un 200 réel lève un ``spent`` périmé (principe VII).
+
+        Le ledger efface déjà l'exhaustion sur un 200 observé ; ``egress_ip_state``
+        doit suivre, sinon la barrière dure T317 (``_spent_egress_ips``) continue
+        d'exclure une IP qui vient de répondre 200 — la preuve de qualification
+        serait annulée par un 429 antérieur. Retour à ``unproven`` (jamais
+        directement ``proven`` sans ``wire_fp``), idempotent et fail-soft.
+        """
+        try:
+            ip_s = str(ip or "").strip() or str(
+                getattr(station, "current_ip", "") or ""
+            ).strip()
+            if not ip_s:
+                return
+            provider = self._provider_for_station(station)
+            if not provider:
+                return
+            store = self._ipstate_store()
+            if store is None:
+                return
+            current = store.get(provider, ip_s)
+            if current is None or str(getattr(current, "state", "")) != "spent":
+                return
+            from free.ip_state import UNPROVEN
+
+            store.transition(provider, ip_s, UNPROVEN, reason="observed 200 proof")
+            self._spent_egress_cache = None
+        except Exception:
+            return
+
+    def _spent_egress_ips(self, *, now: float | None = None) -> set[str]:
+        """[024 T317 / T316] IPs d'egress ``spent`` non expirées.
+
+        Une IP dont le quota est épuisé (429, T316) n'est pas servie avant son
+        ``reset_at`` : la sélection la refuse et la chaîne bascule sur
+        WARP/proxys/direct. Cache 2 s. ``None`` (aucun store — sous pytest sans
+        override) → ensemble vide : aucun effet sur les tests hermétiques.
+        """
+        ts = time.time() if now is None else now
+        cached = getattr(self, "_spent_egress_cache", None)
+        if cached is not None:
+            try:
+                expires, ips = cached
+                if ts < float(expires):
+                    return set(ips)
+            except Exception:
+                pass
+        store = self._ipstate_store()
+        if store is None:
+            self._spent_egress_cache = (ts + 2.0, frozenset())
+            return set()
+        ips: set[str] = set()
+        try:
+            for st in store.list():
+                if str(getattr(st, "state", "")) != "spent":
+                    continue
+                try:
+                    if st.reset_elapsed(ts):
+                        continue
+                except Exception:
+                    pass
+                ip = str(getattr(st, "ip", "") or "")
+                if ip:
+                    ips.add(ip)
+        except Exception:
+            pass
+        self._spent_egress_cache = (ts + 2.0, frozenset(ips))
+        return set(ips)
+
     def _adaptive_health(self, available: list[str]) -> dict[str, dict]:
         """Agrège les 429/succès récents par provider (journal provider-level)."""
         now = time.monotonic()
@@ -5193,20 +5407,6 @@ class FreeIPPool:
                 min_weight_pct=int(adaptive.get("min_weight_pct", 2) or 0),
             )
         return self._egress_swrr.pick(weights) or available[0]
-
-    def _egress_order_prefers_socks5(self) -> bool:
-        """Auto-Egress : WARP/proxys sont-ils prioritaires sur NordVPN ?
-
-        L'ordre GUI (`egress_providers`) est la priorité : si le premier
-        provider est WARP/proxys et que NordVPN est aussi coché, on tente
-        d'abord le backend SOCKS5, avec NordVPN en repli.
-        """
-        order = [
-            str(p or "").strip().lower()
-            for p in (getattr(self, "_egress_providers", None) or [])
-            if str(p or "").strip()
-        ]
-        return bool(order and order[0] in ("warp", "proxies") and "nordvpn" in order)
 
     async def on_request(
         self,
@@ -7339,7 +7539,6 @@ class FreeIPPool:
                 self._spare_station = int(_rotation_cfg.get("spare_station", 0) or 0)
                 self._spare_promoted = False
                 self._draining_stations.clear()
-                self._spare_ready = bool(self._spare_station)
                 self._quota_profile = QuotaProfile.from_config(_rel_cfg)
                 self._quota.apply_profile(self._quota_profile)
                 self._best_ip.quota = self._quota
@@ -7523,15 +7722,10 @@ class FreeIPPool:
                 except Exception:
                     continue
             health_raw = self._station_health.export_state() if hasattr(self, "_station_health") else {}
-            health = {k: v for k, v in (health_raw or {}).items() if _state_sid_kept(k, known)} if isinstance(health_raw, dict) else {}
+            health = {k: v for k, v in health_raw.items() if _state_sid_kept(k, known)} if isinstance(health_raw, dict) else {}
             quota_raw = self._quota.export_state() if hasattr(self, "_quota") else []
-            quota = []
-            for item in (quota_raw or []):
-                try:
-                    if isinstance(item, dict) and _state_sid_kept(item.get("station"), known):
-                        quota.append(item)
-                except Exception:
-                    continue
+            quota = [item for item in (quota_raw or [])
+                     if isinstance(item, dict) and _state_sid_kept(item.get("station"), known)]
             fp = self._pool_state_file()
             payload = {
                 "per": data,

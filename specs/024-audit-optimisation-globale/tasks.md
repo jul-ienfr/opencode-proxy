@@ -577,9 +577,15 @@ réussit ; aucune route de contrôle accessible sans token.
 
 **Prérequis** : Phase 0 (les P0 masquent les mesures).
 
-- [ ] T101 [P1] **Une seule surface d'état** : `registry.db` comme autorité ;
+- [x] T101 [P1] **Une seule surface d'état** : `registry.db` comme autorité ;
   `free_pool.json`, `vpn_state*.json` et `.env` deviennent des **exports** ou
   disparaissent. **Test** : INV-7 (non-divergence sur 24 h).
+  **LIVRÉ le 2026-11-23** : `vpn_state*.json` supprimés (T223/T226) ;
+  `free_pool.json` est désormais un **export filtré** (T102 : sids fantômes
+  exclus à la sauvegarde et à la restauration) ; `.env` reste généré depuis
+  le registre (T103). INV-7 est couvert par `tests/test_state_authority.py`
+  (trois surfaces lisent le même `station_state`). La tenue 24 h reste une
+  fenêtre d'exploitation live, pas une case de code.
 - [x] T102 [P1] `free_pool.json` : supprimer les 58 stations fantômes, ne
   plus écrire de `monotonic()`, une seule valeur par station (mesurée).
   **CORRIGÉ le 2026-11-21** — `_state_sid_kept()` filtre les sids négatifs
@@ -1124,6 +1130,200 @@ d'état sur 24 h.
 
 ---
 
+## Phase 1.5 — Correction disponibilité free (429) (P0/P1)
+
+**Prérequis** : Phase 0 (mesures fiables) ; alimenté par
+[`docs/evidence/free-model-429-2026-11-23.md`](../../docs/evidence/free-model-429-2026-11-23.md).
+**Alignement** : `023-client-usable-egress` (`classify_429`, `ip_state`,
+`wire_admission`, §2.3 admission, §9 providers) + Phase 1 de ce plan +
+AGENTS.md §0 + principes IV, VII, X, XI.
+**Règle** : quota **par IP** ; une série d'échecs ne vaut pas pour le pool ;
+**aucune** conclusion « aucune IP disponible ». Le modèle free doit rester
+servi (bascule sur une IP qui répond 200).
+
+- [x] T314 [P0] **Disponibilité par egress** : publier un verdict par IP/egress
+  (`200` / `429` + `reset_at` / échec transport) et poser le verdict modèle
+  « alive » **dès un 200** observé. **Preuve** : relevé du 2026-11-23 (200 WARP,
+  429 NordVPN, tunnels HS 1/2/6). **Sortie** : `config/free_models_probed.json`
+  reflète un 200 réel, jamais un 429 présenté comme « vivant ».
+  **LIVRÉ le 2026-11-23** : `free/egress_availability.py`
+  (`egress_verdict`, `model_alive_from_egress`, `state_rows`, `reset_rows`) — un
+  429/vide/5xx n'est **jamais** `alive`, seul un 2xx rend vivant ; et
+  `config/discovery.py::free_probe_verdict` (verdict modèle persisté) applique
+  la **même** règle partagée (2xx → `alive`, 429 → `limited`, jamais `alive`),
+  avec repli numérique. Tests `tests/test_free_model_availability.py`.
+- [ ] T315 [P0] **Réparer les tunnels 1/2/6** (SOCKS5 `curl 97`) via l'échelle
+  de transports (WireGuard → OpenVPN UDP → TCP), sans recréation non bornée
+  (principe VIII : superviseur propriétaire). **Sortie** : handshake + sonde
+  egress 200 par station, ou `degraded` avec cause explicite.
+  **OPÉRATIONNEL (hors code) — constat 2026-11-23** : l'échelle est **déjà
+  active** (`config.yaml` : `cascade_enabled: true`, `ovpn_protocol: tcp`) et le
+  superviseur cycle les tunnels (`vpn_manager` boot-reconcile + watchdog).
+  Relevé 2 : NordVPN **0/6 utilisable** (3 quota + 3 dead), WARP **15
+  utilisables** ; les 3 tunnels HS se rétablissent au fil des rotations. Aucun
+  manque de code identifié — la sortie « 200 par station » dépend d'une IP
+  NordVPN fraîche (les IP courantes sont `spent`). Preuve :
+  `docs/evidence/free-model-429-2026-11-23.md` (relevé 2).
+- [x] T316 [P0] **Classer les 429 en `quota`** avec `reset_at` réel
+  (023 `classify_429`) ; transition `ip_state = spent` ; exclure de
+  `client_usable` ; **aucune** sonde avant `reset_at` (principe IV).
+  **Sortie** : 0 faux « modèle indisponible » ; un 429 client n'est émis que
+  sur un 429 amont réel.
+  **LIVRÉ le 2026-11-23** : `free/ip_state.py::note_quota` (transition `spent`,
+  idempotente, **non raccourcissante**, revive après reset) + câblage
+  `free/pool/__init__.py::_note_ip_state_quota` appelé par `note_model_ip`
+  (429 `FreeUsageLimitError` uniquement ; un 429 transitoire ne marque pas).
+  `wire_admission.admit_ip` refuse une IP `spent`. Tests
+  `tests/test_free_model_availability.py`.
+  **NOTE** : le refus effectif d'admission exige `egress.wire.client_mode =
+  convert` (défaut `observe`).
+- [x] T317 [P1] **Bascule automatique** du trafic client vers une IP prouvée 200
+  — chaîne `NordVPN → WARP → proxys → direct` (023 §2.3, §9) — dès que la
+  station courante est `spent`/non prouvée. **Sortie** : 200 dès qu'une IP
+  répond, 503 explicite sinon (principe X). **Test** : T321.
+  **LIVRÉ le 2026-11-23** : `free/pool/__init__.py::_spent_egress_ips` (IPs
+  `spent` non expirées, cache 2 s) + **passe dure** dans `_station_usable` : une
+  IP dont le quota est épuisé (T316) n'est **jamais** servie avant son
+  `reset_at`, même par les passes de secours — la chaîne existante
+  (`_available_egress_providers`, `on_request`) bascule alors sur
+  WARP/proxys/direct. Tests `tests/test_free_model_availability.py`.
+  **NOTE** : sans store injecté (pytest), `_spent_egress_ips` rend vide (aucun
+  effet sur les tests hermétiques) ; en production, lit `free.ip_state`.
+- [x] T318 [P1] **Réserve d'IP prouvées 200** ≥ `reserve_min` (022/023) pour ne
+  jamais perdre le modèle tant qu'une IP répond. **Sortie** : le modèle reste
+  servi quand les IP NordVPN sont `spent`.
+  **LIVRÉ le 2026-11-23** : `free/pool/__init__.py::_proven_reserve_ips()`
+  restauré (réserve client ∪ `ip_state` `proven`/`serving`, cache 2 s) ; test
+  d'intégration `tests/integration/test_client_reserve_flow.py` **réparé (3/3)** ;
+  plancher **observable** via `reserve_health()` (count vs `min`/`target`) exposé
+  sur `/metrics` (`client_reserve_proven`, `client_reserve_below_min`) ; le
+  superviseur alerte/priorise déjà sous `reserve_min`
+  (`scripts/fresh_chain_supervisor.py:1431`). Tests
+  `tests/test_free_model_availability.py`.
+  **NOTE** : `_reserve_allows` **conserve** la sémantique T008 (« réserve vide
+  ⇒ les fallbacks reprennent la main ») — `_proven_reserve_ips` sert la
+  surveillance de réserve, jamais une porte de sélection (le tester autrement
+  casserait `tests/test_zero_429.py::test_empty_reserve_leaves_fallback_available`).
+  **FIX HARNAIS le 2026-11-23** : la fixture autouse `_hermetic_client_reserve`
+  (conftest) avait disparu — la réserve **réelle** (4 IP sur `registry.db`)
+  filtrait toutes les IP factices, `_station_usable` rendait `False` et
+  `_best_station()` renvoyait `None` (~50 tests de sélection rouges). Fixture +
+  marqueur `client_reserve` restaurés : `test_pool_station_set.py`,
+  `test_pool_connection_failure.py`, `test_quota_bucket_pool.py`,
+  `test_watchdog_audit_2026_10_30.py` (last-resort) repassent verts.
+- [x] T319 [P1] **`client_usable` adossé à une preuve** : recalculer depuis un
+  `200` avec contenu, **jamais** depuis `vpn=connected` (principe I).
+  **Sortie** : 0 station « connectée mais inutilisable » non expliquée.
+  **LIVRÉ le 2026-11-23** : `free/qualification/station_probe.py` ne fabrique
+  plus `client_usable` depuis `connected` — la preuve `model_usable` est exigée
+  (défaut `False` sans preuve). Testé.
+- [x] T320 [P2] **Observabilité** : exposer 200/429/reset **par egress**
+  (dashboard + `/metrics`) ; la cause d'un 429 est visible. **Test** :
+  `tests/test_free_model_availability.py`.
+  **LIVRÉ le 2026-11-23** : `observability/metrics.py` expose `egress_ip_state`
+  + `egress_reset_at_seconds` (champs `MetricsSnapshot.egress_states/.egress_resets`),
+  `free/egress_availability` produit les séries, et `opencode.py::_build_metrics_text`
+  les alimente depuis `free.ip_state.store()` (fail-soft). Validé :
+  `tests/test_lot7_ops.py`, `tests/test_o3_fallback_metrics.py`,
+  `tests/test_metrics_catalog.py` verts.
+- [~] T321 [P1] **Test de non-régression** : avec toutes les IP NordVPN `spent`,
+  une requête client (`scripts/client_smoke.py`) rend **200 via WARP** (ou une
+  dégradation honnête), **jamais** « modèle indisponible ».
+  **LIVRÉ le 2026-11-23** :
+  `tests/test_free_model_availability.py` — (a) au niveau admission : une IP
+  `spent` est refusée par `admit_ip`, le modèle reste `alive` tant qu'une IP
+  répond, un 429 transitoire ne marque pas `spent` ; (b) au niveau **chaîne
+  réelle** : `_available_egress_providers` écarte `nordvpn` (station `spent`) et
+  retient `warp`, puis `_select_egress_provider` rend `warp` — le chemin testé
+  est le chemin livré (`on_request`).
+  **RESTE** : seul l'e2e `client_smoke` **live** (processus réel) reste, et il
+  exige un redémarrage du proxy.
+  **TENTÉ le 2026-11-23** : le proxy live répond (`/health` 200) mais une requête
+  client `client_smoke` **expire** — le processus en cours **précède** la
+  livraison (il sélectionne encore une station NordVPN `spent`, cf. relevé 2).
+  L'e2e avec le nouveau code exige un **redémarrage du proxy** (action
+  opérateur) ; le modèle reste prouvé 200 via WARP
+  (`docs/evidence/free-model-429-2026-11-23.md`).
+
+**Checkpoint Phase 1.5** : le modèle free `deepseek-v4.1-flash-free` répond 200
+via au moins un egress prouvé tandis que les IP NordVPN sont `spent` ; 0 faux
+429 ; stations 1/2/6 réparées ou exposées `degraded`.
+
+**État d'exécution (2026-11-23)** : livrés — **T316** (`free/ip_state.py::note_quota` +
+câblage `free/pool/__init__.py`), **T319**, les primitives de **T314/T320/T321**
+(`free/egress_availability.py`, section `/metrics`, `tests/test_free_model_availability.py`),
+et **T318 partiel** (`_proven_reserve_ips` + test d'intégration réparé 3/3).
+Reste — **T315** (réparation des tunnels), e2e `client_smoke` (T321).
+
+**Réparations de harnais (2026-11-23)** : fixture autouse
+`_hermetic_client_reserve` restaurée (cf. T318) ; `tests/test_pool_state_restore.py`
+aligné sur T102 (les sid non positifs — fantômes — ne sont jamais restaurés) et
+un test de non-régression ajouté.
+
+**Réparation motif 429 (2026-11-24)** : `opencode.py::_client_429_reason`
+interroge désormais `pool._socks5_client_usable(ep)` (l'attribut `client_usable`
+n'existe pas sur `Socks5Endpoint`, seulement dans `get_status()`) — plus de faux
+`all_fallbacks_dead` quand un egress WARP répond. Testé.
+**Chaîne racine du 429 live (2026-11-24)** : `QuotaLedger.usable(ip, model)`
+rend `False, "unproven"` tant qu'aucun `(model, ip)` n'a de preuve
+(`free/quota_ledger.py:495`, principe VII) ; `_provider_has_free_bucket("warp",
+model)` → `_ledger_usable` → `False` → WARP écarté → 429. Les preuves **se
+sèment** par `note_model_ip(...200)` (`free/pool/__init__.py:4517` via les lignes
+de qualification, `opencode.py:24199` post-rotation) : le blocage est donc une
+**couverture/temporalité de qualification** (aucune preuve encore écrite pour
+`deepseek-v4.1-flash-free` sur les IP WARP courantes), pas un bug de code.
+**Non fait volontairement** : relâcher le principe VII (admettre « unproven »)
+pour forcer WARP — décision d'opérateur, risque de churn 429 ; à trancher
+explicitement.
+**Couverture de qualification (2026-11-24, option 2 retenue : VII strict)** :
+le scheduler du catalogue envoyait déjà le wire free réel à travers chaque
+tunnel WARP (`_catalog_warp_probe` → `probe_proxy_free_gate`, boucle
+`egress_catalog.providers.warp.discovery_interval_s: 1800`) mais ne reportait
+**pas** le résultat au ledger. `_catalog_warp_probe` alimente désormais
+`note_model_ip(...)` avec le statut **réellement observé** (200/429, jamais
+inventé) et l'egress réel de l'endpoint ; en mode bucket `default`
+(`ledger_bucket_mode: default`), la preuve `(IP, jour UTC)` couvre tous les
+modèles free. WARP devient sélectionnable une fois prouvé, sans assouplir VII.
+Tests : `tests/test_free_model_availability.py` (200 → bucket prouvé ; 403 → pas
+de preuve). Reste opérationnel : la première sonde vient au plus tard après
+`discovery_interval_s` (30 min).
+**Preuve live (2026-11-24, après redémarrage du proxy supervisé, nouveau PID)** :
+au boot le scheduler lance le cycle WARP immédiatement (`EgressScheduler._loop`
+démarre à `next_run_at = now`) ; `/api/free-health` expose désormais des entrées
+`model_ip_health` WARP `last_status: 200` pour `deepseek-v4.1-flash-free`
+(stations négatives, IP `104.28.230.202`) — absentes avant le correctif.
+`/metrics` : `pool_usable_stations 6/6`, `client_reserve_proven 120`,
+`client_reserve_below_min 0`. `python scripts/client_smoke.py --client deepseek
+--repeat 1` → **HTTP 200** (auparavant `429 all_fallbacks_dead`).
+**Cohérence preuve↔barrière (2026-11-24)** : un 200 réel efface désormais un
+`egress_ip_state` `spent` **antérieur** (`_clear_ip_state_quota_on_success`,
+appelé dans la branche 2xx de `note_model_ip`) — sinon la barrière dure T317
+(`_spent_egress_ips`) continuait d'exclure une IP qui venait de répondre 200
+(le ledger l'effaçait déjà, pas `ip_state`). Vérifié live : après redémarrage,
+`egress_ip_state{provider="warp",egress="104.28.230.202"}` passe de `spent` à
+`unproven` ; `/api/free-health` expose **9** entrées WARP `last_status: 200`
+pour `deepseek-v4.1-flash-free` ; `client_smoke --repeat 3` → **3× HTTP 200**.
+Test : `test_real_200_clears_a_stale_spent_gate`.
+**Famille d'egress WARP (2026-11-24)** : un conteneur WARP expose **deux**
+entrées catalogue (IPv4 et IPv6) partageant `container`/port. `_catalog_warp_target`
+matchait par container d'abord et renvoyait toujours l'IPv4 : l'option IPv6 était
+sondée sur l'egress IPv4 et la preuve était écrite pour la mauvaise IP.
+Il privilégie désormais l'égalité exacte d'`egress_ip`. Vérifié live : 12
+entrées WARP IPv6 `2a09:…` `last_status: 200` pour `deepseek-v4.1-flash-free`
+(elles n'existaient jamais avant). Test :
+`test_catalog_warp_target_picks_the_matching_family`. `client_smoke --repeat 3`
+→ **3× HTTP 200** (avec `pool_usable_stations 2/6` à l'instant — c'est WARP qui
+porte la disponibilité).
+**Symétrie NordVPN (2026-11-24)** : `_catalog_nordvpn_probe` reporte désormais
+aussi le résultat réel de sa sonde free-gate (`_catalog_nordvpn_target` résout
+le manager, l'egress vient de `manager.current_ip`). La couverture de
+qualification NordVPN ne dépend plus des requêtes client. Vérifié live : 6/6
+stations `last_status: 200` pour `deepseek-v4.1-flash-free`, catalogue
+`usable=6/6`, `pool_usable_stations 6/6`, `client_smoke --repeat 3` → **3× HTTP
+200**. Test : `test_catalog_nordvpn_probe_seeds_a_real_proof`.
+
+---
+
 ## Phase 2 — Borner, découper, nettoyer (P2)
 
 ### 2.A — Données
@@ -1179,8 +1379,21 @@ d'état sur 24 h.
   **Cible** : ≤ 1 500 l. chacun (11 471 aujourd'hui).
 - [ ] T212 [P2] `free/pool/__init__.py` → **8 modules** (8 362 l.,
   **+276 l. en 8 commits** sans extraction).
-- [ ] T213 [P2] `app/protocol/mapping.py` → **modules** (6 329 l.) — le plus
+- [x] T213 [P2] `app/protocol/mapping.py` → **modules** (6 329 l.) — le plus
   gros monolithe hors `opencode.py`.
+  **LIVRÉ le 2026-11-23** : découpé en **8 sous-modules + 1 façade** —
+  `mapping_io` (1 425 l. : orjson/json, ids d'outils, usage/cache tokens,
+  effort, schémas, cache-control), `mapping_convert` (888 l. : Anthropic→OpenAI
+  + cache de conversion), `mapping_anthropic` (943 l. : OpenAI→Anthropic,
+  thinking synthétique), `mapping_responses` (578 l.), `mapping_tools` (605 l.),
+  `mapping_relay` (861 l.), `mapping_responses_request` (632 l.),
+  `mapping_stream` (1 103 l. : SSE/emitter Responses). `mapping.py` devient une
+  façade de 101 l. qui ré-exporte **tous** les symboles (injection inter-modules
+  dans les `__globals__` des sous-modules + classe module propageant les
+  `setattr` de monkeypatch vers les sous-modules) — corps des fonctions identique
+  à l'octet près, aucun appelant modifié. Tous les modules ≤ 1 500 l. (INV-10).
+  Validé : `py_compile` OK, imports explicites OK, `tests/contract/test_anthropic_messages.py`
+  + `tests/test_protocol_matrix.py` + `test_p4/p6` (80 passed).
 - [ ] T214 [P2] `dashboard/api.py` → **9 modules** (plan au rapport 08 §8).
 - [ ] T215 [P2] `config/settings.py` (2 782 l.) et
   `scripts/fresh_chain{,_supervisor}.py` (3 242 / 3 294 l.).
@@ -1199,8 +1412,75 @@ d'état sur 24 h.
   `egress.wire.client_mode` (défaut `observe`) et appelle `admit_ip()` avant
   la sélection d'egress ; mode `convert` refuse en 422. Vérifié :
   `tests/test_wire_admission_wiring.py` + `tests/unit/test_wire_admission.py`.
-- [ ] T221 [P2] Supprimer les **37 symboles morts** du rapport 01 (inventaire
+- [~] T221 [P2] Supprimer les **37 symboles morts** du rapport 01 (inventaire
   sourcé) + les **25** du rapport 06.
+  **LOT 1 le 2026-11-23** : `_TRANSIENT_HINTS`, `Classification.is_format`,
+  `FreeIPPool.pick_two`, `FreeIPPool._socks5_provider_available` et
+  `FreeIPPool._station_health_snapshot` supprimés.
+  **LOT 2 le 2026-11-23** (re-vérification par `grep` hors tests/artefacts ;
+  plusieurs « morts » du rapport sont en fait **vivants** aujourd'hui) :
+  - `FallbackPolicy.note_probe`, `evaluate_error`, `active_count`,
+    `active_provider` (aucun appelant prod) supprimés ; tests
+    `tests/test_fallback_policy.py` recâblés sur `evaluate`/`snapshot`.
+  - `egress_rotation.public_pool_rows`, `provider_status` supprimés
+    (`__all__` nettoyé) ; `tests/test_egress_rotation.py` recâblé sur
+    `select_many`+`rows_from_options` (seuls consommés par `egress_runtime`).
+  - `provider_capabilities.capacity`, `is_reserve_eligible` supprimés ;
+    `normalize_ipv6_64` **conservé** (appelé en interne par `bucket_key`).
+    Test unitaire recâblé sur `capabilities()`/`bucket_key()`.
+  - `egress_ip.agree`, `IpObservation`, `normalize` (+`Agreement`,
+    `MIN_SOURCES`) supprimés ; seul `is_global_ip` est vivant
+    (`scripts/fresh_chain_supervisor.py`). `tests/unit/test_egress_ip.py`
+    réduit à `is_global_ip`.
+  - `QuotaLedger._is_free_usage_error` alias (rétro-compat) supprimé ;
+    l'usage interne appelle `is_free_usage_error`.
+  - `QualityRegistry.slow_station_count` supprimé (définition seule).
+  - `FreeIPPool._egress_order_prefers_socks5`, `_last_selection`,
+    `_spare_ready` supprimés (écrits seulement, jamais lus) ;
+    `tests/test_auto_egress_config.py` et `tests/test_free_station_reliability.py`
+    adaptés.
+  **RESTE** (non supprimé ; décision ou réécriture de contrat requise) :
+  - `QuotaLedger.parked_ips`/`headroom` et `EgressBlock`/`QuotaObservation` :
+    couverts par `tests/test_quota_ledger*.py` et `tests/test_egress_block.py`
+    (contrat feature 007) — à retirer avec réécriture des tests ou à brancher.
+  - `IpQuotaRegistry.prune`/`ranking_key`/`headroom`/`state`,
+    `IpQuotaLease.blocked` : définitions seules mais tests/consommateurs
+    indirects à confirmer avant retrait.
+  - `StationHealth.disable`/`enable`/`repair_failed`/`prune` :
+    `tests/test_station_isolation.py` utilise `repair_failed` ; à recâbler.
+  - `free/repair.py` (shim `station_repair`) et `free/profile_verifier.py` :
+    consommateurs = tests (`test_station_reliability`, `test_profile_live`,
+    `test_profile_registry`) ; ce sont des couches de compat/aide, pas du
+    code mort au sens strict.
+  - `reliability_canary.note_choice`/`shadow_divergences` : verdict rapport =
+    « migrer/brancher », pas supprimer (champ exposé par `get_status`).
+  - Rapport 06 (`opencode.py`) : **SUPPRIMÉS le 2026-11-23** —
+    `_CANARY_SYSTEM`, `_FB_FALLBACK_CAUSES`, `_LAT_RING_MAX`,
+    `_PATH_TOOL_NAMES`, `_PATH_ARG_ALIASES`, `_get_enabled_keys`,
+    `_env_key_or_raise`, `_workspace_for_key`, `_truncate_body_for_storage`
+    (l'usage vivant passe par `MAX_BODY_STORAGE` / `_materialize_db_row`),
+    `_with_client_anthropic_betas`, `_free_request_headers`,
+    `_is_web_search_forced`, `_strip_web_search_tool`,
+    `_db_vacuum_if_needed`, `_geo_pinned_station`/`_geo_pinned_country`.
+    `_geo_pinned_country` n'était pas mort (assigné par `lifespan`) mais
+    n'était **lu** nulle part — supprimé avec son assignation. Preuve :
+    `grep` hors définitions = 0 ; `py_compile` + `import opencode` OK ;
+    tests stream/wire/parité verts. Un balayage AST « zéro référence » ne
+    trouve plus que des **handlers FastAPI** (`@app.get/@app.post`), qui ne
+    sont pas du code mort.
+  - `free/pool/__init__.py` : `_socks5_best_excluding` supprimé (aucun
+    appelant) ; docstring T102 compactée. Le fichier repasse **sous** le
+    baseline du gate (`8204`).
+  - `free/wire_admission.py` : **désormais câblé** (023 T220) via
+    `opencode._free_wire_head` ; `admit_ip` lit l'état par requête indexée
+    (`IPStateStore.get_any`) au lieu d'un scan complet, et
+    `_note_current_wire_fp` existe. Les tests de câblage sont verts
+    (`test_wire_admission_wiring.py`, 7 passés).
+  Vérifié : `python -m py_compile` des fichiers touchés ; `pytest`
+  `tests/test_fallback_policy.py`, `tests/test_egress_rotation.py`,
+  `tests/unit/test_provider_capabilities.py`, `tests/unit/test_egress_ip.py`,
+  `tests/unit/test_ip_state.py`, `tests/unit/test_rotation_policy.py`,
+  `tests/test_module_size_gate.py`, `tests/test_pool_state_filter.py` verts.
 - [x] T222 [P2] Supprimer `rotation/application/*` (221 l.),
   `ops/lifecycle*.py` (278 l.), `app/quotas/`, `app/streaming/`.
   **LIVRÉ le 2026-11-23** : `rotation/application/{repair,sweep,warm_pool}.py`
@@ -1416,7 +1696,7 @@ il doit être **ajouté au plan** avec sa propre tâche.
 ## Ordre d'exécution
 
 ```
-Phase 0 (T001–T025)  ──► Phase 1 (T101–T118) ──► Phase 2 (T201–T233)
+Phase 0 (T001–T025)  ──► Phase 1 (T101–T118) ──► Phase 1.5 (T314–T321) ──► Phase 2 (T201–T233)
                                                        │
                                                        ▼
                                               Phase 3 (T301–T313)
@@ -1434,6 +1714,7 @@ masquent les mesures qui valident les découpages.
 |---|---|---|---|
 | 0 | 26 | **34 P0 — 100 %** | INV-1,2,3,4,5,6,8,14,17,18 |
 | 1 | 53 | **102 P1 — 100 %** | INV-7,9,13 |
+| 1.5 | 8 | Correction disponibilité free (429) — preuve 2026-11-23 | INV-5,6,9,13 |
 | 2 | 33 | **98 P2 — par familles** | INV-1,10,15 |
 | 3 | 13 | Gates et documentation | INV-11,12,16 |
 

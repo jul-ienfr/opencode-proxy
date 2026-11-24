@@ -3,6 +3,7 @@ Claude Code Proxy → opencode.ai
 Convert Anthropic /v1/messages ↔ OpenAI chat/completions
 """
 
+from core.testing import under_test
 import asyncio
 import contextlib
 import contextvars
@@ -26,6 +27,9 @@ import traceback
 import urllib.parse
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
+
+from app.protocol.sse_wire import _iter_sse_data, _normalize_chat_reasoning_chunk, _sse, _stream_has_yielded, _terminate_after_started
+from app.protocol.chat_wire import _CLIENT_CHAT_KEY_ORDER, _reorder_client_body
 from typing import TYPE_CHECKING, Annotated, Any
 
 # [021 T008/T009] Capture de crash : faulthandler + excepthook vers
@@ -86,8 +90,24 @@ def _client_429_reason() -> str:
 
         pool = getattr(shared_state, "free_ip_pool", None)
         endpoints = list(getattr(pool, "_socks5_eps", None) or [])
-        if any(bool(getattr(ep, "client_usable", False)) for ep in endpoints):
-            return "reserve_empty"
+        # `Socks5Endpoint` n'expose `client_usable` que via ``get_status()`` ;
+        # l'attribut n'existe pas sur l'objet. On interroge donc la méthode du
+        # pool (sinon : toujours « all_fallbacks_dead » alors que WARP répond).
+        client_usable_fn = getattr(pool, "_socks5_client_usable", None)
+        for ep in endpoints:
+            ok = False
+            if callable(client_usable_fn):
+                try:
+                    ok = bool(client_usable_fn(ep))
+                except Exception:
+                    ok = False
+            if not ok:
+                try:
+                    ok = bool(getattr(ep, "client_usable", False))
+                except Exception:
+                    ok = False
+            if ok:
+                return "reserve_empty"
     except Exception:
         pass
     return "all_fallbacks_dead"
@@ -218,12 +238,8 @@ from core import keys as _keys_mod  # noqa: E402
 from core.keys import AllKeysPausedError  # noqa: E402
 
 
-def _get_enabled_keys() -> list[dict]:
-    return _keys_mod.enabled_keys(API_KEYS)
 
 
-def _env_key_or_raise() -> dict:
-    return _keys_mod.env_key_or_raise(API_KEY, _key_pauser, _debug)
 
 
 def get_next_api_key(model_id: str = "") -> dict:
@@ -414,12 +430,6 @@ def _key_from_headers(headers: dict | None, protocol: str) -> str:
     return headers.get("Authorization", "").replace("Bearer ", "")
 
 
-def _workspace_for_key(api_key: str) -> str:
-    """Look up workspace ID for an API key."""
-    for k in API_KEYS:
-        if k.get("api_key") == api_key:
-            return k.get("go_workspace_id", "unknown")
-    return "unknown"
 
 
 def _get_auth_headers(protocol: str, entry: dict | None = None) -> dict:
@@ -701,11 +711,9 @@ from app.compaction.transport import summarizer_request as _transport_request  #
 from app.router import route_for as _app_router_route_for  # noqa: E402  # [P5 tranche 3]
 from observability import db as _app_db  # noqa: E402
 
-MAX_BODY_STORAGE = _app_db.MAX_BODY_STORAGE
+MAX_BODY_STORAGE = yaml_get("database", "max_body_chars", _app_db.MAX_BODY_STORAGE)
 
 
-def _truncate_body_for_storage(body: dict | None, max_chars: int = MAX_BODY_STORAGE) -> str | None:
-    return _app_db.truncate_body_for_storage(body, max_chars)
 
 
 _DB_RAW_SIZE_CAP = _app_db.DB_RAW_SIZE_CAP
@@ -729,7 +737,12 @@ _tools_used_seen: set = set()
 
 def _materialize_db_row(raw: "_DbRowRaw") -> tuple:
     """Thread writer : sérialise/tronque/redige une ligne brute (CPU hors loop)."""
-    return _app_db.materialize_db_row(raw, redact_fn=_redact, tools_seen=_tools_used_seen)
+    return _app_db.materialize_db_row(
+        raw,
+        redact_fn=_redact,
+        tools_seen=_tools_used_seen,
+        max_body_chars=MAX_BODY_STORAGE,
+    )
 
 
 # SQLite setup — synchronous connection, all DB ops run in thread pool
@@ -875,16 +888,6 @@ def _capture_client_anthropic_betas(request_headers) -> None:
             pass
 
 
-def _with_client_anthropic_betas(headers: dict) -> dict:
-    """Fusionne les bêtas client (prioritaires) dans des headers amont. Pur."""
-    try:
-        _betas = _current_client_anthropic_betas.get() or {}
-    except Exception:
-        _betas = {}
-    if _betas and isinstance(headers, dict):
-        for _k, _v in _betas.items():
-            headers[_k] = _v
-    return headers
 
 
 def _warn_huge_context(request, where: str = "") -> None:
@@ -985,24 +988,13 @@ def _db_flush():
     _app_db.flush(_conn, _db_commit_lock, _db_state, debug_fn=_debug)
 
 
-def _db_vacuum_if_needed(deleted_rows: int):
-    """Reclaim disk space after cleanup deletes (Vague 4/(g))."""
-    if deleted_rows <= 0:
-        return
-    try:
-        with _db_commit_lock:
-            # A batched-insert transaction may still be open; VACUUM refuses
-            # to run inside one. Committing it early is harmless.
-            if _conn.in_transaction:
-                _conn.commit()
-            _conn.execute("VACUUM")
-    except Exception as e:
-        _debug(f"  [db] vacuum error: {type(e).__name__}: {e}")
-        return
-    _log(f"  DB VACUUM: reclaimed space after deleting {deleted_rows} rows")
 
 
-def _db_cleanup_old_bodies(retention_days: int = 7, delete_after_days: int = 30):
+def _db_cleanup_old_bodies(
+    retention_days: int = 7,
+    delete_after_days: int = 30,
+    max_body_chars: int | None = None,
+):
     """Clean up old request data (two-phase : DELETE > 30 j, NULL bodies 7-30 j)."""
     return _app_db.cleanup_old_bodies(
         _conn,
@@ -1011,6 +1003,7 @@ def _db_cleanup_old_bodies(retention_days: int = 7, delete_after_days: int = 30)
         delete_after_days,
         log_fn=_log,
         debug_fn=_debug,
+        max_body_chars=max_body_chars,
     )
 
 
@@ -1420,6 +1413,21 @@ async def _save_request(
     # normalize geo_allowed list → string for DB
     if isinstance(geo_allowed, list):
         geo_allowed = ",".join(geo_allowed)
+    # [024 T205] Télémétrie à 100 % : ces trois colonnes ne doivent plus
+    # rester NULL. `free_status=0` = « pas de jambe free pour cette requête »
+    # (les vrais codes 200/400/429/5xx restent ceux de la jambe free) ;
+    # `ttfb_ms` d'un non-stream vaut la durée totale ; `stop_reason` a un
+    # défaut explicite au lieu de NULL. Normalisation APRÈS le calcul de
+    # `final_status` pour ne pas casser le statut effectif de la ligne.
+    if free_status is None:
+        free_status = 0
+    if ttfb_ms is None:
+        try:
+            ttfb_ms = max(0, int(duration_ms))
+        except (TypeError, ValueError):
+            ttfb_ms = 0
+    if stop_reason is None:
+        stop_reason = "end_turn" if success else "error"
     head = (
         req_id,
         timestamp,
@@ -2274,8 +2282,6 @@ _geo_breaker: dict = {}  # (country, station_id) -> consecutive failures
 _geo_breaker_threshold: int = 3
 _geo_pin_duration: list = []  # histogram buckets (ms)
 _geo_pin_duration_max: int = 200
-_geo_pinned_country: str | None = None
-_geo_pinned_station = None
 _geo_block_total = 0
 _geo_forced_pool: set | None = None
 # [plan 18/08 §4] Serializes POST /api/vpn-config station_count hot-reloads
@@ -3163,67 +3169,126 @@ async def _warp_rotation_watchdog():
             _debug(f"  [warp-rotate] watchdog error: {type(exc).__name__}: {exc}")
 
 
-def _catalog_warp_endpoint(option):
+def _catalog_warp_target(option):
+    """Résout ``(pool, endpoint)`` WARP visé par une option du catalogue.
+
+    Un conteneur WARP expose **deux** entrées (IPv4 et IPv6) partageant le même
+    ``container`` et le même port : matcher par container d'abord renvoyait
+    toujours l'IPv4, donc l'option IPv6 était sondée sur l'egress IPv4 et la
+    preuve 200 était écrite pour la mauvaise IP. On préfère donc une égalité
+    exacte d'``egress_ip`` (discriminant le couple de familles) et on ne
+    retombe sur le container qu'en l'absence de correspondance d'IP.
+    """
     try:
         import shared_state as _ss
 
         pool = getattr(_ss, "free_ip_pool", None)
     except Exception:
         pool = None
-    for endpoint in getattr(pool, "_socks5_eps", None) or []:
-        if str(getattr(endpoint, "provider", "")).lower() != "warp":
-            continue
-        if (
-            str(getattr(endpoint, "container", "") or "") == str(option.station)
-            or str(getattr(endpoint, "egress_ip", "") or "") == str(option.egress_ip)
-        ):
-            return str(getattr(endpoint, "socks5_url", "") or "")
-    return ""
+    eps = getattr(pool, "_socks5_eps", None) or []
+    wanted = str(getattr(option, "egress_ip", "") or "")
+    warps = [ep for ep in eps if str(getattr(ep, "provider", "")).lower() == "warp"]
+    if wanted:
+        for endpoint in warps:
+            if str(getattr(endpoint, "egress_ip", "") or "") == wanted:
+                return pool, endpoint
+    for endpoint in warps:
+        if str(getattr(endpoint, "container", "") or "") == str(option.station):
+            return pool, endpoint
+    return pool, None
 
 
-def _catalog_nordvpn_endpoint(option) -> str:
+def _note_catalog_probe_proof(pool, endpoint, outcome, model: str, ip: str = "") -> None:
+    """Une sonde free-gate réelle vaut preuve ledger (Principe VII).
+
+    Le scheduler du catalogue envoie déjà le wire free réel à travers chaque
+    tunnel WARP. Sans ce report, la preuve ``(modèle, IP)`` restait dans le
+    catalogue seulement : ``_provider_has_free_bucket("warp", modèle)``
+    répondait « unproven » et WARP n'était jamais sélectionné. Seuls un 200 ou
+    un 429 réellement observés sont reportés — aucune preuve n'est inventée.
+    """
+    status = int(getattr(outcome, "status", 0) or 0)
+    if pool is None or endpoint is None or status not in (200, 429):
+        return
+    try:
+        pool.note_model_ip(
+            model,
+            endpoint,
+            status,
+            ip=ip or None,
+            body=getattr(outcome, "body", None) or None,
+        )
+    except Exception:
+        return
+
+
+def _catalog_nordvpn_target(option):
+    """Résout ``(pool, manager)`` NordVPN visé par le catalogue."""
     try:
         import shared_state as _ss
 
+        pool = getattr(_ss, "free_ip_pool", None)
         managers = list(getattr(_ss, "vpn_managers", None) or [])
     except Exception:
-        managers = []
+        return None, None
     for index, manager in enumerate(managers, 1):
-        if f"station-{index}" != str(option.station):
-            continue
-        try:
-            return str(getattr(manager, "socks5_url", "") or "")
-        except Exception:
-            return ""
-    return ""
+        if f"station-{index}" == str(option.station):
+            return pool, manager
+    return pool, None
 
 
 async def _catalog_warp_probe(option):
-    from free.egress_probes import probe_proxy_free_gate
+    from free.egress_probes import DEFAULT_PROBE_MODEL, probe_proxy_free_gate
 
-    url = _catalog_warp_endpoint(option)
+    pool, endpoint = _catalog_warp_target(option)
+    url = str(getattr(endpoint, "socks5_url", "") or "") if endpoint is not None else ""
     if not url:
         return None
-    return await probe_proxy_free_gate(
+    egress = ""
+    if endpoint is not None:
+        egress = str(
+            getattr(endpoint, "egress_ip", "")
+            or getattr(endpoint, "current_ip", "")
+            or ""
+        )
+    if not egress:
+        egress = str(option.egress_ip or "")
+    outcome = await probe_proxy_free_gate(
         url,
         provider="warp",
-        egress_ip=str(option.egress_ip or ""),
+        egress_ip=egress,
         label=f"warp:{option.station}",
+        model=DEFAULT_PROBE_MODEL,
     )
+    _note_catalog_probe_proof(pool, endpoint, outcome, DEFAULT_PROBE_MODEL, egress)
+    return outcome
 
 
 async def _catalog_nordvpn_probe(option):
-    from free.egress_probes import probe_proxy_free_gate
+    from free.egress_probes import DEFAULT_PROBE_MODEL, probe_proxy_free_gate
 
-    url = _catalog_nordvpn_endpoint(option)
+    pool, manager = _catalog_nordvpn_target(option)
+    url = str(getattr(manager, "socks5_url", "") or "") if manager is not None else ""
     if not url:
         return None
-    return await probe_proxy_free_gate(
+    egress = ""
+    if manager is not None:
+        egress = str(
+            getattr(manager, "current_ip", "")
+            or getattr(manager, "egress_ip", "")
+            or ""
+        )
+    if not egress:
+        egress = str(option.egress_ip or "")
+    outcome = await probe_proxy_free_gate(
         url,
         provider="nordvpn",
-        egress_ip=str(option.egress_ip or ""),
+        egress_ip=egress,
         label=f"nordvpn:{option.station}",
+        model=DEFAULT_PROBE_MODEL,
     )
+    _note_catalog_probe_proof(pool, manager, outcome, DEFAULT_PROBE_MODEL, egress)
+    return outcome
 
 
 def _catalog_station_rows() -> list[dict]:
@@ -3941,7 +4006,8 @@ async def lifespan(app):
                         break
                     await asyncio.sleep(min(3600.0, remaining))
                 retention = int(yaml_get("database", "body_retention_days", 7) or 7)
-                await asyncio.to_thread(_db_cleanup_old_bodies, retention)
+                cap = yaml_get("database", "max_body_chars", MAX_BODY_STORAGE)
+                await asyncio.to_thread(_db_cleanup_old_bodies, retention, 30, cap)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -4516,7 +4582,7 @@ _VPN_GATE_LOGGER = logging.getLogger("vpn_gate")
 
 def _vpn_gate_log(level: int, msg: str, *args) -> None:
     """Journalise une décision du gate sans polluer debug.log en pytest."""
-    if os.getenv("PYTEST_CURRENT_TEST"):
+    if under_test():
         return
     try:
         _VPN_GATE_LOGGER.log(level, msg, *args)
@@ -5044,6 +5110,23 @@ def _build_metrics_text() -> str:
                 )
             except Exception:
                 pass
+            try:
+                # [024 T318] Plancher de réserve prouvée (client_reserve ∪ ip_state).
+                from free.pool import reserve_health as _reserve_health
+
+                _rh = _reserve_health()
+                lines.append("# HELP client_reserve_proven Proven-200 reserve IPs")
+                lines.append("# TYPE client_reserve_proven gauge")
+                lines.append(f"client_reserve_proven {_rh['count']}")
+                lines.append(
+                    "# HELP client_reserve_below_min 1 if proven reserve below min"
+                )
+                lines.append("# TYPE client_reserve_below_min gauge")
+                lines.append(
+                    f"client_reserve_below_min {1 if _rh['below_min'] else 0}"
+                )
+            except Exception:
+                pass
         except Exception:
             pass
         lines.append("# HELP client_429_total 429 quota returned to clients")
@@ -5213,6 +5296,19 @@ def _build_metrics_text() -> str:
         lines.extend(_metrics_mod.render_free_429_section(_f429))
     except Exception as e:
         _debug(f"  [metrics] pool/free429 échoués (partiel): {e}")
+
+    # [024 T320] Disponibilité par egress : état d'IP + reset fournisseur.
+    try:
+        from free import ip_state as _ipst
+        from free.egress_availability import reset_rows as _eg_r
+        from free.egress_availability import state_rows as _eg_s
+
+        _eg_states = _ipst.store().list()
+        lines.extend(
+            _metrics_mod.render_egress_section(_eg_s(_eg_states), _eg_r(_eg_states))
+        )
+    except Exception as e:
+        _debug(f"  [metrics] egress availability échoué (partiel): {e}")
 
     # [013-egress-catalog] Options par provider et volumétrie threat-intel.
     try:
@@ -6002,7 +6098,7 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
     Appelé en tête de handler avant circuit-breaker/cache/auth/forward,
     et à chaque tentative free si rotation entre tentatives.
     """
-    global _geo_block_total, _geo_forced_pool, _geo_pinned_country
+    global _geo_block_total, _geo_forced_pool
     try:
         _geo_info = _cfg_settings.resolve_geo(route)
     except Exception:
@@ -6394,7 +6490,6 @@ async def _enforce_geo_gate(route: dict, request: Request, *, is_stream: bool, p
                                 _geo_current = _v_cc or _geo_current
                     except Exception:
                         pass
-                    _geo_pinned_country = _geo_current
                     _log(f"  [geo] pin verified country={_geo_current} in effective_allowed={sorted(_geo_effective)}")
                     # If direct was incompatible, enrich context and emit warning/tray
                     try:
@@ -6738,20 +6833,6 @@ def _proxy_session_id() -> str:
     return _sid
 
 
-def _free_request_headers(headers: dict) -> dict:
-    """Strip paid-account artifacts from a header dict for the free endpoint.
-
-    Invariant A.0: no request sent to API_BASE_FREE may carry the paid
-    key (Authorization / x-api-key), client cookies, x-request-id or
-    x-stainless-* SDK identifiers. Protocol headers (anthropic-version)
-    survive — they identify the API shape, not the account.
-    """
-    return {
-        k: v
-        for k, v in headers.items()
-        if k.lower() not in ("authorization", "x-api-key", "cookie", "x-request-id")
-        and not k.lower().startswith("x-stainless-")
-    }
 
 
 # ── Identité client-officiel pour la jambe free (gate 2026-09-17) ──
@@ -8592,87 +8673,171 @@ def _free_wire_body(body, force_stream: bool = False, egress_ip: str | None = No
     return wire, forced
 
 
-# Ordre des clés du corps chat officiel — MESURÉ 242/243 requêtes.
-_CLIENT_CHAT_KEY_ORDER = (
-    "model",
-    "max_tokens",
-    "messages",
-    "tools",
-    "tool_choice",
-    "stream",
-    "stream_options",
-)
+def _note_current_wire_fp(wire_body) -> str:
+    """[023 T006] Calcule et publie le ``wire_fp`` de la tentative courante.
 
-
-def _reorder_client_body(wire: dict) -> dict:
-    """Réordonne les clés du corps selon la séquence officielle mesurée.
-
-    Les clés inconnues (non mesurées chez le client) sont conservées À LA
-    FIN, dans leur ordre d'origine — on ne supprime ni n'invente rien.
+    Le handler 429 lit cette valeur pour distinguer une brûlure de format
+    (même IP, autre format — principe XVIII) d'un bucket réellement épuisé.
+    Fail-soft : une erreur de calcul renvoie "" sans lever.
     """
     try:
-        out = {k: wire[k] for k in _CLIENT_CHAT_KEY_ORDER if k in wire}
-        for k, v in wire.items():
-            if k not in out:
-                out[k] = v
-        return out
+        from free import wire_profile as _wire_profile_mod
+
+        fp = _wire_profile_mod.fingerprint_wire(wire_body)
     except Exception:
-        return wire
+        return ""
+    try:
+        ctx = dict(_current_free_attempt.get() or {})
+        ctx["wire_fp"] = fp
+        _current_free_attempt.set(ctx)
+    except Exception:
+        pass
+    return fp
 
 
-def _iter_sse_data(lines):
-    """Yield les payloads JSON des lignes `data:` d'un flux SSE."""
-    for line in lines or []:
-        s = line.strip() if isinstance(line, str) else bytes(line).decode("utf-8", "replace").strip()
-        if not s.startswith("data:"):
-            continue
-        payload = s[5:].strip()
-        if not payload or payload == "[DONE]":
-            continue
+def _free_wire_mode() -> str:
+    """Mode d'admission wire (``egress.wire.client_mode``, défaut ``observe``)."""
+    try:
+        raw = _cfg_settings.yaml_get("egress", "wire.client_mode", "observe")
+    except Exception:
+        raw = "observe"
+    mode = str(raw or "observe").strip().lower()
+    try:
+        from free.wire_admission import MODES
+
+        if mode not in MODES:
+            return "observe"
+    except Exception:
+        return "observe"
+    return mode
+
+
+class _FreeWireHead:
+    """Objet de retour de ``_free_wire_head`` — une seule construction pour les
+    appelants (headers + corps + stream forcé + identité + fingerprint).
+
+    ``fp`` est l'override TLS (dict) attendu par ``_get_pooled_curl_session`` ;
+    ``wire_fp`` est l'empreinte sha256 du wire (str), publiée dans
+    ``_current_free_attempt`` par ``_note_current_wire_fp``.
+    """
+
+    __slots__ = (
+        "headers",
+        "wire_body",
+        "force_stream",
+        "impersonate",
+        "fp",
+        "wire_fp",
+        "ident_version",
+    )
+
+    def __init__(
+        self,
+        headers,
+        wire_body,
+        force_stream,
+        impersonate,
+        fp,
+        wire_fp,
+        ident_version="",
+    ):
+        self.headers = headers
+        self.wire_body = wire_body
+        self.force_stream = force_stream
+        self.impersonate = impersonate
+        self.fp = fp
+        self.wire_fp = wire_fp
+        self.ident_version = ident_version
+
+
+def _free_wire_head(
+    body,
+    endpoint: str = "",
+    *,
+    station=None,
+    proxy_url: str | None = None,
+    egress_ip: str | None = None,
+    station_runtime=None,
+    ident_version: str | None = None,
+):
+    """[023 T220] Construit la tête free (en-têtes + corps) et applique
+    l'admission wire avant tout egress.
+
+    En mode ``convert``, une IP dont l'état ``ip_state`` contredit le
+    ``wire_fp`` (ou est terminale) fait **refuser localement** la requête
+    (``FreeRefusal`` 422) au lieu de brûler un bucket. En ``observe``, la
+    décision est seulement journalisée — le chemin client est inchangé.
+
+    ``ident_version`` permet à l'appelant d'imposer la version du profil
+    (ex. version d'instance du vault) ; sinon elle est déduite comme avant.
+    """
+    _egress_ip = egress_ip
+    if station_runtime is not None:
+        req_headers = _station_free_headers(
+            station_runtime, _body_conversation_key(body), endpoint or ""
+        )
+        _ident_version = (
+            ident_version
+            if ident_version is not None
+            else getattr(station_runtime, "version", "")
+        )
+    else:
+        req_headers = _official_free_headers(
+            endpoint or "", _body_conversation_key(body), _egress_ip
+        )
+        _ident_version = "" if ident_version is None else str(ident_version)
+    req_headers = _guard_free_wire_headers(req_headers, station=station, proxy_url=proxy_url)
+    _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version, req_headers)
+    wire_body, _force_wire_stream = _free_wire_body(
+        body, force_stream=True, egress_ip=_egress_ip
+    )
+    if station_runtime is not None:
         try:
-            yield _json_loads(payload)
+            wire_body = _station_free_body(wire_body, station_runtime, body)
         except Exception:
-            continue
-
-
-def _normalize_chat_reasoning_chunk(chunk: dict) -> bool:
-    """Ajoute ``delta.reasoning_content`` depuis les autres dialectes.
-
-    Les amonts free ne parlent pas le même dialecte :
-      * deepseek / glm / big-pickle -> ``reasoning_content`` ;
-      * mimo / nemotron             -> ``reasoning`` (+ ``reasoning_details[]``,
-        style OpenRouter).
-
-    Le client officiel 1.19.3 ne lit QUE ``delta.reasoning_content``. On
-    AJOUTE donc l'alias sans retirer les champs d'origine (les clients
-    OpenRouter, eux, lisent ``reasoning``/``reasoning_details``).
-
-    Rend True si un alias a été ajouté. Ne lève jamais.
-    """
-    changed = False
+            pass
     try:
-        if not isinstance(chunk, dict):
-            return False
-        for ch in chunk.get("choices") or []:
-            d = ch.get("delta") if isinstance(ch, dict) else None
-            if not isinstance(d, dict):
-                continue
-            cur = d.get("reasoning_content")
-            if isinstance(cur, str) and cur:
-                continue
-            alt = d.get("reasoning")
-            if not (isinstance(alt, str) and alt):
-                det = d.get("reasoning_details")
-                if isinstance(det, list):
-                    alt = "".join(
-                        p.get("text", "") for p in det if isinstance(p, dict) and isinstance(p.get("text"), str)
-                    )
-            if isinstance(alt, str) and alt:
-                d["reasoning_content"] = alt
-                changed = True
+        wire_fp = _note_current_wire_fp(wire_body) or _free_fp
     except Exception:
-        return changed
-    return changed
+        wire_fp = _free_fp
+    try:
+        from free import wire_admission as _wire_admission
+
+        decision = _wire_admission.admit_ip(
+            wire_fp,
+            _egress_ip or "",
+            mode=_free_wire_mode(),
+        )
+        if not decision.allowed:
+            from core.errors import FreeRefusal
+
+            raise FreeRefusal(
+                status=422,
+                body=(
+                    "wire admission refused: "
+                    f"{decision.reason or decision.action} (mode={_free_wire_mode()})"
+                ),
+            )
+    except ImportError:
+        pass
+    return _FreeWireHead(
+        headers=req_headers,
+        wire_body=wire_body,
+        force_stream=_force_wire_stream,
+        impersonate=_free_impersonate,
+        fp=_free_fp,
+        wire_fp=wire_fp,
+        ident_version=_ident_version,
+    )
+
+
+# Ordre des clés du corps chat officiel — MESURÉ 242/243 requêtes.
+
+
+
+
+
+
 
 
 def _tool_schema_index(tools) -> list[dict]:
@@ -8889,10 +9054,6 @@ def _chat_chunk_has_payload(chunk) -> bool:
     return False
 
 
-_PATH_TOOL_NAMES = frozenset(
-    {"edit", "read", "write", "patch", "multiedit", "create", "delete", "move", "copy"}
-)
-_PATH_ARG_ALIASES = ("filePath", "file_path", "filepath", "filename", "file")
 
 
 def _heal_tool_call_paths(name: str, arguments: str, path_map: dict[str, str]) -> str:
@@ -10858,14 +11019,22 @@ async def _do_free_request_curl_cffi(
                     _ident_version = str(_vlt_fp.get(_egress_ip).version or "")
         except Exception:
             _ident_version = ""
-    req_headers = _guard_free_wire_headers(req_headers, station=station, proxy_url=proxy_url)
-    _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version, req_headers)
-    # [gate body 2026-09-18] grille tools (bash+read) + stream forcé : un corps
-    # non-stream ou sans tools serait 403. Si stream forcé ici, le SSE est
-    # collecté plus bas et reconstitué en JSON (contrat non-stream inchangé).
-    wire_body, _force_wire_stream = _free_wire_body(body, force_stream=True, egress_ip=_egress_ip)
-    if _station_runtime is not None:
-        wire_body = _station_free_body(wire_body, _station_runtime, body)
+    # [023 T220] Tête + corps + admission wire en un seul point (refus local
+    # en mode `convert` avant tout egress ; `observe` journalise seulement).
+    _head = _free_wire_head(
+        body,
+        endpoint or "",
+        station=station,
+        proxy_url=proxy_url,
+        egress_ip=_egress_ip,
+        station_runtime=_station_runtime,
+        ident_version=_ident_version,
+    )
+    req_headers = _head.headers
+    _free_impersonate = _head.impersonate
+    _free_fp = _head.fp
+    wire_body = _head.wire_body
+    _force_wire_stream = _head.force_stream
     _set_free_path_map(body, _station_runtime)
 
     # Pooled session — [A1 perf] checkout/checkin SANS verrou pendant le
@@ -13836,12 +14005,20 @@ async def _open_free_stream(
                         endpoint or "", _body_conversation_key(body), _egress_ip_s or None
                     )
                     _ident_version = str((_inst_snap or {}).get("version") or "")
-                req_headers = _guard_free_wire_headers(req_headers, station=station, proxy_url=proxy_url)
-                _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version, req_headers)
-                # [gate body 2026-09-18] grille tools sur le corps stream.
-                wire_body, _ = _free_wire_body(body, force_stream=True, egress_ip=_egress_ip_s or None)
-                if _station_runtime is not None:
-                    wire_body = _station_free_body(wire_body, _station_runtime, body)
+                # [023 T220] Tête + corps + admission wire en un seul point.
+                _head = _free_wire_head(
+                    body,
+                    endpoint or "",
+                    station=station,
+                    proxy_url=proxy_url,
+                    egress_ip=_egress_ip_s or None,
+                    station_runtime=_station_runtime,
+                    ident_version=_ident_version,
+                )
+                req_headers = _head.headers
+                _free_impersonate = _head.impersonate
+                _free_fp = _head.fp
+                wire_body = _head.wire_body
                 _set_free_path_map(body, _station_runtime)
                 # [2026-11-08] Même pin de famille que le POST non-stream :
                 # le flux doit sortir par l'egress IPv4 ou IPv6 de la station,
@@ -14078,10 +14255,21 @@ async def _open_free_stream(
                 "instance": _direct_inst,
             }
         )
-        free_headers = _official_free_headers(endpoint or "", _body_conversation_key(body), _direct_ip or None)
         _ident_version = str((_direct_inst or {}).get("version") or "")
-        _free_impersonate, _free_fp = _get_free_fp_kwargs(_ident_version, free_headers)
-        wire_body, _ = _free_wire_body(body, force_stream=True, egress_ip=_direct_ip or None)
+        # [023 T220] Tête + corps + admission wire en un seul point (direct).
+        _head = _free_wire_head(
+            body,
+            endpoint or "",
+            station=None,
+            proxy_url=None,
+            egress_ip=_direct_ip or None,
+            station_runtime=None,
+            ident_version=_ident_version,
+        )
+        free_headers = _head.headers
+        _free_impersonate = _head.impersonate
+        _free_fp = _head.fp
+        wire_body = _head.wire_body
         _dpool = None
         _dslot = None
         try:
@@ -14441,7 +14629,7 @@ async def _free_direct_egress_ip() -> str:
     try:
         # Sonde réseau seulement hors tests (hermétisme : aucune I/O réelle
         # dans la suite). En prod, une sonde par fenêtre de cache suffit.
-        if not os.getenv("PYTEST_CURRENT_TEST"):
+        if not under_test():
             _ip = str(await _get_direct_ip() or "")
     except Exception:
         _ip = ""
@@ -16007,7 +16195,7 @@ def _free_retry_delay_seconds(attempt: int) -> float:
     ([0, 2.0] : aucun surcoût de latence structurel).
     """
     try:
-        if os.getenv("PYTEST_CURRENT_TEST"):
+        if under_test():
             return 0.0
     except Exception:
         pass
@@ -17495,7 +17683,6 @@ def _fallback_ctx_pop(req_id):
 _FB_METRICS_LOCK = threading.Lock()
 _FB_FALLBACK_COUNTS: dict[tuple[str, str], int] = {}
 _FB_FAILOVER_COUNTS: dict[tuple[str, str, str], int] = {}
-_FB_FALLBACK_CAUSES = ("quota_429", "payload_400", "upstream_5xx", "tunnel_vide", "other")
 
 
 # [Phase 3 refonte] Compteurs/bucketisation extraits vers
@@ -17528,7 +17715,6 @@ def _reset_fallback_metrics() -> None:
 # _FB_METRICS_LOCK, fail-soft, observabilité seule — aucune incidence sur le
 # routage). Latences : ring buffer borné par métrique (deque maxlen), rendu
 # Prometheus en gauge p50/p95/p99 + count sous /metrics.
-_LAT_RING_MAX = 1024  # ~garantie mémoire O(1) par métrique ; p99 glissant
 _lat_rings: dict[str, "deque[float]"] = {}
 _MISC_COUNTERS: dict[str, int] = {}
 
@@ -18898,50 +19084,10 @@ def _stream_cache_delta(usage, current) -> tuple | None:
         return None
 
 
-def _sse(event: str, payload: dict) -> bytes:
-    return f"event: {event}\ndata: {_json_dumps_str(payload, ensure_ascii=False)}\n\n".encode()
 
 
-def _stream_has_yielded(started, open_blocks, stream_out, line_buf: str = "") -> bool:
-    """True once any SSE byte has been flushed to the client — retry must not concat."""
-    try:
-        has_blocks = bool(open_blocks)
-    except Exception:
-        has_blocks = False
-    try:
-        has_out = int(stream_out or 0) > 0
-    except Exception:
-        has_out = bool(stream_out)
-    return bool(started or has_blocks or has_out or (isinstance(line_buf, str) and bool(line_buf.strip())))
 
 
-async def _terminate_after_started(open_blocks, stream_out, thinking_idx=None, thinking_sig="", stop_reason="error"):
-    """Graceful SSE termination after a mid-stream failure (avoids concat retry).
-
-    [PLAN-raisonnement Phase C.2] si un bloc thinking est encore ouvert,
-    son `signature_delta` local est émis AVANT le content_block_stop — même
-    en fin de stream brutale, le client reçoit un bloc thinking complet
-    (thinking_delta* → signature_delta → stop), sinon il l'abandonne."""
-    for idx in list(open_blocks):
-        if thinking_idx is not None and idx == thinking_idx and thinking_sig:
-            yield _sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": idx,
-                    "delta": {"type": "signature_delta", "signature": thinking_sig},
-                },
-            )
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-    yield _sse(
-        "message_delta",
-        {
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason},
-            "usage": {"output_tokens": stream_out},
-        },
-    )
-    yield _sse("message_stop", {"type": "message_stop"})
 
 
 # Keepalive comment that is harmless to clients: every 15s during idle periods
@@ -19231,22 +19377,6 @@ def _is_tool_choice_auto(body: dict) -> bool:
     return False
 
 
-def _is_web_search_forced(body: dict, protocol: str) -> bool:
-    """Check if tool_choice is forced to web_search (legacy compat)."""
-    tc = body.get("tool_choice")
-    if not isinstance(tc, dict):
-        return False
-    # use normalized name
-    name = tc.get("name", "") or tc.get("function", {}).get("name", "")
-    if _normalize_tool_name({"name": name}) == "web_search":
-        return tc.get("type") in ("tool", "function")
-    # also handle type-based forced without name
-    if tc.get("type") == "tool" and _normalize_tool_name({"type": tc.get("name", "")}) == "web_search":
-        return True
-    if protocol == "anthropic":
-        return tc.get("type") == "tool" and _normalize_tool_name(tc) == "web_search"
-    else:
-        return tc.get("type") == "function" and _normalize_tool_name(tc) == "web_search"
 
 
 def _extract_search_query(body: dict) -> str:
@@ -19350,8 +19480,6 @@ def _strip_web_tool(body: dict, protocol: str, name: str):
     _ws_mod.strip_web_tool(body, protocol, name, normalize_fn=_normalize_tool_name, debug_fn=_debug)
 
 
-def _strip_web_search_tool(body: dict, protocol: str):
-    return _strip_web_tool(body, protocol, "web_search")
 
 
 def _is_web_tool_native(model_id: str) -> bool:
@@ -23908,7 +24036,6 @@ _health_lock = asyncio.Lock()  # sérialise le check upstream caché (§14.3.16 
 # que la jambe répond VRAIMENT. La leçon du 2026-10-22 : `jev-1.13-free`
 # répondait 200 en 4 s sans rien produire. Un canary qui ne lit que le statut
 # aurait dit « tout va bien » pendant toute la panne.
-_CANARY_SYSTEM = "canary"
 
 
 def _canary_verdict(raw: str) -> tuple[bool, str]:
@@ -24286,7 +24413,7 @@ async def _free_prewarm_once() -> bool:
 
 async def _station_quality_probe_loop() -> None:
     """Sonde active légère (score qualité), désactivée par défaut."""
-    if __import__("os").getenv("PYTEST_CURRENT_TEST"):
+    if under_test():
         return
     try:
         from free.probe import probe_once
@@ -24373,7 +24500,7 @@ def _reconcile_free_ledger_once(db_path: str) -> int:
 async def _free_ledger_reconcile_loop() -> None:
     """Boucle de réconciliation ledger ↔ observations (toutes les 60 s)."""
 
-    if os.getenv("PYTEST_CURRENT_TEST"):
+    if under_test():
         return
     db_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "logs", "registry.db"
@@ -24403,7 +24530,7 @@ async def _station_egress_probe_loop() -> None:
     ``station_health.max_effective_age_s``, et une station marquée ``suspect``
     après un 429 n'a plus aucun probe pour revenir ``usable``.
     """
-    if __import__("os").getenv("PYTEST_CURRENT_TEST"):
+    if under_test():
         return
     try:
         interval = float(yaml_get("ip_rotation", "station_health.probe_interval_s", 120) or 0)
@@ -29892,7 +30019,7 @@ async def _systemone_free_via_pool(endpoint: str, body: dict, headers: dict, for
             break  # pas de Retry-After exploitable → on relaie le vrai 429
         _wait = _parsed_wait
         try:
-            if os.getenv("PYTEST_CURRENT_TEST"):
+            if under_test():
                 _wait = 0.0
         except Exception:
             pass

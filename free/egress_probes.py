@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 from free.egress_validation import ProbeOutcome, parse_retry_after
 
+DEFAULT_PROBE_MODEL = "deepseek-v4.1-flash-free"
+
 
 async def probe_proxy_free_gate(
     proxy_url: str,
@@ -19,7 +21,7 @@ async def probe_proxy_free_gate(
     provider: str,
     egress_ip: str = "",
     label: str = "",
-    model: str = "deepseek-v4.1-flash-free",
+    model: str = DEFAULT_PROBE_MODEL,
     timeout: float = 20.0,
     requester=None,
 ) -> ProbeOutcome:
@@ -92,4 +94,4 @@ def reset_from_outcome(outcome: ProbeOutcome, *, now: float | None = None) -> fl
     )
 
 
-__all__ = ["probe_proxy_free_gate", "reset_from_outcome"]
+__all__ = ["DEFAULT_PROBE_MODEL", "probe_proxy_free_gate", "reset_from_outcome"]
