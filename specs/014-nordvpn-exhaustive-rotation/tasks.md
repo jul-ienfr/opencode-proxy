@@ -1,3 +1,9 @@
+> **Réconciliation (2026-11-23, T228 / spec 024)** : les tâches ouvertes de cette spec
+> sont **supersédées** par la spec `024-audit-optimisation-globale` (et, pour le trafic
+> free, par `023-client-usable-egress`). Ne pas les reprendre telles quelles : se
+> référer à `specs/024-audit-optimisation-globale/tasks.md` pour la liste de travail
+> courante. Les tâches déjà `[x]` restent valides comme historique.
+
 # Tasks: Couverture exhaustive et rotation priorisée des IP NordVPN
 
 **Input**: Design documents from `specs/014-nordvpn-exhaustive-rotation/`

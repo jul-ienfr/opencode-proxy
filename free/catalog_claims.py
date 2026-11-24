@@ -13,6 +13,8 @@ import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from free.sql_schemas import CLAIMS_SCHEMA
+
 
 class CatalogClaims:
     def __init__(
@@ -38,34 +40,7 @@ class CatalogClaims:
         self._conn = sqlite3.connect(self._path, timeout=30.0)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=30000")
-        self._conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS catalog (
-                hostname TEXT PRIMARY KEY,
-                country TEXT NOT NULL,
-                priority INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS claims (
-                hostname TEXT PRIMARY KEY,
-                station INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                egress_ip TEXT,
-                retry_after REAL NOT NULL DEFAULT 0,
-                reset_at REAL NOT NULL DEFAULT 0,
-                error TEXT,
-                updated_at REAL NOT NULL,
-                lease_until REAL NOT NULL,
-                fail_count INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_claims_status
-                ON claims(status, reset_at);
-            CREATE TABLE IF NOT EXISTS rebind_budget (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                window_start REAL NOT NULL,
-                count INTEGER NOT NULL
-            );
-            """
-        )
+        self._conn.executescript(CLAIMS_SCHEMA)
         self._conn.commit()
         try:
             cols = {

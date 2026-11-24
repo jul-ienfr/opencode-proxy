@@ -12,7 +12,7 @@ from free.egress_probe import resolve_egress
 from free.egress_reconcile import bucket_for_endpoint
 from free.warp_provisioner import WarpEndpointSpec, WarpProvisioner
 from ops.desired_state import DesiredEndpointSpec
-from ops.lifecycle import SlotObservation
+from ops.providers.base import SlotObservation
 
 
 class WarpProvider:

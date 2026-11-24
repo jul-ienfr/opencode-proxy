@@ -731,6 +731,21 @@ def _compute_costs(rows, pricing: dict | None = None) -> dict:
 _persist_lock = __import__("threading").Lock()
 
 
+def _config_transaction(fn):
+    """[024 T027] Marqueur des écrivains ``config.yaml``.
+
+    Le corps réel écrit via ``config.store.write_yaml`` (verrou cross-process
+    + atomique + no-op). ``functools.wraps`` conserve ``__wrapped__`` pour que
+    les tests inspectent l'implémentation sans exécuter l'écriture.
+    """
+    import functools as _functools
+
+    @_functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return _wrapper
+
 _QUALITY_BLOCK_SPEC: dict[str, dict[str, tuple]] = {
     "quality_preselection": {
         "enabled": (bool, None, None),
@@ -922,6 +937,7 @@ async def _apply_import_payload(mgrs, body: dict, fallback_manager=None):
     return {"ok": True, "stations_applied": applied}, 200
 
 
+@_config_transaction
 def _persist_vpn_config(updates: dict):
     """Persist VPN config changes to config.yaml (non-blocking, best-effort). [32]
 
@@ -1145,31 +1161,10 @@ def _persist_vpn_config(updates: dict):
 
         if changed:
             config["ip_rotation"] = ip_rot
-            # Atomic write via tempfile + fsync + replace (fiabilise sur panne disque)
-            import tempfile
-
-            try:
-                dir_name = os.path.dirname(config_path) or "."
-                fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".config.yaml.tmp.")
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-                        f.flush()
-                        try:
-                            os.fsync(f.fileno())
-                        except OSError:
-                            pass
-                    os.replace(tmp_path, config_path)
-                finally:
-                    try:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                    except Exception:
-                        pass
-            except Exception:
-                # Fallback non-atomique
-                with open(config_path, "w", encoding="utf-8") as f:
-                    yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            # [024 T027] Écrivain unique : verrou cross-process + atomique.
+            __import__("config.store", fromlist=["write_yaml"]).write_yaml(
+                config_path, config, reason="dashboard._persist_vpn_config"
+            )
             # [32] keep the in-memory mirror in sync — otherwise the next
             # settings.yaml_set() re-dumps the stale _yaml_data and reverts
             # what we just wrote to disk.
@@ -1292,6 +1287,7 @@ def _write_config_yaml_atomic(config: dict, config_path: str) -> None:
             pass
 
 
+@_config_transaction
 def _persist_retry_until_success(updates: dict) -> str | None:
     """Persiste `retry_until_success` (top-level) + met à jour le miroir.
 
@@ -1346,7 +1342,9 @@ def _persist_retry_until_success(updates: dict) -> str | None:
             return None
         config["retry_until_success"] = merged
         try:
-            _write_config_yaml_atomic(config, config_path)
+            __import__("config.store", fromlist=["write_yaml"]).write_yaml(
+                config_path, config, reason="dashboard._persist_retry_until_success"
+            )
         except Exception as e:
             return f"écriture config.yaml échouée: {type(e).__name__}: {e}"
         try:
@@ -1365,6 +1363,7 @@ def _persist_retry_until_success(updates: dict) -> str | None:
     return None
 
 
+@_config_transaction
 def _persist_free_model_map(mapping: dict):
     """Persist ``free_model_map`` to config.yaml (top-level key, best-effort).
 
@@ -1383,8 +1382,9 @@ def _persist_free_model_map(mapping: dict):
         with open(config_path, encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
         config["free_model_map"] = dict(mapping)
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        __import__("config.store", fromlist=["write_yaml"]).write_yaml(
+            config_path, config, reason="dashboard._persist_free_model_map"
+        )
         # [Axe 3.4] dashboard wrote the file → not manually dirty.
         global _config_yaml_known_mtime
         _config_yaml_known_mtime = _config_yaml_mtime()

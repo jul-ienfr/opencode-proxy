@@ -138,6 +138,9 @@ def _point_modules_at(db: Path, monkeypatch) -> None:
     monkeypatch.setattr(reserve_settings, "_CACHE", None)
     # Cache 2 s des IPs prouvées : ne pas hériter d'un autre test.
     monkeypatch.setattr(pool_mod, "_PROVEN_RESERVE_CACHE", None)
+    # [T318] ``_proven_reserve_ips`` lit ``ip_state`` : isoler aussi son
+    # singleton pour ne pas toucher le ``registry.db`` de production.
+    monkeypatch.setattr(ip_state, "_STORE", ip_state.IPStateStore(db))
 
 
 def _reserve_db(tmp_path: Path, monkeypatch) -> Path:

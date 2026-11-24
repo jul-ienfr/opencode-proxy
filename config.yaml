@@ -30,11 +30,13 @@ routing:
   aliases:
     nimo: mimo
 free_model_map:
-  mimo-v2.5: deepseek-v4-flash-free
-  glm-5.3-flash: glm-5.3-flash-free
+  mimo-v2.5: mimo-v2.6-flash-free
+  glm-5.3-flash: mimo-v2.6-flash-free
   deepseek-v4.1-flash: deepseek-v4.1-flash-free
   mimo-v2.6-flash: mimo-v2.6-flash-free
-  minimax-m3.1-flash: minimax-m3.1-flash-free
+  minimax-m3.1-flash: mimo-v2.6-flash-free
+  jev-1.13: jev-1.13-free
+  qwen4-max: mimo-v2.6-flash-free
 dashboard_trust:
   mode: lan
   lan_cidrs:
@@ -110,7 +112,6 @@ ip_rotation:
   cascade_max_duration_s: 120
   circuit_breaker_recovery: 5
   circuit_breaker_threshold: 1000
-  compose_service_2: vpn-gluetun-2
   connect_retry_interval: 20
   control_enabled: true
   control_pin_catchup: 25
@@ -118,7 +119,6 @@ ip_rotation:
   country_offset: 14
   country_offset_stride: 17
   country_rotation: true
-  credentials_file: vpn_configs/credentials.txt
   custom_ovpn_file: ''
   disabled_stations: []
   docker_autostart: true
@@ -127,7 +127,6 @@ ip_rotation:
   docker_container: opencode-vpn
   docker_container_2: opencode-vpn-2
   docker_events: true
-  dual_station: false
   egress_adaptive:
     enabled: true
     min_samples: 3
@@ -167,7 +166,6 @@ ip_rotation:
     park_window_s: 1800
     probe_interval_s: 300
     recovery_successes: 2
-  free_exception_fallback: station-first
   free_model_spread: false
   free_parallel:
     enabled: true
@@ -222,7 +220,6 @@ ip_rotation:
     soft_cooldown_sec: 600
     stream_metric: ttfb
     window: 20
-  max_free_attempts: 2
   max_inflight_per_model_ip: 4
   model_global_429_min_ips: 3
   model_global_429_window_s: 60
@@ -309,11 +306,11 @@ ip_rotation:
     enabled: true
     label: WARP 1
     ipv6: false
-    egress_ip: 104.28.198.204
+    egress_ip: 104.28.230.202
     managed: true
     container: warp-1
     image: caomingjun/warp:latest
-    block: 104.28.198.204/32
+    block: 104.28.230.202/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -323,11 +320,11 @@ ip_rotation:
     enabled: true
     label: WARP 1 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d5:be::13:2c8
+    egress_ip: 2a09:bac5:32d3:28aa::40d:31
     managed: true
     container: warp-1
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d5:be::/64
+    block: 2a09:bac5:32d3:28aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -337,11 +334,11 @@ ip_rotation:
     enabled: false
     label: WARP 2
     ipv6: false
-    egress_ip: 104.28.198.200
+    egress_ip: 104.28.230.202
     managed: true
     container: warp-2
     image: caomingjun/warp:latest
-    block: 104.28.198.200/32
+    block: 104.28.230.202/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -351,11 +348,11 @@ ip_rotation:
     enabled: true
     label: WARP 2 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d4:150f::219:df
+    egress_ip: 2a09:bac5:32d3:14dc::214:c4
     managed: true
     container: warp-2
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d4:150f::/64
+    block: 2a09:bac5:32d3:14dc::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -379,11 +376,11 @@ ip_rotation:
     enabled: true
     label: WARP 3 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d2:28aa::40d:16
+    egress_ip: 2a09:bac5:32d6:26aa::3da:3c
     managed: true
     container: warp-3
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d2:28aa::/64
+    block: 2a09:bac5:32d6:26aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -393,11 +390,11 @@ ip_rotation:
     enabled: false
     label: WARP 4
     ipv6: false
-    egress_ip: 104.28.198.202
+    egress_ip: 104.28.230.202
     managed: true
     container: warp-4
     image: caomingjun/warp:latest
-    block: 104.28.198.202/32
+    block: 104.28.230.202/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -407,11 +404,11 @@ ip_rotation:
     enabled: true
     label: WARP 4 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d5:14f0::216:ca
+    egress_ip: 2a09:bac5:32d4:28aa::40d:34
     managed: true
     container: warp-4
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d5:14f0::/64
+    block: 2a09:bac5:32d4:28aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -435,18 +432,18 @@ ip_rotation:
     enabled: true
     label: WARP 5 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d5:26aa::3da:35
+    egress_ip: 2a09:bac1:27c0:2060::216:6c
     managed: true
     container: warp-5
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d5:26aa::/64
+    block: 2a09:bac1:27c0:2060::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
     port: 11105
     username: null
     password: null
-    enabled: false
+    enabled: true
     label: WARP 6
     ipv6: false
     egress_ip: 104.28.230.202
@@ -463,11 +460,11 @@ ip_rotation:
     enabled: true
     label: WARP 6 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d3:14dc::214:7b
+    egress_ip: 2a09:bac5:32d5:14f0::216:d9
     managed: true
     container: warp-6
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d3:14dc::/64
+    block: 2a09:bac5:32d5:14f0::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -491,11 +488,11 @@ ip_rotation:
     enabled: false
     label: WARP 7
     ipv6: false
-    egress_ip: ''
+    egress_ip: 104.28.230.202
     managed: true
     container: warp-7
     image: caomingjun/warp:latest
-    block: ''
+    block: 104.28.230.202/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -505,11 +502,11 @@ ip_rotation:
     enabled: true
     label: WARP 7 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d6:1c82::2d7:f6
+    egress_ip: 2a09:bac5:32d5:14e6::215:7
     managed: true
     container: warp-7
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d6:1c82::/64
+    block: 2a09:bac5:32d5:14e6::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -519,11 +516,11 @@ ip_rotation:
     enabled: false
     label: WARP 8
     ipv6: false
-    egress_ip: ''
+    egress_ip: 104.28.230.202
     managed: true
     container: warp-8
     image: caomingjun/warp:latest
-    block: ''
+    block: 104.28.230.202/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -533,11 +530,11 @@ ip_rotation:
     enabled: true
     label: WARP 8 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d2:150f::219:aa
+    egress_ip: 2a09:bac5:32d7:14e6::215:b4
     managed: true
     container: warp-8
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d2:150f::/64
+    block: 2a09:bac5:32d7:14e6::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -547,11 +544,11 @@ ip_rotation:
     enabled: false
     label: WARP 9
     ipv6: false
-    egress_ip: ''
+    egress_ip: 104.28.230.202
     managed: true
     container: warp-9
     image: caomingjun/warp:latest
-    block: ''
+    block: 104.28.230.202/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -561,25 +558,25 @@ ip_rotation:
     enabled: true
     label: WARP 9 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d6:28b4::40e:39
+    egress_ip: 2a09:bac5:32d7:28aa::40d:52
     managed: true
     container: warp-9
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d6:28b4::/64
+    block: 2a09:bac5:32d7:28aa::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
     port: 11109
     username: null
     password: null
-    enabled: false
+    enabled: true
     label: WARP 10
     ipv6: false
-    egress_ip: ''
+    egress_ip: 104.28.230.203
     managed: true
     container: warp-10
     image: caomingjun/warp:latest
-    block: ''
+    block: 104.28.230.203/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -589,11 +586,11 @@ ip_rotation:
     enabled: true
     label: WARP 10 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d7:14f0::216:ad
+    egress_ip: 2a09:bac5:32d1:14dc::214:70
     managed: true
     container: warp-10
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d7:14f0::/64
+    block: 2a09:bac5:32d1:14dc::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -603,11 +600,11 @@ ip_rotation:
     enabled: false
     label: WARP 11
     ipv6: false
-    egress_ip: ''
+    egress_ip: 104.28.230.202
     managed: true
     container: warp-11
     image: caomingjun/warp:latest
-    block: ''
+    block: 104.28.230.202/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -617,25 +614,25 @@ ip_rotation:
     enabled: true
     label: WARP 11 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d1:150f::219:d
+    egress_ip: 2a09:bac5:32d3:14e6::215:6b
     managed: true
     container: warp-11
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d1:150f::/64
+    block: 2a09:bac5:32d3:14e6::/64
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
     port: 11111
     username: null
     password: null
-    enabled: false
+    enabled: true
     label: WARP 12
     ipv6: false
-    egress_ip: ''
+    egress_ip: 104.28.230.202
     managed: true
     container: warp-12
     image: caomingjun/warp:latest
-    block: ''
+    block: 104.28.230.202/32
     provider: warp
     transport_url: ''
   - host: 127.0.0.1
@@ -645,19 +642,17 @@ ip_rotation:
     enabled: true
     label: WARP 12 IPv6
     ipv6: true
-    egress_ip: 2a09:bac5:32d1:be::13:26b
+    egress_ip: 2a09:bac5:32d1:1c82::2d7:6c
     managed: true
     container: warp-12
     image: caomingjun/warp:latest
-    block: 2a09:bac5:32d1:be::/64
+    block: 2a09:bac5:32d1:1c82::/64
     provider: warp
     transport_url: ''
   socks5_proxy_port: 1080
-  socks5_proxy_port_2: 1081
   socks_catchup_s: 90
   socks_down_routable: true
   stack_age_guard_s: 600
-  state_file_2: logs/vpn_state2.json
   station_bad_ttl_s: 120
   station_connect_retry_interval_s: 30
   station_count: 6
@@ -713,7 +708,6 @@ ip_rotation:
   upstream_event_window_s: 60
   use_nordvpn_api: false
   vpn_proxy_port: 8888
-  vpn_proxy_port_2: 8889
   vpn_stack: auto
   wait_healthy_late_retry_s: 30
   wait_healthy_poll: 0.5
@@ -731,6 +725,9 @@ ip_rotation:
   wg_canary_poll_interval_s: 4
   wg_churn_fallback: true
   wg_return_enabled: true
+  max_free_attempts: 2
+  free_exception_fallback: station-first
+  qualification_probe: true
 geo:
   enabled: true
   version: 1
@@ -877,6 +874,7 @@ database:
   weekly_purge_days: 90
   archive_after_days: 60
   body_retention_days: 7
+  max_body_chars: 100000
 background:
   wal_checkpoint_interval: 3600
   key_pause_cleanup_interval: 30
@@ -899,6 +897,8 @@ debug:
   flush_interval: 10
   max_size: 52428800
   log_lines_max: 200
+  rotate_keep: 3
+  force_production_paths: false
 thinking:
   effort_order:
   - minimal
@@ -1343,21 +1343,6 @@ ip_registry:
     cache_path: logs/nordvpn_api.json
     gluetun_manifest_path: logs/gluetun_manifest.json
 models:
-  glm-5.2:
-    protocol: openai
-    output_limit: 131072
-  glm-5.1:
-    protocol: openai
-    output_limit: 131072
-  glm-5:
-    protocol: openai
-    output_limit: 131072
-  kimi-k2.5:
-    protocol: openai
-    output_limit: 65536
-  kimi-k2.6:
-    protocol: openai
-    output_limit: 65536
   deepseek-v4-pro:
     protocol: openai
     output_limit: 384000
@@ -1410,9 +1395,6 @@ models:
   nemotron-3.5-lightning-free:
     protocol: openai
     output_limit: 262144
-  longcat-2.0:
-    protocol: openai
-    output_limit: 131072
   grok-4.6:
     protocol: openai
     api: responses
@@ -1466,8 +1448,6 @@ models:
   nemotron-3.5-super-vl-free:
     protocol: openai
   step-5-preview:
-    protocol: openai
-  glm-5.3-flash-free:
     protocol: openai
   beam-free:
     protocol: openai
@@ -1577,17 +1557,109 @@ models:
     protocol: openai
   iceman-free:
     protocol: openai
-  inkling-2-small-free:
-    protocol: openai
-  longcat-2.5-free:
-    protocol: openai
   muse-ember-1.0:
     protocol: openai
   claude-fable-5-2:
     protocol: anthropic
-  minimax-m3.1-flash-free:
-    protocol: openai
   gemini-4-carbon:
     protocol: gemini
   gemini-4-hydrogen:
     protocol: gemini
+  qwen4-max:
+    protocol: anthropic
+  hy4-flash-free:
+    protocol: openai
+  gpt-6.2-astra:
+    protocol: openai
+  gpt-6.2-sol:
+    protocol: openai
+  gemini-4-neon:
+    protocol: gemini
+  tidepool-alpha-free:
+    protocol: openai
+  gemini-decision-1:
+    protocol: openai
+  gemini-nano-banana-2.1:
+    protocol: openai
+  gpt-6-luna-decision:
+    protocol: openai
+  gpt-image-2.5-sunburst:
+    protocol: openai
+  gpt-live-1:
+    protocol: openai
+  grok-imagine-image-2.0:
+    protocol: openai
+  text-embedding-3-large:
+    protocol: openai
+  text-embedding-3-small:
+    protocol: openai
+  bge-m3:
+    protocol: openai
+  codestral-embed:
+    protocol: openai
+  cohere-embed-v5-fast:
+    protocol: openai
+  cohere-embed-v5-pro:
+    protocol: openai
+  gemini-embedding-001:
+    protocol: openai
+  gemini-embedding-2:
+    protocol: openai
+  mistral-embed:
+    protocol: openai
+  qwen3-embedding-8b:
+    protocol: openai
+  voyage-4:
+    protocol: openai
+  voyage-code-4:
+    protocol: openai
+  gemini-omni-1.2-flash:
+    protocol: openai
+  gpt-live-1.1:
+    protocol: openai
+  longcat-2.5:
+    protocol: openai
+  jev-1.14:
+    protocol: openai
+  hungerg-free:
+    protocol: openai
+  grok-imagine-video-1.5:
+    protocol: openai
+  grok-imagine-video-1.5-lite:
+    protocol: openai
+egress:
+  strategy: balance
+  providers:
+    nordvpn:
+      enabled: true
+      weight: 52
+    warp:
+      enabled: true
+      weight: 24
+    proxies:
+      enabled: true
+      weight: 24
+    direct:
+      enabled: false
+      weight: 0
+  wire:
+    client_mode: observe
+    burn_guard: true
+  rotation:
+    min_interval_s: 180
+    max_per_hour: 12
+    probe_budget_per_ip: 3
+    probe_cooldown_s: 300
+    release_on_single_429: false
+    require_ip_agreement: true
+clients:
+  enabled: true
+  default_family: anthropic_messages
+  registry: free/clients/registry.json
+  tool_policy: free/clients/tool_policy.json
+  unknown_client: passthrough
+  families:
+    anthropic_messages: {}
+    openai_chat: {}
+    openai_responses: {}
+    passthrough: {}

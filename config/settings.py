@@ -408,6 +408,58 @@ def yaml_set(section: str, key: str, value):
     save_yaml_config()
 
 
+# ── Egress & clients config (023 T017) ──────────────────────────────
+# [T215] La logique PURE (défauts, parsing, helpers de résolution) vit
+# désormais dans `config/egress_config.py` — sans import projet ni état.
+# Les wrappers ci-dessous gardent l'API historique (`EGRESS`, `CLIENTS`,
+# `get_*`, `_egress_*_default`) et injectent `_yaml_data` / `yaml_get` À
+# L'APPEL : un hot-reload de config.yaml reste immédiatement visible, comme
+# avant l'extraction. `EGRESS` / `CLIENTS` restent des snapshots d'import.
+from config import egress_config as _egress_config  # noqa: E402
+
+_EGRESS_PROVIDER_DEFAULTS: dict[str, tuple[bool, int]] = _egress_config.PROVIDER_DEFAULTS
+_EGRESS_STRATEGIES = _egress_config.STRATEGIES
+_CLIENT_FAMILIES = _egress_config.CLIENT_FAMILIES
+
+
+def _egress_provider_default(name: str) -> bool:
+    """Valeur `enabled` de repli pour un provider d'egress."""
+    return _egress_config.provider_default(name)
+
+
+def _egress_provider_weight_default(name: str) -> int:
+    """Poids de repli (89 % de 52/24/24/0 est la répartition historique)."""
+    return _egress_config.provider_weight_default(name)
+
+
+def _egress_strategy_default() -> str:
+    """Stratégie de sélection : balance | priority | failover (lecture live)."""
+    return _egress_config.strategy_default(_yaml_data)
+
+
+def get_egress_config() -> dict[str, Any]:
+    """Configuration egress consolidée (providers, wire, rotation).
+
+    Migration douce (023 T017) : `egress.providers.<name>.enabled` prime ;
+    à défaut, `ip_rotation.egress_providers.<name>` (legacy) est consulté ;
+    à défaut encore, les valeurs de repli historiques s'appliquent.
+    [T215] Mécanique dans `config/egress_config.py` ; store injecté à l'appel.
+    """
+    return _egress_config.get_egress_config(_yaml_data, yaml_get)
+
+
+def get_clients_config() -> dict[str, Any]:
+    """Configuration des familles de clients (023 US7).
+
+    [T215] Mécanique dans `config/egress_config.py` ; store injecté à l'appel.
+    """
+    return _egress_config.get_clients_config(_yaml_data)
+
+
+EGRESS: dict[str, Any] = get_egress_config()
+CLIENTS: dict[str, Any] = get_clients_config()
+
+
 # ── .env Loader (override YAML defaults) ─────────────────────────────
 
 # [plan 18/08 §2.1] Divergence env périmée: rempli par load_env_file()
@@ -2692,19 +2744,12 @@ def get_model_config(model_id: str) -> dict:
 
 def save_env(updates: dict):
     """Update .env file and apply values at runtime."""
-    existing = {}
-    if os.path.exists(ENV_PATH):
-        with open(ENV_PATH, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, value = line.split("=", 1)
-                    existing[key.strip()] = value.strip()
+    # [T027] Écrivain unique : `config.store` porte le verrou cross-process,
+    # l'écriture atomique et la préservation des commentaires/ordre. L'ancien
+    # couple open("r")/open("w") réécrivait tout le fichier hors verrou.
+    from config import store as _config_store
 
-    existing.update(updates)
-    with open(ENV_PATH, "w", encoding="utf-8") as f:
-        for key, value in existing.items():
-            f.write(f"{key}={value}\n")
+    _config_store.upsert_env(ENV_PATH, updates, reason="settings.save_env")
 
     for key, value in updates.items():
         os.environ[key] = value

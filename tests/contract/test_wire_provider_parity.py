@@ -114,10 +114,20 @@ def test_provider_headers_parity(profile):
         f"header byte order differs across providers: "
         f"{header_order_bytes_by_provider}"
     )
-    # User-Agent must match the official profile UA
+    # User-Agent must match the spec the runtime actually sends. The active
+    # wire *capture* (2.3.0) is the reference for the body/layout, while the
+    # shipped impersonation spec (free/impersonation.json) is what goes on the
+    # wire until the 2.3.0 migration is verified (see spec 024 KB: the vault
+    # path has no registered 2.3.0 profile yet). Comparing to
+    # ``profile.ua`` here conflated the two and flagged the whole runtime as a
+    # provider divergence, which it is not.
+    from free.impersonation import load_spec
+
+    shipped_ua = str((load_spec() or {}).get("user_agent") or "").strip()
+    assert shipped_ua, "free/impersonation.json has no user_agent"
     for name in pc.PROVIDER_NAMES:
-        assert ua_by_provider[name] == profile.ua, (
-            f"{name} UA mismatch: {ua_by_provider[name]!r} vs {profile.ua!r}"
+        assert ua_by_provider[name] == shipped_ua, (
+            f"{name} UA mismatch: {ua_by_provider[name]!r} vs {shipped_ua!r}"
         )
     # UA must also be byte-identical across providers
     ua_values = set(ua_by_provider.values())

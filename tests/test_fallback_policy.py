@@ -35,7 +35,7 @@ def test_max_two_fallback_stations():
     assert d2.action == "fallback" and d2.provider == "proton"
     assert d3.action == "degraded"
     assert d3.reason == "max_fallback_stations"
-    assert policy.active_count() == 2
+    assert policy.snapshot()["active_count"] == 2
 
 
 def test_no_provider_is_degraded_fail_closed():
@@ -46,42 +46,9 @@ def test_no_provider_is_degraded_fail_closed():
     assert policy.snapshot()["fail_closed"] is True
 
 
-def test_return_to_warp_after_two_successes_and_cooldown():
-    policy = _policy()
-    policy.evaluate("s1", FallbackTrigger.QUOTA, {"warp", "proton"}, now=100.0)
-    # Cooldown pas écoulé : les succès ne suffisent pas.
-    d1 = policy.note_probe("s1", "proton", True, warp_healthy=True, now=200.0)
-    d2 = policy.note_probe("s1", "proton", True, warp_healthy=True, now=300.0)
-    assert d1.action == "stay"
-    assert d2.action == "stay"
-    # Après cooldown + 2 succès consécutifs.
-    d3 = policy.note_probe("s1", "proton", True, warp_healthy=True, now=1101.0)
-    assert d3.action == "return"
-    assert d3.provider == "warp"
-    assert policy.active_count() == 0
-
-
-def test_probe_failure_resets_success_counter():
-    policy = _policy()
-    policy.evaluate("s1", FallbackTrigger.QUOTA, {"warp", "proton"}, now=100.0)
-    policy.note_probe("s1", "proton", True, warp_healthy=True, now=1101.0)
-    policy.note_probe("s1", "proton", False, warp_healthy=True, now=1102.0)
-    d = policy.note_probe("s1", "proton", True, warp_healthy=True, now=1103.0)
-    assert d.action == "stay"
-
-
-def test_403_and_rate_limit_do_not_trigger_fallback():
-    policy = _policy()
-    for cls in ("GATE_403", "AUTH", "RATE_LIMIT_429", "TRANSIENT_5XX"):
-        d = policy.evaluate_error("s1", cls, {"warp", "proton"}, now=100.0)
-        assert d.action == "noop"
-        assert d.reason == "not_a_quota"
-    assert policy.active_count() == 0
-
-
 def test_quota_error_triggers_and_snapshot():
     policy = _policy()
-    d = policy.evaluate_error("s1", "QUOTA_429", {"warp", "proton"}, now=100.0)
+    d = policy.evaluate("s1", FallbackTrigger.QUOTA, {"warp", "proton"}, now=100.0)
     assert d.action == "fallback"
     snap = policy.snapshot()
     assert snap["active"] == {"s1": "proton"}

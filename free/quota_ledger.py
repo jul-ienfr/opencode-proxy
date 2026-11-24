@@ -20,6 +20,8 @@ Aucun réseau, aucun import projet : le pool pousse les résultats réels.
 
 from __future__ import annotations
 
+from core.testing import under_test
+
 import ipaddress
 import json
 import os
@@ -290,10 +292,6 @@ def is_free_usage_error(error_type: str, body: Any) -> bool:
     return "freeusagelimiterror" in compact or "free usage limit" in low
 
 
-# Rétro-compatibilité pour les appelants internes historiques.
-_is_free_usage_error = is_free_usage_error
-
-
 @dataclass
 class QuotaLedger:
     """Registre persisté des buckets ``(ip_norm, jour, bucket)``."""
@@ -332,7 +330,7 @@ class QuotaLedger:
         # ledger de production. Un test de persistance passe un chemin
         # explicite (ou persist=True + path=tmp) et garde l'écriture.
         try:
-            if os.getenv("PYTEST_CURRENT_TEST") and self._path == DEFAULT_PATH:
+            if under_test() and self._path == DEFAULT_PATH:
                 self.persist = False
         except Exception:
             pass
@@ -430,7 +428,7 @@ class QuotaLedger:
                 state.source = "observed-ok"
             elif code == 429:
                 state.failures += 1
-                if _is_free_usage_error(error_type, body):
+                if is_free_usage_error(error_type, body):
                     state.exhausted = True
                     state.last_error = "FreeUsageLimitError"
                     state.source = "observed"

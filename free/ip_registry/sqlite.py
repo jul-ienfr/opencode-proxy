@@ -12,6 +12,8 @@ import os
 import sqlite3
 from pathlib import Path
 
+from free.sql_schemas import SERVERS_SCHEMA
+
 SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
@@ -20,23 +22,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS servers (
-    hostname           TEXT PRIMARY KEY,
-    server_ip          TEXT,
-    country            TEXT NOT NULL,
-    city               TEXT,
-    load               REAL NOT NULL DEFAULT 0,
-    technologies       TEXT NOT NULL DEFAULT '[]',
-    first_seen_at      REAL NOT NULL,
-    last_seen_at       REAL NOT NULL,
-    active             INTEGER NOT NULL DEFAULT 1,
-    source_id          TEXT NOT NULL DEFAULT 'nordvpn_api_servers',
-    stale              INTEGER NOT NULL DEFAULT 0,
-    catalog_fetched_at REAL
-);
-CREATE INDEX IF NOT EXISTS idx_servers_country
-    ON servers(country, active);
-
+""" + SERVERS_SCHEMA + """
 CREATE TABLE IF NOT EXISTS observations (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     hostname       TEXT NOT NULL,

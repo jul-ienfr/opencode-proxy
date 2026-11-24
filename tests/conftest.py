@@ -414,3 +414,28 @@ def _reset_station_quality_registry():
         reset_quality_registry()
     except Exception:
         pass
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "client_reserve: test qui exerce la réserve client "
+        "(opt-out de l'isolation `_reserve_allows`)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_client_reserve(monkeypatch, request):
+    """[2026-11-17 / 024 T318] Les tests unitaires ne doivent pas dépendre de la
+    réserve client RÉELLE de la machine (``registry.db``).
+
+    Une réserve non vide filtre toutes les IP factices : ``_station_usable``
+    renvoie ``False`` pour elles et les tests de sélection/rotation échouent
+    (~50 constatés). Les tests qui exercent réellement la réserve portent le
+    marqueur ``client_reserve`` et ne sont pas neutralisés.
+    """
+    if request.node.get_closest_marker("client_reserve"):
+        return
+    import free.pool as _pool
+
+    monkeypatch.setattr(_pool, "_reserve_allows", lambda ip: True)

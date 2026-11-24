@@ -15,6 +15,8 @@ Politique :
 
 from __future__ import annotations
 
+from core.testing import under_test
+
 import os
 from collections import deque
 from dataclasses import dataclass, field
@@ -66,7 +68,7 @@ class HealthPolicy:
         # test dédié qui active explicitement le flag d'environnement.
         _secondary_hold = min(600.0, _float("secondary_path_hold_s", 0.0))
         _degraded_hold = min(300.0, _float("degraded_hold_s", 0.0))
-        if os.getenv("PYTEST_CURRENT_TEST") and not os.getenv("STATION_FLAP_TEST"):
+        if under_test() and not os.getenv("STATION_FLAP_TEST"):
             _hyst = 0.0
             _secondary_hold = 0.0
             _degraded_hold = 0.0

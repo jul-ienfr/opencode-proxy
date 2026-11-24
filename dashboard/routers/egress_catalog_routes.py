@@ -47,7 +47,17 @@ def register_egress_catalog_routes(app: FastAPI, catalog_getter: Callable[[], An
             limit=limit,
             offset=offset,
         )
-        return {"options": [asdict(option) for option in rows]}
+        # [024 T021] Ne jamais exposer username/password : `asdict()` ignore
+        # `repr=False` et sérialisait les credentials en clair. On les retire
+        # et on expose seulement le booléen `has_credentials`.
+        options = []
+        for option in rows:
+            data = asdict(option)
+            username = data.pop("username", "")
+            password = data.pop("password", "")
+            data["has_credentials"] = bool(username or password)
+            options.append(data)
+        return {"options": options}
 
     @app.get("/api/egress/catalog/runs")
     async def get_egress_catalog_runs(provider: str = "", limit: int = 20):

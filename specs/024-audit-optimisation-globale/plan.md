@@ -284,11 +284,111 @@ simultanément.
 - [ ] SC-006 : aucun module post-constitution > 1 500 lignes.
 - [ ] SC-007 : les 8 gates de la constitution câblées et vertes.
 - [ ] SC-008 : un `git clone` neuf produit une flotte fonctionnelle.
+- [ ] SC-009 : le modèle free répond 200 tant qu'une IP prouvée 200 existe ;
+  0 faux « modèle indisponible ».
 - [ ] Les 11 principes violés passent à PASS.
 - [ ] La décision de langage est documentée et argumentée sur les mesures.
 - [ ] `docs/DEBT.md` reflète l'état réel, 0 P0 ouverte.
 
-## 6. État d'exécution
+## 6. Plan de correction — disponibilité du modèle free (429)
+
+**Date** : 2026-11-23 · **Preuve** :
+[docs/evidence/free-model-429-2026-11-23.md](../../docs/evidence/free-model-429-2026-11-23.md)
+· **Alignement** : `023-client-usable-egress` (référence free) + ce plan (024)
++ `.specify/memory/constitution.md` + AGENTS.md §0.
+
+### 6.1 Constat mesuré (par IP, 2026-11-23)
+
+Le modèle `deepseek-v4.1-flash-free` est **vivant** : **200 avec contenu** sur
+trois egress WARP distincts. Le symptôme observé (« le modèle ne fonctionne
+pas ») se décompose en **trois causes mesurées séparément** :
+
+| Cause | Egress | Nature |
+|---|---|---|
+| Tunnel HS | stations 1, 2, 6 | SOCKS5 `curl 97`, **avant** toute réponse HTTP |
+| Quota d'IP épuisé | stations 3, 4, 5, direct | `FreeUsageLimitError` + `Retry-After` réel (~4 h) |
+| Modèle sain | WARP-1 / WARP-6 / WARP-12 | **200**, contenu streamé |
+
+**Aucune** ligne n'autorise « aucune IP n'est disponible » : des IP WARP
+répondent 200 **au même instant**. Le quota reste **par IP** (AGENTS.md §0).
+
+### 6.2 Familles causales (ordre imposé par les preuves)
+
+1. **F1 — Tunnels de station cassés** (1/2/6). Aligné 024 Phase 0 (superviseur,
+   fuite `_draining_stations`, probe post-rotation) et 023/016 (échelle de
+   transports WireGuard → OpenVPN, jamais de recréation non bornée).
+2. **F2 — 429 d'IP mal qualifiés** (3/4/5, direct). Aligné 023 `classify_429`
+   (`quota` = `FreeUsageLimitError` + `Retry-After` exploitable) et
+   `ip_state = spent` + `reset_at` réel ; principe IV (aucune sonde avant
+   `reset_at`).
+3. **F3 — Pas de bascule vers une IP prouvée 200**. Aligné 023 §2.3 (admission)
+   et §9 (providers), 024 Phase 1 (1.4, 1.7, 1.10), principe X. C'est l'objectif
+   permanent : « bascule automatique sur une IP qui répond 200 ».
+4. **F4 — `client_usable` non adossé à une preuve 200**. Aligné constitution I et
+   024 Phase 1 (mesure) : `connected` ≠ `client_usable`.
+
+### 6.3 Lots de correction (tâches T314–T321)
+
+| Lot | Tâche | Contenu | Sortie |
+|---|---|---|---|
+| C0 | T314 | Publier la disponibilité **par egress** (modèle « alive » dès un 200) | verdict adossé à une preuve |
+| C1 | T315 | Réparer les tunnels 1/2/6 via l'échelle de transports, sans recréation non bornée | sonde egress 200 |
+| C2 | T316 | Classer les 429 en `quota` + `reset_at` réel ; `ip_state = spent` | 0 faux « indisponible » |
+| C3 | T317 | Bascule client vers une IP prouvée 200 (NordVPN → WARP → proxys → direct) | 200 dès qu'une IP répond |
+| C4 | T318 | Réserve d'IP prouvées 200 ≥ `reserve_min` | modèle jamais perdu si réserve ≥ 1 |
+| C5 | T319 | `client_usable` calculé depuis une preuve 200 | 0 station « connectée mais inutilisable » |
+| C6 | T320 | Observabilité 200/429/reset par egress (dashboard + métriques) | cause visible |
+| C7 | T321 | Test de non-régression : NordVPN épuisé → 200 via WARP | non-régression |
+
+Le découpage exécutable, les critères et le rattachement aux user stories sont
+dans [tasks.md](./tasks.md) « Phase 1.5 ».
+
+### 6.4 Contraintes d'alignement (AGENTS.md §0 + constitution + 023)
+
+- Le quota est **par IP**, jamais « compte-wide » ; une série d'échecs ne vaut
+  pas pour le pool.
+- Les **six stations** restent l'objectif ; aucune 7ᵉ station, aucun second
+  compte, **aucune bascule payante**.
+- Aucun faux 429 : tout 429 émis porte un `429` amont et un `reset_at` réel
+  (principe X, 023 `classify_429`).
+- Aucune sonde avant `reset_at` (principe IV).
+- Un `200` ne compte qu'avec contenu (principe VII, 023 §8.6).
+- Toute bascule est journalisée avec sa cause (principe XI).
+
+### 6.5 Definition of Done (lot de correction)
+
+- [ ] Le modèle free répond **200** tant qu'au moins une IP prouvée 200 existe
+  (WARP aujourd'hui) — vérifié par `scripts/client_smoke.py`.
+- [ ] Les stations 1/2/6 repassent `client_usable` (tunnel + 200) ou sont
+  exposées `degraded` avec cause explicite.
+- [ ] Les 429 NordVPN sont classés `quota` avec `reset_at` ; **0** message
+  « modèle indisponible » sans 429 amont.
+- [ ] `client_usable` provient d'une preuve 200, jamais de l'état du tunnel.
+- [ ] T321 vert : IP NordVPN `spent` ⇒ 200 via WARP.
+
+### 6.6 État d'exécution (2026-11-23)
+
+Première livraison, additive et testée :
+
+| Livré | Fichier | Preuve |
+|---|---|---|
+| Transition `spent` sur 429 quota (T316) | `free/ip_state.py::note_quota` + `free/pool/__init__.py::_note_ip_state_quota` | `tests/test_free_model_availability.py` |
+| Verdict par egress (T314) | `free/egress_availability.py` + `config/discovery.py::free_probe_verdict` (règle partagée) | `tests/test_free_model_availability.py` |
+| `client_usable` exige une preuve 200 (T319) | `free/qualification/station_probe.py` | idem |
+| Séries `/metrics` par egress (T320) | `observability/metrics.py` + `opencode.py::_build_metrics_text` (alimenté par `free.ip_state`) | `tests/test_lot7_ops.py`, `tests/test_o3_fallback_metrics.py` |
+| Réserve prouvée lisible + test réparé (T318) | `free/pool/__init__.py::_proven_reserve_ips` | `tests/integration/test_client_reserve_flow.py` (3/3) |
+| Bascule hors IP `spent` (T317) | `free/pool/__init__.py::_spent_egress_ips` + passe dure dans `_station_usable` | `tests/test_free_model_availability.py` |
+| Plancher de réserve observable (T318) | `free/pool/__init__.py::reserve_health` + `/metrics` (`client_reserve_proven`) | `tests/test_free_model_availability.py` |
+
+**Reste** : T315 (réparation des tunnels), e2e `client_smoke`. Détail dans
+[tasks.md](./tasks.md) « Phase 1.5 ».
+
+**Note de ratchet (T216)** : `free/pool/__init__.py` passe de **8204** à
+**8278** lignes (câblage du 429 quota) ; l'entrée de
+`scripts/module_size_baseline.json` est relevée en conséquence, de façon
+**explicite** — le découpage T212 doit la faire redescendre.
+
+## 7. État d'exécution
 
 **Phase 0 — démarrée le 2026-11-20.** Les 3 correctifs P0 de `opencode.py`
 sont **livrés et vérifiés** :

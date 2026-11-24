@@ -2,7 +2,24 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
+
+
+@dataclass(frozen=True, slots=True)
+class SlotObservation:
+    """Observation d'un slot (pur, sans I/O — schema partagé par les adaptateurs de slot)."""
+    container_state: str = "missing"
+    health: str = "unknown"
+    tunnel_up: bool = False
+    dns_ok: bool = False
+    egress_ip: str | None = None
+    block: str | None = None
+    quota_state: str = "unknown"
+    reset_at: float | None = None
+    client_usable: bool = False
+    last_evidence: str | None = None
+    reason: str | None = None
 
 
 @runtime_checkable

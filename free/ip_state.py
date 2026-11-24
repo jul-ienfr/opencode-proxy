@@ -276,6 +276,18 @@ class IPStateStore:
             ).fetchone()
         return _row_to_state(row) if row else None
 
+    def get_any(self, ip: str) -> list[IPState]:
+        """All rows for an IP across providers, newest-first. Indexed by PK."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT provider, ip, bucket_key, state, wire_fp, proven_at, "
+                "serving_at, reset_at, burned_at, reason, evidence_ref, "
+                "probe_count, updated_at FROM egress_ip_state "
+                "WHERE ip=? ORDER BY updated_at DESC",
+                (ip,),
+            ).fetchall()
+        return [_row_to_state(r) for r in rows]
+
     def list(self, provider: str | None = None) -> list[IPState]:
         sql = (
             "SELECT provider, ip, bucket_key, state, wire_fp, proven_at, "
@@ -426,6 +438,51 @@ class IPStateStore:
         if current.state in _TERMINAL and current.reset_elapsed(now):
             return self.transition(provider, ip, UNPROVEN, reason=reason, now=now)
         return current
+
+    def note_quota(
+        self,
+        provider: str,
+        ip: str,
+        *,
+        reset_at: float,
+        reason: str = "quota 429: bucket exhausted",
+        evidence_ref: str = "",
+        now: float | None = None,
+    ) -> IPState | None:
+        """[024 Phase 1.5 / T316] Marque une IP ``spent`` jusqu'à ``reset_at``.
+
+        Un ``429 FreeUsageLimitError`` est un quota d'IP, pas une brûlure de
+        format : l'IP revient ``unproven`` à ``reset_at`` (principe IV). Idempotent
+        et non raccourcissant : une punition en cours avec un ``reset_at`` plus
+        tardif n'est jamais réduite. Retourne l'état résultant (ou ``None`` si
+        les arguments sont insuffisants). Fail-soft côté appelant.
+        """
+        prov = str(provider or "").strip()
+        ip_s = str(ip or "").strip()
+        if not prov or not ip_s or not reset_at:
+            return None
+        ts = time.time() if now is None else now
+        current = self.get(prov, ip_s)
+        if current is not None and current.state in _TERMINAL:
+            if not current.reset_elapsed(ts):
+                # Punition en cours : on ne fait que l'étendre, jamais la réduire.
+                if current.state == SPENT and float(current.reset_at or 0.0) < float(reset_at):
+                    return self.transition(
+                        prov, ip_s, SPENT,
+                        reset_at=reset_at, reason=reason,
+                        evidence_ref=evidence_ref, now=ts,
+                    )
+                return current
+            # Reset écoulé : la machine à états exige un passage par ``unproven``.
+            self.transition(
+                prov, ip_s, UNPROVEN,
+                reason="reset elapsed before re-quota", now=ts,
+            )
+        return self.transition(
+            prov, ip_s, SPENT,
+            reset_at=reset_at, reason=reason,
+            evidence_ref=evidence_ref, now=ts,
+        )
 
     def note_probe(self, provider: str, ip: str, *, now: float | None = None) -> int:
         ts = time.time() if now is None else now

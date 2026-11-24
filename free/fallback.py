@@ -165,14 +165,6 @@ class FallbackPolicy:
         self._last_switch_at: float = 0.0
         self._lock = RLock()
 
-    def active_count(self) -> int:
-        with self._lock:
-            return len(self._active)
-
-    def active_provider(self, station: str) -> str | None:
-        with self._lock:
-            return self._active.get(str(station))
-
     def select_provider(self, available: set[str] | frozenset[str]) -> str | None:
         """Premier provider de l'ordre qui n'est ni WARP ni déjà saturé."""
         for name in self.config.order:
@@ -225,78 +217,6 @@ class FallbackPolicy:
                 station=label,
                 provider=provider,
                 reason=trigger.value,
-                active=len(self._active),
-            )
-
-    def evaluate_error(
-        self,
-        station: str,
-        error_class: str,
-        available: set[str] | frozenset[str],
-        *,
-        now: float,
-    ) -> FallbackDecision:
-        """Mapping taxonomie → fallback. 403/AUTH/rate-limit/5xx = noop."""
-        cls = str(error_class or "").upper()
-        if cls in ("GATE_403", "AUTH", "RATE_LIMIT_429", "TRANSIENT_5XX"):
-            return FallbackDecision("noop", station=str(station or ""), reason="not_a_quota")
-        if cls in ("QUOTA_429", "ACCOUNT_OR_GLOBAL"):
-            return self.evaluate(station, FallbackTrigger.QUOTA, available, now=now)
-        return FallbackDecision("noop", station=str(station or ""), reason="unknown_class")
-
-    def note_probe(
-        self,
-        station: str,
-        provider: str,
-        ok: bool,
-        *,
-        warp_healthy: bool,
-        now: float,
-    ) -> FallbackDecision:
-        """Enregistre un probe du provider fallback et décide le retour WARP."""
-        label = str(station or "")
-        with self._lock:
-            active_provider = self._active.get(label)
-            if active_provider is None:
-                return FallbackDecision("noop", station=label, reason="not_on_fallback")
-            if str(provider or "") != active_provider:
-                return FallbackDecision(
-                    "noop",
-                    station=label,
-                    provider=active_provider,
-                    reason="provider_mismatch",
-                    active=len(self._active),
-                )
-            if not ok:
-                self._successes[label] = 0
-                return FallbackDecision(
-                    "stay",
-                    station=label,
-                    provider=active_provider,
-                    reason="probe_failed",
-                    active=len(self._active),
-                )
-            self._successes[label] = int(self._successes.get(label, 0)) + 1
-            if (
-                warp_healthy
-                and self._successes[label] >= self.config.recovery_successes
-                and float(now) - self._last_switch_at >= self.config.cooldown_s
-            ):
-                self._active.pop(label, None)
-                self._successes.pop(label, None)
-                self._last_switch_at = float(now)
-                return FallbackDecision(
-                    "return",
-                    station=label,
-                    provider="warp",
-                    reason="warp_recovered",
-                    active=len(self._active),
-                )
-            return FallbackDecision(
-                "stay",
-                station=label,
-                provider=active_provider,
-                reason="probe_ok",
                 active=len(self._active),
             )
 

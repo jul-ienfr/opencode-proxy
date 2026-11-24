@@ -574,11 +574,6 @@ class QualityRegistry:
             "ips": len(items),
         }
 
-    def slow_station_count(self, now: float | None = None) -> int:
-        """Nombre de stations dont au moins une IP est en slow lane."""
-        now_ts = float(now if now is not None else time.monotonic())
-        return len({i.sid for i in self._items.values() if i.is_slow_lane(now_ts)})
-
     def prune_sids(self, max_sid: int) -> int:
         try:
             max_sid = int(max_sid)

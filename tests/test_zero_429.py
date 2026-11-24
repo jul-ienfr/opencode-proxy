@@ -5,7 +5,13 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from free import client_reserve as cr
+
+# Ce fichier exerce réellement la réserve client (``_reserve_allows``) : il doit
+# échapper à l'isolation autouse ``_hermetic_client_reserve`` (conftest).
+pytestmark = pytest.mark.client_reserve
 
 
 def _db_with_reserved(tmp_path: Path) -> Path:

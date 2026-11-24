@@ -833,11 +833,25 @@ def free_probe_verdict(status: Any, body: str, cfg: dict) -> tuple:
         s = int(status)
     except (TypeError, ValueError):
         return "unknown", "transport/réseau — pas de statut"
-    if 200 <= s < 300:
+    # [024 Phase 1.5 / T314] Règle partagée : seul un 2xx rend ``alive`` ; un
+    # 429 est ``quota`` et ne rend jamais ``alive``. Repli numérique si l'import
+    # échoue (ce module de config est importé très tôt).
+    try:
+        from free.egress_availability import ALIVE as _ALIVE
+        from free.egress_availability import QUOTA as _QUOTA
+        from free.egress_availability import egress_verdict as _egress_verdict
+
+        _verdict = _egress_verdict(s)
+    except Exception:
+        _ALIVE, _QUOTA = "alive", "quota"
+        _verdict = (
+            "alive" if 200 <= s < 300 else ("quota" if s == 429 else "transport")
+        )
+    if _verdict == _ALIVE:
         return "alive", "2xx"
     if s in (cfg.get("dead_status") or ()):
         return "dead", f"status {s}"
-    if s == 429:
+    if _verdict == _QUOTA:
         return "limited", "429 quota — modèle vivant"
     if s in (cfg.get("not_free_status") or ()):
         return "not_free", f"status {s} — refus Bearer public"

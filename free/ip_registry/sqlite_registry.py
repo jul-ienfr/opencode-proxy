@@ -165,8 +165,8 @@ class SqliteIpRegistry:
                         (
                             server.hostname,
                             server.server_ip,
-                            server.country,
-                            server.city,
+                            server.country or "",
+                            server.city or "",
                             server.load,
                             repr(list(server.technologies)),
                             ts,

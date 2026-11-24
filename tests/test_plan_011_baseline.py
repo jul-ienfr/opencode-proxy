@@ -306,11 +306,6 @@ def test_supervisor_maintains_unselected_provider(monkeypatch) -> None:
     assert supervisor._nordvpn_maintained() is True
 
 
-def test_common_lifecycle_engine_exists() -> None:
-    from ops.lifecycle import LifecycleEngine, SlotObservation, SlotSpec, SlotState
-
-    assert LifecycleEngine and SlotSpec and SlotObservation and SlotState
-
 
 def test_common_provider_protocol_exists() -> None:
     from ops.providers.base import SlotProvider
@@ -318,8 +313,3 @@ def test_common_provider_protocol_exists() -> None:
     assert SlotProvider
 
 
-def test_startup_policy_is_explicit() -> None:
-    from ops.lifecycle_policy import StartupPolicy
-
-    policy = StartupPolicy(repair_owner="supervisor", providers=["warp"])
-    assert policy.should_connect("nordvpn") is True

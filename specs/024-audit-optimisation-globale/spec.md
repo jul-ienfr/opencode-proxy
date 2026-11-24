@@ -240,6 +240,25 @@ l'audit, avec une recommandation et un plan de migration par strangler.
 2. Le gain est chiffré (latence, concurrence, démarrage).
 3. La recommandation nomme ce qui doit être **fait d'abord** dans tous les cas.
 
+### US9 — Le modèle free reste servi malgré les IP épuisées (P0)
+
+Un opérateur teste `deepseek-v4.1-flash-free` : le modèle répond **200** dès
+qu'une IP prouvée 200 existe, même quand toutes les IP NordVPN d'une station
+sont `spent` ; sinon le client reçoit une **dégradation explicite**, jamais un
+faux « modèle indisponible ».
+
+**Preuve** : [docs/evidence/free-model-429-2026-11-23.md](../../docs/evidence/free-model-429-2026-11-23.md).
+
+**Test indépendant** : `scripts/client_smoke.py` avec les IP NordVPN `spent` →
+200 via WARP (ou 503 explicite) ; `scripts/test_free_egress.py` par IP.
+
+**Critères d'acceptation** :
+
+1. Le modèle free répond **200** tant qu'une IP prouvée 200 existe.
+2. Les 429 d'IP sont classés `quota` avec `reset_at` réel ; 0 faux 429.
+3. `client_usable` provient d'une preuve 200, jamais de `vpn=connected`.
+4. Aucune conclusion « aucune IP disponible » à partir d'une série d'échecs.
+
 ## 6. Edge cases
 
 - Que se passe-t-il si le superviseur est mort alors que `repair_owner:
@@ -274,6 +293,8 @@ l'audit, avec une recommandation et un plan de migration par strangler.
 - **SC-006** : aucun module post-constitution > 1 500 lignes.
 - **SC-007** : les 8 gates de la constitution sont câblées et passent.
 - **SC-008** : un `git clone` neuf produit une flotte fonctionnelle.
+- **SC-009** : le modèle free répond 200 tant qu'une IP prouvée 200 existe ;
+  0 faux « modèle indisponible » ; 0 station « connectée mais inutilisable ».
 
 ## 9. Assumptions
 

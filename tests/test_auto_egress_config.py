@@ -184,16 +184,3 @@ def test_balance_four_providers_equal_parts():
         counts[pool._select_egress_provider(providers)] += 1
     assert counts == {"nordvpn": 25, "warp": 25, "proxies": 25, "direct": 25}
 
-
-def test_order_prefers_socks5_when_first_provider_is_warp():
-    from free.pool import FreeIPPool
-
-    pool = object.__new__(FreeIPPool)
-    pool._egress_providers = ["warp", "nordvpn"]
-    assert pool._egress_order_prefers_socks5() is True
-    pool._egress_providers = ["nordvpn", "warp"]
-    assert pool._egress_order_prefers_socks5() is False
-    pool._egress_providers = ["proxies", "nordvpn"]
-    assert pool._egress_order_prefers_socks5() is True
-    pool._egress_providers = ["warp"]
-    assert pool._egress_order_prefers_socks5() is False

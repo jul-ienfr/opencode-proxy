@@ -93,9 +93,16 @@ def admit_ip(
         return Admission(True, "observe", "no egress ip")
     candidate: Any = None
     try:
-        from free.ip_state import IPStateStore
+        from free import ip_state as _ip_state_mod
 
-        rows = [st for st in IPStateStore(db_path).list() if str(st.ip).strip() == ip_s]
+        # Lecture indexée (WHERE ip=? sur la PK de la table) : l'admission est
+        # appelée sur le chemin chaud free, un `list()` complet y ferait un
+        # scan O(table) par requête.
+        if db_path is None:
+            _store = _ip_state_mod.store()
+        else:
+            _store = _ip_state_mod.IPStateStore(db_path)
+        rows = list(_store.get_any(ip_s))
         if rows:
             rank = {
                 "serving": 0,

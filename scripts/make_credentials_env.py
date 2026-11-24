@@ -17,6 +17,7 @@ NEVER prints credential values.
 import os
 import re
 import stat
+import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "vpn_configs", "credentials.txt")
@@ -56,25 +57,17 @@ def _load_server_countries() -> str | None:
 
 
 def _upsert_env_var(path: str, key: str, value: str) -> None:
-    """Upsert KEY=VALUE in an env file, preserving other lines and comments."""
-    lines: list[str] = []
-    found = False
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                stripped = line.strip()
-                # Match KEY= or KEY = or commented #KEY= — only replace active line
-                if re.match(rf"^{re.escape(key)}\s*=", stripped):
-                    lines.append(f"{key}={value}\n")
-                    found = True
-                else:
-                    lines.append(line)
-    if not found:
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        lines.append(f"{key}={value}\n")
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+    """Upsert KEY=VALUE in an env file, preserving other lines and comments.
+
+    [024 T027] délégué au writer unique ``config.store`` (verrou + atomique).
+    """
+    try:
+        from config.store import upsert_env
+    except Exception:
+        sys.path.insert(0, ROOT)
+        from config.store import upsert_env
+
+    upsert_env(path, {key: value}, reason="make_credentials_env")
     try:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
     except Exception:

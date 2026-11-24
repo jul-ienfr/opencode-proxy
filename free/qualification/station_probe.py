@@ -96,9 +96,11 @@ class HttpStationProbe:
             or row.get("transport")
             or ""
         ).strip()
+        # [024 Phase 1.5 / T319] `client_usable` exige une preuve 200 réelle
+        # (`model_usable`), jamais le seul état du tunnel : `connected` +
+        # `egress_ip` ne prouvent pas qu'une requête modèle aboutit (principe I,
+        # « connected n'est jamais synonyme de client_usable »).
         raw_usable = row.get("model_usable")
-        if raw_usable is None:
-            raw_usable = bool(connected and egress_ip and not auth_failed)
         client_usable = bool(raw_usable)
         reason = str(
             row.get("model_usable_reason")

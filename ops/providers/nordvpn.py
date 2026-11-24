@@ -1,7 +1,7 @@
 """Adapter NordVPN (Gluetun/Compose/auth/session) du noyau 011.
 
 Le mécanisme reste ici : compose, credentials, AUTH throttle, session et
-transport WG/OV. La politique commune vient de ``ops.lifecycle_policy``.
+transport WG/OV. Politique commune : voir spec 024 (consolidation lifecycle).
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import asyncio
 from typing import Any
 
 from ops.desired_state import DesiredStationSpec
-from ops.lifecycle import SlotObservation
+from ops.providers.base import SlotObservation
 
 
 def _run(coro):

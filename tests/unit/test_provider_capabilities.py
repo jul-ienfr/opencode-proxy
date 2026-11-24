@@ -1,8 +1,8 @@
 """[P3 2026-11-21 — T307] Couverture du module `free/provider_capabilities.py`.
 
 Le module est pur (aucune I/O) et pilote des décisions structurantes :
-capacité WARP IPv4 nulle, bucket `/64` pour l'IPv6, éligibilité réserve.
-Sans tests, une inversion de `capacity()` ferait croire WARP IPv4 utilisable.
+bucket `/64` pour l'IPv6, éligibilité réserve.
+Sans tests, une inversion de `bucket_key()` ferait croire WARP IPv4 utilisable.
 """
 
 from __future__ import annotations
@@ -26,11 +26,6 @@ def test_unknown_provider_fails_closed_to_direct():
     assert caps.reserve_eligible is False
 
 
-def test_warp_ipv4_has_zero_capacity_but_ipv6_slash64_has_one():
-    assert pc.capacity(pc.WARP, "203.0.113.7") == 0
-    assert pc.capacity(pc.WARP, "2a09:bac1:27c0:2060::1") == 1
-
-
 def test_warp_ipv6_bucket_is_normalized_to_64():
     one = pc.bucket_key(pc.WARP, "2a09:bac1:27c0:2060::1")
     two = pc.bucket_key(pc.WARP, "2a09:bac1:27c0:2060::ffff")
@@ -52,10 +47,10 @@ def test_nordvpn_bucket_is_the_address_itself():
 
 
 def test_reserve_eligibility_excludes_proxies_and_direct():
-    assert pc.is_reserve_eligible(pc.NORDVPN) is True
-    assert pc.is_reserve_eligible(pc.WARP) is True
-    assert pc.is_reserve_eligible(pc.PROXIES) is False
-    assert pc.is_reserve_eligible(pc.DIRECT) is False
+    assert pc.capabilities(pc.NORDVPN).reserve_eligible is True
+    assert pc.capabilities(pc.WARP).reserve_eligible is True
+    assert pc.capabilities(pc.PROXIES).reserve_eligible is False
+    assert pc.capabilities(pc.DIRECT).reserve_eligible is False
 
 
 def test_normalize_ipv6_64_is_idempotent_and_safe_on_garbage():

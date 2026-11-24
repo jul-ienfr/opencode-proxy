@@ -28,9 +28,7 @@ def test_free_discovery_import():
 def test_app_packages_import():
     import app.db
     import app.protocol
-    import app.quotas
     import app.router
-    import app.streaming
     import vpn
 
     assert hasattr(app.router, "get_model_config")

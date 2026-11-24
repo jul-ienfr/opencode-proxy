@@ -246,6 +246,9 @@ class MetricsSnapshot:
     # [audit 2026-09-08 §6/O4 + PC-5] pool free + 429 par modèle.
     pool: dict | None = None
     free429: dict = field(default_factory=dict)
+    # [024 Phase 1.5 / T320] disponibilité par egress (état d'IP + reset).
+    egress_states: list = field(default_factory=list)
+    egress_resets: list = field(default_factory=list)
 
 
 def _gauge(lines: list, name: str, help_txt: str, rows) -> None:
@@ -436,6 +439,30 @@ def render_free_429_section(counts: dict | None) -> list[str]:
     return lines
 
 
+def render_egress_section(state_rows: list | None, reset_rows: list | None) -> list[str]:
+    """[024 T320] Disponibilité par egress : état d'IP + reset fournisseur.
+
+    Alimenté par ``free.egress_availability`` : une série par IP d'egress
+    (``proven``/``serving``/``spent``/``burned``/``unproven``/``mismatch``) et
+    le ``reset_at`` des IP bloquées. Vide = section sautée (rendu inchangé pour
+    un état inchangé).
+    """
+    lines: list[str] = []
+    _gauge(
+        lines,
+        "egress_ip_state",
+        "état d'une IP d'egress (1 = ligne active)",
+        state_rows or [],
+    )
+    _gauge(
+        lines,
+        "egress_reset_at_seconds",
+        "reset fournisseur d'une IP bloquée (epoch secondes)",
+        reset_rows or [],
+    )
+    return lines
+
+
 def render_fallback_section(fb_snap: dict, fo_snap: dict, causes: tuple = FALLBACK_CAUSES) -> list[str]:
     """Familles counter proxy_fallback_total / proxy_failover_total.
 
@@ -506,6 +533,7 @@ def build_metrics_text(snap: MetricsSnapshot) -> str:
     lines.extend(render_vpn_section(snap.vpn))
     lines.extend(render_pool_section(snap.pool))
     lines.extend(render_free_429_section(snap.free429))
+    lines.extend(render_egress_section(snap.egress_states, snap.egress_resets))
     lines.extend(render_fallback_section(snap.fb, snap.fo))
     lines.extend(render_lot0_section(snap.latency, snap.misc, snap.ttfb, snap.conv))
     return "\n".join(lines) + "\n"
@@ -525,6 +553,7 @@ __all__ = [
     "new_metrics_lock",
     "observe_latency_ms",
     "percentile",
+    "render_egress_section",
     "render_fallback_section",
     "render_free_429_section",
     "render_catalog_section",

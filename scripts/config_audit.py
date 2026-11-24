@@ -73,10 +73,129 @@ CARTES_PAR_IDENTIFIANT = {
     "state_file_2",
 }
 
-# Sections dont CHAQUE feuille doit être lue explicitement (`yaml_get` avec
-# clé pointée). Le nom-de-feuille-permissif est interdit : une clé inerte dans
-# ces sections est un mensonge (incident `server_host`/`ip_registry.*`).
-STRICT_SECTIONS = {"ip_registry"}
+# [024 T224] Toutes les sections sont strictes : une feuille n'est vivante que
+# si le code la lit explicitement. L'ancien filet « le nom de la feuille
+# apparaît entre guillemets » est retiré (il retenait 62 % des clés par
+# coïncidence ; `enabled` apparaît 1 110 fois).
+STRICT_SECTIONS: set[str] | None = None
+
+_READER_NAMES = {
+    "yaml_get",
+    "_cfg_get",
+    "cfg_get",
+    "_cfg",
+    "_cfg_int",
+    "_cfg_float",
+    "_cfg_bool",
+    "_cfg_str",
+    "_cfg_list",
+    "_cfg_dict",
+    "_cfg_num",
+    "_yaml_get",
+    "yaml_get_fn",
+    "_yaml_int",
+    "_yaml_float",
+    "_yaml_bool",
+    "_yaml_str",
+    "_yaml_list",
+    "_yaml_dict",
+}
+
+_CONFIG_RECEIVER_MARKERS = (
+    "cfg",
+    "config",
+    "settings",
+    "yaml",
+    "section",
+    "_data",
+)
+
+
+def _receiver_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Call):
+        return _receiver_name(node.func)
+    return ""
+
+
+def _is_config_receiver(name: str) -> bool:
+    lowered = name.lower()
+    if any(marker in lowered for marker in _CONFIG_RECEIVER_MARKERS):
+        return True
+    return name.isupper() and len(name) > 3
+
+
+def _is_config_expression(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and _is_config_receiver(child.id):
+            return True
+        if isinstance(child, ast.Attribute) and _is_config_receiver(child.attr):
+            return True
+    return False
+
+
+def _literal_str(node: ast.AST, consts: dict[str, str]) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return consts.get(node.id)
+    return None
+
+
+_CONST_MAP_MARKERS = (
+    "CONFIG",
+    "DEFAULT",
+    "BOUND",
+    "THRESHOLD",
+    "KEY",
+    "MAP",
+    "SECTION",
+    "FIELDS",
+)
+
+
+def _collect_consts(arbre: ast.AST) -> dict[str, str]:
+    consts: dict[str, str] = {}
+    for node in ast.walk(arbre):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                consts[target.id] = value.value
+    return consts
+
+
+def _collect_config_map_keys(arbre: ast.AST) -> set[str]:
+    keys: set[str] = set()
+    for node in ast.walk(arbre):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not isinstance(value, ast.Dict):
+            continue
+        names = [t.id for t in targets if isinstance(t, ast.Name)]
+        if not any(
+            marker in name.upper()
+            for name in names
+            for marker in _CONST_MAP_MARKERS
+        ):
+            continue
+        for key in value.keys:
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                keys.add(key.value)
+    return keys
 
 # Secrets lus depuis l'environnement/credentials.env, volontairement absents
 # du config.yaml suivi (scrub au chargement). Ne pas les compter « missing ».
@@ -164,19 +283,22 @@ def cles_du_fichier(chemin: Path | None = None) -> dict[str, Any]:
 
 
 def _litteraux_yaml_get() -> set[str]:
-    """Clés lues via `yaml_get("...")` — extraites par l'AST, pas par regex.
+    """Chemins de configuration lus explicitement par le code.
 
-    La regex comptait les docstrings : une explication contenant
-    `yaml_get("<clé>")` créait une fausse clé « manquante ». L'AST ne voit que
-    les appels réels.
-
-    Résultat mis en cache : parser ~200 fichiers coûtait l'essentiel des 28 s
-    du gate, pour une donnée qui ne change pas pendant un run.
+    Reconnaît ``yaml_get`` et ses variantes typées, les accès dictionnaire
+    (``cfg.get("clé")``, ``section["clé"]``), les constantes module et les
+    dictionnaires de bornes/défauts. Le nom-de-feuille permissif est supprimé.
     """
-    global _CLES_LUES_CACHE
-    if _CLES_LUES_CACHE is not None:
+    global _CLES_LUES_CACHE, _LEAF_READS, _DICT_SECTIONS, _READS_CACHE
+    if (
+        _CLES_LUES_CACHE is not None
+        and _READS_CACHE is not None
+        and _READS_CACHE[0] is _CLES_LUES_CACHE
+    ):
         return _CLES_LUES_CACHE
     cles: set[str] = set()
+    leaves: set[str] = set()
+    dict_sections: set[str] = set()
     for chemin in _fichiers_python():
         if chemin.name == "config_audit.py":
             continue
@@ -184,31 +306,59 @@ def _litteraux_yaml_get() -> set[str]:
             arbre = ast.parse(_lire_source(chemin))
         except (OSError, SyntaxError):
             continue
+        consts = _collect_consts(arbre)
+        leaves.update(_collect_config_map_keys(arbre))
         for noeud in ast.walk(arbre):
-            if not isinstance(noeud, ast.Call):
-                continue
-            fonction = noeud.func
-            nom = getattr(fonction, "id", None) or getattr(fonction, "attr", None) or ""
-            if nom not in ("yaml_get", "_cfg_get", "cfg_get"):
-                continue
-            if not noeud.args:
-                continue
-            premier = noeud.args[0]
-            if isinstance(premier, ast.Constant) and isinstance(premier.value, str):
-                cles.add(premier.value)
-                # `yaml_get("ip_registry", "score.min_score")` : la feuille
-                # complète permet l'audit strict des sous-sections typées.
-                if (
-                    len(noeud.args) > 1
-                    and isinstance(noeud.args[1], ast.Constant)
-                    and isinstance(noeud.args[1].value, str)
-                ):
-                    cles.add(f"{premier.value}.{noeud.args[1].value}")
+            if isinstance(noeud, ast.Call):
+                fonction = noeud.func
+                nom = getattr(fonction, "id", None) or getattr(fonction, "attr", None) or ""
+                if nom == "get" and isinstance(fonction, ast.Attribute):
+                    if noeud.args:
+                        first = _literal_str(noeud.args[0], consts)
+                        if first:
+                            leaves.add(first)
+                    continue
+                if len(noeud.args) > 1 and _is_config_expression(noeud.args[0]):
+                    key = _literal_str(noeud.args[1], consts)
+                    if key:
+                        leaves.add(key)
+                if nom not in _READER_NAMES:
+                    continue
+                args = list(noeud.args)
+                if not args:
+                    continue
+                section = _literal_str(args[0], consts)
+                if not section:
+                    continue
+                if len(args) == 1:
+                    cles.add(section)
+                    continue
+                if isinstance(args[1], ast.Constant) and args[1].value is None:
+                    dict_sections.add(section)
+                    continue
+                key = _literal_str(args[1], consts)
+                if not key:
+                    continue
+                chemin_complet = f"{section}.{key}"
+                cles.add(chemin_complet)
+                if len(args) > 2 and isinstance(args[2], ast.Dict):
+                    dict_sections.add(chemin_complet)
+            elif isinstance(noeud, ast.Subscript):
+                if _is_config_expression(noeud.value):
+                    key = _literal_str(noeud.slice, consts)
+                    if key:
+                        leaves.add(key)
+    _LEAF_READS = leaves
+    _DICT_SECTIONS = dict_sections
     _CLES_LUES_CACHE = cles
+    _READS_CACHE = (cles, leaves, dict_sections)
     return cles
 
 
 _CLES_LUES_CACHE: set[str] | None = None
+_LEAF_READS: set[str] | None = None
+_DICT_SECTIONS: set[str] | None = None
+_READS_CACHE: tuple[set[str], set[str], set[str]] | None = None
 
 
 def _source_complete() -> str:
@@ -234,6 +384,18 @@ _SOURCE_CACHE: str | None = None
 _AUDIT_CACHE: dict[tuple[str, float], dict[str, object]] = {}
 
 
+def _cle_est_lue(cle: str, lues: set[str]) -> bool:
+    """Vrai si la clé est lue explicitement (ou via un dict d'ancêtre)."""
+    feuille = cle.rsplit(".", 1)[-1]
+    if cle in lues or (feuille and _LEAF_READS and feuille in _LEAF_READS):
+        return True
+    parties = cle.split(".")
+    return any(
+        ".".join(parties[:i]) in (_DICT_SECTIONS or set())
+        for i in range(len(parties) - 1, 0, -1)
+    )
+
+
 def auditer(chemin: Path | None = None) -> dict[str, Any]:
     chemin = chemin or CONFIG
     try:
@@ -245,25 +407,11 @@ def auditer(chemin: Path | None = None) -> dict[str, Any]:
 
     aplaties = cles_du_fichier(chemin)
     lues_exactement = _litteraux_yaml_get()
-    source = _source_complete()
 
+    # [024 T224] Audit strict sur toutes les sections.
     mortes: list[str] = []
     for cle in aplaties:
-        section = cle.split(".", 1)[0]
-        if section in STRICT_SECTIONS:
-            # Strict : seule une lecture explicite de la feuille complète
-            # compte. Le nom-de-feuille trouvé n'importe où dans le code ne
-            # suffit pas (il masquait les clés mortes de `ip_registry`).
-            if cle not in lues_exactement:
-                mortes.append(cle)
-            continue
-        feuille = cle.rsplit(".", 1)[-1]
-        # « utilisée » = son nom apparaît quelque part dans le code, ou elle est
-        # lue via yaml_get sous sa forme complète. Volontairement permissif :
-        # on cherche le silence, pas la pureté.
-        if cle in lues_exactement:
-            continue
-        if re.search(rf"[\"']{re.escape(feuille)}[\"']", source):
+        if _cle_est_lue(cle, lues_exactement):
             continue
         mortes.append(cle)
 

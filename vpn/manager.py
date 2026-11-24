@@ -22,6 +22,7 @@ versions au-delà, plan §10) ; le nouveau code importe ``vpn.manager``.
 La découpe fine stations/compose/watchdog/geo reste en follow-up.
 """
 
+from core.testing import under_test
 import asyncio
 import json
 import logging
@@ -2554,7 +2555,7 @@ class VPNManager:
 
                 # Let the new tunnel stabilize before probing the IP
                 await asyncio.sleep(
-                    self._switch_delay * (random.uniform(0.8, 1.2) if not os.getenv("PYTEST_CURRENT_TEST") else 1.0)
+                    self._switch_delay * (random.uniform(0.8, 1.2) if not under_test() else 1.0)
                 )  # [P3.5] jitter ±20% healthy
 
                 new_ip = await self.get_public_ip()
@@ -4371,7 +4372,7 @@ class VPNManager:
                     # cursor always advances, so this picks a NEW country.
                     await self._pin_country_for_rotation()
                     await asyncio.sleep(
-                        self._switch_delay * (random.uniform(0.8, 1.2) if not os.getenv("PYTEST_CURRENT_TEST") else 1.0)
+                        self._switch_delay * (random.uniform(0.8, 1.2) if not under_test() else 1.0)
                     )  # [P3.5] jitter ±20% healthy
                 except Exception as e:
                     logger.debug("[vpn] finalize recovery round failed: %s", e)
@@ -6443,7 +6444,7 @@ class VPNManager:
                     # 6 stations qui dorment 15 s pile repartent en rafale
                     # synchronisée → le jitter désynchronise les handshakes).
                     _raw = _bo if _bo > 0 else 15.0
-                    if not os.getenv("PYTEST_CURRENT_TEST"):
+                    if not under_test():
                         _raw *= random.uniform(0.8, 1.2)
                     # Injectable clock: the offline control suites replace
                     # `_sleep_fn` with a no-op. Bypassing it made a single
@@ -6476,7 +6477,7 @@ class VPNManager:
                 )
                 # [fiab 09/09] jitter ±20% : désync les re-pins parallèles.
                 _skip_delay = 5.0
-                if not os.getenv("PYTEST_CURRENT_TEST"):
+                if not under_test():
                     _skip_delay *= random.uniform(0.8, 1.2)
                 await self._sleep_fn(_skip_delay)
                 continue
@@ -9760,7 +9761,7 @@ class VPNManager:
             # [P3.5 perf] jitter ±20% uniquement sur branche healthy (interval)
             # jamais sur backoff ni cadence armée — dual-wait docker intact
             # (désactivé sous pytest pour ne pas casser les assertions exactes)
-            if delay == self._watchdog_interval and not os.getenv("PYTEST_CURRENT_TEST"):
+            if delay == self._watchdog_interval and not under_test():
                 delay *= random.uniform(0.8, 1.2)
             # Sleep dually on the interval AND container events: every
             # die/stop/kill/start (docker events watcher sets
@@ -10972,7 +10973,7 @@ class VPNManager:
         Appels sans boucle (tests) → fallback sync immédiat.
         """
         # [tests] en pytest, le save doit être synchrone pour que les assertions sur le fichier passent
-        if os.getenv("PYTEST_CURRENT_TEST"):
+        if under_test():
             self._save_state_sync()
             self._save_state_last = time.monotonic()
             return

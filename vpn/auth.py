@@ -16,6 +16,8 @@ Contrat :
 
 from __future__ import annotations
 
+from core.testing import under_test
+
 import asyncio
 import logging
 import os
@@ -67,7 +69,7 @@ def _auth_connect_done() -> None:
 async def _auth_gate(station: str | None = None) -> None:
     """Throttle AUTH NordVPN : 2 connexions simultanées max + cooldowns."""
     global _AUTH_LAST_CONNECT_AT, _AUTH_IN_FLIGHT
-    if os.getenv("PYTEST_CURRENT_TEST"):
+    if under_test():
         return
     while True:
         wait = _auth_cooldown_remaining()

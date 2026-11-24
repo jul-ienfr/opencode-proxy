@@ -70,24 +70,6 @@ def select_many(
     return selected
 
 
-def public_pool_rows(
-    store: EgressStore,
-    policy: ProviderPolicy,
-    *,
-    max_active: int | None = None,
-    now: float | None = None,
-) -> list[dict[str, Any]]:
-    """Rows accepted by ``FreeIPPool.set_public_proxies``.
-
-    The worker is fed only catalog-proven ``usable`` options.  The catalog
-    keeps the rest; the active pool stays capped.
-    """
-
-    cap = max(1, int(max_active or policy.max_active or 1))
-    selected = select_many(store, policy, count=cap, now=now)
-    return rows_from_options(selected)
-
-
 def rows_from_options(options: Iterable[EgressOption]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for option in options:
@@ -108,10 +90,6 @@ def rows_from_options(options: Iterable[EgressOption]) -> list[dict[str, Any]]:
             }
         )
     return rows
-
-
-def provider_status(store: EgressStore, provider: str) -> dict[str, Any]:
-    return dict(store.summary().get(str(provider)) or {})
 
 
 def rotation_plan(
@@ -136,8 +114,6 @@ def rotation_plan(
 
 __all__ = [
     "Provider",
-    "provider_status",
-    "public_pool_rows",
     "rotation_plan",
     "rows_from_options",
     "select_many",

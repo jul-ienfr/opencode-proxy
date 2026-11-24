@@ -83,18 +83,3 @@ def bucket_key(provider: str, ip: str, *, endpoint: str = "") -> str:
         return str(ipaddress.ip_address(raw))
     except ValueError:
         return raw
-
-
-def capacity(provider: str, ip: str) -> int:
-    """Capacité d'un bucket : 0 pour WARP IPv4, 1 sinon."""
-    name = str(provider or "").lower()
-    if name == WARP:
-        try:
-            return 0 if ipaddress.ip_address(str(ip).strip()).version == 4 else 1
-        except ValueError:
-            return 0
-    return 1
-
-
-def is_reserve_eligible(provider: str) -> bool:
-    return capabilities(provider).reserve_eligible

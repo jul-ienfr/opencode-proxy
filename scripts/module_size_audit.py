@@ -24,6 +24,8 @@ EXCLUDED_PARTS = {
     ".kilo",
     ".audit-wt",
     ".audit-logs-wt",
+    ".artifacts",
+    "_research",
     "node_modules",
 }
 

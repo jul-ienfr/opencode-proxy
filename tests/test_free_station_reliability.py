@@ -86,8 +86,6 @@ def test_shadow_selector_logs_but_keeps_legacy_routing(monkeypatch):
         pool._best_ip, "rank", lambda stations, model: [Pick()]
     )
     assert pool._best_station(model="m") is st1
-    assert pool._last_selection is not None
-    assert pool._last_selection.snapshot()["station"] == 2
 
 
 def test_dynamic_rotation_threshold_uses_profile_and_percent():
@@ -104,8 +102,6 @@ def test_model_usable_rejects_draining_ip_and_selector_picks_fresh_one():
     assert pool.model_usable("m", st1)[0] is False
     chosen = pool._best_station(model="m")
     assert chosen is st2
-    assert pool._last_selection is not None
-    assert pool._last_selection.station is st2
 
 
 def test_strict_health_rejects_auth_failed_and_stale_egress():

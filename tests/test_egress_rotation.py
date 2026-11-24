@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from free.egress_catalog import Observation, ObservationPhase, OptionStatus, Provider, ProviderPolicy
-from free.egress_rotation import public_pool_rows, rotation_plan, select_many, select_option
+from free.egress_rotation import rotation_plan, rows_from_options, select_many, select_option
 from free.egress_store import EgressStore
 
 
@@ -62,13 +62,14 @@ def test_select_many_returns_distinct_blocks_only(tmp_path):
         store.close()
 
 
-def test_public_pool_rows_are_ready_for_the_worker(tmp_path):
+def test_rows_from_options_are_ready_for_the_worker(tmp_path):
     store = _store(tmp_path)
     policy = ProviderPolicy(provider=Provider.PUBLIC, max_active=2, ttl_usable_s=10_000.0)
     try:
         _add(store, policy, host="1.2.3.4", egress="1.2.3.4")
         _add(store, policy, host="5.6.7.8", egress="5.6.7.8")
-        rows = public_pool_rows(store, policy, max_active=2, now=1_100.0)
+        selected = select_many(store, policy, count=2, now=1_100.0)
+        rows = rows_from_options(selected)
         assert len(rows) == 2
         assert rows[0]["url"].startswith("https://")
         assert rows[0]["provider"] == "public"

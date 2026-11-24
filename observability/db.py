@@ -53,15 +53,15 @@ DB_RAW_SIZE_CAP = 2_000_000  # [D1] au-delà : résumé compact mis en queue
 # ── Corps : tronquage / estimation / stub ───────────────────────────
 
 
-def truncate_body_for_storage(body: dict | None, max_chars: int = MAX_BODY_STORAGE) -> str | None:
+def truncate_body_for_storage(body: dict | None, max_chars: int | None = None) -> str | None:
     """Serialize body to JSON, truncating messages array if needed to stay under max_chars.
 
-    Keeps model, tools, and a summary of messages to preserve context while
-    avoiding the memory waste of serializing a 10MB body just to keep 100K.
-
-    Optimized: builds truncated version first, only falls back to full
-    serialization if the truncated version is small enough.
+    ``max_chars=None`` lit ``MAX_BODY_STORAGE`` au moment de l'appel (un test
+    peut monkeypatcher le global ; une valeur par défaut liée à la définition
+    ne verrait pas le changement).
     """
+    if max_chars is None:
+        max_chars = MAX_BODY_STORAGE
     if not body:
         return None
     # Quick size estimate: sum of string lengths of non-messages fields
@@ -178,7 +178,13 @@ class DbRowRaw:
         self.tools_used = tools_used
 
 
-def materialize_db_row(raw: DbRowRaw, *, redact_fn, tools_seen: set | None = None) -> tuple:
+def materialize_db_row(
+    raw: DbRowRaw,
+    *,
+    redact_fn,
+    tools_seen: set | None = None,
+    max_body_chars: int | None = None,
+) -> tuple:
     """Thread writer : sérialise/tronque/redige une ligne brute (CPU hors loop).
 
     ``redact_fn`` injecté (la redaction reste la propriété d'opencode) ;
@@ -191,8 +197,9 @@ def materialize_db_row(raw: DbRowRaw, *, redact_fn, tools_seen: set | None = Non
     # scanner TOUTE la table JSON à chaque requête de filtres.
     if raw.tools_used and tools_seen is not None:
         tools_seen.update(raw.tools_used)
-    request_body_json = redact_fn(truncate_body_for_storage(raw.request_body)) if raw.request_body else None
-    response_body_json = redact_fn(truncate_body_for_storage(raw.response_body)) if raw.response_body else None
+    cap = MAX_BODY_STORAGE if max_body_chars is None else max_body_chars
+    request_body_json = redact_fn(truncate_body_for_storage(raw.request_body, cap)) if raw.request_body else None
+    response_body_json = redact_fn(truncate_body_for_storage(raw.response_body, cap)) if raw.response_body else None
     return raw.head + (tools_json, tools_used_json, request_body_json, response_body_json) + raw.tail
 
 
@@ -845,6 +852,7 @@ def cleanup_old_bodies(
     *,
     log_fn,
     debug_fn,
+    max_body_chars: int | None = None,
 ) -> int:
     """Clean up old request data to prevent DB bloat.
 
@@ -913,6 +921,31 @@ def cleanup_old_bodies(
             if n <= 0:
                 break
             cleaned += n
+
+        # [025 T025] Re-tronque les corps conservés (jeunes mais > cap) sans
+        # les supprimer : le plafond configurable s'applique aussi aux lignes
+        # déjà écrites avant le changement de configuration.
+        if max_body_chars and int(max_body_chars) > 0:
+            cap = int(max_body_chars)
+            while True:
+                with lock:
+                    cur = conn.execute(
+                        "UPDATE requests SET "
+                        "request_body = CASE WHEN request_body IS NOT NULL "
+                        "THEN SUBSTR(request_body, 1, ?) ELSE NULL END, "
+                        "response_body = CASE WHEN response_body IS NOT NULL "
+                        "THEN SUBSTR(response_body, 1, ?) ELSE NULL END "
+                        "WHERE rowid IN (SELECT rowid FROM requests "
+                        "WHERE (LENGTH(request_body) > ? OR LENGTH(response_body) > ?) "
+                        "LIMIT ?)",
+                        (cap, cap, cap, cap, batch_size),
+                    )
+                    n = int(cur.rowcount or 0)
+                    if n:
+                        _commit_batch()
+                if n <= 0:
+                    break
+                cleaned += n
 
         total = deleted + deleted2 + cleaned
         if total > 0:

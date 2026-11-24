@@ -51,6 +51,8 @@ Historicité — docstring latency_rotation.py :
 
 from __future__ import annotations
 
+from core.testing import under_test
+
 import calendar
 import logging
 import os
@@ -565,7 +567,7 @@ class LatencyRotationEngine:
         try:
             import os as _os
 
-            if not _os.getenv("PYTEST_CURRENT_TEST"):
+            if not _under_test():
                 self._load_engine_state()
         except Exception:
             pass
@@ -700,9 +702,7 @@ class LatencyRotationEngine:
         # soft_history. Débouncée 60s (mark = rare, pas hot path requête).
         # Sauf sous pytest (isolation).
         try:
-            import os as _os
-
-            if _os.getenv("PYTEST_CURRENT_TEST"):
+            if under_test():
                 return
             now = self._now()
             if not force and (now - float(getattr(self, "_last_engine_persist_at", 0.0))) < 60.0:
